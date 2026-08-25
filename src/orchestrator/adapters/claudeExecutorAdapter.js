@@ -249,7 +249,11 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn }) {
 
 export function createClaudeExecutorAdapter({
   command = 'claude',
-  args = ['-p', '--output-format', 'text'],
+  // Runs non-interactively with no TTY to approve prompts, so file edits
+  // must be pre-authorized or every task reports BLOCKED before it can
+  // touch allowed_files. acceptEdits still leaves Bash and other
+  // permission classes gated normally — only file edits are auto-accepted.
+  args = ['-p', '--output-format', 'text', '--permission-mode', 'acceptEdits'],
   cwd = process.cwd(),
   env = process.env,
   timeoutMs = 10 * 60 * 1000,

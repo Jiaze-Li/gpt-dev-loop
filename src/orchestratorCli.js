@@ -19,6 +19,7 @@ import { createGitEvidenceCollector } from './adapters/gate/git-evidence/index.j
 import { UsageError, mapErrorToExitCode } from './bridge/errors.js';
 import { loadConfig, workflowProfileDir } from './config.js';
 import { cleanupWorkflowChromeProfile } from './bridge/chromeProfile.js';
+import { closeExtensionServer } from './bridge/extensionServer.js';
 
 // Same `wf-<uuid>` shape as WorkflowManager.createWorkflowId
 // (workflowManager.js) — generated here, not by the core, because the
@@ -133,5 +134,15 @@ export async function main(argv) {
   } catch (err) {
     console.error(`gpt-loop-run: ${err.message}`);
     process.exitCode = mapErrorToExitCode(err);
+  } finally {
+    // Same reason as cli.js's `ask` command: the extension transport's
+    // bridge server is a loopback WebSocket *listener*, which keeps
+    // Node's event loop alive indefinitely unless closed explicitly —
+    // without this, `gpt-loop-run` never exits in extension mode
+    // regardless of how the workflow ended (success, REWORK loop, or a
+    // thrown adapter error).
+    if (loadConfig().browserMode === 'extension') {
+      await closeExtensionServer();
+    }
   }
 }

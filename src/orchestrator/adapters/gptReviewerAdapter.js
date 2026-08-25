@@ -225,7 +225,7 @@ function parseReviewResult(taskId, text) {
   if (matches.length === 0) {
     throw new AdapterError(
       ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT,
-      'reviewer output contained no Review Result headings'
+      `reviewer output contained no Review Result headings. Raw reply (first 1000 chars): ${text.slice(0, 1000)}`
     );
   }
 
