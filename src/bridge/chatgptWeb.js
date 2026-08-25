@@ -19,7 +19,7 @@ const STOP_BUTTON_SELECTORS = [
   'button[aria-label="Stop generating"]',
 ];
 
-const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]';
+export const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]';
 
 const LOGIN_HINT_SELECTORS = ['text=Log in', '[data-testid="login-button"]'];
 
@@ -93,8 +93,7 @@ async function sendPrompt(page, composer, prompt) {
   }
 }
 
-async function waitForReply(page, config) {
-  const baselineCount = await page.locator(ASSISTANT_MESSAGE_SELECTOR).count();
+export async function waitForReply(page, config, baselineCount) {
   const deadline = Date.now() + config.responseTimeoutMs;
 
   while (Date.now() < deadline) {
@@ -154,8 +153,9 @@ export async function askGpt(prompt, config) {
     await page.goto(config.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
     const composer = await ensureLoggedIn(page, config);
+    const baselineCount = await page.locator(ASSISTANT_MESSAGE_SELECTOR).count();
     await sendPrompt(page, composer, prompt);
-    const reply = await waitForReply(page, config);
+    const reply = await waitForReply(page, config, baselineCount);
 
     if (!reply) {
       throw new ResponseExtractionError('ChatGPT returned an empty response.');
