@@ -14,6 +14,15 @@ export const DEFAULTS = Object.freeze({
   backgroundWindow: true,
 });
 
+// Each workflow gets its own Chrome profile, nested under the shared base
+// profile dir's directory, so concurrent/sequential workflows never fight
+// over the same profile's SingletonLock (chromeRuntime.js). Keyed off
+// baseProfileDir (rather than hardcoding home dir) so a GPT_LOOP_PROFILE_DIR
+// override still relocates the whole workflows/ tree with it.
+export function workflowProfileDir(workflowId, baseProfileDir = DEFAULTS.profileDir) {
+  return path.join(path.dirname(baseProfileDir), 'workflows', workflowId, 'chrome-profile');
+}
+
 function parseIntEnv(env, name, fallback) {
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;

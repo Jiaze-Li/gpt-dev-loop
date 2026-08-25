@@ -11,6 +11,7 @@ import { STATES } from '../src/orchestrator/stateMachine.js';
 import { createMockExecutorAdapter } from '../src/orchestrator/mocks/mockExecutorAdapter.js';
 import { createMockGateRunner } from '../src/orchestrator/mocks/mockGateRunner.js';
 import { createMockReviewerAdapter } from '../src/orchestrator/mocks/mockReviewerAdapter.js';
+import { workflowProfileDir, loadConfig } from '../src/config.js';
 
 async function withTempDir(fn) {
   const dir = await mkdtemp(path.join(tmpdir(), 'gpt-dev-loop-cli-'));
@@ -91,5 +92,74 @@ test('runWorkflow reports HUMAN_REQUIRED without duplicating a state that repeat
 
     assert.equal(finalState.current_state, STATES.HUMAN_REQUIRED);
     assert.deepEqual(loggedStates, [STATES.PENDING, STATES.EXECUTING, STATES.HUMAN_REQUIRED]);
+  });
+});
+
+test('runWorkflow gives the reviewer adapter a workflow-scoped Chrome profile, and two workflows never collide', async () => {
+  await withTempDir(async (dir) => {
+    const capturedWorkflowIds = [];
+    const capturedReviewerWorkflowIds = [];
+
+    async function runOnce() {
+      return runWorkflow('unused-task-card-path.md', {
+        baseDir: dir,
+        createPersistence: (base) => new Persistence(base),
+        readTaskCardFn: async () => demoTaskCard(),
+        createExecutorAdapter: () => createMockExecutorAdapter({ status: 'DONE' }),
+        createReviewerAdapter: ({ workflowId }) => {
+          capturedReviewerWorkflowIds.push(workflowId);
+          return createMockReviewerAdapter({ decision: 'PASS' });
+        },
+        createGateRunnerAdapter: () => createMockGateRunner({ pass: true }),
+        log: () => {},
+        cleanupChromeProfile: async () => {},
+      });
+    }
+
+    const first = await runOnce();
+    const second = await runOnce();
+    capturedWorkflowIds.push(first.workflow_id, second.workflow_id);
+
+    assert.notEqual(first.workflow_id, second.workflow_id);
+    // The reviewer adapter factory was handed the same workflow_id the core
+    // actually ran with, not a mismatched or missing one.
+    assert.deepEqual(capturedReviewerWorkflowIds, [first.workflow_id, second.workflow_id]);
+
+    const firstProfile = workflowProfileDir(first.workflow_id, loadConfig().profileDir);
+    const secondProfile = workflowProfileDir(second.workflow_id, loadConfig().profileDir);
+    assert.notEqual(firstProfile, secondProfile);
+    assert.notEqual(firstProfile, loadConfig().profileDir);
+  });
+});
+
+test('runWorkflow cleans up the Chrome profile on COMPLETE but keeps it for manual recovery on HUMAN_REQUIRED', async () => {
+  await withTempDir(async (dir) => {
+    const cleanedUp = [];
+
+    const completed = await runWorkflow('unused-task-card-path.md', {
+      baseDir: dir,
+      createPersistence: (base) => new Persistence(base),
+      readTaskCardFn: async () => demoTaskCard(),
+      createExecutorAdapter: () => createMockExecutorAdapter({ status: 'DONE' }),
+      createReviewerAdapter: () => createMockReviewerAdapter({ decision: 'PASS' }),
+      createGateRunnerAdapter: () => createMockGateRunner({ pass: true }),
+      log: () => {},
+      cleanupChromeProfile: async (workflowId) => cleanedUp.push(workflowId),
+    });
+    assert.deepEqual(cleanedUp, [completed.workflow_id]);
+
+    const humanRequired = await runWorkflow('unused-task-card-path.md', {
+      baseDir: dir,
+      createPersistence: (base) => new Persistence(base),
+      readTaskCardFn: async () => demoTaskCard(),
+      createExecutorAdapter: () => createMockExecutorAdapter({ status: 'HUMAN_REQUIRED' }),
+      createReviewerAdapter: () => createMockReviewerAdapter({ decision: 'PASS' }),
+      createGateRunnerAdapter: () => createMockGateRunner({ pass: true }),
+      log: () => {},
+      cleanupChromeProfile: async (workflowId) => cleanedUp.push(workflowId),
+    });
+    assert.equal(humanRequired.current_state, STATES.HUMAN_REQUIRED);
+    // Still just the one cleanup call from the COMPLETE run above.
+    assert.deepEqual(cleanedUp, [completed.workflow_id]);
   });
 });

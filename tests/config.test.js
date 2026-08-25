@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, DEFAULTS } from '../src/config.js';
+import { loadConfig, DEFAULTS, workflowProfileDir } from '../src/config.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -64,6 +64,26 @@ test('loadConfig warns on stderr and ignores the retired GPT_LOOP_HEADLESS env v
   } finally {
     console.error = originalConsoleError;
   }
+});
+
+test('workflowProfileDir nests a workflow-scoped Chrome profile under the base profile dir, not the shared default', () => {
+  const dir = workflowProfileDir('wf-abc123');
+  assert.match(dir, /\.gpt-dev-loop[\\/]workflows[\\/]wf-abc123[\\/]chrome-profile$/);
+  assert.notEqual(dir, DEFAULTS.profileDir);
+  assert.ok(dir.startsWith(os.homedir()));
+});
+
+test('workflowProfileDir gives two different workflows non-conflicting profile paths', () => {
+  const first = workflowProfileDir('wf-111');
+  const second = workflowProfileDir('wf-222');
+  assert.notEqual(first, second);
+  assert.match(first, /wf-111/);
+  assert.match(second, /wf-222/);
+});
+
+test('workflowProfileDir honors a custom base profile dir (e.g. GPT_LOOP_PROFILE_DIR override)', () => {
+  const dir = workflowProfileDir('wf-abc123', '/tmp/custom-profile');
+  assert.equal(dir, path.join('/tmp', 'workflows', 'wf-abc123', 'chrome-profile'));
 });
 
 test('default profile dir lives under the home directory, not inside this repo', () => {

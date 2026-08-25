@@ -12,7 +12,7 @@
 
 import { askGpt } from '../../bridge/chatgptWeb.js';
 import { TransportError, ResponseTimeoutError, RequestTimeoutError } from '../../bridge/errors.js';
-import { loadConfig } from '../../config.js';
+import { loadConfig, workflowProfileDir } from '../../config.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
 
 const RESULT_FIELDS = ['task_id', 'repository_context', 'decision', 'findings', 'required_changes', 'rationale'];
@@ -272,14 +272,24 @@ function parseReviewResult(taskId, text) {
   };
 }
 
-export function createGptReviewerAdapter({ askGptFn = askGpt, config = loadConfig() } = {}) {
+// workflowId (ORCHESTRATOR_DESIGN.md/PERSISTENCE.md's workflow_id), when
+// given, scopes this adapter's Chrome profile to
+// workflows/<workflow_id>/chrome-profile instead of the shared default
+// profile dir — see workflowProfileDir in config.js. Without it, the
+// adapter falls back to the shared profile dir from `config`, unchanged
+// from before this scoping existed.
+export function createGptReviewerAdapter({ askGptFn = askGpt, config = loadConfig(), workflowId } = {}) {
+  const effectiveConfig = workflowId
+    ? { ...config, profileDir: workflowProfileDir(workflowId, config.profileDir) }
+    : config;
+
   return {
     async review(taskCard, executionReport, evidence) {
       const prompt = buildPrompt(taskCard, executionReport, evidence);
 
       let reply;
       try {
-        reply = await askGptFn(prompt, config);
+        reply = await askGptFn(prompt, effectiveConfig);
       } catch (err) {
         if (err instanceof ResponseTimeoutError || err instanceof RequestTimeoutError) {
           throw new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_TIMEOUT, err.message);

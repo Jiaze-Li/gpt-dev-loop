@@ -6,6 +6,7 @@
 // browser bridge.
 
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import { readTaskCard } from './orchestrator/taskCard.js';
 import { Persistence } from './orchestrator/persistence.js';
@@ -16,6 +17,17 @@ import { createGptReviewerAdapter } from './orchestrator/adapters/gptReviewerAda
 import { createGateRunner } from './orchestrator/adapters/gateRunner.js';
 import { createGitEvidenceCollector } from './adapters/gate/git-evidence/index.js';
 import { UsageError, mapErrorToExitCode } from './bridge/errors.js';
+import { loadConfig, workflowProfileDir } from './config.js';
+import { cleanupWorkflowChromeProfile } from './bridge/chromeProfile.js';
+
+// Same `wf-<uuid>` shape as WorkflowManager.createWorkflowId
+// (workflowManager.js) — generated here, not by the core, because the
+// reviewer adapter needs the workflow_id *before* runTask() starts in
+// order to give it a workflow-scoped Chrome profile (see
+// createReviewerAdapter's default below).
+function createWorkflowId() {
+  return `wf-${randomUUID()}`;
+}
 
 export function parseArgs(argv) {
   const [command, ...rest] = argv;
@@ -61,23 +73,43 @@ export async function runWorkflow(
     baseDir = DEFAULT_BASE_DIR,
     createPersistence = (dir) => new Persistence(dir),
     createExecutorAdapter = () => createClaudeExecutorAdapter(),
-    createReviewerAdapter = () => createGptReviewerAdapter(),
+    createReviewerAdapter = ({ workflowId }) => createGptReviewerAdapter({ workflowId }),
     createGateRunnerAdapter = () => createGateRunner({ gitEvidenceCollector: createGitEvidenceCollector() }),
     readTaskCardFn = readTaskCard,
     log = (line) => console.log(line),
+    cleanupChromeProfile = cleanupWorkflowChromeProfile,
   } = {}
 ) {
   const taskCard = await readTaskCardFn(taskCardPath);
   const persistence = withStateLogging(createPersistence(baseDir), log);
+  const workflowId = createWorkflowId();
 
   const manager = new WorkflowManager({
     executorAdapter: createExecutorAdapter(),
-    reviewerAdapter: createReviewerAdapter(),
+    reviewerAdapter: createReviewerAdapter({ workflowId }),
     gateRunner: createGateRunnerAdapter(),
     persistence,
   });
 
-  return manager.runTask(taskCard);
+  const finalState = await manager.runTask(taskCard, { workflowId });
+
+  // Review result + all other artifacts (PERSISTENCE.md) already saved by
+  // the core under baseDir, untouched by any of this. Only the throwaway
+  // Chrome profile is handled here. Uses console.error directly (not the
+  // `log` callback above, which is reserved for state-transition reporting
+  // — see withStateLogging) so this doesn't interleave with that output.
+  if (finalState.current_state === STATES.HUMAN_REQUIRED) {
+    const profileDir = workflowProfileDir(workflowId, loadConfig().profileDir);
+    console.error(
+      `gpt-loop-run: manual recovery may be needed (login/Cloudflare) — this workflow's Chrome profile is kept at ${profileDir}`
+    );
+  } else {
+    await cleanupChromeProfile(workflowId, loadConfig().profileDir).catch((err) => {
+      console.error(`gpt-loop-run: could not clean up chrome profile for ${workflowId}: ${err.message}`);
+    });
+  }
+
+  return finalState;
 }
 
 export async function main(argv) {

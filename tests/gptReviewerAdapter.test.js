@@ -313,3 +313,66 @@ test('gpt reviewer adapter: an unexpected error still maps to REVIEWER_UNAVAILAB
     }
   );
 });
+
+test('gpt reviewer adapter: a workflowId scopes the Chrome profile to that workflow, not the shared default', async () => {
+  let capturedConfig;
+  const askGptFn = async (prompt, config) => {
+    capturedConfig = config;
+    return resultText({ decision: 'PASS' });
+  };
+  const adapter = createGptReviewerAdapter({
+    askGptFn,
+    config: { profileDir: '/home/user/.gpt-dev-loop/chrome-profile' },
+    workflowId: 'wf-abc123',
+  });
+
+  await adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+
+  assert.match(capturedConfig.profileDir, /workflows[\\/]wf-abc123[\\/]chrome-profile$/);
+  assert.notEqual(capturedConfig.profileDir, '/home/user/.gpt-dev-loop/chrome-profile');
+});
+
+test('gpt reviewer adapter: two different workflowIds get non-conflicting Chrome profile paths', async () => {
+  const askGptFn = async () => resultText({ decision: 'PASS' });
+  const sharedConfig = { profileDir: '/home/user/.gpt-dev-loop/chrome-profile' };
+
+  let firstConfig;
+  const first = createGptReviewerAdapter({
+    askGptFn: async (prompt, config) => {
+      firstConfig = config;
+      return askGptFn();
+    },
+    config: sharedConfig,
+    workflowId: 'wf-111',
+  });
+  let secondConfig;
+  const second = createGptReviewerAdapter({
+    askGptFn: async (prompt, config) => {
+      secondConfig = config;
+      return askGptFn();
+    },
+    config: sharedConfig,
+    workflowId: 'wf-222',
+  });
+
+  await first.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+  await second.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+
+  assert.notEqual(firstConfig.profileDir, secondConfig.profileDir);
+});
+
+test('gpt reviewer adapter: without a workflowId, falls back to the shared config profileDir unchanged', async () => {
+  let capturedConfig;
+  const askGptFn = async (prompt, config) => {
+    capturedConfig = config;
+    return resultText({ decision: 'PASS' });
+  };
+  const adapter = createGptReviewerAdapter({
+    askGptFn,
+    config: { profileDir: '/home/user/.gpt-dev-loop/chrome-profile' },
+  });
+
+  await adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+
+  assert.equal(capturedConfig.profileDir, '/home/user/.gpt-dev-loop/chrome-profile');
+});
