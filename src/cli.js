@@ -1,4 +1,4 @@
-import { askGpt } from './bridge/chatgptWeb.js';
+import { resolveAskGpt } from './bridge/transport.js';
 import { loadConfig } from './config.js';
 import { UsageError, mapErrorToExitCode } from './bridge/errors.js';
 
@@ -26,7 +26,7 @@ export async function main(argv) {
 
   try {
     const config = loadConfig();
-    const reply = await askGpt(parsed.prompt, config);
+    const reply = await resolveAskGpt(config)(parsed.prompt, config);
     process.stdout.write(`${reply}\n`);
     process.exitCode = 0;
   } catch (err) {
