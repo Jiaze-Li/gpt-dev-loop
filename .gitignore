@@ -1,0 +1,31 @@
+# Dependencies / build outputs
+node_modules/
+dist/
+build/
+coverage/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# ChatGPT / browser authentication and profile state
+.chatgpt/
+.gpt-dev-loop/
+.browser-profile/
+playwright/.auth/
+**/cookies.json
+**/storage-state.json
+**/session.json
+
+# Local runtime state
+*.pid
+*.sock
+*.log
+runs/
+state.local.json
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
