@@ -1,0 +1,20 @@
+// Implements docs/workflow/ADAPTER_INTERFACE.md §5 error model.
+
+export class AdapterError extends Error {
+  constructor(code, message) {
+    super(message ?? code);
+    this.name = 'AdapterError';
+    this.code = code;
+  }
+}
+
+export const ADAPTER_ERROR_CODES = Object.freeze({
+  EXECUTOR_UNAVAILABLE: 'EXECUTOR_UNAVAILABLE',
+  EXECUTOR_TIMEOUT: 'EXECUTOR_TIMEOUT',
+  EXECUTOR_INVALID_OUTPUT: 'EXECUTOR_INVALID_OUTPUT',
+  REVIEWER_UNAVAILABLE: 'REVIEWER_UNAVAILABLE',
+  REVIEWER_TIMEOUT: 'REVIEWER_TIMEOUT',
+  REVIEWER_INVALID_OUTPUT: 'REVIEWER_INVALID_OUTPUT',
+  GATE_FAILED: 'GATE_FAILED',
+  GATE_RUNNER_ERROR: 'GATE_RUNNER_ERROR',
+});

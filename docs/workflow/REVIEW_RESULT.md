@@ -20,6 +20,11 @@ Same convention as TASK_PROTOCOL.md §1: one Markdown document, one level-2
 
 - **task_id** — must match the `task_id` of the Task Card and Execution
   Report this result answers.
+- **repository_context** — which repository *commit* this review was
+  actually performed against, same four sub-fields as
+  [TASK_PROTOCOL.md](./TASK_PROTOCOL.md) §2 (`repository_name`,
+  `repository_url`, `branch`, `commit_sha`). Lets a human or a future audit
+  confirm the review wasn't run against a stale checkout.
 - **decision** — one of:
   - `PASS` — acceptance criteria are met; the loop advances to `NEXT TASK`
     per [WORKFLOW.md](./WORKFLOW.md) §PASS/REWORK.
@@ -52,6 +57,12 @@ Same convention as TASK_PROTOCOL.md §1: one Markdown document, one level-2
 ```markdown
 ## task_id
 <matches the originating Task Card and Execution Report>
+
+## repository_context
+repository_name: <name>
+repository_url: <url, or "none">
+branch: <branch>
+commit_sha: <the commit this review was performed against>
 
 ## decision
 PASS | REWORK | HUMAN_REQUIRED

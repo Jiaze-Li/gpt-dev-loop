@@ -21,6 +21,12 @@ Same convention as TASK_PROTOCOL.md §1: one Markdown document, one level-2
 - **task_id** — must match the `task_id` of the Task Card this report
   answers. This is the correlation key a reviewer or future automation uses
   to pair a report with its originating task.
+- **repository_context** — which repository *state* this report describes,
+  same four sub-fields as [TASK_PROTOCOL.md](./TASK_PROTOCOL.md) §2
+  (`repository_name`, `repository_url`, `branch`, `commit_sha`). `commit_sha`
+  here is the commit the executor actually left the repo at, which is not
+  necessarily the Task Card's `commit_sha` — a reviewer checks the two
+  against each other rather than assuming they match.
 - **status** — one of `DONE`, `BLOCKED`, `HUMAN_REQUIRED`, matching the
   `completion_signal` values defined in
   [TASK_PROTOCOL.md](./TASK_PROTOCOL.md) §2. This is the single field a
@@ -56,6 +62,12 @@ Same convention as TASK_PROTOCOL.md §1: one Markdown document, one level-2
 ```markdown
 ## task_id
 <matches the originating Task Card>
+
+## repository_context
+repository_name: <name>
+repository_url: <url, or "none">
+branch: <branch>
+commit_sha: <the commit the repo was actually left at>
 
 ## status
 DONE | BLOCKED | HUMAN_REQUIRED

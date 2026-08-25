@@ -33,6 +33,14 @@ card. Don't omit; state "none."
   `phase3.1-task-protocol`). Used to correlate this card with its eventual
   [EXECUTION_REPORT.md](./EXECUTION_REPORT.md) and
   [REVIEW_RESULT.md](./REVIEW_RESULT.md).
+- **repository_context** — which repository this Task Card belongs to, so
+  every downstream reader (executor, reviewer, human) knows what it's
+  looking at without inferring it from `cwd`. Four sub-fields, one per line:
+  - `repository_name` — short human-readable repo name.
+  - `repository_url` — the repo's remote URL (e.g. GitHub), or "none" for a
+    repo with no remote.
+  - `branch` — the branch this task is scoped to.
+  - `commit_sha` — the commit this Task Card was planned against.
 - **goal** — one to three sentences: what should be true when this task is
   done. States intent, not implementation steps.
 - **context** — the minimum background the executor needs that isn't
@@ -76,6 +84,12 @@ card. Don't omit; state "none."
 ```markdown
 ## task_id
 <short unique id>
+
+## repository_context
+repository_name: <name>
+repository_url: <url, or "none">
+branch: <branch>
+commit_sha: <sha>
 
 ## goal
 <1-3 sentences>
