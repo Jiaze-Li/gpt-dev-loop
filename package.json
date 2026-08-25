@@ -6,7 +6,8 @@
   "type": "module",
   "bin": {
     "gpt-loop": "./bin/gpt-loop.js",
-    "gpt-loop-mcp": "./bin/gpt-loop-mcp.js"
+    "gpt-loop-mcp": "./bin/gpt-loop-mcp.js",
+    "gpt-loop-run": "./bin/gpt-loop-run.js"
   },
   "scripts": {
     "ask": "node ./bin/gpt-loop.js ask",
