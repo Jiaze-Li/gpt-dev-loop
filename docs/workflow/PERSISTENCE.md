@@ -21,11 +21,14 @@ transition — history lives in the event log (§2), not here.
 
 Fields:
 
-- **workflow_id** — identifier for the overall spec/run this task belongs to
-  (one workflow breaks down into many tasks per WORKFLOW.md §NEXT TASK).
-  Lets recovery find "everything in progress for this run" without scanning
-  every task file.
-- **task_id** — matches TASK_PROTOCOL.md §2 `task_id`. Primary key.
+- **workflow_id** — identifies one complete workflow execution: the overall
+  spec/run this task belongs to (one workflow breaks down into many tasks
+  per WORKFLOW.md §NEXT TASK). Remains constant across every task that
+  belongs to the same workflow run, unlike `task_id`, which is unique per
+  task. Lets recovery find "everything in progress for this run" without
+  scanning every task file (§3).
+- **task_id** — matches TASK_PROTOCOL.md §2 `task_id`. Primary key for this
+  task; distinct from `workflow_id`, which groups many tasks under one run.
 - **current_state** — one of the states in STATE_MACHINE.md §1
   (`PENDING`, `EXECUTING`, `VERIFYING`, `REVIEWING`, `COMPLETE`, `REWORK`,
   `HUMAN_REQUIRED`, `ABORTED`).
@@ -63,6 +66,11 @@ in order."
 
 Each event records one state transition:
 
+- **workflow_id** — same meaning and value as `state.json`'s `workflow_id`
+  (§1): identifies which workflow execution this task's events belong to.
+  Constant across every event for every task in the same workflow run — lets
+  recovery (§3) and audit tooling filter the log to one workflow without
+  cross-referencing `task_id` against a separate workflow index.
 - **timestamp** — when the transition happened.
 - **previous_state** — the state before the transition.
 - **new_state** — the state after the transition.
@@ -77,7 +85,7 @@ Each event records one state transition:
 Example:
 
 ```json
-{"timestamp": "2026-08-25T10:14:02Z", "previous_state": "EXECUTING", "new_state": "VERIFYING", "trigger": "executor reports DONE", "actor": "claude"}
+{"workflow_id": "phase4-persistence-run", "timestamp": "2026-08-25T10:14:02Z", "previous_state": "EXECUTING", "new_state": "VERIFYING", "trigger": "executor reports DONE", "actor": "claude"}
 ```
 
 The event log is what makes `state.json` reconstructible from scratch (§3)
@@ -86,7 +94,14 @@ cache of "replay the log," not an independent record.
 
 ## 3. Recovery
 
-On process restart, for every task whose `current_state` is not terminal
+On process restart, recovery first groups by `workflow_id`: it locates every
+task's `state.json` and event log belonging to the same workflow execution,
+so it can reconstruct "everything in progress for this run" as one unit
+before deciding what to do with any individual task. Only after that
+workflow-level history is assembled does recovery look at each task
+individually.
+
+For every task whose `current_state` is not terminal
 (`COMPLETE` or `ABORTED`), recovery inspects `current_state` and decides
 what to do next. No state resumes by silently continuing as if nothing
 happened — every recovery path either re-derives fresh evidence or
