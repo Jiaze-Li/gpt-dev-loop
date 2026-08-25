@@ -36,11 +36,43 @@ export class ExtensionServer {
     this.host = config.extensionHost;
     this.port = config.extensionPort;
     this.extensionId = config.extensionId;
+    // "Worker window" lifecycle listeners — the ChatGPT tab this server
+    // relays requests to, from the caller's point of view a WS
+    // connect/disconnect *is* that worker window becoming available/going
+    // away. Kept as a plain Set (not Node's EventEmitter) since this is the
+    // only thing that needs it and the extension sandbox side of this
+    // protocol (background.js) can't import node:events anyway — this file
+    // stays a plausible model for what that side would need to mirror.
+    this._lifecycleListeners = new Set();
     this.wss = null;
     this.conn = null;
     this.ready = false;
     this.queue = [];
     this.inFlight = null;
+  }
+
+  // Subscribes to "worker window" lifecycle events (`{ type: 'connected' |
+  // 'disconnected', extensionVersion?, capabilities? }`), fired from the
+  // same points as the console log lines just below (hello / _onClose).
+  // Returns an unsubscribe function. A caller that wants these tied to a
+  // specific workflow's event log (orchestratorCli.js) is expected to
+  // subscribe around just its own runTask() call and unsubscribe after —
+  // this server is a process-wide singleton reused across unrelated calls,
+  // so listeners left attached would misattribute later connects/
+  // disconnects to a workflow that already finished.
+  onLifecycle(listener) {
+    this._lifecycleListeners.add(listener);
+    return () => this._lifecycleListeners.delete(listener);
+  }
+
+  _emitLifecycle(event) {
+    for (const listener of this._lifecycleListeners) {
+      try {
+        listener(event);
+      } catch (err) {
+        log(`worker window lifecycle listener threw: ${err.message}`);
+      }
+    }
   }
 
   start() {
@@ -114,6 +146,11 @@ export class ExtensionServer {
           (msg.payload?.capabilities ?? []).join(', ') || 'none'
         })`
       );
+      this._emitLifecycle({
+        type: 'connected',
+        extensionVersion: msg.payload?.extensionVersion ?? 'unknown',
+        capabilities: msg.payload?.capabilities ?? [],
+      });
       if (previous && previous !== ws && previous.readyState === previous.OPEN) {
         previous.close(4000, 'replaced by newer connection');
       }
@@ -138,6 +175,7 @@ export class ExtensionServer {
     log('extension disconnected');
     this.conn = null;
     this.ready = false;
+    this._emitLifecycle({ type: 'disconnected' });
     this._failAll(new ChromeUnavailableError('Chrome extension disconnected while a request was in flight.'));
   }
 

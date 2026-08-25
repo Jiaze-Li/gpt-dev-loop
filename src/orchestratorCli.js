@@ -19,7 +19,7 @@ import { createGitEvidenceCollector } from './adapters/gate/git-evidence/index.j
 import { UsageError, mapErrorToExitCode } from './bridge/errors.js';
 import { loadConfig, workflowProfileDir } from './config.js';
 import { cleanupWorkflowChromeProfile } from './bridge/chromeProfile.js';
-import { closeExtensionServer } from './bridge/extensionServer.js';
+import { closeExtensionServer, getExtensionServer } from './bridge/extensionServer.js';
 
 // Same `wf-<uuid>` shape as WorkflowManager.createWorkflowId
 // (workflowManager.js) — generated here, not by the core, because the
@@ -79,10 +79,15 @@ export async function runWorkflow(
     readTaskCardFn = readTaskCard,
     log = (line) => console.log(line),
     cleanupChromeProfile = cleanupWorkflowChromeProfile,
+    getExtensionServerFn = getExtensionServer,
   } = {}
 ) {
   const taskCard = await readTaskCardFn(taskCardPath);
-  const persistence = withStateLogging(createPersistence(baseDir), log);
+  let lastKnownState = null;
+  const persistence = withStateLogging(createPersistence(baseDir), (line) => {
+    lastKnownState = line;
+    log(line);
+  });
   const workflowId = createWorkflowId();
 
   const manager = new WorkflowManager({
@@ -92,7 +97,39 @@ export async function runWorkflow(
     persistence,
   });
 
-  const finalState = await manager.runTask(taskCard, { workflowId });
+  // "Worker window" lifecycle (docs/workflow/PERSISTENCE.md §2): the
+  // extension transport's Chrome-extension WS connection is, from this
+  // workflow's point of view, the ChatGPT tab doing the reviewer's work
+  // becoming available/going away. Logged as ordinary events.jsonl lines —
+  // previous_state === new_state (no state machine transition happens
+  // here) — so the audit trail shows when the reviewer's worker window
+  // connected/disconnected without adding a new state or altering
+  // stateMachine.js. Only wired up in extension mode; launch/cdp mode has
+  // no comparable external connection to observe.
+  let unsubscribeLifecycle = () => {};
+  if (loadConfig().browserMode === 'extension') {
+    const server = getExtensionServerFn(loadConfig());
+    unsubscribeLifecycle = server.onLifecycle((event) => {
+      persistence
+        .appendEvent({
+          workflow_id: workflowId,
+          task_id: taskCard.task_id,
+          timestamp: new Date().toISOString(),
+          previous_state: lastKnownState,
+          new_state: lastKnownState,
+          trigger: event.type === 'connected' ? 'worker_window_connected' : 'worker_window_disconnected',
+          actor: 'extension',
+        })
+        .catch((err) => console.error(`gpt-loop-run: could not log worker window lifecycle event: ${err.message}`));
+    });
+  }
+
+  let finalState;
+  try {
+    finalState = await manager.runTask(taskCard, { workflowId });
+  } finally {
+    unsubscribeLifecycle();
+  }
 
   // Review result + all other artifacts (PERSISTENCE.md) already saved by
   // the core under baseDir, untouched by any of this. Only the throwaway

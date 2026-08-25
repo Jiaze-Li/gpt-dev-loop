@@ -131,6 +131,34 @@ test('a new extension connection replaces the previous one', async () => {
   second.close();
 });
 
+test('onLifecycle fires "connected" on hello and "disconnected" on close, and unsubscribe stops further events', async () => {
+  const config = nextConfig();
+  const events = [];
+  const unsubscribe = getExtensionServer(config).onLifecycle((event) => events.push(event));
+
+  const client = await connectFakeExtension(config, () => {});
+  assert.deepEqual(events, [{ type: 'connected', extensionVersion: 'unknown', capabilities: [] }]);
+
+  const closed = new Promise((resolve) => client.on('close', resolve));
+  client.close();
+  await closed;
+  // The client's own 'close' event fires before the server side has
+  // necessarily processed its matching 'close' event (two separate TCP
+  // endpoints) — poll briefly instead of assuming one tick is enough.
+  const deadline = Date.now() + 2000;
+  while (events.length < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.deepEqual(events, [
+    { type: 'connected', extensionVersion: 'unknown', capabilities: [] },
+    { type: 'disconnected' },
+  ]);
+
+  unsubscribe();
+  await connectFakeExtension(config, () => {});
+  assert.equal(events.length, 2, 'no further events after unsubscribe');
+});
+
 test('a socket that connects but never sends hello does not interrupt an already active connection', async () => {
   const config = nextConfig();
   const active = await connectFakeExtension(config, (ws, msg) => {

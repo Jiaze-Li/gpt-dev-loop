@@ -95,6 +95,75 @@ test('runWorkflow reports HUMAN_REQUIRED without duplicating a state that repeat
   });
 });
 
+test('runWorkflow logs worker window connect/disconnect as events.jsonl lines, not state machine transitions', async () => {
+  await withTempDir(async (dir) => {
+    const originalMode = process.env.GPT_BROWSER_MODE;
+    process.env.GPT_BROWSER_MODE = 'extension';
+    let subscribed = false;
+    let unsubscribed = false;
+    let capturedListener = null;
+
+    const fakeExtensionServer = {
+      onLifecycle(listener) {
+        subscribed = true;
+        capturedListener = listener;
+        return () => {
+          unsubscribed = true;
+          capturedListener = null;
+        };
+      },
+    };
+
+    try {
+      const finalState = await runWorkflow('unused-task-card-path.md', {
+        baseDir: dir,
+        createPersistence: (base) => new Persistence(base),
+        readTaskCardFn: async () => demoTaskCard(),
+        // By the time EXECUTING runs, the lifecycle subscription (set up
+        // right before manager.runTask()) is already attached — this fires
+        // one "connected" event from inside the workflow, same as a real
+        // extension hello arriving mid-run.
+        createExecutorAdapter: () => ({
+          async execute(taskCard) {
+            assert.ok(subscribed, 'lifecycle listener should be attached before EXECUTING runs');
+            capturedListener({ type: 'connected', extensionVersion: '0.1.0', capabilities: ['chatgpt-dom-v1'] });
+            return createMockExecutorAdapter({ status: 'DONE' }).execute(taskCard);
+          },
+        }),
+        createReviewerAdapter: () => createMockReviewerAdapter({ decision: 'PASS' }),
+        createGateRunnerAdapter: () => createMockGateRunner({ pass: true }),
+        log: () => {},
+        cleanupChromeProfile: async () => {},
+        getExtensionServerFn: () => fakeExtensionServer,
+      });
+
+      assert.equal(finalState.current_state, STATES.COMPLETE);
+      assert.ok(unsubscribed, 'lifecycle listener should be detached once the workflow finishes');
+
+      const events = await new Persistence(dir).readEvents(finalState.workflow_id, 'demo-task');
+      const lifecycleEvents = events.filter((event) => event.actor === 'extension');
+      assert.equal(lifecycleEvents.length, 1);
+      assert.equal(lifecycleEvents[0].trigger, 'worker_window_connected');
+      // Logged alongside the real state transitions, but as a no-op entry
+      // (previous_state === new_state) — it must never look like the state
+      // machine itself transitioned.
+      assert.equal(lifecycleEvents[0].previous_state, lifecycleEvents[0].new_state);
+      assert.equal(lifecycleEvents[0].previous_state, STATES.EXECUTING);
+
+      // The state machine's own transition sequence is untouched by any of
+      // this — same states, same order as the plain COMPLETE test above.
+      const stateEvents = events.filter((event) => event.actor !== 'extension');
+      assert.deepEqual(
+        stateEvents.map((event) => event.new_state),
+        [STATES.PENDING, STATES.EXECUTING, STATES.VERIFYING, STATES.REVIEWING, STATES.COMPLETE]
+      );
+    } finally {
+      if (originalMode === undefined) delete process.env.GPT_BROWSER_MODE;
+      else process.env.GPT_BROWSER_MODE = originalMode;
+    }
+  });
+});
+
 test('runWorkflow gives the reviewer adapter a workflow-scoped Chrome profile, and two workflows never collide', async () => {
   await withTempDir(async (dir) => {
     const capturedWorkflowIds = [];
