@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, DEFAULTS } from '../src/config.js';
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 test('loadConfig falls back to defaults with an empty environment', () => {
   const config = loadConfig({});
@@ -40,6 +45,14 @@ test('loadConfig ignores invalid numeric overrides and keeps defaults', () => {
   assert.equal(config.responseTimeoutMs, DEFAULTS.responseTimeoutMs);
 });
 
-test('default profile dir stays inside the repository (git-ignored)', () => {
+test('default profile dir lives under the home directory, not inside this repo', () => {
   assert.match(DEFAULTS.profileDir, /\.gpt-dev-loop[\\/]chrome-profile$/);
+  assert.ok(
+    DEFAULTS.profileDir.startsWith(os.homedir()),
+    'account-equivalent cookies must not default into a Git work tree'
+  );
+  assert.ok(
+    !DEFAULTS.profileDir.startsWith(REPO_ROOT),
+    'default profile dir must not resolve inside the gpt-dev-loop repository'
+  );
 });

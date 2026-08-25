@@ -8,6 +8,7 @@ import {
   ResponseTimeoutError,
   ResponseExtractionError,
 } from './errors.js';
+import { classifyComposerTimeout, describePageState } from './diagnostics.js';
 
 const COMPOSER_SELECTORS = ['#prompt-textarea', 'div[contenteditable="true"].ProseMirror'];
 
@@ -21,11 +22,10 @@ const STOP_BUTTON_SELECTORS = [
 
 export const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"]';
 
-const LOGIN_HINT_SELECTORS = ['text=Log in', '[data-testid="login-button"]'];
-
 const RESPONSE_STABLE_WINDOW_MS = 1200;
+const STATUS_LOG_INTERVAL_MS = 10000;
 
-async function locateFirstVisible(page, selectors, timeoutMs) {
+async function locateFirstVisible(page, selectors, timeoutMs, { onPoll } = {}) {
   const deadline = Date.now() + timeoutMs;
   do {
     for (const selector of selectors) {
@@ -38,9 +38,16 @@ async function locateFirstVisible(page, selectors, timeoutMs) {
         // try next selector / next poll
       }
     }
+    if (onPoll) await onPoll();
     await page.waitForTimeout(300);
   } while (Date.now() < deadline);
   return null;
+}
+
+async function getPageDiagnostics(page) {
+  const url = page.url();
+  const title = await page.title().catch(() => '');
+  return { url, title };
 }
 
 async function isAnyVisible(page, selectors) {
@@ -56,29 +63,35 @@ async function isAnyVisible(page, selectors) {
   return false;
 }
 
-async function ensureLoggedIn(page, config) {
-  const composer = await locateFirstVisible(page, COMPOSER_SELECTORS, 8000);
+export async function ensureLoggedIn(page, config) {
+  let hasWarned = false;
+  let lastStatusLogAt = 0;
+  const startedAt = Date.now();
+
+  const composer = await locateFirstVisible(page, COMPOSER_SELECTORS, config.loginTimeoutMs, {
+    onPoll: async () => {
+      if (!hasWarned) {
+        hasWarned = true;
+        console.error(
+          'gpt-loop: ChatGPT composer not visible yet. Complete any login, Cloudflare/bot check, or ' +
+            `cookie consent in the opened browser window; waiting up to ${config.loginTimeoutMs}ms...`
+        );
+      }
+      const now = Date.now();
+      if (now - lastStatusLogAt < STATUS_LOG_INTERVAL_MS) return;
+      lastStatusLogAt = now;
+      const diagnostics = await getPageDiagnostics(page);
+      console.error(`gpt-loop: still waiting (${describePageState(diagnostics)}, elapsed=${now - startedAt}ms)`);
+    },
+  });
   if (composer) return composer;
 
-  const loginHint = await locateFirstVisible(page, LOGIN_HINT_SELECTORS, 3000);
-  if (!loginHint) {
-    throw new SelectorMismatchError(
-      'Could not find the ChatGPT composer or a login prompt. The page layout may have changed.'
-    );
+  const diagnostics = await getPageDiagnostics(page);
+  const outcome = classifyComposerTimeout(diagnostics, config.loginTimeoutMs);
+  if (outcome.kind === 'cloudflare') {
+    throw new LoginRequiredError(outcome.message);
   }
-
-  console.error(
-    'gpt-loop: no active ChatGPT session detected. Please log in in the opened browser window; ' +
-      'the command will continue automatically once the chat composer appears.'
-  );
-
-  const loggedInComposer = await locateFirstVisible(page, COMPOSER_SELECTORS, config.loginTimeoutMs);
-  if (!loggedInComposer) {
-    throw new LoginRequiredError(
-      `Timed out after ${config.loginTimeoutMs}ms waiting for ChatGPT login to complete.`
-    );
-  }
-  return loggedInComposer;
+  throw new SelectorMismatchError(outcome.message);
 }
 
 async function sendPrompt(page, composer, prompt) {
@@ -142,15 +155,22 @@ export async function askGpt(prompt, config) {
     context = await chromium.launchPersistentContext(config.profileDir, {
       channel: 'chrome',
       headless: config.headless,
-      viewport: { width: 1280, height: 900 },
+      viewport: null,
+      args: ['--disable-blink-features=AutomationControlled'],
     });
   } catch (err) {
     throw new ChromeUnavailableError(`Could not launch system Chrome: ${err.message}`);
   }
 
   try {
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
     const page = context.pages()[0] ?? (await context.newPage());
-    await page.goto(config.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(config.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((err) => {
+      throw new TransportError(`Could not reach ${config.chatgptUrl}: ${err.message}`);
+    });
 
     const composer = await ensureLoggedIn(page, config);
     const baselineCount = await page.locator(ASSISTANT_MESSAGE_SELECTOR).count();

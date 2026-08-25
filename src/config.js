@@ -1,12 +1,11 @@
+import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dirname, '..');
 
 export const DEFAULTS = Object.freeze({
   chatgptUrl: 'https://chatgpt.com/',
-  profileDir: path.join(REPO_ROOT, '.gpt-dev-loop', 'chrome-profile'),
+  // Account-equivalent cookies/session state must live outside any Git work
+  // tree, not merely be gitignored inside one.
+  profileDir: path.join(os.homedir(), '.gpt-dev-loop', 'chrome-profile'),
   headless: false,
   loginTimeoutMs: 300000,
   responseTimeoutMs: 120000,
