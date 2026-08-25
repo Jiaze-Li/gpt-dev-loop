@@ -1,7 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { parseTaskCard } from '../src/orchestrator/taskCard.js';
+import { parseTaskCard, readTaskCard } from '../src/orchestrator/taskCard.js';
+
+const EXAMPLE_TASK_CARD_PATH = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'docs',
+  'workflow',
+  'examples',
+  'TASK_CARD_EXAMPLE.md'
+);
 
 function sampleCard({ completionSignal = 'DONE' } = {}) {
   return `## task_id
@@ -79,4 +90,38 @@ test('parseTaskCard rejects an invalid completion_signal', () => {
 
 test('parseTaskCard rejects text with no headings at all', () => {
   assert.throws(() => parseTaskCard('just some prose'), /no "## field_name" headings/);
+});
+
+test('readTaskCard accepts the standard example Task Card from TASK_PROTOCOL.md as-is', async () => {
+  const taskCard = await readTaskCard(EXAMPLE_TASK_CARD_PATH);
+
+  assert.equal(taskCard.task_id, 'e2e-example-001');
+  assert.deepEqual(taskCard.allowed_files, ['docs/E2E_TEST.md']);
+  assert.deepEqual(taskCard.forbidden_files, ['src/**', 'docs/workflow/**']);
+  assert.equal(taskCard.completion_signal, 'DONE');
+});
+
+test('parseTaskCard gives a clear, field-specific error for each required field missing in turn', () => {
+  for (const field of [
+    'task_id',
+    'repository_context',
+    'goal',
+    'context',
+    'scope',
+    'allowed_files',
+    'forbidden_files',
+    'acceptance_criteria',
+    'verification_commands',
+    'completion_signal',
+  ]) {
+    const card = sampleCard()
+      .split('\n\n')
+      .filter((section) => !section.startsWith(`## ${field}\n`) && !section.startsWith(`## ${field}\r`))
+      .join('\n\n');
+    assert.throws(
+      () => parseTaskCard(card),
+      new RegExp(`missing the "${field}" section`),
+      `expected a clear error when "${field}" is missing`
+    );
+  }
 });

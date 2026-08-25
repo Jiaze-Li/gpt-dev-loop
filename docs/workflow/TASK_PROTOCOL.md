@@ -119,6 +119,13 @@ Out of scope:
 DONE | BLOCKED | HUMAN_REQUIRED
 ```
 
+A complete, working Task Card that `gpt-loop-run` accepts as-is lives at
+[examples/TASK_CARD_EXAMPLE.md](./examples/TASK_CARD_EXAMPLE.md). Each field
+above must be its own `## field_name` heading at the top level — notably
+`allowed_files` and `forbidden_files` are separate headings, not bullets
+nested under `## scope`, and each `repository_context` sub-field is a single
+`key: value` line, not a key on one line and its value on the next.
+
 ## 4. Non-goals
 
 - Does not define how Task Cards are transported between agents (file,
