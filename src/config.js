@@ -12,7 +12,21 @@ export const DEFAULTS = Object.freeze({
   // reply), so it's set above loginTimeoutMs + responseTimeoutMs.
   requestTimeoutMs: 450000,
   backgroundWindow: true,
+  // 'launch' (default): Playwright launches/owns a dedicated Chrome profile
+  // (profileDir). 'cdp': attach to a Chrome the user already has running
+  // instead — see GPT_BROWSER_MODE below and chromeRuntime.js.
+  browserMode: 'launch',
+  cdpUrl: 'http://localhost:9222',
 });
+
+const BROWSER_MODES = new Set(['launch', 'cdp']);
+
+function parseBrowserMode(raw, fallback) {
+  if (raw === undefined || raw === '') return fallback;
+  if (BROWSER_MODES.has(raw)) return raw;
+  console.error(`gpt-loop: unrecognized GPT_BROWSER_MODE "${raw}"; falling back to "${fallback}".`);
+  return fallback;
+}
 
 // Each workflow gets its own Chrome profile, nested under the shared base
 // profile dir's directory, so concurrent/sequential workflows never fight
@@ -51,5 +65,7 @@ export function loadConfig(env = process.env) {
     responseTimeoutMs: parseIntEnv(env, 'GPT_LOOP_RESPONSE_TIMEOUT_MS', DEFAULTS.responseTimeoutMs),
     requestTimeoutMs: parseIntEnv(env, 'GPT_LOOP_REQUEST_TIMEOUT_MS', DEFAULTS.requestTimeoutMs),
     backgroundWindow: parseBoolEnv(env, 'GPT_LOOP_BACKGROUND_WINDOW', DEFAULTS.backgroundWindow),
+    browserMode: parseBrowserMode(env.GPT_BROWSER_MODE, DEFAULTS.browserMode),
+    cdpUrl: env.GPT_LOOP_CDP_URL || DEFAULTS.cdpUrl,
   };
 }

@@ -73,6 +73,23 @@ async function launchChromePersistentContext(profileDir) {
   }
 }
 
+// GPT_BROWSER_MODE=cdp (config.js): attaches to a Chrome the user already
+// has running with --remote-debugging-port, instead of launching/owning a
+// dedicated profile. Reuses that Chrome's existing browser context (its
+// real profile, cookies, and login state already sitting in it) rather
+// than creating a new one, so this deliberately does not accept a
+// profileDir.
+async function connectChromeOverCdp(cdpUrl) {
+  let browser;
+  try {
+    browser = await chromium.connectOverCDP(cdpUrl);
+  } catch (err) {
+    throw new ChromeUnavailableError(`Could not attach to Chrome over CDP at ${cdpUrl}: ${err.message}`);
+  }
+  const context = browser.contexts()[0] ?? (await browser.newContext());
+  return { browser, context };
+}
+
 // One ChromeRuntime keeps a single persistent context+page alive across many
 // askGpt() calls instead of relaunching per call. Calls are serialized
 // through a FIFO queue since one page can't safely handle concurrent
@@ -80,12 +97,20 @@ async function launchChromePersistentContext(profileDir) {
 export class ChromeRuntime {
   constructor(config, deps = {}) {
     this.profileDir = config.profileDir;
+    this.mode = config.browserMode === 'cdp' ? 'cdp' : 'launch';
+    this.cdpUrl = config.cdpUrl;
     this.backgroundWindow = config.backgroundWindow !== false;
     this.launchPersistentContext = deps.launchPersistentContext ?? launchChromePersistentContext;
+    this.connectOverCdp = deps.connectOverCdp ?? connectChromeOverCdp;
     this.hideWindow = deps.hideWindow ?? hideWindowCdp;
     this.showWindow = deps.showWindow ?? showWindowCdp;
     this.context = null;
     this.page = null;
+    // Only set in 'cdp' mode — the Browser handle connectOverCDP returns,
+    // separate from `context` because closing it must disconnect the CDP
+    // session without touching the context (the user's real browser
+    // context, holding their other tabs) the way `context.close()` would.
+    this.browser = null;
     this.queue = Promise.resolve();
     this.closed = false;
     this.poisoned = false;
@@ -115,6 +140,29 @@ export class ChromeRuntime {
     this.poisoned = true;
   }
 
+  // Launches (mode 'launch') or attaches to (mode 'cdp') a browser context,
+  // returning { context, browser } — browser is only present in 'cdp' mode.
+  async _connect() {
+    if (this.mode === 'cdp') {
+      const { browser, context } = await this.connectOverCdp(this.cdpUrl);
+      return { context, browser };
+    }
+    const context = await this.launchPersistentContext(this.profileDir);
+    return { context, browser: null };
+  }
+
+  // Undoes _connect() for a context/browser pair that was never adopted
+  // (this.context/this.browser). In 'cdp' mode this must not touch
+  // `context` — it's the user's real browser context — so only the
+  // connection itself is torn down.
+  async _discard({ context, browser }) {
+    if (this.mode === 'cdp') {
+      await browser?.close().catch(() => {});
+    } else {
+      await context.close().catch(() => {});
+    }
+  }
+
   async _ensurePage() {
     if (this.context && this.page && !this.page.isClosed() && !this.poisoned) {
       return this.page;
@@ -124,12 +172,13 @@ export class ChromeRuntime {
       await this._rebuild();
     }
     const myGeneration = this.generation;
-    const context = await this.launchPersistentContext(this.profileDir);
+    const { context, browser } = await this._connect();
     if (this.closed || this.generation !== myGeneration) {
-      await context.close().catch(() => {});
+      await this._discard({ context, browser });
       throw new ChromeUnavailableError('Chrome runtime was closed while Chrome was starting.');
     }
     this.context = context;
+    this.browser = browser;
     this.page = await context.newPage();
     if (this.backgroundWindow) {
       await this.hideWindow(this.context, this.page).catch((err) => {
@@ -140,10 +189,21 @@ export class ChromeRuntime {
   }
 
   async _rebuild() {
-    const stale = this.context;
+    const stalePage = this.page;
+    const staleContext = this.context;
+    const staleBrowser = this.browser;
     this.context = null;
     this.page = null;
-    if (stale) await stale.close().catch(() => {});
+    this.browser = null;
+    if (this.mode === 'cdp') {
+      // Close only the tab this runtime opened, then disconnect — never
+      // this.context.close(), which would close every tab in the user's
+      // real browser context.
+      if (stalePage) await stalePage.close().catch(() => {});
+      if (staleBrowser) await staleBrowser.close().catch(() => {});
+    } else if (staleContext) {
+      await staleContext.close().catch(() => {});
+    }
   }
 
   // Runs `task(page, controls)` after all previously queued tasks on this
@@ -189,17 +249,29 @@ export class ChromeRuntime {
     this.generation += 1;
     process.removeListener('SIGINT', this._onSignal);
     process.removeListener('SIGTERM', this._onSignal);
+    const page = this.page;
     const context = this.context;
+    const browser = this.browser;
     this.context = null;
     this.page = null;
-    if (context) await context.close().catch(() => {});
+    this.browser = null;
+    if (this.mode === 'cdp') {
+      if (page) await page.close().catch(() => {});
+      if (browser) await browser.close().catch(() => {});
+    } else if (context) {
+      await context.close().catch(() => {});
+    }
   }
 }
 
 let activeRuntime = null;
 
 export function getChromeRuntime(config) {
-  if (activeRuntime && (activeRuntime.closed || activeRuntime.profileDir !== config.profileDir)) {
+  const mode = config.browserMode === 'cdp' ? 'cdp' : 'launch';
+  const identityChanged =
+    mode !== activeRuntime?.mode ||
+    (mode === 'launch' ? activeRuntime?.profileDir !== config.profileDir : activeRuntime?.cdpUrl !== config.cdpUrl);
+  if (activeRuntime && (activeRuntime.closed || identityChanged)) {
     activeRuntime = null;
   }
   if (!activeRuntime) {

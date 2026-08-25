@@ -34,6 +34,38 @@ test('loadConfig honors explicit overrides', () => {
   assert.equal(config.backgroundWindow, false);
 });
 
+test('browserMode defaults to "launch" (Playwright owns a dedicated profile)', () => {
+  assert.equal(DEFAULTS.browserMode, 'launch');
+  assert.equal(loadConfig({}).browserMode, 'launch');
+});
+
+test('GPT_BROWSER_MODE=cdp switches to attaching over CDP', () => {
+  const config = loadConfig({ GPT_BROWSER_MODE: 'cdp' });
+  assert.equal(config.browserMode, 'cdp');
+});
+
+test('cdpUrl defaults to localhost:9222 and can be overridden', () => {
+  assert.equal(DEFAULTS.cdpUrl, 'http://localhost:9222');
+  assert.equal(loadConfig({}).cdpUrl, 'http://localhost:9222');
+  assert.equal(
+    loadConfig({ GPT_LOOP_CDP_URL: 'http://localhost:9333' }).cdpUrl,
+    'http://localhost:9333'
+  );
+});
+
+test('loadConfig warns and falls back to "launch" on an unrecognized GPT_BROWSER_MODE', () => {
+  const originalConsoleError = console.error;
+  const loggedLines = [];
+  console.error = (line) => loggedLines.push(line);
+  try {
+    const config = loadConfig({ GPT_BROWSER_MODE: 'headless-ws' });
+    assert.equal(config.browserMode, 'launch');
+    assert.ok(loggedLines.some((line) => /unrecognized GPT_BROWSER_MODE/.test(line)));
+  } finally {
+    console.error = originalConsoleError;
+  }
+});
+
 test('loadConfig treats "0" and "false" as backgroundWindow=false', () => {
   assert.equal(loadConfig({ GPT_LOOP_BACKGROUND_WINDOW: '0' }).backgroundWindow, false);
   assert.equal(loadConfig({ GPT_LOOP_BACKGROUND_WINDOW: 'false' }).backgroundWindow, false);

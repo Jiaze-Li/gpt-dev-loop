@@ -67,9 +67,10 @@ All overrides are environment variables; defaults are otherwise used:
 | --- | --- | --- |
 | `GPT_LOOP_CHATGPT_URL` | `https://chatgpt.com/` | Target page |
 | `GPT_LOOP_PROFILE_DIR` | `~/.gpt-dev-loop/chrome-profile` | Persistent browser profile location (account-equivalent cookies — keep it outside any Git work tree) |
-| `GPT_LOOP_HEADLESS` | `true` | Run Chrome headless; set to `false` to always use a visible window |
 | `GPT_LOOP_LOGIN_TIMEOUT_MS` | `300000` | How long to wait for manual login |
 | `GPT_LOOP_RESPONSE_TIMEOUT_MS` | `120000` | How long to wait for a completed reply |
+| `GPT_BROWSER_MODE` | `launch` | `launch` (default): Playwright launches/owns `GPT_LOOP_PROFILE_DIR`. `cdp`: attach to a Chrome you already have running instead, over `GPT_LOOP_CDP_URL` |
+| `GPT_LOOP_CDP_URL` | `http://localhost:9222` | CDP endpoint to attach to when `GPT_BROWSER_MODE=cdp` (start Chrome with `--remote-debugging-port=9222` first) |
 
 ## Exit codes
 
