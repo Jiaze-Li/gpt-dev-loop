@@ -1,0 +1,20 @@
+{
+  "name": "gpt-dev-loop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Phase 1 PoC: deterministic text handshake between local code and an authenticated ChatGPT web session.",
+  "type": "module",
+  "bin": {
+    "gpt-loop": "./bin/gpt-loop.js"
+  },
+  "scripts": {
+    "ask": "node ./bin/gpt-loop.js ask",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
