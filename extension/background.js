@@ -15,10 +15,28 @@ const RECONNECT_DELAY_MS = 2000;
 // primary way requests are expected to finish.
 const TAB_MESSAGE_TIMEOUT_MARGIN_MS = 10000;
 
+// MV3-service-worker gotcha: `setTimeout` does NOT keep a service worker
+// alive, and the worker can be terminated by Chrome (idle timeout, ~30s of
+// no activity) at any point, including while a reconnect setTimeout is still
+// pending — silently dropping the reconnect loop until *something* wakes the
+// worker again. Top-level code re-runs (and so calls connect() again) every
+// time the worker wakes for any reason, so the only gap is having a reason
+// to wake up at all: chrome.alarms is the one API guaranteed to revive a
+// terminated MV3 service worker on a schedule (setTimeout/setInterval are
+// not). RECONNECT_ALARM_PERIOD_MINUTES is the practical floor Chrome
+// enforces for alarms.
+const RECONNECT_ALARM_NAME = 'gpt-loop-bridge-reconnect';
+const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
+
 let ws = null;
 
 function log(message) {
   console.log(`[gpt-loop bridge] ${message}`);
+}
+
+function ensureConnected() {
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+  connect();
 }
 
 function connect() {
@@ -39,9 +57,13 @@ function connect() {
   ws.addEventListener('message', (event) => handleMessage(event.data));
 
   ws.addEventListener('close', () => {
-    log('disconnected from local bridge; retrying shortly');
+    log('disconnected from local bridge (or nothing was listening yet); retrying shortly');
     ws = null;
-    setTimeout(connect, RECONNECT_DELAY_MS);
+    // Best-effort fast retry for the common case (worker still alive, e.g.
+    // the bridge server just hadn't started listening yet). The
+    // chrome.alarms listener below is the fallback that fires regardless of
+    // whether this timer survives.
+    setTimeout(ensureConnected, RECONNECT_DELAY_MS);
   });
 
   ws.addEventListener('error', () => {
@@ -49,6 +71,13 @@ function connect() {
     // reconnect loop lives in the 'close' handler, not here.
   });
 }
+
+chrome.alarms.create(RECONNECT_ALARM_NAME, { periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES });
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === RECONNECT_ALARM_NAME) ensureConnected();
+});
+chrome.runtime.onStartup.addListener(ensureConnected);
+chrome.runtime.onInstalled.addListener(ensureConnected);
 
 async function handleMessage(raw) {
   let msg;
@@ -63,9 +92,11 @@ async function handleMessage(raw) {
   try {
     const tab = await findChatGptTab(payload.chatgptUrl);
     if (!tab) {
+      log(`[${requestId}] no tab matched ${toOriginMatchPattern(payload.chatgptUrl)}`);
       sendResult(requestId, { ok: false, code: 'NO_CHATGPT_TAB', message: 'No open ChatGPT tab was found.' });
       return;
     }
+    log(`[${requestId}] using tab ${tab.id} (${tab.url})`);
     const result = await sendToContentScript(tab.id, {
       type: 'perform',
       requestId,
@@ -122,4 +153,4 @@ function sendResult(requestId, result) {
   ws.send(JSON.stringify(message));
 }
 
-connect();
+ensureConnected();

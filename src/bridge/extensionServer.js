@@ -16,6 +16,17 @@ import { buildHelloAck, buildRequestMessage, parseMessage, ExtensionProtocolErro
 
 const SERVER_VERSION = '1';
 
+// The content script's own responseTimeoutMs clock only starts once it has
+// found the composer (findComposer can itself take up to 5s) and does its
+// own message-passing round trip back through background.js before this
+// server sees anything — so it always needs strictly more than
+// responseTimeoutMs of *our* clock to legitimately report its own, more
+// specific error (RESPONSE_TIMEOUT/RESPONSE_EMPTY/LOGIN_REQUIRED/etc).
+// Without this margin, our own timer here would almost always win that
+// race and mask the real reason behind a generic "did not reply" message.
+// Mirrors background.js's TAB_MESSAGE_TIMEOUT_MARGIN_MS.
+const RESPONSE_TIMER_MARGIN_MS = 10000;
+
 function log(message) {
   console.error(`gpt-loop: ${message}`);
 }
@@ -39,8 +50,23 @@ export class ExtensionServer {
       port: this.port,
       verifyClient: ({ origin }) => this._verifyOrigin(origin),
     });
+    this.wss.on('listening', () => {
+      log(`bridge server listening on ${this.host}:${this.port}, waiting for the Chrome extension to connect...`);
+    });
     this.wss.on('connection', (ws) => this._onConnection(ws));
-    this.wss.on('error', (err) => log(`extension bridge server error: ${err.message}`));
+    this.wss.on('error', (err) => {
+      const hint =
+        err.code === 'EADDRINUSE'
+          ? ` — port ${this.port} is already in use, most likely by another gpt-loop process (a previous \`ask\` invocation that didn't exit cleanly). Find it with \`lsof -i :${this.port}\` and stop it, then retry.`
+          : '';
+      log(`bridge server error: ${err.message}${hint}`);
+      // A listen failure (e.g. EADDRINUSE) means this server will never
+      // reach 'listening' and can never receive a connection — waiting out
+      // the full connectTimeoutMs would just produce a misleading "no
+      // extension connected" message instead of the real cause above.
+      this.wss = null;
+      this._failAll(new ChromeUnavailableError(`Extension bridge server failed to start: ${err.message}${hint}`));
+    });
   }
 
   _verifyOrigin(origin) {
@@ -50,7 +76,13 @@ export class ExtensionServer {
       );
       return false;
     }
-    return origin === `chrome-extension://${this.extensionId}`;
+    if (origin !== `chrome-extension://${this.extensionId}`) {
+      log(
+        `rejected connection from origin "${origin}" — expected "chrome-extension://${this.extensionId}" (GPT_LOOP_EXTENSION_ID). Check the extension ID matches chrome://extensions.`
+      );
+      return false;
+    }
+    return true;
   }
 
   // A newly opened TCP connection is not promoted to `this.conn` until it
@@ -77,6 +109,11 @@ export class ExtensionServer {
       const previous = this.conn;
       this.conn = ws;
       this.ready = true;
+      log(
+        `extension connected (version ${msg.payload?.extensionVersion ?? 'unknown'}, capabilities: ${
+          (msg.payload?.capabilities ?? []).join(', ') || 'none'
+        })`
+      );
       if (previous && previous !== ws && previous.readyState === previous.OPEN) {
         previous.close(4000, 'replaced by newer connection');
       }
@@ -98,6 +135,7 @@ export class ExtensionServer {
 
   _onClose(ws) {
     if (ws !== this.conn) return; // a socket that was never promoted to active
+    log('extension disconnected');
     this.conn = null;
     this.ready = false;
     this._failAll(new ChromeUnavailableError('Chrome extension disconnected while a request was in flight.'));
@@ -178,9 +216,13 @@ export class ExtensionServer {
 
     const responseTimer = setTimeout(() => {
       this.inFlight = null;
-      entry.reject(new ResponseTimeoutError(`Extension did not reply within ${entry.responseTimeoutMs}ms.`));
+      entry.reject(
+        new ResponseTimeoutError(
+          `Extension did not reply within ${entry.responseTimeoutMs + RESPONSE_TIMER_MARGIN_MS}ms (no response/error message arrived — check the ChatGPT tab's own devtools console for [gpt-loop bridge] logs to see which stage it was stuck at).`
+        )
+      );
       this._pump();
-    }, entry.responseTimeoutMs);
+    }, entry.responseTimeoutMs + RESPONSE_TIMER_MARGIN_MS);
 
     this.inFlight = {
       requestId: entry.requestId,
