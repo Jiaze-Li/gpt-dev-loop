@@ -24,6 +24,12 @@ export const DEFAULTS = Object.freeze({
   extensionHost: '127.0.0.1',
   extensionPort: 8877,
   extensionConnectTimeoutMs: 15000,
+  // extension/manifest.json pins a "key" field, which makes Chrome derive
+  // this same ID for the unpacked extension on every machine/reload —
+  // there is nothing to copy out of chrome://extensions. Only override
+  // GPT_LOOP_EXTENSION_ID if you've deliberately swapped in a different
+  // signing key (e.g. testing a second copy of the extension side by side).
+  extensionId: 'eihkgiaebcdghglmainkobahkkaidmim',
 });
 
 const BROWSER_MODES = new Set(['launch', 'cdp', 'extension']);
@@ -81,6 +87,6 @@ export function loadConfig(env = process.env) {
       'GPT_LOOP_EXTENSION_CONNECT_TIMEOUT_MS',
       DEFAULTS.extensionConnectTimeoutMs
     ),
-    extensionId: env.GPT_LOOP_EXTENSION_ID || null,
+    extensionId: env.GPT_LOOP_EXTENSION_ID || DEFAULTS.extensionId,
   };
 }

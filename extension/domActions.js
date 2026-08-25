@@ -56,19 +56,40 @@ function defaultPressEnter(composer) {
   composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
 }
 
+// ChatGPT's send button is a Radix/Base-UI-style control that reacts to
+// pointer events, not just `click`— a plain `el.click()` synthesizes a
+// MouseEvent click but no pointerdown/pointerup, so the button's own
+// handlers never fire and the prompt silently stays in the composer
+// (observed live: 2026-08-25, aria-disabled="false" button, click() alone
+// was a no-op). Only constructs PointerEvent/MouseEvent when those globals
+// exist (real browser) — tests/extensionDomActions.test.js runs this
+// against a fake `document` in Node, where they don't, and el.click() alone
+// is enough to satisfy the fake element's click() stub.
+function defaultSimulateClick(el) {
+  if (typeof PointerEvent !== 'undefined') {
+    const pointerOpts = { bubbles: true, cancelable: true, composed: true, pointerId: 1, isPrimary: true, button: 0 };
+    const mouseOpts = { bubbles: true, cancelable: true, button: 0 };
+    el.dispatchEvent(new PointerEvent('pointerdown', pointerOpts));
+    el.dispatchEvent(new MouseEvent('mousedown', mouseOpts));
+    el.dispatchEvent(new PointerEvent('pointerup', pointerOpts));
+    el.dispatchEvent(new MouseEvent('mouseup', mouseOpts));
+  }
+  el.click();
+}
+
 export async function sendPrompt(
   doc,
   composer,
   prompt,
   sendSelectors = SEND_BUTTON_SELECTORS,
-  { pressEnter = defaultPressEnter } = {}
+  { pressEnter = defaultPressEnter, simulateClick = defaultSimulateClick } = {}
 ) {
   composer.focus();
   doc.execCommand('insertText', false, prompt);
 
   const sendButton = firstVisible(doc, sendSelectors);
   if (sendButton) {
-    sendButton.click();
+    simulateClick(sendButton);
   } else {
     pressEnter(composer);
   }

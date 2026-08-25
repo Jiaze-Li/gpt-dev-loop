@@ -97,7 +97,7 @@ async function handleMessage(raw) {
       return;
     }
     log(`[${requestId}] using tab ${tab.id} (${tab.url})`);
-    const result = await sendToContentScript(tab.id, {
+    const result = await sendToContentScriptWithRetry(tab.id, {
       type: 'perform',
       requestId,
       prompt: payload.prompt,
@@ -143,6 +143,28 @@ function sendToContentScript(tabId, message) {
       resolve(response);
     });
   });
+}
+
+// A tab that was already open before this extension's service worker last
+// (re)started never got content.js injected via manifest.json's declarative
+// content_scripts entry — Chrome only runs those on navigation, not
+// retroactively on already-loaded tabs. That surfaces as chrome.runtime's
+// generic "Could not establish connection. Receiving end does not exist."
+// rather than anything actionable. Since manifest.json already grants the
+// "scripting" permission, inject content.js ourselves once and retry rather
+// than making the user manually refresh the ChatGPT tab after every
+// extension reload/update.
+const NO_RECEIVER_ERROR_PATTERN = /Receiving end does not exist|Could not establish connection/;
+
+async function sendToContentScriptWithRetry(tabId, message) {
+  try {
+    return await sendToContentScript(tabId, message);
+  } catch (err) {
+    if (!NO_RECEIVER_ERROR_PATTERN.test(err.message)) throw err;
+    log(`[${message.requestId}] no content script listener in tab ${tabId} yet; injecting and retrying`);
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+    return sendToContentScript(tabId, message);
+  }
 }
 
 function sendResult(requestId, result) {

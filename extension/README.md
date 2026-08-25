@@ -11,17 +11,23 @@ this file only covers install/run steps.
 1. Open `chrome://extensions`.
 2. Turn on "Developer mode" (top right).
 3. Click "Load unpacked" and select this `extension/` directory.
-4. Copy the extension's ID shown on its card (a long lowercase string).
+
+That's it — no ID to copy. `manifest.json` pins a `"key"` field, so Chrome
+always derives the same extension ID (`eihkgiaebcdghglmainkobahkkaidmim`)
+for this extension no matter which machine or directory it's loaded from,
+and gpt-loop already knows that ID by default. If the card in
+`chrome://extensions` ever shows a different ID than that, the `key` field
+was stripped or edited — restore it from git rather than reloading.
 
 ## 2. Point gpt-loop at it
 
-The local bridge server only accepts connections whose `Origin` matches
-this extension's ID, so it has to be configured once:
-
 ```bash
-export GPT_LOOP_EXTENSION_ID=<the ID you copied>
 export GPT_BROWSER_MODE=extension
 ```
+
+`GPT_LOOP_EXTENSION_ID` no longer needs to be set — only export it if
+you've deliberately swapped in a different signing key (e.g. running a
+second copy of the extension side by side for testing).
 
 Optional overrides (defaults shown):
 
@@ -54,12 +60,25 @@ npm run ask -- "return handshake-ok"
 
 The first call may take a couple of seconds while the extension's
 background worker reconnects and finds your ChatGPT tab. If it fails with a
-"no Chrome extension connected" style error, double-check the extension is
-loaded and `GPT_LOOP_EXTENSION_ID`/`GPT_BROWSER_MODE` are set in the same
-shell you're running `npm run ask` from.
+"no Chrome extension connected" style error:
+
+- Confirm the extension is loaded in `chrome://extensions` and
+  `GPT_BROWSER_MODE=extension` is set in the same shell you're running
+  `npm run ask` from.
+- Check the bridge server's own stderr output — it logs
+  `rejected connection from origin "..."` with the origin it actually saw
+  whenever an ID mismatch is the cause, which only happens if
+  `manifest.json`'s `key` field was edited/removed or `GPT_LOOP_EXTENSION_ID`
+  was overridden by hand.
 
 ## Known Phase 1 limits
 
+- **Keep the ChatGPT tab in the foreground for the duration of each
+  request** (from send until the reply comes back, up to a couple of
+  minutes). Chrome throttles timers in background/inactive tabs almost to a
+  halt, so the extension's polling loop that watches for the reply can miss
+  gpt-loop's own response deadline even though ChatGPT actually replied —
+  sending the prompt itself isn't affected, only detecting the reply is.
 - One ChatGPT tab, one Chrome, one request in flight at a time (later
   requests queue).
 - If the extension can't find the composer on the page (e.g. you're logged
