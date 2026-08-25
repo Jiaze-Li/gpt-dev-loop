@@ -12,7 +12,7 @@ import { readTaskCard } from './orchestrator/taskCard.js';
 import { Persistence } from './orchestrator/persistence.js';
 import { WorkflowManager } from './orchestrator/workflowManager.js';
 import { STATES } from './orchestrator/stateMachine.js';
-import { createClaudeExecutorAdapter } from './orchestrator/adapters/claudeExecutorAdapter.js';
+import { createClaudeSessionManager } from './orchestrator/adapters/claudeSessionManager.js';
 import { createGptReviewerAdapter } from './orchestrator/adapters/gptReviewerAdapter.js';
 import { createGateRunner } from './orchestrator/adapters/gateRunner.js';
 import { createGitEvidenceCollector } from './adapters/gate/git-evidence/index.js';
@@ -73,7 +73,8 @@ export async function runWorkflow(
   {
     baseDir = DEFAULT_BASE_DIR,
     createPersistence = (dir) => new Persistence(dir),
-    createExecutorAdapter = () => createClaudeExecutorAdapter(),
+    createExecutorAdapter = ({ workflowId, taskId, persistence: persistenceAdapter }) =>
+      createClaudeSessionManager({ workflowId, taskId, persistence: persistenceAdapter }),
     createReviewerAdapter = ({ workflowId }) => createGptReviewerAdapter({ workflowId }),
     createGateRunnerAdapter = () => createGateRunner({ gitEvidenceCollector: createGitEvidenceCollector() }),
     readTaskCardFn = readTaskCard,
@@ -91,7 +92,7 @@ export async function runWorkflow(
   const workflowId = createWorkflowId();
 
   const manager = new WorkflowManager({
-    executorAdapter: createExecutorAdapter(),
+    executorAdapter: createExecutorAdapter({ workflowId, taskId: taskCard.task_id, persistence }),
     reviewerAdapter: createReviewerAdapter({ workflowId }),
     gateRunner: createGateRunnerAdapter(),
     persistence,
