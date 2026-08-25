@@ -6,7 +6,7 @@ export const DEFAULTS = Object.freeze({
   // Account-equivalent cookies/session state must live outside any Git work
   // tree, not merely be gitignored inside one.
   profileDir: path.join(os.homedir(), '.gpt-dev-loop', 'chrome-profile'),
-  headless: false,
+  headless: true,
   loginTimeoutMs: 300000,
   responseTimeoutMs: 120000,
 });

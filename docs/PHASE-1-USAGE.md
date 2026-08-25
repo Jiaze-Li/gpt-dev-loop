@@ -67,7 +67,7 @@ All overrides are environment variables; defaults are otherwise used:
 | --- | --- | --- |
 | `GPT_LOOP_CHATGPT_URL` | `https://chatgpt.com/` | Target page |
 | `GPT_LOOP_PROFILE_DIR` | `~/.gpt-dev-loop/chrome-profile` | Persistent browser profile location (account-equivalent cookies — keep it outside any Git work tree) |
-| `GPT_LOOP_HEADLESS` | `false` | Run Chrome headless once login is no longer needed |
+| `GPT_LOOP_HEADLESS` | `true` | Run Chrome headless; set to `false` to always use a visible window |
 | `GPT_LOOP_LOGIN_TIMEOUT_MS` | `300000` | How long to wait for manual login |
 | `GPT_LOOP_RESPONSE_TIMEOUT_MS` | `120000` | How long to wait for a completed reply |
 
@@ -102,6 +102,10 @@ ChatGPT DOM.
 - Response completion is detected by watching for the "stop generating"
   control to disappear combined with the reply text becoming stable; an
   unusual UI state could in principle cause a slightly early or late read.
-- Phase 1 always drives a real, persistent Chrome profile; there is no
-  headless/CI mode for the live path (see `docs/ARCHITECTURE.md` §"Non-goals"
-  for why CI login is explicitly out of scope).
+- Phase 1 always drives a real, persistent Chrome profile — there is still no
+  CI/unattended login (see `docs/ARCHITECTURE.md` §"Non-goals" for why that
+  stays out of scope). Once login has already succeeded once, `gpt-loop`
+  defaults to running headless (no visible window). If a headless run can't
+  reach the composer (expired login, Cloudflare/bot check, unexpected
+  layout), it automatically retries once in a visible window and prints a
+  message explaining why, so the failure can be resolved manually.

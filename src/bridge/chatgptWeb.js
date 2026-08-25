@@ -147,26 +147,36 @@ export async function waitForReply(page, config, baselineCount) {
   throw new ResponseTimeoutError(`ChatGPT response did not finish within ${config.responseTimeoutMs}ms.`);
 }
 
-export async function askGpt(prompt, config) {
-  fs.mkdirSync(config.profileDir, { recursive: true });
-
-  let context;
+async function launchContext(config, headless) {
   try {
-    context = await chromium.launchPersistentContext(config.profileDir, {
+    const context = await chromium.launchPersistentContext(config.profileDir, {
       channel: 'chrome',
-      headless: config.headless,
+      headless,
       viewport: null,
       args: ['--disable-blink-features=AutomationControlled'],
     });
-  } catch (err) {
-    throw new ChromeUnavailableError(`Could not launch system Chrome: ${err.message}`);
-  }
-
-  try {
     await context.addInitScript(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
+    return context;
+  } catch (err) {
+    throw new ChromeUnavailableError(`Could not launch system Chrome: ${err.message}`);
+  }
+}
 
+// Fallback from headless to a visible window is only safe before a prompt
+// has been sent (no risk of double-submitting). These are exactly the
+// failures ensureLoggedIn raises when the composer never becomes reachable:
+// an expired login, a Cloudflare/bot challenge, or an unexpected layout that
+// a human may be able to clear manually in a visible window.
+export function shouldFallbackToVisible(err) {
+  return err instanceof LoginRequiredError || err instanceof SelectorMismatchError;
+}
+
+export async function runSession(prompt, config, headless) {
+  const context = await launchContext(config, headless);
+
+  try {
     const page = context.pages()[0] ?? (await context.newPage());
     await page.goto(config.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((err) => {
       throw new TransportError(`Could not reach ${config.chatgptUrl}: ${err.message}`);
@@ -187,4 +197,26 @@ export async function askGpt(prompt, config) {
   } finally {
     await context.close().catch(() => {});
   }
+}
+
+export async function runAskGpt(prompt, config, { runSession: run = runSession } = {}) {
+  fs.mkdirSync(config.profileDir, { recursive: true });
+
+  if (config.headless) {
+    try {
+      return await run(prompt, config, true);
+    } catch (err) {
+      if (!shouldFallbackToVisible(err)) throw err;
+      console.error(
+        `gpt-loop: headless mode could not reach the ChatGPT composer (${err.message}) ` +
+          'Falling back to a visible Chrome window so you can complete login/verification manually.'
+      );
+    }
+  }
+
+  return run(prompt, config, false);
+}
+
+export async function askGpt(prompt, config) {
+  return runAskGpt(prompt, config);
 }

@@ -36,6 +36,15 @@ test('loadConfig treats "0" and "false" as headless=false', () => {
   assert.equal(loadConfig({ GPT_LOOP_HEADLESS: 'false' }).headless, false);
 });
 
+test('headless defaults to true so gpt-loop runs without a visible window', () => {
+  assert.equal(DEFAULTS.headless, true);
+  assert.equal(loadConfig({}).headless, true);
+});
+
+test('GPT_LOOP_HEADLESS=false overrides the headless default', () => {
+  assert.equal(loadConfig({ GPT_LOOP_HEADLESS: 'false' }).headless, false);
+});
+
 test('loadConfig ignores invalid numeric overrides and keeps defaults', () => {
   const config = loadConfig({
     GPT_LOOP_LOGIN_TIMEOUT_MS: 'not-a-number',
