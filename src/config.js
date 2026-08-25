@@ -17,9 +17,16 @@ export const DEFAULTS = Object.freeze({
   // instead — see GPT_BROWSER_MODE below and chromeRuntime.js.
   browserMode: 'launch',
   cdpUrl: 'http://localhost:9222',
+  // 'extension' mode (GPT_BROWSER_MODE=extension): gpt-loop starts a
+  // loopback-only WebSocket server instead of driving Chrome itself; a
+  // Chrome extension the user installs separately connects to it and
+  // drives the user's own already-logged-in ChatGPT tab.
+  extensionHost: '127.0.0.1',
+  extensionPort: 8877,
+  extensionConnectTimeoutMs: 15000,
 });
 
-const BROWSER_MODES = new Set(['launch', 'cdp']);
+const BROWSER_MODES = new Set(['launch', 'cdp', 'extension']);
 
 function parseBrowserMode(raw, fallback) {
   if (raw === undefined || raw === '') return fallback;
@@ -67,5 +74,13 @@ export function loadConfig(env = process.env) {
     backgroundWindow: parseBoolEnv(env, 'GPT_LOOP_BACKGROUND_WINDOW', DEFAULTS.backgroundWindow),
     browserMode: parseBrowserMode(env.GPT_BROWSER_MODE, DEFAULTS.browserMode),
     cdpUrl: env.GPT_LOOP_CDP_URL || DEFAULTS.cdpUrl,
+    extensionHost: env.GPT_LOOP_EXTENSION_HOST || DEFAULTS.extensionHost,
+    extensionPort: parseIntEnv(env, 'GPT_LOOP_EXTENSION_PORT', DEFAULTS.extensionPort),
+    extensionConnectTimeoutMs: parseIntEnv(
+      env,
+      'GPT_LOOP_EXTENSION_CONNECT_TIMEOUT_MS',
+      DEFAULTS.extensionConnectTimeoutMs
+    ),
+    extensionId: env.GPT_LOOP_EXTENSION_ID || null,
   };
 }

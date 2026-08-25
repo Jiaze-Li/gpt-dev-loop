@@ -376,3 +376,39 @@ test('gpt reviewer adapter: without a workflowId, falls back to the shared confi
 
   assert.equal(capturedConfig.profileDir, '/home/user/.gpt-dev-loop/chrome-profile');
 });
+
+test('gpt reviewer adapter: with no askGptFn override, resolves the transport from config.browserMode', async () => {
+  let resolvedWithConfig;
+  const fakeExtensionAskGpt = async () => resultText({ decision: 'PASS' });
+  const resolveAskGptFn = (config) => {
+    resolvedWithConfig = config;
+    return fakeExtensionAskGpt;
+  };
+  const adapter = createGptReviewerAdapter({
+    config: { browserMode: 'extension' },
+    resolveAskGptFn,
+  });
+
+  const result = await adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+
+  assert.equal(result.decision, 'PASS');
+  assert.equal(resolvedWithConfig.browserMode, 'extension');
+});
+
+test('gpt reviewer adapter: an explicit askGptFn takes priority over browserMode resolution', async () => {
+  let resolveAskGptFnCalled = false;
+  const askGptFn = async () => resultText({ decision: 'PASS' });
+  const resolveAskGptFn = () => {
+    resolveAskGptFnCalled = true;
+    return askGptFn;
+  };
+  const adapter = createGptReviewerAdapter({
+    askGptFn,
+    config: { browserMode: 'extension' },
+    resolveAskGptFn,
+  });
+
+  await adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+
+  assert.equal(resolveAskGptFnCalled, false);
+});

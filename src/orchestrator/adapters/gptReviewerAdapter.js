@@ -10,7 +10,7 @@
 // review_result` signature; wiring a real reviewer in is the caller's job.
 // Does not modify the browser bridge or the MCP transport.
 
-import { askGpt } from '../../bridge/chatgptWeb.js';
+import { resolveAskGpt } from '../../bridge/transport.js';
 import { TransportError, ResponseTimeoutError, RequestTimeoutError } from '../../bridge/errors.js';
 import { loadConfig, workflowProfileDir } from '../../config.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
@@ -278,10 +278,19 @@ function parseReviewResult(taskId, text) {
 // profile dir — see workflowProfileDir in config.js. Without it, the
 // adapter falls back to the shared profile dir from `config`, unchanged
 // from before this scoping existed.
-export function createGptReviewerAdapter({ askGptFn = askGpt, config = loadConfig(), workflowId } = {}) {
+// resolveAskGptFn defaults to the real transport.js resolver; tests inject a
+// fake to verify the browserMode -> transport switch without needing a real
+// Chrome or extension connection.
+export function createGptReviewerAdapter({
+  askGptFn,
+  config = loadConfig(),
+  workflowId,
+  resolveAskGptFn = resolveAskGpt,
+} = {}) {
   const effectiveConfig = workflowId
     ? { ...config, profileDir: workflowProfileDir(workflowId, config.profileDir) }
     : config;
+  const askGptImpl = askGptFn ?? resolveAskGptFn(effectiveConfig);
 
   return {
     async review(taskCard, executionReport, evidence) {
@@ -289,7 +298,7 @@ export function createGptReviewerAdapter({ askGptFn = askGpt, config = loadConfi
 
       let reply;
       try {
-        reply = await askGptFn(prompt, effectiveConfig);
+        reply = await askGptImpl(prompt, effectiveConfig);
       } catch (err) {
         if (err instanceof ResponseTimeoutError || err instanceof RequestTimeoutError) {
           throw new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_TIMEOUT, err.message);

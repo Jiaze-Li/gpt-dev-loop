@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "gpt-dev-loop bridge",
+  "version": "0.1.0",
+  "description": "Lets a local gpt-loop process send prompts to, and read replies from, your already-logged-in ChatGPT tab.",
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["domActions.js"],
+      "matches": ["https://chatgpt.com/*"]
+    }
+  ]
+}

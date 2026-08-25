@@ -211,6 +211,40 @@ Later:
 ./install codex
 ```
 
+## Phase 9 — Chrome extension browser bridge
+
+Status: **in progress** (design converged 2026-08-25, execution not started)
+
+Motivation: the Playwright/CDP transport (Phase 1) requires gpt-loop to manage
+its own Chrome profile (or attach via CDP to a specially-launched Chrome).
+That does not match the desired experience — the user should be able to stay
+logged into ChatGPT in the Chrome they already use day to day, with no
+separate profile or launch flags, and have gpt-loop reach that session
+through an extension instead.
+
+Decided approach:
+
+- Add a Manifest V3 Chrome extension (new top-level `extension/` directory,
+  not under `src/`) that: connects outward to a local WebSocket server gpt-loop
+  starts on `127.0.0.1` (loopback only), finds the user's ChatGPT tab, drives
+  the composer/send/wait-for-reply DOM interaction, and returns the reply
+  text over the same connection.
+- The extension is a new **browser transport**, selected via a new
+  `GPT_BROWSER_MODE=extension` value alongside the existing `launch`/`cdp`
+  modes. The GPT reviewer adapter's `review(task_card, execution_report,
+  evidence) -> review_result` signature and the orchestrator core are
+  unchanged — only the adapter's default transport selection gains a third
+  branch.
+- The existing Playwright bridge (`launch`/`cdp` modes) is untouched and
+  remains the default; extension mode is opt-in.
+- Full protocol, file layout, and test plan: see the implementation handoff.
+
+Explicitly out of scope for this phase: multiple concurrent Chrome
+instances/tabs, a browser connection pool, automatic login, any cloud
+deployment of the bridge server.
+
+Handoff: `docs/handoff/2026-08-25-chrome-extension-bridge.md`.
+
 ## Pilot strategy
 
 Do not begin with a large production feature. Use progressively harder pilots:
