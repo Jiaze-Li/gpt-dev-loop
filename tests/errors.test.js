@@ -7,6 +7,7 @@ import {
   SelectorMismatchError,
   ResponseTimeoutError,
   ResponseExtractionError,
+  RequestTimeoutError,
   UsageError,
   mapErrorToExitCode,
 } from '../src/bridge/errors.js';
@@ -19,6 +20,7 @@ test('each transport error carries a distinct non-zero exit code', () => {
     new SelectorMismatchError('x'),
     new ResponseTimeoutError('x'),
     new ResponseExtractionError('x'),
+    new RequestTimeoutError('x'),
     new UsageError('x'),
   ];
   for (const err of errors) {

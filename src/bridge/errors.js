@@ -41,6 +41,13 @@ export class ResponseExtractionError extends TransportError {
   }
 }
 
+export class RequestTimeoutError extends TransportError {
+  constructor(message) {
+    super(message, 7);
+    this.name = 'RequestTimeoutError';
+  }
+}
+
 export class UsageError extends Error {
   constructor(message) {
     super(message);

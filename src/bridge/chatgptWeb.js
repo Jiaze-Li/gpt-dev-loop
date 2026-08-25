@@ -1,14 +1,13 @@
-import fs from 'node:fs';
-import { chromium } from 'playwright';
 import {
   TransportError,
-  ChromeUnavailableError,
   LoginRequiredError,
   SelectorMismatchError,
   ResponseTimeoutError,
   ResponseExtractionError,
+  RequestTimeoutError,
 } from './errors.js';
 import { classifyComposerTimeout, describePageState } from './diagnostics.js';
+import { getChromeRuntime, withTimeout } from './chromeRuntime.js';
 
 const COMPOSER_SELECTORS = ['#prompt-textarea', 'div[contenteditable="true"].ProseMirror'];
 
@@ -24,6 +23,10 @@ export const ASSISTANT_MESSAGE_SELECTOR = '[data-message-author-role="assistant"
 
 const RESPONSE_STABLE_WINDOW_MS = 1200;
 const STATUS_LOG_INTERVAL_MS = 10000;
+
+function log(message) {
+  console.error(`gpt-loop: ${message}`);
+}
 
 async function locateFirstVisible(page, selectors, timeoutMs, { onPoll } = {}) {
   const deadline = Date.now() + timeoutMs;
@@ -94,6 +97,48 @@ export async function ensureLoggedIn(page, config) {
   throw new SelectorMismatchError(outcome.message);
 }
 
+function remainingMs(deadlineAt) {
+  return Math.max(0, deadlineAt - Date.now());
+}
+
+// Bounds `config[field]` by whatever's left of the caller's overall deadline
+// (if any), so two sequential waits (e.g. the two ensureLoggedIn attempts
+// below) share one budget instead of each getting a full allowance.
+function withBoundedTimeout(config, field, deadlineAt) {
+  if (deadlineAt === undefined) return config;
+  const remaining = remainingMs(deadlineAt);
+  if (remaining <= 0) {
+    throw new RequestTimeoutError(`ChatGPT request exceeded its time budget before ${field} could run.`);
+  }
+  return { ...config, [field]: Math.min(config[field], remaining) };
+}
+
+// The runtime keeps the Chrome window hidden by default. When the composer
+// can't be reached (expired login, Cloudflare/bot check, cookie consent,
+// passkey prompt), this shows the window so a human can clear it, then
+// retries and hides the window again once the composer is reachable. This
+// only ever runs before a prompt has been sent, so there's no risk of
+// double-submitting. `deadlineAt`, if given, bounds both attempts combined
+// so manual recovery can't run past the caller's overall request timeout.
+export async function ensureLoggedInWithRecovery(page, config, controls, deadlineAt) {
+  try {
+    return await ensureLoggedIn(page, withBoundedTimeout(config, 'loginTimeoutMs', deadlineAt));
+  } catch (err) {
+    if (!(err instanceof LoginRequiredError || err instanceof SelectorMismatchError)) throw err;
+    log(`ChatGPT needs manual attention (${err.message}). Showing the Chrome window for you to complete it.`);
+    await controls.showWindow().catch((showErr) => {
+      log(`could not show the Chrome window for manual recovery: ${showErr.message}`);
+    });
+    try {
+      const composer = await ensureLoggedIn(page, withBoundedTimeout(config, 'loginTimeoutMs', deadlineAt));
+      log('Manual step complete; hiding the Chrome window again.');
+      return composer;
+    } finally {
+      await controls.hideWindow().catch(() => {});
+    }
+  }
+}
+
 async function sendPrompt(page, composer, prompt) {
   await composer.click();
   await page.keyboard.insertText(prompt);
@@ -147,45 +192,21 @@ export async function waitForReply(page, config, baselineCount) {
   throw new ResponseTimeoutError(`ChatGPT response did not finish within ${config.responseTimeoutMs}ms.`);
 }
 
-async function launchContext(config, headless) {
-  try {
-    const context = await chromium.launchPersistentContext(config.profileDir, {
-      channel: 'chrome',
-      headless,
-      viewport: null,
-      args: ['--disable-blink-features=AutomationControlled'],
-    });
-    await context.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    });
-    return context;
-  } catch (err) {
-    throw new ChromeUnavailableError(`Could not launch system Chrome: ${err.message}`);
+async function runSessionOnPage(page, controls, prompt, config, deadlineAt) {
+  if (remainingMs(deadlineAt) <= 0) {
+    throw new RequestTimeoutError(`ChatGPT request did not start within ${config.requestTimeoutMs}ms (queue wait).`);
   }
-}
 
-// Fallback from headless to a visible window is only safe before a prompt
-// has been sent (no risk of double-submitting). These are exactly the
-// failures ensureLoggedIn raises when the composer never becomes reachable:
-// an expired login, a Cloudflare/bot challenge, or an unexpected layout that
-// a human may be able to clear manually in a visible window.
-export function shouldFallbackToVisible(err) {
-  return err instanceof LoginRequiredError || err instanceof SelectorMismatchError;
-}
-
-export async function runSession(prompt, config, headless) {
-  const context = await launchContext(config, headless);
+  await page.goto(config.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((err) => {
+    throw new TransportError(`Could not reach ${config.chatgptUrl}: ${err.message}`);
+  });
 
   try {
-    const page = context.pages()[0] ?? (await context.newPage());
-    await page.goto(config.chatgptUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((err) => {
-      throw new TransportError(`Could not reach ${config.chatgptUrl}: ${err.message}`);
-    });
-
-    const composer = await ensureLoggedIn(page, config);
+    const composer = await ensureLoggedInWithRecovery(page, config, controls, deadlineAt);
     const baselineCount = await page.locator(ASSISTANT_MESSAGE_SELECTOR).count();
     await sendPrompt(page, composer, prompt);
-    const reply = await waitForReply(page, config, baselineCount);
+    const replyConfig = withBoundedTimeout(config, 'responseTimeoutMs', deadlineAt);
+    const reply = await waitForReply(page, replyConfig, baselineCount);
 
     if (!reply) {
       throw new ResponseExtractionError('ChatGPT returned an empty response.');
@@ -194,29 +215,17 @@ export async function runSession(prompt, config, headless) {
   } catch (err) {
     if (err instanceof TransportError) throw err;
     throw new TransportError(`Unexpected transport failure: ${err.message}`);
-  } finally {
-    await context.close().catch(() => {});
   }
-}
-
-export async function runAskGpt(prompt, config, { runSession: run = runSession } = {}) {
-  fs.mkdirSync(config.profileDir, { recursive: true });
-
-  if (config.headless) {
-    try {
-      return await run(prompt, config, true);
-    } catch (err) {
-      if (!shouldFallbackToVisible(err)) throw err;
-      console.error(
-        `gpt-loop: headless mode could not reach the ChatGPT composer (${err.message}) ` +
-          'Falling back to a visible Chrome window so you can complete login/verification manually.'
-      );
-    }
-  }
-
-  return run(prompt, config, false);
 }
 
 export async function askGpt(prompt, config) {
-  return runAskGpt(prompt, config);
+  const runtime = getChromeRuntime(config);
+  const deadlineAt = Date.now() + config.requestTimeoutMs;
+  const run = runtime.run((page, controls) => runSessionOnPage(page, controls, prompt, config, deadlineAt));
+  return withTimeout(
+    run,
+    config.requestTimeoutMs,
+    `ChatGPT request did not complete within ${config.requestTimeoutMs}ms.`,
+    () => runtime.poison()
+  );
 }

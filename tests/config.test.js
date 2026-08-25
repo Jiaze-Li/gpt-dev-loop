@@ -11,38 +11,37 @@ test('loadConfig falls back to defaults with an empty environment', () => {
   const config = loadConfig({});
   assert.equal(config.chatgptUrl, DEFAULTS.chatgptUrl);
   assert.equal(config.profileDir, DEFAULTS.profileDir);
-  assert.equal(config.headless, DEFAULTS.headless);
   assert.equal(config.loginTimeoutMs, DEFAULTS.loginTimeoutMs);
   assert.equal(config.responseTimeoutMs, DEFAULTS.responseTimeoutMs);
+  assert.equal(config.requestTimeoutMs, DEFAULTS.requestTimeoutMs);
+  assert.equal(config.backgroundWindow, DEFAULTS.backgroundWindow);
 });
 
 test('loadConfig honors explicit overrides', () => {
   const config = loadConfig({
     GPT_LOOP_CHATGPT_URL: 'https://chatgpt.com/custom',
     GPT_LOOP_PROFILE_DIR: '/tmp/custom-profile',
-    GPT_LOOP_HEADLESS: 'true',
     GPT_LOOP_LOGIN_TIMEOUT_MS: '1000',
     GPT_LOOP_RESPONSE_TIMEOUT_MS: '2000',
+    GPT_LOOP_REQUEST_TIMEOUT_MS: '3000',
+    GPT_LOOP_BACKGROUND_WINDOW: 'false',
   });
   assert.equal(config.chatgptUrl, 'https://chatgpt.com/custom');
   assert.equal(config.profileDir, '/tmp/custom-profile');
-  assert.equal(config.headless, true);
   assert.equal(config.loginTimeoutMs, 1000);
   assert.equal(config.responseTimeoutMs, 2000);
+  assert.equal(config.requestTimeoutMs, 3000);
+  assert.equal(config.backgroundWindow, false);
 });
 
-test('loadConfig treats "0" and "false" as headless=false', () => {
-  assert.equal(loadConfig({ GPT_LOOP_HEADLESS: '0' }).headless, false);
-  assert.equal(loadConfig({ GPT_LOOP_HEADLESS: 'false' }).headless, false);
+test('loadConfig treats "0" and "false" as backgroundWindow=false', () => {
+  assert.equal(loadConfig({ GPT_LOOP_BACKGROUND_WINDOW: '0' }).backgroundWindow, false);
+  assert.equal(loadConfig({ GPT_LOOP_BACKGROUND_WINDOW: 'false' }).backgroundWindow, false);
 });
 
-test('headless defaults to true so gpt-loop runs without a visible window', () => {
-  assert.equal(DEFAULTS.headless, true);
-  assert.equal(loadConfig({}).headless, true);
-});
-
-test('GPT_LOOP_HEADLESS=false overrides the headless default', () => {
-  assert.equal(loadConfig({ GPT_LOOP_HEADLESS: 'false' }).headless, false);
+test('backgroundWindow defaults to true so gpt-loop does not disturb the desktop', () => {
+  assert.equal(DEFAULTS.backgroundWindow, true);
+  assert.equal(loadConfig({}).backgroundWindow, true);
 });
 
 test('loadConfig ignores invalid numeric overrides and keeps defaults', () => {
@@ -52,6 +51,19 @@ test('loadConfig ignores invalid numeric overrides and keeps defaults', () => {
   });
   assert.equal(config.loginTimeoutMs, DEFAULTS.loginTimeoutMs);
   assert.equal(config.responseTimeoutMs, DEFAULTS.responseTimeoutMs);
+});
+
+test('loadConfig warns on stderr and ignores the retired GPT_LOOP_HEADLESS env var', () => {
+  const originalConsoleError = console.error;
+  const loggedLines = [];
+  console.error = (line) => loggedLines.push(line);
+  try {
+    const config = loadConfig({ GPT_LOOP_HEADLESS: 'true' });
+    assert.equal('headless' in config, false);
+    assert.ok(loggedLines.some((line) => /GPT_LOOP_HEADLESS is no longer supported/.test(line)));
+  } finally {
+    console.error = originalConsoleError;
+  }
 });
 
 test('default profile dir lives under the home directory, not inside this repo', () => {
