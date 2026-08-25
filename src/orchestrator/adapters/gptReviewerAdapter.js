@@ -219,8 +219,20 @@ function parseList(raw) {
 
 // Splits GPT's reply on "## field_name" headings (TASK_PROTOCOL.md §1
 // convention) and validates it against REVIEW_RESULT.md §2.
+//
+// The prompt asks for literal "## field_name" markdown, but the reply
+// crosses through ChatGPT's *rendered* web UI (extension/domActions.js
+// reads `.innerText` off the rendered DOM, not the raw markdown source) —
+// the browser renders "## task_id" as a heading element and its innerText
+// is just "task_id", with the "##" characters gone entirely (observed
+// live: 2026-08-26). The Playwright/CLI-backed executor doesn't have this
+// problem (its output is raw text, never DOM-rendered), so only this
+// parser needs to tolerate the "##" being stripped. Matches each known
+// field name alone on its own line, with an optional "##" prefix and/or
+// trailing colon, case-insensitively.
 function parseReviewResult(taskId, text) {
-  const headingRe = /^##\s+(\w+)\s*$/gm;
+  const fieldPattern = RESULT_FIELDS.join('|');
+  const headingRe = new RegExp(`^#{0,2}\\s*(${fieldPattern})\\s*:?\\s*$`, 'gim');
   const matches = [...text.matchAll(headingRe)];
   if (matches.length === 0) {
     throw new AdapterError(
@@ -231,7 +243,7 @@ function parseReviewResult(taskId, text) {
 
   const sections = {};
   for (let i = 0; i < matches.length; i += 1) {
-    const name = matches[i][1];
+    const name = matches[i][1].toLowerCase();
     const start = matches[i].index + matches[i][0].length;
     const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
     sections[name] = text.slice(start, end).trim();

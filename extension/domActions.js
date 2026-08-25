@@ -102,6 +102,54 @@ function isAnyVisible(doc, selectors) {
   });
 }
 
+// Chrome throttles setTimeout/setInterval in background/inactive tabs
+// (observed live: 2026-08-26, a 120s responseTimeoutMs elapsed with zero
+// polls landing while the ChatGPT tab sat behind the terminal window,
+// producing a false RESPONSE_EMPTY even though ChatGPT had replied) — but
+// MutationObserver callbacks are NOT subject to that throttling, since they
+// fire as a direct consequence of the page's own script mutating the DOM in
+// response to the streaming reply, not off a timer wheel. defaultTick races
+// the plain poll-interval sleep against "a mutation happened", so a
+// backgrounded tab still wakes the loop the instant new text lands instead
+// of waiting out the throttled interval. Falls back to pure interval
+// polling when MutationObserver/doc.body aren't available (real browser
+// only — tests/extensionDomActions.test.js's fake `document` has neither,
+// so it exercises the exact same polling path as before this change).
+function createMutationWaiter(doc, sleep) {
+  if (typeof MutationObserver === 'undefined' || !doc?.body) {
+    return { tick: (ms) => sleep(ms), disconnect() {} };
+  }
+
+  let wake = null;
+  const observer = new MutationObserver(() => {
+    if (wake) {
+      const resolve = wake;
+      wake = null;
+      resolve();
+    }
+  });
+  observer.observe(doc.body, { childList: true, subtree: true, characterData: true });
+
+  return {
+    tick(ms) {
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          wake = null;
+          resolve();
+        };
+        wake = finish;
+        sleep(ms).then(finish);
+      });
+    },
+    disconnect() {
+      observer.disconnect();
+    },
+  };
+}
+
 // Ported from src/bridge/chatgptWeb.js's waitForReply: wait for the
 // assistant message count to exceed baselineCount, then wait for the stop
 // button to disappear and the text to stay unchanged for
@@ -123,41 +171,46 @@ export async function waitForReply(
   } = {}
 ) {
   const deadline = Date.now() + responseTimeoutMs;
+  const waiter = createMutationWaiter(doc, sleep);
 
-  while (Date.now() < deadline && doc.querySelectorAll(assistantSelector).length <= baselineCount) {
-    await sleep(DEFAULT_POLL_MS);
-  }
-  if (doc.querySelectorAll(assistantSelector).length <= baselineCount) {
-    const err = new Error(`No assistant response appeared within ${responseTimeoutMs}ms.`);
-    err.code = 'RESPONSE_EMPTY';
-    throw err;
-  }
-
-  let lastText = null;
-  let stableSince = null;
-
-  while (Date.now() < deadline) {
-    const nodes = doc.querySelectorAll(assistantSelector);
-    const lastNode = nodes[nodes.length - 1];
-    const currentText = (lastNode?.innerText ?? '').trim();
-    const stopVisible = isAnyVisible(doc, stopSelectors);
-
-    if (!stopVisible && currentText.length > 0 && currentText === lastText) {
-      if (!stableSince) stableSince = Date.now();
-      if (Date.now() - stableSince >= RESPONSE_STABLE_WINDOW_MS) {
-        return currentText;
-      }
-    } else {
-      stableSince = null;
+  try {
+    while (Date.now() < deadline && doc.querySelectorAll(assistantSelector).length <= baselineCount) {
+      await waiter.tick(DEFAULT_POLL_MS);
+    }
+    if (doc.querySelectorAll(assistantSelector).length <= baselineCount) {
+      const err = new Error(`No assistant response appeared within ${responseTimeoutMs}ms.`);
+      err.code = 'RESPONSE_EMPTY';
+      throw err;
     }
 
-    lastText = currentText;
-    await sleep(DEFAULT_POLL_MS);
-  }
+    let lastText = null;
+    let stableSince = null;
 
-  const nodes = doc.querySelectorAll(assistantSelector);
-  const finalText = (nodes[nodes.length - 1]?.innerText ?? '').trim();
-  const err = new Error(`ChatGPT response did not finish within ${responseTimeoutMs}ms.`);
-  err.code = finalText ? 'RESPONSE_TIMEOUT' : 'RESPONSE_EMPTY';
-  throw err;
+    while (Date.now() < deadline) {
+      const nodes = doc.querySelectorAll(assistantSelector);
+      const lastNode = nodes[nodes.length - 1];
+      const currentText = (lastNode?.innerText ?? '').trim();
+      const stopVisible = isAnyVisible(doc, stopSelectors);
+
+      if (!stopVisible && currentText.length > 0 && currentText === lastText) {
+        if (!stableSince) stableSince = Date.now();
+        if (Date.now() - stableSince >= RESPONSE_STABLE_WINDOW_MS) {
+          return currentText;
+        }
+      } else {
+        stableSince = null;
+      }
+
+      lastText = currentText;
+      await waiter.tick(DEFAULT_POLL_MS);
+    }
+
+    const nodes = doc.querySelectorAll(assistantSelector);
+    const finalText = (nodes[nodes.length - 1]?.innerText ?? '').trim();
+    const err = new Error(`ChatGPT response did not finish within ${responseTimeoutMs}ms.`);
+    err.code = finalText ? 'RESPONSE_TIMEOUT' : 'RESPONSE_EMPTY';
+    throw err;
+  } finally {
+    waiter.disconnect();
+  }
 }
