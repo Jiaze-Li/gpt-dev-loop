@@ -10,6 +10,7 @@ import {
   ResponseTimeoutError,
   ResponseExtractionError,
   RequestTimeoutError,
+  SendFailedError,
 } from '../src/bridge/errors.js';
 
 const EXTENSION_ID = 'test-extension-id';
@@ -98,6 +99,7 @@ const ERROR_CASES = [
   ['SEND_BUTTON_NOT_FOUND', SelectorMismatchError],
   ['RESPONSE_TIMEOUT', ResponseTimeoutError],
   ['RESPONSE_EMPTY', ResponseExtractionError],
+  ['SEND_FAILED', SendFailedError],
   ['INTERNAL_ERROR', ChromeUnavailableError],
 ];
 

@@ -14,6 +14,7 @@ import {
   SelectorMismatchError,
   ResponseTimeoutError,
   ResponseExtractionError,
+  SendFailedError,
 } from './errors.js';
 import { ExtensionProtocolError } from './extensionProtocol.js';
 
@@ -25,6 +26,7 @@ const ERROR_CODE_MAP = {
   SEND_BUTTON_NOT_FOUND: SelectorMismatchError,
   RESPONSE_TIMEOUT: ResponseTimeoutError,
   RESPONSE_EMPTY: ResponseExtractionError,
+  SEND_FAILED: SendFailedError,
   INTERNAL_ERROR: ChromeUnavailableError,
 };
 

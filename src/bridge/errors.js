@@ -48,6 +48,13 @@ export class RequestTimeoutError extends TransportError {
   }
 }
 
+export class SendFailedError extends TransportError {
+  constructor(message) {
+    super(message, 8);
+    this.name = 'SendFailedError';
+  }
+}
+
 export class UsageError extends Error {
   constructor(message) {
     super(message);

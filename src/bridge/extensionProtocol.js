@@ -22,6 +22,7 @@ export const RESULT_ERROR_CODES = Object.freeze([
   'SEND_BUTTON_NOT_FOUND',
   'RESPONSE_TIMEOUT',
   'RESPONSE_EMPTY',
+  'SEND_FAILED',
   'INTERNAL_ERROR',
 ]);
 

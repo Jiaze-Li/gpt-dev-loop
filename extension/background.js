@@ -1,9 +1,14 @@
 // Service worker: owns the WebSocket connection to the local gpt-loop
 // bridge server (src/bridge/extensionServer.js) and relays each `request`
-// to whichever tab is running content.js. Protocol constants mirror
+// to a fresh, background ChatGPT tab created just for that request (see
+// reviewSession.js — 2026-08-26 transport stabilization: one review
+// conversation was previously reused across every review, which let GPT's
+// judgment on one review bleed into the next). Protocol constants mirror
 // src/bridge/extensionProtocol.js — the extension sandbox can't import
 // files outside this directory, so this is a second, small copy of the
 // same wire contract; keep both in sync when the protocol changes.
+
+import { runReviewInFreshTab } from './reviewSession.js';
 
 const PROTOCOL_ID = 'gpt-loop-extension/v1';
 const WS_HOST = '127.0.0.1';
@@ -14,6 +19,11 @@ const RECONNECT_DELAY_MS = 2000;
 // content script that hangs entirely (e.g. the tab crashed), not the
 // primary way requests are expected to finish.
 const TAB_MESSAGE_TIMEOUT_MARGIN_MS = 10000;
+// How long a freshly created tab gets to reach "complete" load status
+// before this request gives up on it — separate from responseTimeoutMs,
+// since a slow initial chatgpt.com load shouldn't eat into the caller's
+// reply-wait budget.
+const TAB_LOAD_TIMEOUT_MS = 20000;
 
 // MV3-service-worker gotcha: `setTimeout` does NOT keep a service worker
 // alive, and the worker can be terminated by Chrome (idle timeout, ~30s of
@@ -79,6 +89,35 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 chrome.runtime.onStartup.addListener(ensureConnected);
 chrome.runtime.onInstalled.addListener(ensureConnected);
 
+// Resolves once `tabId` reaches status "complete", or rejects after
+// timeoutMs. Checks the tab's current status first (race-safe against a
+// load that already finished before this was called), then falls back to
+// chrome.tabs.onUpdated.
+function waitForTabComplete(tabId, { timeoutMs = TAB_LOAD_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      fn();
+    };
+
+    const timer = setTimeout(() => finish(() => reject(new Error(`tab ${tabId} did not finish loading within ${timeoutMs}ms`))), timeoutMs);
+
+    function onUpdated(updatedTabId, changeInfo) {
+      if (updatedTabId === tabId && changeInfo.status === 'complete') finish(resolve);
+    }
+    chrome.tabs.onUpdated.addListener(onUpdated);
+
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) return; // tab may not exist yet from the caller's point of view; onUpdated will still fire
+      if (tab.status === 'complete') finish(resolve);
+    });
+  });
+}
+
 async function handleMessage(raw) {
   let msg;
   try {
@@ -89,43 +128,35 @@ async function handleMessage(raw) {
   if (msg.protocol !== PROTOCOL_ID || msg.type !== 'request') return;
 
   const { requestId, payload } = msg;
+  const startedAt = Date.now();
+  const reqLog = (stage) => log(`[${requestId}] ${stage} +${Date.now() - startedAt}ms`);
+  reqLog('request received');
+
   try {
-    const tab = await findChatGptTab(payload.chatgptUrl);
-    if (!tab) {
-      log(`[${requestId}] no tab matched ${toOriginMatchPattern(payload.chatgptUrl)}`);
-      sendResult(requestId, { ok: false, code: 'NO_CHATGPT_TAB', message: 'No open ChatGPT tab was found.' });
-      return;
-    }
-    log(`[${requestId}] using tab ${tab.id} (${tab.url})`);
-    const result = await sendToContentScriptWithRetry(tab.id, {
-      type: 'perform',
-      requestId,
-      prompt: payload.prompt,
-      responseTimeoutMs: payload.responseTimeoutMs,
-    });
+    const result = await runReviewInFreshTab(
+      {
+        chatgptUrl: payload.chatgptUrl,
+        perform: (tabId) =>
+          sendToContentScriptWithRetry(tabId, {
+            type: 'perform',
+            requestId,
+            prompt: payload.prompt,
+            responseTimeoutMs: payload.responseTimeoutMs,
+          }),
+      },
+      {
+        createTab: (opts) => chrome.tabs.create(opts),
+        waitForTabComplete: (tabId) => waitForTabComplete(tabId),
+        removeTab: (tabId) => chrome.tabs.remove(tabId),
+        log: reqLog,
+      }
+    );
+    reqLog('reply returned');
     sendResult(requestId, result);
   } catch (err) {
+    reqLog(`failed: ${err.message}`);
     sendResult(requestId, { ok: false, code: 'NO_CHATGPT_TAB', message: err.message });
   }
-}
-
-// Turns the request's chatgptUrl into a chrome.tabs.query match pattern
-// (e.g. "https://chatgpt.com/" -> "https://chatgpt.com/*"), so the tab we
-// operate on actually matches what the caller configured rather than always
-// being hardcoded to chatgpt.com. Falls back to the default origin if the
-// request didn't supply one or it doesn't parse.
-function toOriginMatchPattern(chatgptUrl) {
-  try {
-    return `${new URL(chatgptUrl).origin}/*`;
-  } catch {
-    return 'https://chatgpt.com/*';
-  }
-}
-
-async function findChatGptTab(chatgptUrl) {
-  const tabs = await chrome.tabs.query({ url: toOriginMatchPattern(chatgptUrl) });
-  if (tabs.length === 0) return null;
-  return tabs.reduce((best, tab) => ((tab.lastAccessed ?? 0) > (best.lastAccessed ?? 0) ? tab : best));
 }
 
 function sendToContentScript(tabId, message) {
@@ -145,15 +176,14 @@ function sendToContentScript(tabId, message) {
   });
 }
 
-// A tab that was already open before this extension's service worker last
-// (re)started never got content.js injected via manifest.json's declarative
-// content_scripts entry — Chrome only runs those on navigation, not
-// retroactively on already-loaded tabs. That surfaces as chrome.runtime's
-// generic "Could not establish connection. Receiving end does not exist."
-// rather than anything actionable. Since manifest.json already grants the
-// "scripting" permission, inject content.js ourselves once and retry rather
-// than making the user manually refresh the ChatGPT tab after every
-// extension reload/update.
+// A freshly created tab needs a moment after reaching "complete" for
+// manifest.json's declarative content_scripts entry to actually finish
+// injecting content.js — the first sendMessage can beat that by a beat and
+// surface as chrome.runtime's generic "Could not establish connection.
+// Receiving end does not exist." rather than anything actionable. Since
+// manifest.json already grants the "scripting" permission, inject
+// content.js ourselves once and retry rather than polling/guessing at a
+// fixed extra delay.
 const NO_RECEIVER_ERROR_PATTERN = /Receiving end does not exist|Could not establish connection/;
 
 async function sendToContentScriptWithRetry(tabId, message) {
