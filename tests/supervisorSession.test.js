@@ -5,6 +5,7 @@ import WebSocket from 'ws';
 import { SupervisorSession } from '../src/bridge/supervisorSession.js';
 import { getExtensionServer, closeExtensionServer } from '../src/bridge/extensionServer.js';
 import { SupervisorTabLostError, SupervisorIdentityMismatchError } from '../src/bridge/errors.js';
+import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
 
 const EXTENSION_ID = 'test-extension-id';
 const PROTOCOL_ID = 'gpt-loop-extension/v1';
@@ -206,5 +207,62 @@ test('create() called twice without an intervening close() throws', async () => 
   const session = new SupervisorSession(config);
   await session.create();
   await assert.rejects(() => session.create(), /already called/);
+  client.close();
+});
+
+test('decide() sends the built Supervisor prompt and returns the parsed decision', async () => {
+  const config = nextConfig();
+  const seenPrompts = [];
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    if (msg.payload.action === 'supervisorCreate') {
+      ws.send(JSON.stringify({ protocol: PROTOCOL_ID, type: 'response', requestId: msg.requestId, payload: { text: '', tabId: 601 } }));
+      return;
+    }
+    seenPrompts.push(msg.payload.prompt);
+    ws.send(
+      JSON.stringify({
+        protocol: PROTOCOL_ID,
+        type: 'response',
+        requestId: msg.requestId,
+        payload: { text: 'WORKFLOW_DONE\n\n## summary\ndone', conversationId: 'conv-decide' },
+      })
+    );
+  });
+
+  const session = new SupervisorSession(config);
+  await session.create();
+  const decision = await session.decide({ workflowGoal: 'ship it' });
+
+  assert.deepEqual(decision, { action: 'WORKFLOW_DONE', summary: 'done' });
+  assert.equal(seenPrompts.length, 1);
+  assert.match(seenPrompts[0], /ship it/);
+  assert.match(seenPrompts[0], /## summary/);
+  client.close();
+});
+
+test('decide() rejects with AdapterError(SUPERVISOR_INVALID_OUTPUT) when the reply is not a valid decision', async () => {
+  const config = nextConfig();
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    if (msg.payload.action === 'supervisorCreate') {
+      ws.send(JSON.stringify({ protocol: PROTOCOL_ID, type: 'response', requestId: msg.requestId, payload: { text: '', tabId: 602 } }));
+      return;
+    }
+    ws.send(
+      JSON.stringify({
+        protocol: PROTOCOL_ID,
+        type: 'response',
+        requestId: msg.requestId,
+        payload: { text: 'Sure, moving on to the next task.', conversationId: 'conv-invalid' },
+      })
+    );
+  });
+
+  const session = new SupervisorSession(config);
+  await session.create();
+  await assert.rejects(() => session.decide({}), (err) => {
+    assert.ok(err instanceof AdapterError);
+    assert.equal(err.code, ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT);
+    return true;
+  });
   client.close();
 });

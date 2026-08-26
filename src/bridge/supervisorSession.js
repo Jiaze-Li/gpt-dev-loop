@@ -31,6 +31,7 @@ import { withTimeout } from './chromeRuntime.js';
 import { mapProtocolError } from './chatgptExtension.js';
 import { TransportError, ChromeUnavailableError } from './errors.js';
 import { ExtensionProtocolError } from './extensionProtocol.js';
+import { buildSupervisorPrompt, parseSupervisorDecision } from '../orchestrator/supervisorProtocol.js';
 
 const NOT_CREATED_MESSAGE = 'SupervisorSession.create() has not been called (or did not succeed) — there is no tab to address.';
 const ALREADY_CREATED_MESSAGE =
@@ -136,6 +137,18 @@ export class SupervisorSession {
     );
     this._conversationId = result.conversationId;
     return result.text;
+  }
+
+  // Thin structured-decision wrapper around ask(): builds the Supervisor
+  // prompt from `context` (supervisorProtocol.js's buildSupervisorPrompt),
+  // sends it into this same persistent conversation, and returns the
+  // parsed decision (parseSupervisorDecision) instead of the raw reply
+  // text. Throws AdapterError(SUPERVISOR_INVALID_OUTPUT) exactly as
+  // parseSupervisorDecision does if the reply isn't a valid decision — this
+  // wrapper adds no further validation of its own.
+  async decide(context) {
+    const reply = await this.ask(buildSupervisorPrompt(context));
+    return parseSupervisorDecision(reply);
   }
 
   // Closes just this session's own tab (a plain chrome.tabs.remove — never
