@@ -13,7 +13,8 @@
     "ask": "node ./bin/gpt-loop.js ask",
     "mcp": "node ./bin/gpt-loop-mcp.js",
     "test": "node --test tests/*.test.js",
-    "test:cdp-live": "node ./scripts/test-cdp-live.js"
+    "test:cdp-live": "node ./scripts/test-cdp-live.js",
+    "test:delete-conversation-live": "node ./scripts/test-delete-conversation-live.js"
   },
   "engines": {
     "node": ">=20"

@@ -18,9 +18,27 @@ function makeLogger(requestId, startedAt) {
   };
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (message?.type !== 'perform') return false;
+// background.js's sendToContentScriptWithRetry manually re-injects this
+// file via chrome.scripting.executeScript when it beats manifest.json's
+// declarative content_scripts injection to the punch — that manual
+// injection can also land *after* the declarative one finishes, running
+// this whole script a second time in the same page. Without this guard,
+// each execution would register its own chrome.runtime.onMessage
+// listener, so a single request could be picked up (and its DOM actions,
+// e.g. deleteConversation, executed) by both listeners concurrently.
+// globalThis persists across script executions within the same page, so
+// this flag reliably survives into the second run.
+if (!globalThis.__gptLoopContentScriptInstalled) {
+  globalThis.__gptLoopContentScriptInstalled = true;
 
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type === 'perform') return handlePerform(message, sendResponse);
+    if (message?.type === 'performDelete') return handlePerformDelete(message, sendResponse);
+    return false;
+  });
+}
+
+function handlePerform(message, sendResponse) {
   const { requestId } = message;
   const startedAt = Date.now();
   const log = makeLogger(requestId, startedAt);
@@ -48,11 +66,30 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       log('composer found');
 
       const baselineCount = document.querySelectorAll(domActions.ASSISTANT_MESSAGE_SELECTOR).length;
+      const baselineConversationId = domActions.readConversationId(document);
       await domActions.sendPromptReliably(document, composer, message.prompt, domActions.SEND_BUTTON_SELECTORS, { onStage: log });
+
+      // ChatGPT is a SPA: the /c/<id> URL segment is assigned by client-side
+      // routing, not guaranteed to be present the instant send confirms —
+      // so this waits (event-driven, bounded) for it rather than reading it
+      // once. A timeout here is non-fatal to the ask itself (the reply is
+      // still worth returning) but conversationId comes back null, which
+      // callers (e.g. anything about to delete this conversation) must
+      // treat as "no identity" and refuse to proceed — never fall back to
+      // guessing by title or "most recent".
+      let conversationId = null;
+      let identityDiagnostics;
+      try {
+        conversationId = await domActions.waitForConversationIdentity(document, { baselineId: baselineConversationId, onStage: log });
+      } catch (err) {
+        if (err.code !== 'CONVERSATION_IDENTITY_NOT_FOUND') throw err;
+        identityDiagnostics = err.diagnostics;
+        log(`identity diagnostics: ${JSON.stringify(identityDiagnostics)}`);
+      }
 
       const text = await domActions.waitForReply(document, { responseTimeoutMs: message.responseTimeoutMs }, baselineCount, { onStage: log });
       log('reply returned');
-      sendResponse({ ok: true, text });
+      sendResponse({ ok: true, text, conversationId, identityDiagnostics });
     } catch (err) {
       log(`failed: ${err.code ?? 'INTERNAL_ERROR'} — ${err.message}`);
       sendResponse({ ok: false, code: err.code ?? 'INTERNAL_ERROR', message: err.message });
@@ -60,4 +97,24 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   })();
 
   return true; // keep the message channel open for the async sendResponse above
-});
+}
+
+function handlePerformDelete(message, sendResponse) {
+  const { requestId, conversationId } = message;
+  const startedAt = Date.now();
+  const log = makeLogger(requestId, startedAt);
+
+  (async () => {
+    try {
+      log(`delete request received (${conversationId})`);
+      const domActions = await import(chrome.runtime.getURL('domActions.js'));
+      await domActions.deleteConversation(document, conversationId, { onStage: log });
+      sendResponse({ ok: true });
+    } catch (err) {
+      log(`failed: ${err.code ?? 'INTERNAL_ERROR'} — ${err.message}`);
+      sendResponse({ ok: false, code: err.code ?? 'INTERNAL_ERROR', message: err.message });
+    }
+  })();
+
+  return true; // keep the message channel open for the async sendResponse above
+}

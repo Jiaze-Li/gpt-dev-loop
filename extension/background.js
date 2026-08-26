@@ -132,17 +132,16 @@ async function handleMessage(raw) {
   const reqLog = (stage) => log(`[${requestId}] ${stage} +${Date.now() - startedAt}ms`);
   reqLog('request received');
 
+  const isDelete = payload.action === 'delete';
+  const contentMessage = isDelete
+    ? { type: 'performDelete', requestId, conversationId: payload.conversationId, responseTimeoutMs: payload.responseTimeoutMs }
+    : { type: 'perform', requestId, prompt: payload.prompt, responseTimeoutMs: payload.responseTimeoutMs };
+
   try {
     const result = await runReviewInFreshTab(
       {
         chatgptUrl: payload.chatgptUrl,
-        perform: (tabId) =>
-          sendToContentScriptWithRetry(tabId, {
-            type: 'perform',
-            requestId,
-            prompt: payload.prompt,
-            responseTimeoutMs: payload.responseTimeoutMs,
-          }),
+        perform: (tabId) => sendToContentScriptWithRetry(tabId, contentMessage),
       },
       {
         createTab: (opts) => chrome.tabs.create(opts),
@@ -151,7 +150,7 @@ async function handleMessage(raw) {
         log: reqLog,
       }
     );
-    reqLog('reply returned');
+    reqLog(isDelete ? 'delete confirmed' : 'reply returned');
     sendResult(requestId, result);
   } catch (err) {
     reqLog(`failed: ${err.message}`);
@@ -199,8 +198,20 @@ async function sendToContentScriptWithRetry(tabId, message) {
 
 function sendResult(requestId, result) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  // `text` is required by the wire protocol's 'response' shape even for a
+  // delete result, which has none — an empty string keeps the shape valid
+  // without inventing a second response schema for one action.
   const message = result.ok
-    ? { protocol: PROTOCOL_ID, type: 'response', requestId, payload: { text: result.text } }
+    ? {
+        protocol: PROTOCOL_ID,
+        type: 'response',
+        requestId,
+        payload: {
+          text: result.text ?? '',
+          conversationId: result.conversationId,
+          ...(result.identityDiagnostics !== undefined ? { identityDiagnostics: result.identityDiagnostics } : {}),
+        },
+      }
     : { protocol: PROTOCOL_ID, type: 'error', requestId, error: { code: result.code, message: result.message } };
   ws.send(JSON.stringify(message));
 }

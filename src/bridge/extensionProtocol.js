@@ -23,6 +23,10 @@ export const RESULT_ERROR_CODES = Object.freeze([
   'RESPONSE_TIMEOUT',
   'RESPONSE_EMPTY',
   'SEND_FAILED',
+  'RATE_LIMITED',
+  'CONVERSATION_NOT_FOUND',
+  'DELETE_MENU_NOT_FOUND',
+  'DELETE_NOT_CONFIRMED',
   'INTERNAL_ERROR',
 ]);
 
@@ -42,12 +46,18 @@ export function buildHelloAck(requestId, serverVersion) {
   return { protocol: PROTOCOL_ID, type: 'hello_ack', requestId, payload: { serverVersion } };
 }
 
-export function buildRequestMessage(requestId, { prompt, chatgptUrl, responseTimeoutMs }) {
+// `action`: 'ask' (default, review flow, needs `prompt`) or 'delete' (needs
+// `conversationId`, no prompt). Both share one envelope shape rather than
+// separate message types, since the tab lifecycle around them (create,
+// wait for load, perform, close) is identical — only what happens inside
+// the tab differs, and that's dispatched on `payload.action` by
+// background.js/content.js.
+export function buildRequestMessage(requestId, { prompt, chatgptUrl, responseTimeoutMs, action = 'ask', conversationId } = {}) {
   return {
     protocol: PROTOCOL_ID,
     type: 'request',
     requestId,
-    payload: { prompt, chatgptUrl, responseTimeoutMs },
+    payload: action === 'delete' ? { action, chatgptUrl, responseTimeoutMs, conversationId } : { action, prompt, chatgptUrl, responseTimeoutMs },
   };
 }
 

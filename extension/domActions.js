@@ -41,6 +41,181 @@ function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function randomJitterMs(minMs, maxMs) {
+  return minMs + Math.floor(Math.random() * (maxMs - minMs));
+}
+
+// --- Conversation identity --------------------------------------------
+//
+// ChatGPT's only stable, unambiguous identity for a conversation is the
+// `/c/<id>` segment of its own URL (assigned once the conversation's first
+// message actually lands — a blank "New chat" has no id yet). Never fall
+// back to matching by title: titles are user-visible text, can repeat, can
+// be renamed/auto-generated late, and are explicitly out of scope as an
+// identity source (see the 2026-08-26 conversation-deletion primitive).
+export const CONVERSATION_ID_PATTERN = /\/c\/([a-zA-Z0-9-]+)/;
+
+// A real ChatGPT conversation id is a server-assigned UUID (always
+// hyphen-segmented) — never a bare word. CONVERSATION_ID_PATTERN above is
+// deliberately loose (any /c/<alnum-or-hyphen> segment) so it still matches
+// whatever exact id shape ChatGPT uses; this second check is what rejects a
+// stray non-conversation anchor/URL segment (e.g. a nav/mode link that
+// happens to start with "/c/") from ever being mistaken for one. This is
+// the fix for the live bug where a bare token ("WEB") was captured and
+// logged as "identity captured" before deletion refused it as not found in
+// the sidebar — with this check it is never accepted as a candidate in the
+// first place. Does not change the exact-string /c/<id> lookup used to
+// locate a conversation's row for deletion (see conversationLinkSelector).
+export const CONVERSATION_ID_SHAPE_PATTERN = /^[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)+$/;
+
+export function isValidConversationId(id) {
+  return typeof id === 'string' && CONVERSATION_ID_SHAPE_PATTERN.test(id);
+}
+
+export function extractConversationId(href) {
+  const match = typeof href === 'string' ? href.match(CONVERSATION_ID_PATTERN) : null;
+  const id = match ? match[1] : null;
+  return isValidConversationId(id) ? id : null;
+}
+
+// Reads the current tab's conversation id straight off its own URL. Returns
+// null if the URL has no `/c/<id>` segment yet (e.g. right after "New chat"
+// before the first message is sent) — callers must treat that as "no
+// identity yet", not retry with a guess.
+export function readConversationId(doc) {
+  return extractConversationId(doc?.location?.href ?? '');
+}
+
+// Reads the sidebar's own idea of which conversation is currently active —
+// the anchor ChatGPT itself marks current (`aria-current="page"`), not just
+// "the most recent /c/<...> link", since the sidebar can (and, mid-navigation,
+// does) list other conversations too. This is a second, independent
+// identity source alongside the URL: the SPA has been observed to update one
+// before the other, so waitForConversationIdentity below checks both rather
+// than trusting either alone.
+function readActiveSidebarConversationId(doc) {
+  if (typeof doc?.querySelectorAll !== 'function') return null;
+  const anchors = doc.querySelectorAll('a[href^="/c/"]') || [];
+  for (const anchor of anchors) {
+    const ariaCurrent = typeof anchor.getAttribute === 'function' ? anchor.getAttribute('aria-current') : anchor.ariaCurrent;
+    if (ariaCurrent !== 'page') continue;
+    const href = typeof anchor.getAttribute === 'function' ? anchor.getAttribute('href') : anchor.href;
+    const id = extractConversationId(href);
+    if (id) return id;
+  }
+  return null;
+}
+
+function conversationIdentityNotFoundError(message) {
+  const err = new Error(message);
+  err.code = 'CONVERSATION_IDENTITY_NOT_FOUND';
+  return err;
+}
+
+const DEFAULT_IDENTITY_TIMEOUT_MS = 15000;
+
+// Snapshot of both identity sources' raw state, attached to the timeout
+// error so a caller without live DOM access (e.g. reading this from the
+// Node-side error message/logs) can tell *why* neither source produced an
+// id, instead of only "it didn't". Never includes prompt/reply text.
+function captureIdentityDiagnostics(doc, baselineId) {
+  const anchors = typeof doc?.querySelectorAll === 'function' ? doc.querySelectorAll('a[href^="/c/"]') || [] : [];
+  let activeAnchorCount = 0;
+  for (const anchor of anchors) {
+    const ariaCurrent = typeof anchor.getAttribute === 'function' ? anchor.getAttribute('aria-current') : anchor.ariaCurrent;
+    if (ariaCurrent === 'page') activeAnchorCount += 1;
+  }
+  return {
+    baselineId,
+    finalUrl: doc?.location?.href ?? null,
+    sidebarConversationLinkCount: anchors.length,
+    sidebarActiveAnchorCount: activeAnchorCount,
+  };
+}
+
+// Waits for the freshly-sent conversation's own identity to show up, after
+// sendPromptReliably has already confirmed the send. ChatGPT is a SPA: the
+// `/c/<id>` URL segment is assigned by client-side routing (history API), not
+// a full navigation, so it is NOT guaranteed to be present the instant send
+// confirms — reading location.href synchronously right after send (the prior
+// bug) can observe the pre-send URL and either miss the id entirely or, worse
+// if a stale conversation was still loaded, capture the WRONG id.
+//
+// Two independent sources are checked, either sufficient: the tab's own URL,
+// and the sidebar anchor ChatGPT itself marks as the active conversation.
+// Both are compared against `baselineId` (the identity read *before* send)
+// so a slow-updating source that still reports the old id is never mistaken
+// for the new one. Event-driven first (MutationObserver wakes the check the
+// instant the SPA router mutates the DOM), with the timer only as a bounded
+// timeout guard — never the sole trigger — matching waitForReply's own
+// pattern for exactly the same background-tab-throttling reason.
+//
+// Returns the new conversation id, or throws CONVERSATION_IDENTITY_NOT_FOUND
+// if bounded by timeoutMs with neither source ever producing one. Never
+// falls back to a title, a "most recent" guess, or any other heuristic.
+export async function waitForConversationIdentity(
+  doc,
+  { baselineId = null, timeoutMs = DEFAULT_IDENTITY_TIMEOUT_MS, sleep = defaultSleep, onStage = () => {} } = {}
+) {
+  onStage('waiting for conversation identity');
+
+  function readCandidate() {
+    const urlId = readConversationId(doc);
+    if (urlId && urlId !== baselineId) return urlId;
+    const sidebarId = readActiveSidebarConversationId(doc);
+    if (sidebarId && sidebarId !== baselineId) return sidebarId;
+    return null;
+  }
+
+  const immediate = readCandidate();
+  if (immediate) {
+    onStage(`identity captured (${immediate})`);
+    return immediate;
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  const waiter = createMutationWaiter(doc, sleep);
+  try {
+    while (Date.now() < deadline) {
+      await waiter.tick(DEFAULT_POLL_MS);
+      const candidate = readCandidate();
+      if (candidate) {
+        onStage(`identity captured (${candidate})`);
+        return candidate;
+      }
+    }
+  } finally {
+    waiter.disconnect();
+  }
+
+  onStage('identity timeout');
+  const err = conversationIdentityNotFoundError(
+    `No conversation identity (/c/<id>) appeared within ${timeoutMs}ms after send was confirmed — refusing to guess.`
+  );
+  err.diagnostics = captureIdentityDiagnostics(doc, baselineId);
+  throw err;
+}
+
+// --- Rate-limit detection ------------------------------------------------
+//
+// ChatGPT's own throttling banner ("You're making requests too quickly...")
+// is a distinct failure mode from any DOM/selector problem: it means
+// ChatGPT itself is refusing to proceed for a while, so the right response
+// is to back off and retry later (handled Node-side, see
+// chatgptExtension.js), not to keep polling/retrying immediately.
+const RATE_LIMIT_TEXT_PATTERN = /making requests too quickly|temporarily limited/i;
+
+export function isRateLimited(doc) {
+  const text = doc?.body?.innerText ?? doc?.body?.textContent ?? '';
+  return RATE_LIMIT_TEXT_PATTERN.test(text);
+}
+
+function rateLimitedError(message) {
+  const err = new Error(message);
+  err.code = 'RATE_LIMITED';
+  return err;
+}
+
 function firstVisible(doc, selectors) {
   for (const selector of selectors) {
     const el = doc.querySelector(selector);
@@ -69,6 +244,7 @@ function sendFailedError(message) {
 export async function findComposer(doc, selectors = COMPOSER_SELECTORS, { timeoutMs = 5000, sleep = defaultSleep } = {}) {
   const deadline = Date.now() + timeoutMs;
   do {
+    if (isRateLimited(doc)) throw rateLimitedError('ChatGPT reported "making requests too quickly" while looking for the composer.');
     const el = firstVisible(doc, selectors);
     if (el) return el;
     await sleep(DEFAULT_POLL_MS);
@@ -328,6 +504,12 @@ export async function sendPromptReliably(
     onStage = () => {},
   } = {}
 ) {
+  // A small, randomized pause before the first keystroke — a script that
+  // inserts text and clicks send in the same tick is a distinctive,
+  // instantly-fireable signature; a brief human-scale jitter here costs
+  // nothing functionally and avoids that.
+  await sleep(randomJitterMs(150, 500));
+
   if (!insertPromptText(doc, composer, prompt)) {
     throw sendFailedError('Could not insert the prompt into the ChatGPT composer (both insertText and the DOM fallback left it empty).');
   }
@@ -400,6 +582,7 @@ export async function waitForReply(
 
   try {
     while (Date.now() < deadline && doc.querySelectorAll(assistantSelector).length <= baselineCount) {
+      if (isRateLimited(doc)) throw rateLimitedError('ChatGPT reported "making requests too quickly" while waiting for a reply.');
       await waiter.tick(DEFAULT_POLL_MS);
     }
     if (doc.querySelectorAll(assistantSelector).length <= baselineCount) {
@@ -451,4 +634,224 @@ export async function waitForReply(
   } finally {
     waiter.disconnect();
   }
+}
+
+// --- Conversation deletion (2026-08-26 primitive) -------------------------
+//
+// deleteConversation(doc, conversationId) verifies and deletes exactly one
+// ChatGPT conversation, identified only by the `/c/<id>` it was created
+// with — never by its sidebar title. It never throws away a real DOM
+// postcondition for a click: every stage below is gated on real evidence
+// (the row existing, the menu item existing, the confirm button existing,
+// and finally the row actually disappearing from the sidebar), and it
+// fails loudly with a specific error code rather than guessing when any of
+// those don't show up.
+//
+// SELECTOR CAVEAT: the candidate selectors below were written from
+// ChatGPT's known Radix-style sidebar/menu/dialog conventions (a
+// conversation row exposing a per-row "options" button, a role="menu"
+// popup, a role="dialog" confirmation with a "Delete" button) but were NOT
+// confirmed against a live, logged-in ChatGPT session — no such session was
+// reachable while writing this. Before this primitive is trusted for
+// unattended use, run it once against a real conversation and, if the
+// selectors below don't match, update these constants (the algorithm —
+// identity-anchored lookup + real postconditions — should not need to
+// change).
+export const CONVERSATION_MENU_BUTTON_SELECTORS = [
+  'button[aria-label="Open conversation options"]',
+  'button[data-testid$="-options"]',
+  'button[aria-haspopup="menu"]',
+];
+
+export const DELETE_MENU_ITEM_SELECTORS = ['[role="menuitem"]', 'div[role="menuitem"]'];
+export const DELETE_MENU_ITEM_TEXT_PATTERN = /^delete( chat)?$/i;
+
+export const DELETE_CONFIRM_BUTTON_SELECTORS = [
+  '[data-testid="delete-conversation-confirm-button"]',
+  'div[role="dialog"] button',
+];
+export const DELETE_CONFIRM_BUTTON_TEXT_PATTERN = /^delete$/i;
+
+function conversationLinkSelector(conversationId) {
+  return `a[href="/c/${conversationId}"]`;
+}
+
+// Locates the sidebar row for `conversationId` by its href — the one
+// unambiguous identity ChatGPT exposes for a conversation — never by
+// title. Returns null if the row isn't currently present in the DOM (not
+// visible in the sidebar at all, e.g. scrolled out of the loaded window);
+// the caller treats that as CONVERSATION_NOT_FOUND rather than falling back
+// to a title search.
+function findConversationRow(doc, conversationId) {
+  const anchor = doc.querySelector(conversationLinkSelector(conversationId));
+  if (!anchor) return null;
+  if (typeof anchor.closest === 'function') {
+    const li = anchor.closest('li');
+    if (li) return li;
+  }
+  return anchor.parentElement || anchor;
+}
+
+function firstVisibleWithin(container, selectors) {
+  if (!container || typeof container.querySelector !== 'function') return null;
+  for (const selector of selectors) {
+    const el = container.querySelector(selector);
+    if (el && el.isVisible !== false) return el;
+  }
+  return null;
+}
+
+// Searches (globally, since Radix-style menus/dialogs portal to <body>, not
+// into the row that opened them) for an element matching one of `selectors`
+// whose own text matches `textPattern` — used for both the "Delete" menu
+// item and the confirm-dialog "Delete" button, where a stable data-testid
+// isn't known to exist. This is text matching scoped to a just-opened
+// native ChatGPT menu/dialog control, not a conversation-title match.
+function findControlByText(doc, selectors, textPattern) {
+  for (const selector of selectors) {
+    const nodes = doc.querySelectorAll(selector) || [];
+    for (const node of nodes) {
+      const text = (node.innerText ?? node.textContent ?? '').trim();
+      if (textPattern.test(text)) return node;
+    }
+  }
+  return null;
+}
+
+function conversationNotFoundError(conversationId) {
+  const err = new Error(
+    `Conversation "${conversationId}" is not visible in the sidebar by its /c/<id> link; refusing to guess by title.`
+  );
+  err.code = 'CONVERSATION_NOT_FOUND';
+  return err;
+}
+
+function invalidConversationIdError(conversationId) {
+  const err = new Error(
+    `"${conversationId}" is not shaped like a real ChatGPT conversation id (/c/<id>); refusing to attempt deletion.`
+  );
+  err.code = 'CONVERSATION_NOT_FOUND';
+  return err;
+}
+
+function deleteMenuNotFoundError(message) {
+  const err = new Error(message);
+  err.code = 'DELETE_MENU_NOT_FOUND';
+  return err;
+}
+
+function deleteNotConfirmedError(message) {
+  const err = new Error(message);
+  err.code = 'DELETE_NOT_CONFIRMED';
+  return err;
+}
+
+export async function deleteConversation(
+  doc,
+  conversationId,
+  {
+    menuButtonSelectors = CONVERSATION_MENU_BUTTON_SELECTORS,
+    deleteMenuItemSelectors = DELETE_MENU_ITEM_SELECTORS,
+    deleteMenuItemTextPattern = DELETE_MENU_ITEM_TEXT_PATTERN,
+    confirmButtonSelectors = DELETE_CONFIRM_BUTTON_SELECTORS,
+    confirmButtonTextPattern = DELETE_CONFIRM_BUTTON_TEXT_PATTERN,
+    simulateClick = defaultSimulateClick,
+    sleep = defaultSleep,
+    menuOpenTimeoutMs = 3000,
+    confirmDialogTimeoutMs = 3000,
+    postconditionTimeoutMs = 5000,
+    rowLookupTimeoutMs = 5000,
+    onStage = () => {},
+  } = {}
+) {
+  if (!conversationId) throw conversationNotFoundError('(missing)');
+  if (!isValidConversationId(conversationId)) throw invalidConversationIdError(conversationId);
+
+  // A tab freshly navigated to chatgptUrl reaches "complete" before its
+  // sidebar's conversation list (populated by an async fetch) has
+  // necessarily hydrated — a single synchronous lookup here was observed
+  // live to fail fast with CONVERSATION_NOT_FOUND even though the
+  // conversation existed and appeared moments later. This polls (still
+  // matching only the exact /c/<id> href, never a title) until the row
+  // shows up or rowLookupTimeoutMs elapses, mirroring the menu-open and
+  // confirm-dialog waits below.
+  const rowWaiter = createMutationWaiter(doc, sleep);
+  let row;
+  try {
+    const rowDeadline = Date.now() + rowLookupTimeoutMs;
+    do {
+      row = findConversationRow(doc, conversationId);
+      if (row) break;
+      if (isRateLimited(doc)) throw rateLimitedError('ChatGPT reported "making requests too quickly" while locating the conversation to delete.');
+      await rowWaiter.tick(DEFAULT_POLL_MS);
+    } while (Date.now() < rowDeadline);
+  } finally {
+    rowWaiter.disconnect();
+  }
+  if (!row) throw conversationNotFoundError(conversationId);
+  onStage('conversation row located');
+
+  const menuButton = firstVisibleWithin(row, menuButtonSelectors);
+  if (!menuButton) {
+    throw deleteMenuNotFoundError(
+      `Conversation "${conversationId}" was found in the sidebar but no options/menu button matched the known selectors.`
+    );
+  }
+  await sleep(randomJitterMs(150, 400));
+  simulateClick(menuButton);
+  onStage('conversation menu opened');
+
+  const menuDeadline = Date.now() + menuOpenTimeoutMs;
+  let deleteItem = null;
+  do {
+    if (isRateLimited(doc)) throw rateLimitedError('ChatGPT reported "making requests too quickly" while deleting a conversation.');
+    deleteItem = findControlByText(doc, deleteMenuItemSelectors, deleteMenuItemTextPattern);
+    if (deleteItem) break;
+    await sleep(DEFAULT_POLL_MS);
+  } while (Date.now() < menuDeadline);
+  if (!deleteItem) {
+    throw deleteMenuNotFoundError(`Delete menu item did not appear within ${menuOpenTimeoutMs}ms after opening the conversation menu.`);
+  }
+  onStage('delete menu item found');
+
+  simulateClick(deleteItem);
+  onStage('delete clicked');
+
+  const confirmDeadline = Date.now() + confirmDialogTimeoutMs;
+  let confirmButton = null;
+  do {
+    confirmButton = findControlByText(doc, confirmButtonSelectors, confirmButtonTextPattern);
+    if (confirmButton) break;
+    await sleep(DEFAULT_POLL_MS);
+  } while (Date.now() < confirmDeadline);
+  if (!confirmButton) {
+    throw deleteMenuNotFoundError(`Delete confirmation dialog did not appear within ${confirmDialogTimeoutMs}ms.`);
+  }
+  onStage('delete confirmation dialog found');
+
+  simulateClick(confirmButton);
+  onStage('delete triggered');
+
+  const waiter = createMutationWaiter(doc, sleep);
+  try {
+    const postDeadline = Date.now() + postconditionTimeoutMs;
+    do {
+      if (!doc.querySelector(conversationLinkSelector(conversationId))) {
+        onStage('delete confirmed');
+        return { deleted: true };
+      }
+      await waiter.tick(DEFAULT_POLL_MS);
+    } while (Date.now() < postDeadline);
+  } finally {
+    waiter.disconnect();
+  }
+
+  if (!doc.querySelector(conversationLinkSelector(conversationId))) {
+    onStage('delete confirmed');
+    return { deleted: true };
+  }
+  onStage('cleanup failed');
+  throw deleteNotConfirmedError(
+    `Conversation "${conversationId}" is still visible in the sidebar ${postconditionTimeoutMs}ms after confirming delete — treating this as a failed cleanup rather than assuming success.`
+  );
 }

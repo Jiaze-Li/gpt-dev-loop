@@ -30,6 +30,12 @@ export const DEFAULTS = Object.freeze({
   // GPT_LOOP_EXTENSION_ID if you've deliberately swapped in a different
   // signing key (e.g. testing a second copy of the extension side by side).
   extensionId: 'eihkgiaebcdghglmainkobahkkaidmim',
+  // How askGpt/deleteConversation react to ChatGPT's own "making requests
+  // too quickly" throttling: wait a randomized (backoff .. backoff+jitter)
+  // delay, then retry, up to rateLimitMaxRetries times.
+  rateLimitBackoffMs: 90000,
+  rateLimitJitterMs: 30000,
+  rateLimitMaxRetries: 2,
 });
 
 const BROWSER_MODES = new Set(['launch', 'cdp', 'extension']);
@@ -88,5 +94,8 @@ export function loadConfig(env = process.env) {
       DEFAULTS.extensionConnectTimeoutMs
     ),
     extensionId: env.GPT_LOOP_EXTENSION_ID || DEFAULTS.extensionId,
+    rateLimitBackoffMs: parseIntEnv(env, 'GPT_LOOP_RATE_LIMIT_BACKOFF_MS', DEFAULTS.rateLimitBackoffMs),
+    rateLimitJitterMs: parseIntEnv(env, 'GPT_LOOP_RATE_LIMIT_JITTER_MS', DEFAULTS.rateLimitJitterMs),
+    rateLimitMaxRetries: parseIntEnv(env, 'GPT_LOOP_RATE_LIMIT_MAX_RETRIES', DEFAULTS.rateLimitMaxRetries),
   };
 }

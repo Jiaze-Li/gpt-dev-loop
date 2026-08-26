@@ -7,12 +7,21 @@ import {
   waitForSendReady,
   sendPromptReliably,
   waitForReply,
+  extractConversationId,
+  readConversationId,
+  waitForConversationIdentity,
+  isValidConversationId,
+  isRateLimited,
+  deleteConversation,
   COMPOSER_SELECTORS,
   SEND_BUTTON_SELECTORS,
   STOP_BUTTON_SELECTORS,
   ASSISTANT_MESSAGE_SELECTOR,
   USER_MESSAGE_SELECTOR,
   NEW_CHAT_BUTTON_SELECTORS,
+  CONVERSATION_MENU_BUTTON_SELECTORS,
+  DELETE_MENU_ITEM_SELECTORS,
+  DELETE_CONFIRM_BUTTON_SELECTORS,
 } from '../extension/domActions.js';
 
 // Instant fake "sleep" so tests don't actually wait.
@@ -407,5 +416,376 @@ test('waitForReply throws RESPONSE_EMPTY when no assistant message ever appears'
   await assert.rejects(
     () => waitForReply(doc, { responseTimeoutMs: 10 }, 0, { sleep: async () => {} }),
     (err) => err.code === 'RESPONSE_EMPTY'
+  );
+});
+
+// --- Conversation identity -------------------------------------------
+
+test('extractConversationId reads the /c/<id> segment and only that', () => {
+  assert.equal(extractConversationId('https://chatgpt.com/c/abc-123'), 'abc-123');
+  assert.equal(extractConversationId('https://chatgpt.com/'), null);
+  assert.equal(extractConversationId('https://chatgpt.com/c/'), null);
+  assert.equal(extractConversationId(undefined), null);
+});
+
+// Regression: a stray non-conversation anchor/URL segment starting with
+// "/c/" (e.g. a nav/mode link, not a chat row) can satisfy the loose
+// /c/<alnum-or-hyphen> pattern with a bare word like "WEB" — this must
+// never be accepted as a real conversation id. Real ChatGPT ids are always
+// hyphen-segmented (UUIDs).
+test('extractConversationId rejects a bare word that is not shaped like a real conversation id', () => {
+  assert.equal(extractConversationId('https://chatgpt.com/c/WEB'), null);
+  assert.equal(extractConversationId('https://chatgpt.com/c/new'), null);
+});
+
+test('isValidConversationId accepts hyphen-segmented ids and rejects bare words', () => {
+  assert.equal(isValidConversationId('abc-123'), true);
+  assert.equal(isValidConversationId('WEB'), false);
+  assert.equal(isValidConversationId(''), false);
+  assert.equal(isValidConversationId(null), false);
+});
+
+test('readConversationId reads the id off doc.location.href', () => {
+  const doc = { location: { href: 'https://chatgpt.com/c/xyz-789' } };
+  assert.equal(readConversationId(doc), 'xyz-789');
+  assert.equal(readConversationId({ location: { href: 'https://chatgpt.com/' } }), null);
+});
+
+// --- waitForConversationIdentity ----------------------------------------
+//
+// Fake doc: a mutable location.href plus a mutable list of sidebar anchors
+// (each `{ href, ariaCurrent }`), mirroring the two independent identity
+// sources waitForConversationIdentity checks. sleep also drives
+// createMutationWaiter's fallback path (no MutationObserver in Node).
+function createIdentityScenarioDoc({ href = 'https://chatgpt.com/', anchors = [] } = {}) {
+  return {
+    location: { href },
+    querySelectorAll(selector) {
+      if (selector !== 'a[href^="/c/"]') return [];
+      return anchors
+        .filter((a) => a.href.startsWith('/c/'))
+        .map((a) => ({
+          getAttribute: (name) => (name === 'href' ? a.href : name === 'aria-current' ? (a.ariaCurrent ?? null) : null),
+        }));
+    },
+  };
+}
+
+test('waitForConversationIdentity returns immediately when the URL already has a fresh /c/<id>', async () => {
+  const doc = createIdentityScenarioDoc({ href: 'https://chatgpt.com/c/new-1' });
+  const stages = [];
+  const id = await waitForConversationIdentity(doc, { sleep: instantSleep, onStage: (s) => stages.push(s) });
+  assert.equal(id, 'new-1');
+  assert.deepEqual(stages, ['waiting for conversation identity', 'identity captured (new-1)']);
+});
+
+test('waitForConversationIdentity waits (event/poll-driven) for the URL to pick up /c/<id> later', async () => {
+  const doc = createIdentityScenarioDoc({ href: 'https://chatgpt.com/' });
+  let ticks = 0;
+  const id = await waitForConversationIdentity(doc, {
+    timeoutMs: 10000,
+    sleep: async () => {
+      ticks += 1;
+      if (ticks === 2) doc.location.href = 'https://chatgpt.com/c/new-2';
+    },
+  });
+  assert.equal(id, 'new-2');
+});
+
+test('waitForConversationIdentity accepts the active sidebar anchor when the URL never updates', async () => {
+  const doc = createIdentityScenarioDoc({
+    href: 'https://chatgpt.com/',
+    anchors: [
+      { href: '/c/old-1', ariaCurrent: null },
+      { href: '/c/new-3', ariaCurrent: 'page' },
+    ],
+  });
+  const id = await waitForConversationIdentity(doc, { sleep: instantSleep });
+  assert.equal(id, 'new-3');
+});
+
+test('waitForConversationIdentity throws CONVERSATION_IDENTITY_NOT_FOUND rather than guessing when identity never appears', async () => {
+  const doc = createIdentityScenarioDoc({ href: 'https://chatgpt.com/' });
+  const stages = [];
+  let now = 0;
+  await assert.rejects(
+    () =>
+      waitForConversationIdentity(doc, {
+        timeoutMs: 5,
+        sleep: async () => {
+          now += 10;
+        },
+        onStage: (s) => stages.push(s),
+      }),
+    (err) => err.code === 'CONVERSATION_IDENTITY_NOT_FOUND'
+  );
+  assert.ok(stages.includes('identity timeout'));
+});
+
+test('waitForConversationIdentity never accepts a bare-word decoy anchor as identity — from either the URL or the sidebar', async () => {
+  // Regression for the live "identity captured (WEB)" bug: a decoy anchor
+  // (not a real conversation row) with aria-current="page" and an href
+  // shaped like /c/WEB must be skipped in favor of the real, later
+  // hyphen-segmented id — never captured/logged as identity itself.
+  const doc = createIdentityScenarioDoc({
+    href: 'https://chatgpt.com/c/WEB',
+    anchors: [{ href: '/c/WEB', ariaCurrent: 'page' }],
+  });
+  let ticks = 0;
+  const stages = [];
+  const id = await waitForConversationIdentity(doc, {
+    timeoutMs: 10000,
+    sleep: async () => {
+      ticks += 1;
+      if (ticks === 2) {
+        doc.location.href = 'https://chatgpt.com/c/real-42';
+        doc.querySelectorAll = (selector) =>
+          selector === 'a[href^="/c/"]' ? [{ getAttribute: (n) => (n === 'href' ? '/c/real-42' : 'page') }] : [];
+      }
+    },
+    onStage: (s) => stages.push(s),
+  });
+  assert.equal(id, 'real-42');
+  assert.ok(!stages.some((s) => s.includes('WEB')), 'must never log the decoy as a captured identity');
+});
+
+test('waitForConversationIdentity never returns a stale/baseline id — from either the URL or the sidebar', async () => {
+  // Simulates re-entering the same page still showing the previous
+  // conversation's id/active anchor: neither source should be accepted
+  // until it actually differs from the baseline captured before send.
+  const doc = createIdentityScenarioDoc({
+    href: 'https://chatgpt.com/c/old-1',
+    anchors: [{ href: '/c/old-1', ariaCurrent: 'page' }],
+  });
+  let ticks = 0;
+  const id = await waitForConversationIdentity(doc, {
+    baselineId: 'old-1',
+    timeoutMs: 10000,
+    sleep: async () => {
+      ticks += 1;
+      if (ticks === 2) {
+        doc.location.href = 'https://chatgpt.com/c/new-4';
+        doc.querySelectorAll = (selector) =>
+          selector === 'a[href^="/c/"]' ? [{ getAttribute: (n) => (n === 'href' ? '/c/new-4' : 'page') }] : [];
+      }
+    },
+  });
+  assert.equal(id, 'new-4');
+});
+
+// --- Rate-limit detection ----------------------------------------------
+
+test('isRateLimited recognizes ChatGPT\'s own throttling banner text', () => {
+  const doc = { body: { innerText: "You're making requests too quickly. We've temporarily limited access to your conversations to protect your data." } };
+  assert.equal(isRateLimited(doc), true);
+  assert.equal(isRateLimited({ body: { innerText: 'ordinary page text' } }), false);
+});
+
+test('findComposer throws RATE_LIMITED as soon as the throttling banner appears, instead of waiting out the full timeout', async () => {
+  const doc = { body: { innerText: "You're making requests too quickly." }, querySelector: () => null };
+  await assert.rejects(
+    () => findComposer(doc, COMPOSER_SELECTORS, { timeoutMs: 10000, sleep: async () => {} }),
+    (err) => err.code === 'RATE_LIMITED'
+  );
+});
+
+test('waitForReply throws RATE_LIMITED if the throttling banner appears mid-wait', async () => {
+  const doc = { body: { innerText: '' }, querySelectorAll: () => [], querySelector: () => null };
+  let tick = 0;
+  await assert.rejects(
+    () =>
+      waitForReply(doc, { responseTimeoutMs: 10000 }, 0, {
+        sleep: async () => {
+          tick += 1;
+          if (tick === 1) doc.body.innerText = "You're making requests too quickly.";
+        },
+      }),
+    (err) => err.code === 'RATE_LIMITED'
+  );
+});
+
+// --- Conversation deletion -----------------------------------------------
+//
+// Fake sidebar: an anchor identified only by its href (never by title),
+// whose `.closest('li')` returns a row exposing the options button; the
+// options button "opens" a global menu (querySelectorAll'd off `doc`,
+// mirroring a real Radix portal), whose Delete item "opens" a confirm
+// dialog, whose own Delete button removes the anchor — the real DOM
+// postcondition deleteConversation checks for.
+function createDeleteScenarioDoc(conversationId, { confirmActuallyDeletes = true, linkHydratesAfterQueries = 0 } = {}) {
+  let hydrated = linkHydratesAfterQueries === 0;
+  let hydrationQueries = 0;
+  let linkPresent = true;
+  let deleteMenuItemPresent = false;
+  let confirmDialogPresent = false;
+
+  const menuButton = {
+    isVisible: true,
+    click() {
+      deleteMenuItemPresent = true;
+    },
+  };
+  const row = {
+    querySelector(selector) {
+      return CONVERSATION_MENU_BUTTON_SELECTORS.includes(selector) ? menuButton : null;
+    },
+  };
+  const anchor = {
+    isVisible: true,
+    closest(selector) {
+      return selector === 'li' ? row : null;
+    },
+  };
+  const deleteMenuItem = {
+    innerText: 'Delete',
+    click() {
+      deleteMenuItemPresent = false;
+      confirmDialogPresent = true;
+    },
+  };
+  const confirmButton = {
+    innerText: 'Delete',
+    click() {
+      confirmDialogPresent = false;
+      if (confirmActuallyDeletes) linkPresent = false;
+    },
+  };
+
+  return {
+    querySelector(selector) {
+      if (selector !== `a[href="/c/${conversationId}"]`) return null;
+      if (!hydrated) {
+        hydrationQueries += 1;
+        if (hydrationQueries >= linkHydratesAfterQueries) hydrated = true;
+        return null;
+      }
+      return linkPresent ? anchor : null;
+    },
+    querySelectorAll(selector) {
+      if (DELETE_MENU_ITEM_SELECTORS.includes(selector)) return deleteMenuItemPresent ? [deleteMenuItem] : [];
+      if (DELETE_CONFIRM_BUTTON_SELECTORS.includes(selector)) return confirmDialogPresent ? [confirmButton] : [];
+      return [];
+    },
+  };
+}
+
+test('deleteConversation locates the row by href, drives menu -> delete -> confirm, and confirms via the row actually disappearing', async () => {
+  const doc = createDeleteScenarioDoc('conv-1');
+  const stages = [];
+  const result = await deleteConversation(doc, 'conv-1', { sleep: instantSleep, onStage: (s) => stages.push(s) });
+  assert.deepEqual(result, { deleted: true });
+  assert.deepEqual(stages, [
+    'conversation row located',
+    'conversation menu opened',
+    'delete menu item found',
+    'delete clicked',
+    'delete confirmation dialog found',
+    'delete triggered',
+    'delete confirmed',
+  ]);
+});
+
+test('deleteConversation throws CONVERSATION_NOT_FOUND rather than falling back to a title match when the id is not in the sidebar', async () => {
+  const doc = { querySelector: () => null, querySelectorAll: () => [] };
+  await assert.rejects(
+    () => deleteConversation(doc, 'missing-id', { sleep: instantSleep, rowLookupTimeoutMs: 5 }),
+    (err) => err.code === 'CONVERSATION_NOT_FOUND'
+  );
+});
+
+test('deleteConversation waits out a delayed sidebar hydration and still succeeds once the row appears', async () => {
+  // A freshly navigated tab reaches "complete" before its sidebar's
+  // conversation list (populated by an async fetch) has necessarily
+  // hydrated; the row must not be missed just because it wasn't there on
+  // the very first synchronous check.
+  const doc = createDeleteScenarioDoc('conv-1', { linkHydratesAfterQueries: 3 });
+  const stages = [];
+  const result = await deleteConversation(doc, 'conv-1', { sleep: instantSleep, onStage: (s) => stages.push(s) });
+  assert.deepEqual(result, { deleted: true });
+  assert.equal(stages[0], 'conversation row located');
+  assert.deepEqual(stages.slice(-1), ['delete confirmed']);
+});
+
+test('deleteConversation fails safely with CONVERSATION_NOT_FOUND (not a hang) if the sidebar never hydrates the row', async () => {
+  const doc = createDeleteScenarioDoc('conv-1', { linkHydratesAfterQueries: Number.POSITIVE_INFINITY });
+  const stages = [];
+  await assert.rejects(
+    () => deleteConversation(doc, 'conv-1', { sleep: instantSleep, rowLookupTimeoutMs: 5, onStage: (s) => stages.push(s) }),
+    (err) => err.code === 'CONVERSATION_NOT_FOUND'
+  );
+  assert.deepEqual(stages, [], 'must fail before ever reaching "conversation row located"');
+});
+
+test('deleteConversation rejects a missing conversation id outright rather than guessing', async () => {
+  await assert.rejects(
+    () => deleteConversation({ querySelector: () => null, querySelectorAll: () => [] }, '', { sleep: instantSleep }),
+    (err) => err.code === 'CONVERSATION_NOT_FOUND'
+  );
+});
+
+// Regression: a live run once captured the bare word "WEB" (from a stray
+// non-conversation anchor/URL segment, not an actual chat row) as if it
+// were a real conversation id, logged "identity captured (WEB)", and then
+// failed deletion with a confusing "not visible in the sidebar" error. A
+// real ChatGPT conversation id is always hyphen-segmented (a UUID); a bare
+// word must never reach the row-lookup/click flow at all.
+test('deleteConversation rejects a bare-word conversation id (not a real /c/<id> shape) before touching the DOM', async () => {
+  let queried = false;
+  const doc = {
+    querySelector: () => {
+      queried = true;
+      return null;
+    },
+    querySelectorAll: () => {
+      queried = true;
+      return [];
+    },
+  };
+  await assert.rejects(
+    () => deleteConversation(doc, 'WEB', { sleep: instantSleep }),
+    (err) => err.code === 'CONVERSATION_NOT_FOUND'
+  );
+  assert.equal(queried, false, 'must reject before ever looking for the row in the DOM');
+});
+
+test('deleteConversation throws DELETE_MENU_NOT_FOUND when the row has no matching options control', async () => {
+  const anchor = { isVisible: true, closest: () => ({ querySelector: () => null }) };
+  const doc = {
+    querySelector: (selector) => (selector === 'a[href="/c/conv-1"]' ? anchor : null),
+    querySelectorAll: () => [],
+  };
+  await assert.rejects(
+    () => deleteConversation(doc, 'conv-1', { sleep: instantSleep }),
+    (err) => err.code === 'DELETE_MENU_NOT_FOUND'
+  );
+});
+
+test('deleteConversation throws DELETE_NOT_CONFIRMED instead of assuming success if the row never disappears', async () => {
+  const doc = createDeleteScenarioDoc('conv-1', { confirmActuallyDeletes: false });
+  await assert.rejects(
+    () => deleteConversation(doc, 'conv-1', { sleep: instantSleep, postconditionTimeoutMs: 5 }),
+    (err) => err.code === 'DELETE_NOT_CONFIRMED'
+  );
+});
+
+test('deleteConversation throws RATE_LIMITED if the throttling banner appears while the menu is still opening', async () => {
+  const menuButton = { isVisible: true, click() {} }; // clicked, but the menu item never actually shows up below
+  const anchor = { isVisible: true, closest: () => ({ querySelector: (selector) => (CONVERSATION_MENU_BUTTON_SELECTORS.includes(selector) ? menuButton : null) }) };
+  const doc = {
+    body: { innerText: '' },
+    querySelector: (selector) => (selector === 'a[href="/c/conv-1"]' ? anchor : null),
+    querySelectorAll: () => [],
+  };
+  let tick = 0;
+  await assert.rejects(
+    () =>
+      deleteConversation(doc, 'conv-1', {
+        menuOpenTimeoutMs: 10000,
+        sleep: async () => {
+          tick += 1;
+          if (tick === 1) doc.body.innerText = "You're making requests too quickly.";
+        },
+      }),
+    (err) => err.code === 'RATE_LIMITED'
   );
 });

@@ -1,7 +1,7 @@
 import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import WebSocket from 'ws';
-import { askGpt } from '../src/bridge/chatgptExtension.js';
+import { askGpt, askGptWithIdentity, deleteConversation } from '../src/bridge/chatgptExtension.js';
 import { getExtensionServer, closeExtensionServer } from '../src/bridge/extensionServer.js';
 import {
   ChromeUnavailableError,
@@ -11,6 +11,8 @@ import {
   ResponseExtractionError,
   RequestTimeoutError,
   SendFailedError,
+  RateLimitedError,
+  CleanupFailedError,
 } from '../src/bridge/errors.js';
 
 const EXTENSION_ID = 'test-extension-id';
@@ -115,6 +117,97 @@ for (const [code, ErrorClass] of ERROR_CASES) {
     client.close();
   });
 }
+
+test('askGptWithIdentity resolves both the reply text and the conversation identity the extension captured', async () => {
+  const config = nextConfig();
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    assert.equal(msg.payload.action, 'ask');
+    ws.send(
+      JSON.stringify({
+        protocol: PROTOCOL_ID,
+        type: 'response',
+        requestId: msg.requestId,
+        payload: { text: 'mock reply', conversationId: 'conv-42' },
+      })
+    );
+  });
+  const result = await askGptWithIdentity('review this', config);
+  assert.deepEqual(result, { text: 'mock reply', conversationId: 'conv-42' });
+  client.close();
+});
+
+test('deleteConversation resolves once the extension confirms the conversation is gone', async () => {
+  const config = nextConfig();
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    assert.equal(msg.payload.action, 'delete');
+    assert.equal(msg.payload.conversationId, 'conv-1');
+    assert.equal(msg.payload.prompt, undefined);
+    ws.send(JSON.stringify({ protocol: PROTOCOL_ID, type: 'response', requestId: msg.requestId, payload: { text: '' } }));
+  });
+  await deleteConversation('conv-1', config);
+  client.close();
+});
+
+test('deleteConversation rejects immediately for an empty conversation id, without contacting the extension', async () => {
+  const config = nextConfig();
+  await assert.rejects(() => deleteConversation('', config), CleanupFailedError);
+});
+
+// Regression: a captured identity that is a bare word (e.g. "WEB" — a
+// stray non-conversation anchor/URL segment, not a real /c/<id>) must be
+// rejected here too, at the Node-side entry point, rather than being
+// relayed to the extension and failing later with a confusing
+// "not visible in the sidebar" error.
+test('deleteConversation rejects a bare-word conversation id, without contacting the extension', async () => {
+  const config = nextConfig();
+  await assert.rejects(() => deleteConversation('WEB', config), CleanupFailedError);
+});
+
+const DELETE_ERROR_CASES = [
+  ['CONVERSATION_NOT_FOUND', CleanupFailedError],
+  ['DELETE_MENU_NOT_FOUND', CleanupFailedError],
+  ['DELETE_NOT_CONFIRMED', CleanupFailedError],
+];
+
+for (const [code, ErrorClass] of DELETE_ERROR_CASES) {
+  test(`deleteConversation maps protocol error code ${code} to ${ErrorClass.name}`, async () => {
+    const config = nextConfig();
+    const client = await connectFakeExtension(config, (ws, msg) => {
+      ws.send(JSON.stringify({ protocol: PROTOCOL_ID, type: 'error', requestId: msg.requestId, error: { code, message: code } }));
+    });
+    await assert.rejects(() => deleteConversation('conv-1', config), ErrorClass);
+    client.close();
+  });
+}
+
+test('askGpt retries after a RATE_LIMITED error (fresh attempt, after a backoff) and can still succeed', async () => {
+  const config = nextConfig({ rateLimitBackoffMs: 5, rateLimitJitterMs: 0, rateLimitMaxRetries: 2 });
+  let attempts = 0;
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    attempts += 1;
+    if (attempts === 1) {
+      ws.send(JSON.stringify({ protocol: PROTOCOL_ID, type: 'error', requestId: msg.requestId, error: { code: 'RATE_LIMITED', message: 'too fast' } }));
+    } else {
+      ws.send(JSON.stringify({ protocol: PROTOCOL_ID, type: 'response', requestId: msg.requestId, payload: { text: 'ok after retry' } }));
+    }
+  });
+  const reply = await askGpt('review this', config);
+  assert.equal(reply, 'ok after retry');
+  assert.equal(attempts, 2);
+  client.close();
+});
+
+test('askGpt gives up after exhausting rateLimitMaxRetries and rejects with RateLimitedError', async () => {
+  const config = nextConfig({ rateLimitBackoffMs: 5, rateLimitJitterMs: 0, rateLimitMaxRetries: 1 });
+  let attempts = 0;
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    attempts += 1;
+    ws.send(JSON.stringify({ protocol: PROTOCOL_ID, type: 'error', requestId: msg.requestId, error: { code: 'RATE_LIMITED', message: 'too fast' } }));
+  });
+  await assert.rejects(() => askGpt('review this', config), RateLimitedError);
+  assert.equal(attempts, 2); // initial attempt + 1 retry
+  client.close();
+});
 
 test('a new extension connection replaces the previous one', async () => {
   const config = nextConfig();

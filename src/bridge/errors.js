@@ -55,6 +55,27 @@ export class SendFailedError extends TransportError {
   }
 }
 
+export class RateLimitedError extends TransportError {
+  constructor(message) {
+    super(message, 9);
+    this.name = 'RateLimitedError';
+  }
+}
+
+export class CleanupFailedError extends TransportError {
+  constructor(message) {
+    super(message, 10);
+    this.name = 'CleanupFailedError';
+  }
+}
+
+export class ConversationIdentityError extends TransportError {
+  constructor(message) {
+    super(message, 11);
+    this.name = 'ConversationIdentityError';
+  }
+}
+
 export class UsageError extends Error {
   constructor(message) {
     super(message);

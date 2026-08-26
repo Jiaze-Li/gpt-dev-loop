@@ -206,9 +206,21 @@ export class ExtensionServer {
   // so the caller can call cancel(requestId) if its own overall
   // requestTimeoutMs fires while this is still queued/in flight.
   ask(prompt, { requestId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'ask', prompt, chatgptUrl, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  // Enqueues one conversation deletion. Resolves once the extension
+  // confirms the conversation's sidebar row is gone (see
+  // extension/domActions.js's deleteConversation postcondition), or rejects
+  // the same way ask() does.
+  deleteConversation(conversationId, { requestId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'delete', conversationId, chatgptUrl, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  _enqueue({ requestId, action, prompt, conversationId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
     this.start();
     return new Promise((resolve, reject) => {
-      const entry = { requestId, prompt, chatgptUrl, responseTimeoutMs, resolve, reject, connectTimer: null };
+      const entry = { requestId, action, prompt, conversationId, chatgptUrl, responseTimeoutMs, resolve, reject, connectTimer: null };
       // Only guards "no extension has ever connected yet". If a connection
       // is already ready, this entry is merely waiting its FIFO turn behind
       // other queued work — that wait is bounded by the caller's own
@@ -264,10 +276,10 @@ export class ExtensionServer {
 
     this.inFlight = {
       requestId: entry.requestId,
-      resolve: (text) => {
+      resolve: (payload) => {
         clearTimeout(responseTimer);
         this.inFlight = null;
-        entry.resolve(text);
+        entry.resolve(payload);
         this._pump();
       },
       reject: (err) => {
@@ -281,7 +293,9 @@ export class ExtensionServer {
     this.conn.send(
       JSON.stringify(
         buildRequestMessage(entry.requestId, {
+          action: entry.action,
           prompt: entry.prompt,
+          conversationId: entry.conversationId,
           chatgptUrl: entry.chatgptUrl,
           responseTimeoutMs: entry.responseTimeoutMs,
         })
@@ -292,7 +306,11 @@ export class ExtensionServer {
   _settle(msg) {
     if (!this.inFlight || msg.requestId !== this.inFlight.requestId) return;
     if (msg.type === 'response') {
-      this.inFlight.resolve(msg.payload.text);
+      this.inFlight.resolve({
+        text: msg.payload.text,
+        conversationId: msg.payload.conversationId,
+        ...(msg.payload.identityDiagnostics !== undefined ? { identityDiagnostics: msg.payload.identityDiagnostics } : {}),
+      });
     } else {
       this.inFlight.reject(new ExtensionProtocolError(msg.error.code, msg.error.message ?? msg.error.code));
     }
