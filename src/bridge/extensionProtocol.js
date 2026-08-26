@@ -27,6 +27,9 @@ export const RESULT_ERROR_CODES = Object.freeze([
   'CONVERSATION_NOT_FOUND',
   'DELETE_MENU_NOT_FOUND',
   'DELETE_NOT_CONFIRMED',
+  'CONVERSATION_IDENTITY_NOT_FOUND',
+  'SUPERVISOR_TAB_LOST',
+  'SUPERVISOR_IDENTITY_MISMATCH',
   'INTERNAL_ERROR',
 ]);
 
@@ -46,19 +49,32 @@ export function buildHelloAck(requestId, serverVersion) {
   return { protocol: PROTOCOL_ID, type: 'hello_ack', requestId, payload: { serverVersion } };
 }
 
-// `action`: 'ask' (default, review flow, needs `prompt`) or 'delete' (needs
-// `conversationId`, no prompt). Both share one envelope shape rather than
-// separate message types, since the tab lifecycle around them (create,
-// wait for load, perform, close) is identical — only what happens inside
-// the tab differs, and that's dispatched on `payload.action` by
-// background.js/content.js.
-export function buildRequestMessage(requestId, { prompt, chatgptUrl, responseTimeoutMs, action = 'ask', conversationId } = {}) {
-  return {
-    protocol: PROTOCOL_ID,
-    type: 'request',
-    requestId,
-    payload: action === 'delete' ? { action, chatgptUrl, responseTimeoutMs, conversationId } : { action, prompt, chatgptUrl, responseTimeoutMs },
-  };
+// `action`: 'ask' (default, one-shot Reviewer flow, needs `prompt`, gets a
+// fresh tab), 'delete' (needs `conversationId`, no prompt), or the
+// Supervisor trio — 'supervisorCreate' (opens a tab and leaves it open,
+// no prompt), 'supervisorAsk' (needs `tabId` + `prompt`, addresses that
+// exact tab rather than creating one, and carries `expectedConversationId`
+// so the content script can refuse to silently continue in the wrong
+// conversation), and 'supervisorClose' (needs `tabId`, closes just that
+// tab). All share one envelope shape — only what happens inside the tab
+// differs, dispatched on `payload.action` by background.js/content.js.
+export function buildRequestMessage(
+  requestId,
+  { prompt, chatgptUrl, responseTimeoutMs, action = 'ask', conversationId, tabId, expectedConversationId } = {}
+) {
+  let payload;
+  if (action === 'delete') {
+    payload = { action, chatgptUrl, responseTimeoutMs, conversationId };
+  } else if (action === 'supervisorCreate') {
+    payload = { action, chatgptUrl, responseTimeoutMs };
+  } else if (action === 'supervisorAsk') {
+    payload = { action, prompt, responseTimeoutMs, tabId, expectedConversationId: expectedConversationId ?? null };
+  } else if (action === 'supervisorClose') {
+    payload = { action, tabId, responseTimeoutMs };
+  } else {
+    payload = { action, prompt, chatgptUrl, responseTimeoutMs };
+  }
+  return { protocol: PROTOCOL_ID, type: 'request', requestId, payload };
 }
 
 // Parses and validates one incoming text frame. Throws a plain Error (not

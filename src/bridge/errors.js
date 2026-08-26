@@ -76,6 +76,62 @@ export class ConversationIdentityError extends TransportError {
   }
 }
 
+// Thrown by SupervisorSession.ask()/close() when the Chrome tab a
+// Supervisor conversation was created in no longer exists (the user closed
+// it) — deliberately not auto-recovered; the caller must decide whether to
+// give up or create a new SupervisorSession.
+export class SupervisorTabLostError extends TransportError {
+  constructor(message) {
+    super(message, 12);
+    this.name = 'SupervisorTabLostError';
+  }
+}
+
+// Thrown by SupervisorSession.ask() when the conversation actually loaded
+// in the Supervisor's tab no longer matches the id captured at creation (or
+// the previous ask()) — e.g. the user manually navigated the tab to a
+// different conversation. Never silently continues in the new one.
+export class SupervisorIdentityMismatchError extends TransportError {
+  constructor(message) {
+    super(message, 13);
+    this.name = 'SupervisorIdentityMismatchError';
+  }
+}
+
+// Thrown by ReviewerSession.review()/close() when the caller passes a
+// taskId different from the one this session was create()'d for. A
+// ReviewerSession is bound to exactly one task for its whole lifetime — see
+// reviewerSession.js's doc comment for why (reusing it across tasks would
+// let one task's review history leak into another's verdict).
+export class ReviewerTaskMismatchError extends TransportError {
+  constructor(message) {
+    super(message, 14);
+    this.name = 'ReviewerTaskMismatchError';
+  }
+}
+
+// Thrown by ReviewerSession.review()/close() when the Chrome tab a Reviewer
+// conversation was created in no longer exists (the user closed it) —
+// mirrors SupervisorTabLostError; deliberately not auto-recovered, and never
+// falls back to picking a different ChatGPT tab.
+export class ReviewerTabLostError extends TransportError {
+  constructor(message) {
+    super(message, 15);
+    this.name = 'ReviewerTabLostError';
+  }
+}
+
+// Thrown by ReviewerSession.review() when the conversation actually loaded
+// in the Reviewer's tab no longer matches the id captured at the task's
+// first review() call — mirrors SupervisorIdentityMismatchError; never
+// silently continues in a different conversation.
+export class ReviewerIdentityMismatchError extends TransportError {
+  constructor(message) {
+    super(message, 16);
+    this.name = 'ReviewerIdentityMismatchError';
+  }
+}
+
 export class UsageError extends Error {
   constructor(message) {
     super(message);

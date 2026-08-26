@@ -9,6 +9,7 @@
 // same wire contract; keep both in sync when the protocol changes.
 
 import { runReviewInFreshTab } from './reviewSession.js';
+import { createSupervisorTab, askSupervisorTab, closeSupervisorTab } from './supervisorLifecycle.js';
 
 const PROTOCOL_ID = 'gpt-loop-extension/v1';
 const WS_HOST = '127.0.0.1';
@@ -132,30 +133,120 @@ async function handleMessage(raw) {
   const reqLog = (stage) => log(`[${requestId}] ${stage} +${Date.now() - startedAt}ms`);
   reqLog('request received');
 
-  const isDelete = payload.action === 'delete';
-  const contentMessage = isDelete
-    ? { type: 'performDelete', requestId, conversationId: payload.conversationId, responseTimeoutMs: payload.responseTimeoutMs }
-    : { type: 'perform', requestId, prompt: payload.prompt, responseTimeoutMs: payload.responseTimeoutMs };
-
   try {
-    const result = await runReviewInFreshTab(
-      {
-        chatgptUrl: payload.chatgptUrl,
-        perform: (tabId) => sendToContentScriptWithRetry(tabId, contentMessage),
-      },
-      {
-        createTab: (opts) => chrome.tabs.create(opts),
-        waitForTabComplete: (tabId) => waitForTabComplete(tabId),
-        removeTab: (tabId) => chrome.tabs.remove(tabId),
-        log: reqLog,
-      }
-    );
-    reqLog(isDelete ? 'delete confirmed' : 'reply returned');
+    let result;
+    switch (payload.action) {
+      case 'supervisorCreate':
+        result = await handleSupervisorCreate(payload, reqLog);
+        break;
+      case 'supervisorAsk':
+        result = await handleSupervisorAsk(requestId, payload, reqLog);
+        break;
+      case 'supervisorClose':
+        result = await handleSupervisorClose(payload, reqLog);
+        break;
+      case 'delete':
+        result = await runReviewInFreshTab(
+          {
+            chatgptUrl: payload.chatgptUrl,
+            perform: (tabId) =>
+              sendToContentScriptWithRetry(tabId, {
+                type: 'performDelete',
+                requestId,
+                conversationId: payload.conversationId,
+                responseTimeoutMs: payload.responseTimeoutMs,
+              }),
+          },
+          {
+            createTab: (opts) => chrome.tabs.create(opts),
+            waitForTabComplete: (tabId) => waitForTabComplete(tabId),
+            removeTab: (tabId) => chrome.tabs.remove(tabId),
+            log: reqLog,
+          }
+        );
+        reqLog('delete confirmed');
+        break;
+      default:
+        result = await runReviewInFreshTab(
+          {
+            chatgptUrl: payload.chatgptUrl,
+            perform: (tabId) =>
+              sendToContentScriptWithRetry(tabId, {
+                type: 'perform',
+                requestId,
+                prompt: payload.prompt,
+                responseTimeoutMs: payload.responseTimeoutMs,
+              }),
+          },
+          {
+            createTab: (opts) => chrome.tabs.create(opts),
+            waitForTabComplete: (tabId) => waitForTabComplete(tabId),
+            removeTab: (tabId) => chrome.tabs.remove(tabId),
+            log: reqLog,
+          }
+        );
+        reqLog('reply returned');
+    }
     sendResult(requestId, result);
   } catch (err) {
     reqLog(`failed: ${err.message}`);
     sendResult(requestId, { ok: false, code: 'NO_CHATGPT_TAB', message: err.message });
   }
+}
+
+// Resolves true if `tabId` currently exists, false otherwise — the
+// dependency supervisorLifecycle.js's askSupervisorTab/closeSupervisorTab
+// use to give an immediate, unambiguous SUPERVISOR_TAB_LOST rather than
+// letting a stale tabId fall through to sendToContentScriptWithRetry's
+// "content script not injected yet" retry path (which is for a real,
+// existing tab only).
+function tabExists(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.get(tabId, (tab) => {
+      resolve(!chrome.runtime.lastError && !!tab);
+    });
+  });
+}
+
+// Thin chrome.tabs-backed wiring over supervisorLifecycle.js's pure
+// orchestration — same pattern as runReviewInFreshTab's own wiring just
+// below. The Node-side SupervisorSession (src/bridge/supervisorSession.js)
+// is what actually remembers tabId across create() -> ask() -> ask() ->
+// close(); nothing here does.
+async function handleSupervisorCreate(payload, reqLog) {
+  const { tabId } = await createSupervisorTab(
+    { chatgptUrl: payload.chatgptUrl },
+    {
+      createTab: (opts) => chrome.tabs.create(opts),
+      waitForTabComplete: (tabId) => waitForTabComplete(tabId),
+      removeTab: (tabId) => chrome.tabs.remove(tabId),
+      log: reqLog,
+    }
+  );
+  return { ok: true, text: '', tabId };
+}
+
+async function handleSupervisorAsk(requestId, payload, reqLog) {
+  return askSupervisorTab(
+    payload.tabId,
+    {
+      type: 'supervisorAsk',
+      requestId,
+      prompt: payload.prompt,
+      expectedConversationId: payload.expectedConversationId ?? null,
+      responseTimeoutMs: payload.responseTimeoutMs,
+    },
+    { tabExists, sendToContentScript: sendToContentScriptWithRetry, log: reqLog }
+  );
+}
+
+async function handleSupervisorClose(payload, reqLog) {
+  await closeSupervisorTab(payload.tabId, {
+    tabExists,
+    removeTab: (tabId) => new Promise((resolve) => chrome.tabs.remove(tabId, resolve)),
+    log: reqLog,
+  });
+  return { ok: true, text: '' };
 }
 
 function sendToContentScript(tabId, message) {
@@ -209,6 +300,7 @@ function sendResult(requestId, result) {
         payload: {
           text: result.text ?? '',
           conversationId: result.conversationId,
+          ...(result.tabId !== undefined ? { tabId: result.tabId } : {}),
           ...(result.identityDiagnostics !== undefined ? { identityDiagnostics: result.identityDiagnostics } : {}),
         },
       }

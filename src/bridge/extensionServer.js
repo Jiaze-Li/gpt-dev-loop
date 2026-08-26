@@ -217,10 +217,39 @@ export class ExtensionServer {
     return this._enqueue({ requestId, action: 'delete', conversationId, chatgptUrl, responseTimeoutMs, connectTimeoutMs });
   }
 
-  _enqueue({ requestId, action, prompt, conversationId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
+  // Supervisor trio — see extensionProtocol.js's buildRequestMessage doc
+  // comment for the shape/lifecycle each carries. Queued through the same
+  // FIFO as ask()/deleteConversation() (still one in-flight request at a
+  // time), but supervisorAsk/supervisorClose address an existing `tabId`
+  // rather than getting a fresh tab created for them.
+  supervisorCreate({ requestId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'supervisorCreate', chatgptUrl, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  supervisorAsk(prompt, { requestId, tabId, expectedConversationId, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'supervisorAsk', prompt, tabId, expectedConversationId, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  supervisorClose({ requestId, tabId, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'supervisorClose', tabId, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  _enqueue({ requestId, action, prompt, conversationId, tabId, expectedConversationId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
     this.start();
     return new Promise((resolve, reject) => {
-      const entry = { requestId, action, prompt, conversationId, chatgptUrl, responseTimeoutMs, resolve, reject, connectTimer: null };
+      const entry = {
+        requestId,
+        action,
+        prompt,
+        conversationId,
+        tabId,
+        expectedConversationId,
+        chatgptUrl,
+        responseTimeoutMs,
+        resolve,
+        reject,
+        connectTimer: null,
+      };
       // Only guards "no extension has ever connected yet". If a connection
       // is already ready, this entry is merely waiting its FIFO turn behind
       // other queued work — that wait is bounded by the caller's own
@@ -296,6 +325,8 @@ export class ExtensionServer {
           action: entry.action,
           prompt: entry.prompt,
           conversationId: entry.conversationId,
+          tabId: entry.tabId,
+          expectedConversationId: entry.expectedConversationId,
           chatgptUrl: entry.chatgptUrl,
           responseTimeoutMs: entry.responseTimeoutMs,
         })
@@ -309,6 +340,7 @@ export class ExtensionServer {
       this.inFlight.resolve({
         text: msg.payload.text,
         conversationId: msg.payload.conversationId,
+        ...(msg.payload.tabId !== undefined ? { tabId: msg.payload.tabId } : {}),
         ...(msg.payload.identityDiagnostics !== undefined ? { identityDiagnostics: msg.payload.identityDiagnostics } : {}),
       });
     } else {

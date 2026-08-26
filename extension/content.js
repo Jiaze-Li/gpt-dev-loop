@@ -34,6 +34,7 @@ if (!globalThis.__gptLoopContentScriptInstalled) {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'perform') return handlePerform(message, sendResponse);
     if (message?.type === 'performDelete') return handlePerformDelete(message, sendResponse);
+    if (message?.type === 'supervisorAsk') return handleSupervisorAsk(message, sendResponse);
     return false;
   });
 }
@@ -110,6 +111,67 @@ function handlePerformDelete(message, sendResponse) {
       const domActions = await import(chrome.runtime.getURL('domActions.js'));
       await domActions.deleteConversation(document, conversationId, { onStage: log });
       sendResponse({ ok: true });
+    } catch (err) {
+      log(`failed: ${err.code ?? 'INTERNAL_ERROR'} — ${err.message}`);
+      sendResponse({ ok: false, code: err.code ?? 'INTERNAL_ERROR', message: err.message });
+    }
+  })();
+
+  return true; // keep the message channel open for the async sendResponse above
+}
+
+function supervisorIdentityMismatchError(expectedConversationId, actualConversationId) {
+  const err = new Error(
+    `Supervisor conversation identity changed: expected "${expectedConversationId}" but the tab is now showing "${actualConversationId}" — refusing to continue in a different conversation.`
+  );
+  err.code = 'SUPERVISOR_IDENTITY_MISMATCH';
+  return err;
+}
+
+// Sends one prompt into the Supervisor's already-open tab/conversation and
+// waits for the reply — deliberately never calls startNewChat (that would
+// break the whole point of a persistent conversation). Reuses exactly the
+// same DOM primitives as handlePerform (findComposer/sendPromptReliably/
+// waitForConversationIdentity/waitForReply); the only Supervisor-specific
+// behavior is here: identity capture is fatal (not optional, since
+// SupervisorSession.getIdentity() must always be trustworthy), and if the
+// caller already knows the expected id, a mismatch fails safe instead of
+// silently continuing in whatever conversation the tab now shows.
+function handleSupervisorAsk(message, sendResponse) {
+  const { requestId, prompt, expectedConversationId } = message;
+  const startedAt = Date.now();
+  const log = makeLogger(requestId, startedAt);
+
+  (async () => {
+    try {
+      log('supervisor ask request received');
+      const domActions = await import(chrome.runtime.getURL('domActions.js'));
+
+      const composer = await domActions.findComposer(document, domActions.COMPOSER_SELECTORS, { timeoutMs: 5000 });
+      if (!composer) {
+        log('composer not found within 5000ms (treated as LOGIN_REQUIRED)');
+        sendResponse({ ok: false, code: 'LOGIN_REQUIRED', message: 'ChatGPT composer not found; login may be required.' });
+        return;
+      }
+      log('composer found');
+
+      const baselineCount = document.querySelectorAll(domActions.ASSISTANT_MESSAGE_SELECTOR).length;
+      await domActions.sendPromptReliably(document, composer, prompt, domActions.SEND_BUTTON_SELECTORS, { onStage: log });
+
+      // baselineId: null is correct for both the first ask (the URL
+      // genuinely has no id yet) and every later ask in the SAME
+      // conversation (the URL already carries the existing id, which is
+      // accepted immediately since any real id differs from `null`) — see
+      // waitForConversationIdentity's doc comment in domActions.js.
+      const conversationId = await domActions.waitForConversationIdentity(document, { baselineId: null, onStage: log });
+
+      if (expectedConversationId && conversationId !== expectedConversationId) {
+        throw supervisorIdentityMismatchError(expectedConversationId, conversationId);
+      }
+
+      const text = await domActions.waitForReply(document, { responseTimeoutMs: message.responseTimeoutMs }, baselineCount, { onStage: log });
+      log('reply returned');
+      sendResponse({ ok: true, text, conversationId });
     } catch (err) {
       log(`failed: ${err.code ?? 'INTERNAL_ERROR'} — ${err.message}`);
       sendResponse({ ok: false, code: err.code ?? 'INTERNAL_ERROR', message: err.message });

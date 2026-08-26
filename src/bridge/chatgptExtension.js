@@ -19,10 +19,14 @@ import {
   RateLimitedError,
   CleanupFailedError,
   ConversationIdentityError,
+  SupervisorTabLostError,
+  SupervisorIdentityMismatchError,
 } from './errors.js';
 import { ExtensionProtocolError } from './extensionProtocol.js';
 
 // docs/handoff/2026-08-25-chrome-extension-bridge.md "错误映射" table.
+// Shared with supervisorSession.js (imports mapProtocolError below) so both
+// callers of extensionServer.js map the same wire error codes the same way.
 const ERROR_CODE_MAP = {
   NO_CHATGPT_TAB: ChromeUnavailableError,
   LOGIN_REQUIRED: LoginRequiredError,
@@ -36,10 +40,12 @@ const ERROR_CODE_MAP = {
   CONVERSATION_NOT_FOUND: CleanupFailedError,
   DELETE_MENU_NOT_FOUND: CleanupFailedError,
   DELETE_NOT_CONFIRMED: CleanupFailedError,
+  SUPERVISOR_TAB_LOST: SupervisorTabLostError,
+  SUPERVISOR_IDENTITY_MISMATCH: SupervisorIdentityMismatchError,
   INTERNAL_ERROR: ChromeUnavailableError,
 };
 
-function mapProtocolError(err) {
+export function mapProtocolError(err) {
   const ErrorClass = ERROR_CODE_MAP[err.code] ?? ChromeUnavailableError;
   return new ErrorClass(err.message || err.code);
 }

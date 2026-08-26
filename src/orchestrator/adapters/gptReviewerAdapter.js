@@ -165,7 +165,12 @@ Commit:
 ${ctx.commit_sha ?? 'unknown'}`;
 }
 
-function buildPrompt(taskCard, executionReport, evidence) {
+// Exported so reviewerSession.js (task-scoped, multi-turn Reviewer
+// conversations) can reuse this exact prompt template rather than
+// duplicating the Task Card/Execution Report/Evidence rendering logic — see
+// that file's own doc comment for why a multi-turn Reviewer conversation
+// needs additional framing text on top of this per-turn content.
+export function buildReviewPrompt(taskCard, executionReport, evidence) {
   return `You are the Reviewer in an automated dev loop. Judge whether the Execution Report below satisfies the Task Card's acceptance_criteria, using the evidence provided. Per REVIEW_POLICY.md, judge intent-alignment — do not merely restate the gate pass/fail already shown in the evidence. If the evidence's diff status is NO_CHANGES, decide for yourself whether that's acceptable for this task's acceptance_criteria — the evidence only reports the fact, not the verdict.
 
 ${renderRepositoryHeader(taskCard, executionReport)}
@@ -230,7 +235,10 @@ function parseList(raw) {
 // parser needs to tolerate the "##" being stripped. Matches each known
 // field name alone on its own line, with an optional "##" prefix and/or
 // trailing colon, case-insensitively.
-function parseReviewResult(taskId, text) {
+// Exported for reviewerSession.js — same parser, same REVIEW_RESULT.md §2
+// contract, whether the reply came from a fresh one-shot conversation
+// (this adapter) or a task-scoped multi-turn one (ReviewerSession).
+export function parseReviewResult(taskId, text) {
   const fieldPattern = RESULT_FIELDS.join('|');
   const headingRe = new RegExp(`^#{0,2}\\s*(${fieldPattern})\\s*:?\\s*$`, 'gim');
   const matches = [...text.matchAll(headingRe)];
@@ -306,7 +314,7 @@ export function createGptReviewerAdapter({
 
   return {
     async review(taskCard, executionReport, evidence) {
-      const prompt = buildPrompt(taskCard, executionReport, evidence);
+      const prompt = buildReviewPrompt(taskCard, executionReport, evidence);
 
       let reply;
       try {
