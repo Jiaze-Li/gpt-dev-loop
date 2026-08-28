@@ -29,7 +29,7 @@ import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
-import { loadWorkspaceConfig, resolveApprovedExternalRoots } from './workspaceConfig.js';
+import { loadWorkspaceConfig, resolveApprovedExternalRoots, loadAndValidateExternalRoots, ExternalReadRootConfigError } from './workspaceConfig.js';
 import {
   WorkflowStateManager,
   readLiveWorkflowState,
@@ -357,10 +357,49 @@ export async function runSuperGPT({
   }, 400);
   if (typeof stopWatcher.unref === 'function') stopWatcher.unref();
 
-  const resolvedExternalRoots = resolveApprovedExternalRoots({
-    cwd,
-    explicitRoots: [...(Array.isArray(externalReadRoots) ? externalReadRoots : []), ...(Array.isArray(approvedExternalRoots) ? approvedExternalRoots : [])],
-  });
+  // External read roots policy:
+  // - New workflows: load from workspace config once, validate strictly, persist immutably.
+  // - Resume: frozen policy from workflow metadata only (handled in pipeline/supergptResume).
+  // - explicitRoots / approvedExternalRoots: retained only for trusted programmatic/test callers.
+  let resolvedExternalRoots;
+
+  try {
+    if (isResume) {
+      // Resume path: the pipeline reads frozen roots from persisted metadata.
+      // externalReadRoots here are the persisted ones passed by supergptResume.
+      resolvedExternalRoots = Array.isArray(externalReadRoots) ? [...externalReadRoots] : [];
+      // Deduplicate with approvedExternalRoots (both should be the same frozen set on resume)
+      const seen = new Set(resolvedExternalRoots);
+      for (const r of (Array.isArray(approvedExternalRoots) ? approvedExternalRoots : [])) {
+        if (!seen.has(r)) { seen.add(r); resolvedExternalRoots.push(r); }
+      }
+    } else {
+      // New workflow: load workspace config, validate strictly, combine with any
+      // trusted programmatic explicitRoots (never model-supplied).
+      const explicitList = [
+        ...(Array.isArray(externalReadRoots) ? externalReadRoots : []),
+        ...(Array.isArray(approvedExternalRoots) ? approvedExternalRoots : []),
+      ];
+      if (explicitList.length > 0) {
+        // Trusted programmatic caller with explicit roots — use legacy resolution
+        resolvedExternalRoots = resolveApprovedExternalRoots({ cwd, explicitRoots: explicitList });
+      } else {
+        // Normal path: strict workspace config validation (fail closed)
+        resolvedExternalRoots = loadAndValidateExternalRoots(cwd);
+      }
+    }
+  } catch (err) {
+    // ExternalReadRootConfigError: fail closed before model invocation
+    result.status = 'FAILED';
+    result.reason = err?.message ?? String(err);
+    workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: result.reason });
+    workflowStateManager.stopHeartbeat();
+    emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, reason: result.reason });
+    clearInterval(stopWatcher);
+    ACTIVE_WORKFLOWS.delete(workflowId);
+    if (signal) signal.removeEventListener('abort', onAbort);
+    return result;
+  }
 
   try {
     // Do not race cancellation against the pipeline: doing so reports a
@@ -499,11 +538,10 @@ async function defaultPipeline({
       const persistedRoots = Array.isArray(meta.external_read_roots)
         ? meta.external_read_roots
         : (Array.isArray(meta.approved_external_roots) ? meta.approved_external_roots : []);
-      resolvedApprovedRoots = resolveApprovedExternalRoots({
-        cwd: worktree.source_workspace || cwd || process.cwd(),
-        explicitRoots: [...externalReadRoots, ...approvedExternalRoots],
-        persistedRoots,
-      });
+      // FROZEN POLICY: use ONLY the persisted roots from workflow metadata.
+      // Do NOT reload .supergpt/config.json, do NOT merge newly supplied roots.
+      // Changing config affects only NEW workflows.
+      resolvedApprovedRoots = [...persistedRoots];
     } catch (err) {
       if (lifecycleManager) await lifecycleManager.onInitFailed();
       workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: `resume failed: ${err.message}` });
@@ -511,10 +549,11 @@ async function defaultPipeline({
     }
   } else {
     try {
-      resolvedApprovedRoots = resolveApprovedExternalRoots({
-        cwd: cwd || process.cwd(),
-        explicitRoots: [...externalReadRoots, ...approvedExternalRoots],
-      });
+      // Roots were already validated at workflow creation time in runSuperGPT.
+      // Use the exact validated list passed through.
+      resolvedApprovedRoots = [...externalReadRoots, ...approvedExternalRoots];
+      // Deduplicate
+      resolvedApprovedRoots = [...new Set(resolvedApprovedRoots)];
       const established = await establishIsolatedWorkspace({
         sourceCwd: cwd,
         workflowId,
@@ -1004,8 +1043,6 @@ export async function supergptResume({
   workflowId,
   answer = null,
   cwd,
-  externalReadRoots = [],
-  approvedExternalRoots = [],
   onEvent,
   outputFormat,
   signal,
@@ -1028,6 +1065,10 @@ export async function supergptResume({
   }
 
   const effectiveCwd = cwd ?? meta.source_workspace ?? meta.source_repo_root ?? process.cwd();
+
+  // FROZEN POLICY: use ONLY the persisted roots from workflow metadata.
+  // Do NOT reload .supergpt/config.json, do NOT merge newly supplied roots.
+  // Changing .supergpt/config.json affects only NEW workflows.
   const persistedRoots = Array.isArray(meta.external_read_roots)
     ? meta.external_read_roots
     : (Array.isArray(meta.approved_external_roots) ? meta.approved_external_roots : []);
@@ -1039,11 +1080,7 @@ export async function supergptResume({
     goal: meta.goal ?? null,
     planPath: meta.plan_path ?? null,
     cwd: effectiveCwd,
-    externalReadRoots: [
-      ...persistedRoots,
-      ...(Array.isArray(externalReadRoots) ? externalReadRoots : []),
-      ...(Array.isArray(approvedExternalRoots) ? approvedExternalRoots : []),
-    ],
+    externalReadRoots: persistedRoots,
     onEvent,
     outputFormat,
     signal,
@@ -1117,4 +1154,5 @@ export {
   REWORK_VERIFICATION_STATUSES,
   WORKFLOW_STAGES,
   WORKFLOW_STATUSES,
+  ExternalReadRootConfigError,
 };

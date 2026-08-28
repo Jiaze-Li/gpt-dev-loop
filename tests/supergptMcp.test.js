@@ -50,7 +50,7 @@ test('lists the frontend-neutral prepare/run/plan/status contract with schemas',
   assert.ok(prepare.description.includes('Task Cards'));
 
   const run = tools.find((t) => t.name === 'supergpt_run');
-  assert.deepEqual(Object.keys(run.inputSchema.properties).sort(), ['cwd', 'externalReadRoots', 'goal', 'planPath']);
+  assert.deepEqual(Object.keys(run.inputSchema.properties).sort(), ['cwd', 'goal', 'planPath']);
 
   await client.close();
 });
