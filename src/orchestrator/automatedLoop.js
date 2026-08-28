@@ -45,9 +45,20 @@
 // at all for that reply.
 
 import { AdapterError, ADAPTER_ERROR_CODES } from './errors.js';
+import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
+import { defaultOrganicReworkRecorder } from './organicReworkRecorder.js';
 
 function defaultLog(line) {
   console.log(`gpt-loop: ${line}`);
+}
+
+// Local deterministic warning only: it never changes the Reviewer verdict.
+export function reviewerReworkNonConvergence(previous, current, evidence) {
+  if (previous?.decision !== 'REWORK' || current?.decision !== 'REWORK' || evidence?.pass !== true) return false;
+  const normalize = (items) => (Array.isArray(items) ? items : [items])
+    .map((item) => String(item).toLowerCase().replace(/\s+/g, ' ').trim())
+    .filter(Boolean).sort().join('\n');
+  return normalize(previous.required_changes) !== '' && normalize(previous.required_changes) === normalize(current.required_changes);
 }
 
 // --- Bounded rate-limit recovery ---------------------------------------
@@ -323,6 +334,9 @@ export async function runAutomatedWorkflow({
   // random spread. sleep — injectable for deterministic tests only.
   rateLimitRecovery = {},
   log = defaultLog,
+  workflowStateManager = null,
+  usageTracker = null,
+  onTaskCompleted = null,
 }) {
   const {
     maxRetries: rlMaxRetries = 2,
@@ -436,12 +450,58 @@ export async function runAutomatedWorkflow({
     }
 
     log(`claude attempt started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
-    const executionReport = await claudeManager.execute(currentTaskCard);
+    workflowStateManager?.startStage(WORKFLOW_STAGES.EXECUTOR, {
+      taskId: currentTaskCard.task_id,
+      taskName: currentTaskCard.goal,
+      attempt: attemptCount,
+    });
+    // A fresh Executor deliberately has no conversational memory. Carry the
+    // last Reviewer verdict in the task payload so a CONTINUE_REWORK can
+    // actually correct the defect it identified instead of repeating the
+    // original attempt verbatim.
+    const executorTaskCard = latestReviewResult?.decision === 'REWORK'
+      ? {
+          ...currentTaskCard,
+          rework_feedback: {
+            findings: latestReviewResult.findings ?? [],
+            required_changes: latestReviewResult.required_changes ?? [],
+            rationale: latestReviewResult.rationale ?? null,
+          },
+        }
+      : currentTaskCard;
+    const executionReport = await claudeManager.execute(executorTaskCard);
     log(`claude attempt completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
 
+    if (executionReport?.usage && usageTracker) {
+      usageTracker.record({
+        role: 'executor',
+        callId: executionReport.callId ?? executionReport.usage?.callId,
+        taskId: currentTaskCard.task_id,
+        attempt: attemptCount,
+        model: executionReport.model,
+        usage: executionReport.usage,
+        costUsd: executionReport.costUsd,
+      });
+    }
+    if (workflowStateManager) {
+      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+      if (executionReport?.model) {
+        workflowStateManager.setRouting({
+          model: executionReport.model,
+          escalated: executionReport.modelEscalated,
+          escalationReason: executionReport.escalationReason,
+        });
+      }
+    }
+
     log(`gate started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
+    workflowStateManager?.startStage(WORKFLOW_STAGES.GATE);
     const evidence = await gateRunner.run(currentTaskCard.verification_commands);
     log(`gate completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
+    if (workflowStateManager) {
+      workflowStateManager.state.stageStatuses.gate = evidence.pass ? 'PASS' : 'FAIL';
+      workflowStateManager.recordProgress();
+    }
 
     if (!reviewerCreated) {
       const reviewerIdentity = await reviewerSession.create(currentTaskCard.task_id, { windowId });
@@ -453,6 +513,7 @@ export async function runAutomatedWorkflow({
 
     await activateReviewerTab();
     log(`review started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
+    workflowStateManager?.startStage(WORKFLOW_STAGES.REVIEWER);
     let reviewResult;
     try {
       reviewResult = await runWithRateLimitRecovery({
@@ -487,6 +548,51 @@ export async function runAutomatedWorkflow({
     }
     log(`review completed: task=${currentTaskCard.task_id} attempt=${attemptCount} decision=${reviewResult.decision}`);
 
+    if (reviewResult?.usage && usageTracker) {
+      usageTracker.record({
+        role: 'reviewer',
+        callId: reviewResult.callId ?? reviewResult.usage?.callId,
+        taskId: currentTaskCard.task_id,
+        attempt: attemptCount,
+        model: reviewResult.model,
+        usage: reviewResult.usage,
+        durationMs: reviewResult.durationMs,
+      });
+    }
+    if (workflowStateManager) {
+      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+      workflowStateManager.state.stageStatuses.reviewer = reviewResult.decision;
+      workflowStateManager.setDecision(reviewResult.decision);
+      workflowStateManager.recordTaskAttempt({
+        taskId: currentTaskCard.task_id,
+        attempt: attemptCount,
+        executorCallId: executionReport?.callId ?? executionReport?.usage?.callId ?? null,
+        gateResult: evidence?.pass ? 'PASS' : 'FAIL',
+        reviewerDecision: reviewResult.decision,
+        requiredChanges: Array.isArray(reviewResult.required_changes) ? reviewResult.required_changes : reviewResult.required_changes ? [reviewResult.required_changes] : [],
+        reviewerCallId: reviewResult.callId ?? reviewResult.usage?.callId ?? null,
+      });
+    }
+
+    try {
+      defaultOrganicReworkRecorder.observeAttempt({
+        workflowId,
+        taskId: currentTaskCard.task_id,
+        attempt: attemptCount,
+        executorCallId: executionReport?.callId ?? executionReport?.usage?.callId ?? null,
+        executorModel: executionReport?.model ?? null,
+        gateResult: evidence?.pass ? 'PASS' : 'FAIL',
+        reviewerDecision: reviewResult.decision,
+        reviewerCallId: reviewResult.callId ?? reviewResult.usage?.callId ?? null,
+        reviewerModel: reviewResult.model ?? null,
+        requiredChanges: reviewResult.required_changes ?? [],
+        evidence,
+        nonConvergence: reviewerReworkNonConvergence(latestReviewResult, reviewResult, evidence),
+      });
+    } catch {
+      /* non-blocking passive observation */
+    }
+
     if (reviewResult.decision !== 'PASS' && persistence) {
       await persistence.writeState({
         workflow_id: workflowId,
@@ -495,9 +601,21 @@ export async function runAutomatedWorkflow({
       });
     }
 
+    if (reviewerReworkNonConvergence(latestReviewResult, reviewResult, evidence)) {
+      log(`REVIEWER_REWORK_NONCONVERGENCE task=${currentTaskCard.task_id} attempt=${attemptCount}`);
+      workflowStateManager?.recordProgress({ diagnostic: 'REVIEWER_REWORK_NONCONVERGENCE' });
+    }
     latestReviewResult = reviewResult;
     if (reviewResult.decision === 'PASS') {
       history.push({ task_id: currentTaskCard.task_id, decision: 'PASS', attempts: attemptCount });
+      workflowStateManager?.recordCompletedTask({ taskId: currentTaskCard.task_id, decision: 'PASS', attempts: attemptCount });
+      if (typeof onTaskCompleted === 'function') {
+        try {
+          await onTaskCompleted({ taskId: currentTaskCard.task_id, taskCard: currentTaskCard });
+        } catch (err) {
+          log(`onTaskCompleted error: ${err.message}`);
+        }
+      }
     }
     return { done: false };
   }
@@ -527,16 +645,13 @@ export async function runAutomatedWorkflow({
         // Fail closed: verify the placeholder is actually gone rather than
         // trusting the close call's mere resolution — a swallowed error
         // upstream (or an extension-side response missing initialTabId, as
-        // in the 2026-08-27 live finding) must never leave an unexpected
-        // extra tab in play unnoticed.
-        if (typeof windowSession.listTabs === 'function') {
-          const tabsAfterClose = await windowSession.listTabs(windowId);
-          const stillPresent = Array.isArray(tabsAfterClose) && tabsAfterClose.some((tab) => tab.tabId === initialTabId);
-          if (stillPresent) {
-            throw new Error(
-              `Automation window placeholder tab initialTabId=${initialTabId} is still present after close() reported success — refusing to continue with an unexpected extra tab.`
-            );
-          }
+        // seen in the live test) leaves the placeholder silently open.
+        const tabsAfterClose = await windowSession.listTabs(windowId);
+        const placeholderStillPresent = tabsAfterClose.some((tab) => tab.tabId === initialTabId);
+        if (placeholderStillPresent) {
+          throw new Error(
+            `Automation window placeholder tab initialTabId=${initialTabId} is still present after close() reported success — refusing to continue with an unexpected extra tab.`
+          );
         }
       }
     }
@@ -544,6 +659,7 @@ export async function runAutomatedWorkflow({
 
     for (;;) {
       await activateSupervisorTab();
+      workflowStateManager?.startStage(WORKFLOW_STAGES.SUPERVISOR);
       let decision;
       try {
         decision = await runWithRateLimitRecovery({
@@ -563,6 +679,10 @@ export async function runAutomatedWorkflow({
           // Same contract as the Reviewer case: nothing is closed, nothing
           // is rerun, the Supervisor conversation and any open Reviewer
           // session/tab are preserved for a resumed run.
+          workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+            reason: err.message,
+            question: 'ChatGPT rate-limiting is blocking the Supervisor decision.',
+          });
           return {
             status: 'HUMAN_REQUIRED',
             reason: err.message,
@@ -570,12 +690,27 @@ export async function runAutomatedWorkflow({
               'ChatGPT rate-limiting is blocking the Supervisor decision. Wait for the limit to clear, then resume this workflow.',
             history,
             ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
+            tokenUsage: usageTracker?.summary() ?? null,
           };
         }
         throw err;
       }
 
       log(`supervisor decision: ${decision.action}`);
+
+      if (decision?.usage && usageTracker) {
+        usageTracker.record({
+          role: 'supervisor',
+          callId: decision.callId ?? decision.usage?.callId,
+          model: decision.model,
+          usage: decision.usage,
+          durationMs: decision.durationMs,
+        });
+      }
+      if (workflowStateManager) {
+        if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+        workflowStateManager.setDecision(decision.action);
+      }
 
       const hasPendingRework = latestReviewResult !== null && latestReviewResult.decision !== 'PASS';
       assertLegalTransition(decision, hasPendingRework);
@@ -586,10 +721,23 @@ export async function runAutomatedWorkflow({
         // of these being persistent conversations (inside a window that is
         // left open too) is that a human (or a resumed run) can pick the
         // same conversation/tab back up.
-        return { status: 'HUMAN_REQUIRED', reason: decision.reason, question: decision.question, history };
+        workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+          reason: decision.reason,
+          question: decision.question,
+        });
+        return {
+          status: 'HUMAN_REQUIRED',
+          reason: decision.reason,
+          question: decision.question,
+          history,
+          tokenUsage: usageTracker?.summary() ?? null,
+        };
       }
 
       if (decision.action === 'WORKFLOW_DONE') {
+        workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {
+          summary: decision.summary,
+        });
         if (keepOpenOnSuccess) {
           log(
             `workflow done; --keep-open is set — leaving windowId=${windowId} supervisorTabId=${supervisorTabId} ` +
@@ -600,10 +748,26 @@ export async function runAutomatedWorkflow({
           await supervisorSession.close();
           await windowSession.close(windowId);
         }
-        return { status: 'WORKFLOW_DONE', summary: decision.summary, history };
+        return {
+          status: 'WORKFLOW_DONE',
+          summary: decision.summary,
+          history,
+          tokenUsage: usageTracker?.summary() ?? null,
+        };
       }
 
       if (decision.action === 'CONTINUE_REWORK') {
+        workflowStateManager?.startStage(WORKFLOW_STAGES.REWORK);
+        if (workflowStateManager) {
+          const reqStr = Array.isArray(latestReviewResult?.required_changes)
+            ? latestReviewResult.required_changes.join('; ')
+            : latestReviewResult?.required_changes || 'rework needed';
+          const banner = workflowStateManager.formatFailureBanner(
+            `Review requested changes: ${reqStr}`,
+            { retrying: true, nextAttempt: attemptCount + 1 }
+          );
+          log(banner);
+        }
         const outcome = await runAttempt();
         if (outcome.done) return outcome.result;
         continue;
@@ -627,6 +791,10 @@ export async function runAutomatedWorkflow({
       if (outcome.done) return outcome.result;
     }
   } catch (err) {
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: err.message });
+    if (workflowStateManager) {
+      log(workflowStateManager.formatFailureBanner(err.message, { retrying: false }));
+    }
     if (keepOpenOnFailure) {
       // Debug-only: preserve every resource this run opened instead of the
       // usual best-effort teardown, so a live failure can be inspected in

@@ -1,270 +1,174 @@
-# Architecture
+# SuperGPT V1 architecture — current source of truth
 
-## 1. Target shape
+SuperGPT is a local autonomous coding workflow. Its deterministic core owns
+state, isolation, delivery, progress, and policy; models supply only bounded
+role decisions or execution output.
 
-`gpt-dev-loop` is a local review-loop core with thin integrations for coding agents.
+## V1 functional freeze
 
-```text
-                    ┌─────────────────────┐
-                    │       Human         │
-                    │ WHAT / WHY / final  │
-                    └──────────┬──────────┘
-                               │
-                               v
-                    ┌─────────────────────┐
-                    │   Target repo SPEC  │
-                    │  goals + acceptance │
-                    └──────────┬──────────┘
-                               │
-                               v
-┌─────────────────────────────────────────────────────────┐
-│                    Coding-agent adapter                 │
-│            Claude first, Codex later                    │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           v
-┌─────────────────────────────────────────────────────────┐
-│                     gpt-dev-loop core                   │
-│                                                         │
-│  policy -> state -> gates -> git evidence -> reviewer  │
-└──────────────────────────┬──────────────────────────────┘
-                           │ ask_gpt(review request)
-                           v
-┌─────────────────────────────────────────────────────────┐
-│                 Local ChatGPT Web Bridge                │
-│  session reuse / login detection / deterministic I/O   │
-└──────────────────────────┬──────────────────────────────┘
-                           │
-                           v
-                    ┌─────────────────────┐
-                    │   ChatGPT web chat  │
-                    │ planner / reviewer  │
-                    └──────────┬──────────┘
-                               │
-                               v
-                    ┌─────────────────────┐
-                    │ GitHub repo / diff  │
-                    │ primary evidence    │
-                    └─────────────────────┘
-```
-
-## 2. Important control decision
-
-ChatGPT does **not** need to actively wake the coding agent.
-
-The coding side owns the long-running loop and calls the reviewer synchronously when a review is required:
+V1 is frozen at the production contracts documented here: frontend ->
+AutoRoutePolicy -> `supergpt_prepare` -> `supergpt.request/v1`; role-routed
+Planner, Supervisor, Executor and Reviewer; deterministic Gate; scoped REWORK;
+delivery and cleanup. Cross-cutting policy, quota, health, effort, session,
+usage-callId, anomaly, process-telemetry, acceptance-snapshot and workspace
+contracts are frozen with it. No V1.1 parallel execution behavior is present.
 
 ```text
-implement -> test -> publish evidence -> ask_gpt -> interpret result -> continue
+USER / FRONTEND
+  natural engineering request
+    -> AutoRoutePolicy -> supergpt_prepare -> supergpt.request/v1
+    -> persisted deterministic core
+
+SUPERGPT CORE
+  Planner RoleRouter -> Supervisor RoleRouter -> Executor RoleRouter
+    -> deterministic Gate -> scoped Reviewer RoleRouter
+    -> REWORK (only when required) -> delivery -> cleanup
 ```
 
-This removes the hardest bidirectional event-delivery problem. The reviewer only needs to answer requests.
+## Frontends and public contract
 
-## 3. Separation of concerns
+Frontends are thin adapters. They pass the exact invocation workspace and
+never create internal Task Cards, infer state from logs, or perform review.
+The stable operations are `supergpt_prepare`, `supergpt_plan`,
+`supergpt_run`/`supergpt_start`, `supergpt_status`, `supergpt_wait`,
+`supergpt_resume`, and `supergpt_stop`.
 
-### Core
+`supergpt_prepare` accepts raw natural-language intent and returns the small
+portable `supergpt.request/v1` object. Planning then creates internal task
+cards. This makes a fresh Gemini, Claude, Codex, or generic frontend
+zero-knowledge: tool discovery tells it to call prepare rather than inventing
+orchestration syntax.
 
-The core should eventually own only deterministic orchestration concerns:
+Status and wait read persisted local state only. They make no model calls.
+The generic renderer is portable text; the terminal renderer adds an in-place
+spinner, elapsed time, heartbeat, and durable transition lines only for TTYs.
+JSON mode has no ANSI output.
 
-- run state;
-- allowed transitions;
-- retry policy;
-- deterministic gates;
-- Git evidence coordinates;
-- reviewer result validation;
-- stop conditions;
-- audit events.
+### Human-visible progress and ownership
 
-It should not contain Claude-specific prompt text or ChatGPT DOM selectors.
+`FrontendProgressObserver` is the chat/agent frontend binding. Immediately
+after a non-blocking start returns a `workflowId`, the frontend attaches this
+local subscriber and renders only meaningful persisted transitions: task/total
+and title, task-local attempt, stage, routed role/provider/model, Gate and
+Reviewer result, and terminal state. `HUMAN_REQUIRED` is rendered as a
+distinct intervention request with the persisted question. A new frontend can
+attach using the same workflow ID and receives the current canonical state;
+it never invents state from a model response.
 
-### Reviewer bridge
+The observer polls `status` locally. Spinner, elapsed time, heartbeat,
+last-progress and last-activity formatting are also local. They create zero
+provider/model calls. Stopping or disconnecting an observer only stops its
+timer: workflow state, provider children, isolation and delivery remain Core
+owned. Terminal state stops the observer cleanly.
 
-The bridge exposes a small transport contract such as:
+Normal internal reports and task artifacts are optional/viewable evidence,
+never approval prompts or a workflow dependency. A frontend must label them
+as optional if its host displays an artifact count. Only `HUMAN_REQUIRED`
+means a blocking human action is needed; `resume` is then the sole way to
+continue that suspended workflow.
+
+## Roles, aliases, quota, and provider health
+
+Roles are independent of frontends and are routed role-first, not provider-first.
+The policy contains stable family aliases; a provider resolves its current
+concrete model at invocation time and records both `requestedFamily` and
+`resolvedModel`. A resolution change emits routing telemetry and does not
+require a policy edit.
 
 ```text
-ask_gpt(request) -> response
+Planner:    codex:default > agy:gemini > claude:opus > agy:gpt-oss
+Supervisor: agy:gemini > codex:default > claude:opus > agy:gpt-oss
+Reviewer:   agy:gpt-oss > codex:default > agy:gemini > claude:opus
+Executor:   claude:sonnet > codex:default > claude:opus
+Gate:       local deterministic verification
 ```
 
-Responsibilities:
+`RolePolicy`, `QuotaPoolRegistry`, `ProviderHealthRegistry`, `EffortPolicy`,
+and `TokenAwareSessionPolicy` are separate deterministic concerns. The default
+quota topology is Codex (`codex:default`), shared Claude (`claude:sonnet` and
+`claude:opus`), AGY Gemini, and AGY Claude/GPT (`agy:gpt-oss`). Runtime native
+telemetry may add or override family-to-pool membership without changing role
+policy. Pool state is user-level runtime state, never target-repository state.
 
-- ensure a usable local ChatGPT session exists;
-- reuse persisted browser/session state;
-- send text to the selected conversation/session;
-- wait for the completed assistant response;
-- return plain text / structured result;
-- expose meaningful transport errors.
+Readiness, cooldown/reset lookup, routing, effort and session decisions are
+zero-token. A known cooldown is skipped; an UNKNOWN pool is allowed one real
+business invocation when no free native telemetry exists. Quota/rate-limit
+errors update every shared pool immediately. Structured reset time wins;
+otherwise a configurable persisted exponential local backoff moves from
+COOLDOWN to UNKNOWN at expiry. No model prompt is used as a health probe.
 
-Non-responsibilities:
+Typed provider failures include quota exhaustion, rate limit, auth failure,
+unavailable, timeout, and protocol errors. A recoverable failure emits
+`ROLE_PROVIDER_FAILED` then `ROLE_PROVIDER_SWITCHED`, preserving workflow and
+task state through a local checkpoint. Quota failure never attempts the same
+provider at higher effort.
 
-- deciding whether code is correct;
-- deciding task scope;
-- interpreting Git diffs itself;
-- invoking the OpenAI API as an implicit fallback.
+The handoff uses a deterministic checkpoint: goal, canonical request, plan,
+completed/current/remaining tasks, attempt, Gate/Reviewer results, constraints
+and workflow decisions. It does not copy provider conversation history.
+Supervisor physical sessions reuse by default. Native input/cache/latency,
+context pressure, provider compaction, protocol instability and a safety call
+ceiling can trigger local checkpoint + rotation. Missing telemetry simply
+removes that signal; token values are never estimated.
 
-### Claude adapter
+Reasoning effort defaults to medium when supported. Deterministic repeated
+reasoning failure, rework cycles, or high-risk work can escalate to high. A
+provider without an effort API is invoked normally.
 
-The Claude adapter should make the loop feel native inside Claude Code.
+Codex Supervisor uses `codex exec` in read-only, ephemeral,
+`--ignore-user-config` mode by default. It has no repository-editing tools,
+skills, or inherited MCP servers. Native usage is recorded when present; it
+is never estimated. The opt-in `npm run probe:provider-overhead` command is
+the only fixed-prompt live transport measurement and never updates baselines.
 
-Likely mechanisms:
+## Workflow and safety
 
-- a Claude Code Skill describing the implementation/review protocol;
-- an MCP-exposed local tool for reviewer calls and possibly run-state operations;
-- optional plugin hooks for startup/status checks.
+The workflow is one task at a time: Supervisor -> fresh Claude Executor ->
+Gate -> task-scoped Reviewer -> Supervisor. REWORK loops back through a fresh
+Executor attempt and preserves the Reviewer for that task. Parallel DAG
+execution is deliberately out of scope for v1.
 
-The adapter should be thin enough that removal of Claude does not remove the core system.
+Before execution, SuperGPT snapshots the exact invocation workspace into an
+owned isolated worktree. It supports primary checkouts, linked worktrees,
+branches, staged/unstaged edits, and untracked files. Delivery is fail-closed
+and returns approved changes to the same invocation workspace while preserving
+unrelated edits. Successful workflows clean only positively-owned worktrees,
+branches, and children; resumable states retain their owned resources.
 
-### Future Codex adapter
+Every workflow ends durably as `WORKFLOW_DONE`, `HUMAN_REQUIRED`, `FAILED`,
+`TIMEOUT`, `STALLED`, or `STOPPED`. Resume retains the workflow ID, completed
+tasks, reviewer state, and required isolation resources. Stop terminates
+owned active children and persists `STOPPED`.
 
-A Codex adapter should reuse:
+## Token and operational guardrails
 
-- the same reviewer bridge;
-- the same config format;
-- the same run-state format;
-- the same Git evidence contract;
-- the same reviewer result vocabulary.
+Usage records carry immutable provider call IDs. Deterministic monitoring
+detects duplicate accounting, unexpected call count, prompt inflation, and
+compatible-baseline regressions plus `SESSION_REUSE_INEFFICIENT` conditions.
+`npm test` and `npm run benchmark` make zero model calls. Only explicit live
+commands consume provider quota. `doctor` is local-only and checks runtimes,
+configuration, aliases, configured pools, persisted cooldowns, writable
+storage, and stale owned resources.
 
-Only agent-native installation and workflow instructions should differ.
+Organic Reviewer REWORK is deliberately reported as **NOT YET OBSERVED** until
+the passive `OrganicReworkRecorder` captures a genuine production occurrence.
+The deterministic REWORK path is verified, and durable recorder evidence is
+preserved independently of workflow cleanup; the absence of organic evidence
+does not downgrade V1 readiness.
 
-## 4. Proposed repository layout
+## Installation and extension
 
-This is a direction, not a frozen implementation detail:
+`npm run install-global` installs the MCP server and the Gemini-compatible
+skill once; see `docs/GLOBAL_INSTALL.md`. A frontend extension implements the
+thin public contract. A provider extension implements the logical role
+protocol, typed failures, native usage when available, and compact checkpoint
+input; it never changes Core semantics.
 
-```text
-gpt-dev-loop/
-├── core/
-│   ├── loop
-│   ├── state
-│   └── policy
-├── bridge/
-│   └── chatgpt-web
-├── evidence/
-│   └── git
-├── gates/
-├── adapters/
-│   ├── claude/
-│   └── codex/
-├── config/
-├── scripts/
-├── docs/
-└── tests/
-```
+## History and v1.1
 
-V1 may begin with fewer files. Boundaries matter more than directory count.
-
-## 5. Review contract
-
-The handoff should be coordinate-based instead of copying implementation content through the bridge.
-
-Example conceptual request:
-
-```text
-Task: implement feature X
-Spec: docs/SPEC.md
-Repo: owner/repo
-Base: abc123
-Head: def456
-Gates: PASS
-Instruction: inspect the GitHub diff and decide CONTINUE / REWORK / DONE / HUMAN_REQUIRED
-```
-
-Benefits:
-
-- low transport volume;
-- reviewer sees authoritative code;
-- executor cannot hide mistakes in a prose summary;
-- fewer duplicated tokens/context;
-- easy auditing and reproduction.
-
-## 6. Loop state
-
-V1 can use a lightweight state model:
-
-```text
-READY
-  -> EXECUTING
-  -> VERIFYING
-  -> REVIEWING
-      -> EXECUTING       (CONTINUE / REWORK)
-      -> COMPLETE        (DONE)
-      -> HUMAN_REQUIRED
-      -> ABORTED         (hard failure / retry limit)
-```
-
-A full state machine is not required for the first `ask_gpt` PoC, but the eventual system should persist enough information to resume without accidentally rerunning already-reviewed work.
-
-## 7. Git policy
-
-GitHub is the primary code evidence channel.
-
-Recommended mature flow:
-
-1. Capture clean-worktree and branch/HEAD anchors.
-2. Let the coding agent modify files and run tests.
-3. Validate scope and deterministic gates.
-4. Publish a mechanical evidence commit/push through trusted orchestration logic where practical.
-5. Ask GPT to review `base...head`.
-6. Record reviewer result against that exact head.
-
-The executor should not have unrestricted authority to perform destructive history operations as part of ordinary task execution.
-
-## 8. Browser/session boundary
-
-The browser should be hidden beneath the bridge.
-
-The coding agent must not need to:
-
-- inspect screenshots;
-- locate DOM elements;
-- click controls;
-- poll visual state;
-- reason about browser layout.
-
-If DOM automation is necessary, deterministic bridge code owns it. A DOM change should fail as a bridge error, not consume coding-agent reasoning trying to recover visually.
-
-## 9. Installation direction
-
-The desired end state is one local checkout plus adapter installation.
-
-Conceptually:
-
-```text
-git clone .../gpt-dev-loop
-./install claude
-```
-
-and later:
-
-```text
-./install codex
-```
-
-Normal use should not require separately managing a bridge daemon. Startup and health checks should be handled by the adapter/plugin or a local process manager hidden behind it.
-
-## 10. What stays configurable
-
-Policy belongs in configuration, including:
-
-- task size;
-- planning horizon;
-- reviewer conversation strategy;
-- retry count;
-- test commands;
-- commit policy;
-- human-gate triggers;
-- structured vs natural-language review output.
-
-The architecture should not assume one permanent answer to these choices.
-
-## 11. Modern Headless Architecture (SuperGPT Production)
-
-The modern production architecture operates entirely headless through the Google Antigravity CLI (`agy`) and local Claude Code without any browser extension, DOM interaction, or open tabs:
-
-1. **Invocation State**: The user or agent invokes SuperGPT from any workspace. `src/orchestrator/workspaceSnapshot.js` captures HEAD, staged changes, unstaged changes, and untracked files into an isolated git worktree (`~/.supergpt/worktrees`).
-2. **Planner**: `src/orchestrator/planner.js` uses Gemini via `agy` to decompose natural-language intent into bounded, verification-ready tasks.
-3. **Supervisor**: `src/orchestrator/adapters/agySupervisorProvider.js` maintains a single persistent conversation across the workflow to guide task sequencing and evaluate rework.
-4. **Executor**: Clean Claude Code session per attempt in the isolated worktree with symlinked `node_modules`.
-5. **Gate**: `src/orchestrator/adapters/gateRunner.js` runs verification commands with output bounding to protect reviewer context.
-6. **Reviewer**: `src/orchestrator/adapters/agyReviewerProvider.js` independently audits git diffs in a persistent per-task conversation across rework cycles.
-7. **Delivery**: `src/orchestrator/resultDelivery.js` applies approved deltas safely back into the invocation workspace, preserving user dirty files and pruning the worktree.
-
-*(Note: The legacy Chrome extension and Playwright web bridge located in `src/adapters/gpt-reviewer/` and `src/extension-bridge/` are deprecated historical implementations preserved for reference).*
+The legacy Chrome/ChatGPT Web bridge, extension transport, browser tabs, and
+DOM selectors are explicitly **HISTORY/LEGACY**, not part of the production
+SuperGPT entrypoints or active RoleRouter composition. They must not be
+presented by doctor or current installation instructions as production
+architecture. v1.1 is limited to parallel task DAG execution with isolated
+task worktrees and an explicit integration task; it is not implemented in V1.

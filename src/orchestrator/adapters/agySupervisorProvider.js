@@ -25,6 +25,7 @@
 // existing parseTaskCard — there is still exactly one Task Card schema in
 // this codebase.
 
+import { randomUUID } from 'node:crypto';
 import { callAgy as defaultCallAgy } from '../../agy/agyClient.js';
 import {
   AgyTimeoutError,
@@ -56,18 +57,56 @@ commit_sha: ${c.commit_sha ?? 'unknown'}`;
 
 function renderHistory(history) {
   if (!Array.isArray(history) || history.length === 0) return 'none';
-  return history.map((entry, i) => `${i + 1}. ${JSON.stringify(entry)}`).join('\n');
+  return history
+    .map((entry, i) => {
+      if (typeof entry === 'string') return `${i + 1}. ${entry}`;
+      const id = entry.task_id ?? `task-${i + 1}`;
+      const dec = entry.decision ?? 'PASS';
+      const att = entry.attempts !== undefined ? ` (${entry.attempts} attempt${entry.attempts === 1 ? '' : 's'})` : '';
+      return `${i + 1}. ${id}: ${dec}${att}`;
+    })
+    .join('\n');
+}
+
+function renderReviewResult(reviewResult) {
+  if (!reviewResult) return 'none';
+  if (reviewResult.decision === 'PASS') {
+    return 'Previous task PASSED. No task currently in rework.';
+  }
+  const changes = Array.isArray(reviewResult.required_changes)
+    ? reviewResult.required_changes.map((c) => `- ${c}`).join('\n')
+    : String(reviewResult.required_changes ?? 'none');
+  return `decision: ${reviewResult.decision}
+task_id: ${reviewResult.task_id ?? 'current'}
+required_changes:
+${changes}${reviewResult.rationale ? `\nrationale: ${reviewResult.rationale}` : ''}`;
+}
+
+function renderCheckpoint(checkpoint) {
+  if (!checkpoint || typeof checkpoint !== 'object') return '';
+  const completed = Array.isArray(checkpoint.completed_tasks) && checkpoint.completed_tasks.length > 0
+    ? checkpoint.completed_tasks.map((t) => `${t.task_id} (${t.status})`).join(', ')
+    : 'none';
+  return `\n# Workflow Checkpoint (Rotated Conversation)
+This Supervisor session was rotated for context efficiency. The orchestrator maintains full continuity:
+- Overall Goal: ${checkpoint.overall_goal ?? 'in progress'}
+- Completed Tasks: ${completed}
+- Current Rework Task: ${checkpoint.current_task ? JSON.stringify(checkpoint.current_task) : 'none'}
+- Workflow Invariants: verified clean worktree, single task at a time
+\n`;
 }
 
 export function buildAgySupervisorPrompt(context = {}) {
-  const { workflowGoal, repositoryContext, history, latestReviewResult } = context;
+  const { workflowGoal, repositoryContext, history, latestReviewResult, checkpoint } = context;
   const reworkInProgress = latestReviewResult && latestReviewResult.decision && latestReviewResult.decision !== 'PASS';
 
-  return `You are the Supervisor in an automated development loop. Decide the single next step.
-
-Reply with ONLY one JSON object, no prose, no code fence. Shape:
-
-{
+  const shapeBlock = reworkInProgress
+    ? `{
+  "action": "CONTINUE_REWORK" | "HUMAN_REQUIRED",
+  "reason": "<why only a human can decide>",   // REQUIRED iff action == "HUMAN_REQUIRED"
+  "question": "<the specific question for the human>"  // REQUIRED iff action == "HUMAN_REQUIRED"
+}`
+    : `{
   "action": "NEXT_TASK" | "CONTINUE_REWORK" | "WORKFLOW_DONE" | "HUMAN_REQUIRED",
   "task_card": {                       // REQUIRED iff action == "NEXT_TASK", omit otherwise
     "task_id": "<short-unique-id>",
@@ -84,7 +123,13 @@ Reply with ONLY one JSON object, no prose, no code fence. Shape:
   "summary": "<what was accomplished>",  // REQUIRED iff action == "WORKFLOW_DONE"
   "reason": "<why only a human can decide>",   // REQUIRED iff action == "HUMAN_REQUIRED"
   "question": "<the specific question for the human>"  // REQUIRED iff action == "HUMAN_REQUIRED"
-}
+}`;
+
+  return `You are the Supervisor in an automated development loop. Decide the single next step.
+
+Reply with ONLY one JSON object, no prose, no code fence. Shape:
+
+${shapeBlock}
 
 Rules:
 - One task at a time. Derive each task ONLY from the plan below.
@@ -95,7 +140,7 @@ Rules:
     ? 'A rework is IN PROGRESS on the current task (see "Latest Review Result"): reply with CONTINUE_REWORK or HUMAN_REQUIRED only.'
     : 'No task is mid-rework: reply with NEXT_TASK, WORKFLOW_DONE, or HUMAN_REQUIRED only.'}
 - When every task in the plan has a PASS in the history, reply WORKFLOW_DONE.
-
+${renderCheckpoint(checkpoint)}
 # Plan (authoritative)
 ${isNonEmptyString(workflowGoal) ? workflowGoal : '(none provided)'}
 
@@ -106,7 +151,7 @@ ${renderRepositoryContext(repositoryContext)}
 ${renderHistory(history)}
 
 # Latest Review Result
-${latestReviewResult ? JSON.stringify(latestReviewResult, null, 2) : 'none'}
+${renderReviewResult(latestReviewResult)}
 
 Reply with the JSON object now.`;
 }
@@ -217,6 +262,9 @@ function mapAgyError(err, model) {
     stderr: typeof err.stderr === 'string' ? err.stderr : null,
     durationMs: Number.isFinite(err.durationMs) ? err.durationMs : null,
     agyEnvelope: err.envelope && typeof err.envelope === 'object' ? err.envelope : null,
+    providerFailure: /quota|rate.?limit|usage limit/i.test(err.stderr ?? '') ? 'PROVIDER_QUOTA_EXHAUSTED'
+      : /auth|required|login|credential/i.test(err.stderr ?? '') ? 'PROVIDER_AUTH_FAILED'
+        : isTimeout ? 'PROVIDER_TIMEOUT' : 'PROVIDER_UNAVAILABLE',
   };
   return new AdapterError(code, err.message, details);
 }
@@ -235,7 +283,7 @@ export function createAgySupervisorProvider({
     // returned decision carries `conversationId` — the id agy actually used
     // (newly created on the first call, echoed back on every resume) — so
     // the caller can capture it once and reuse it thereafter.
-    async decide(context = {}, { conversationId } = {}) {
+    async decide(context = {}, { conversationId, effort } = {}) {
       const prompt = buildAgySupervisorPrompt(context);
 
       let result;
@@ -253,7 +301,24 @@ export function createAgySupervisorProvider({
         if (err instanceof AgyStructuredOutputError) throw invalid(err.message);
         throw err;
       }
-      return { ...parseSupervisorJson(obj), conversationId: result.conversationId ?? null };
+      const callId = `call-agy-sup-${randomUUID()}`;
+      const decision = {
+        ...parseSupervisorJson(obj),
+        conversationId: result.conversationId ?? null,
+      };
+      const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };
+      try {
+        Object.defineProperties(decision, {
+          callId: { value: callId, writable: true, configurable: true, enumerable: false },
+          usage: { value: usageWithCallId, writable: true, configurable: true, enumerable: false },
+          durationMs: { value: result.durationMs ?? null, writable: true, configurable: true, enumerable: false },
+          // agy has no documented effort control; do not send an unsupported flag.
+          effortResolved: { value: null, writable: true, configurable: true, enumerable: false },
+        });
+      } catch {
+        /* best effort */
+      }
+      return decision;
     },
   };
 }

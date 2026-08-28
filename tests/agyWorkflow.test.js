@@ -84,7 +84,7 @@ function makeConversationalCallAgy(answers) {
     }
     let cid = conversationId ?? null;
     if (cid === null) cid = role === 'supervisor' ? `sup-conv-${++sup}` : `rev-conv-${++rev}`;
-    calls.push({ role, conversationId: conversationId ?? null, assigned: cid, model });
+    calls.push({ role, conversationId: conversationId ?? null, assigned: cid, model, hasCheckpoint: /Workflow Checkpoint/.test(prompt) });
     const text = typeof answer === 'string' ? answer : JSON.stringify(answer);
     return { model, exitCode: 0, text, json: { result: text }, stdout: text, durationMs: 1, conversationId: cid };
   }
@@ -99,6 +99,8 @@ function run(callAgy, extra = {}) {
   const sel = selectProviders({
     env: extra.env ?? ENV,
     callAgy,
+    codexCall: extra.codexCall ?? (async () => { throw new Error('Codex not configured in test'); }),
+    claudeCall: extra.claudeCall ?? (async () => { throw new Error('Claude not configured in test'); }),
     persistence,
     workflowId: extra.workflowId ?? 'wf-test',
   });
@@ -151,14 +153,15 @@ test('fail closed: malformed Reviewer output aborts the workflow', async () => {
     { action: 'NEXT_TASK', task_card: validTaskCardObject() },
     'not-json-at-all',
   ]);
-  await assert.rejects(() => run(callAgy), (err) => err.code === ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+  const malformedCall = async () => ({ text: 'not-json-at-all', usage: null, durationMs: 1 });
+  await assert.rejects(() => run(callAgy, { codexCall: malformedCall, claudeCall: malformedCall }), (err) => err.code === ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
 });
 
-test('fail closed: invalid Supervisor Task Card aborts the workflow', async () => {
+test('invalid Supervisor protocol output is treated as a provider failure and never executes the bad task', async () => {
   const bad = validTaskCardObject();
   delete bad.acceptance_criteria;
   const callAgy = makeFakeCallAgy([{ action: 'NEXT_TASK', task_card: bad }]);
-  await assert.rejects(() => run(callAgy), (err) => err.code === ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT);
+  await assert.rejects(() => run(callAgy), (err) => /INVALID_OUTPUT/.test(err.code));
 });
 
 test('Supervisor and Reviewer run on different models in one workflow; neither leaks into Claude', async () => {
@@ -212,7 +215,7 @@ test('HUMAN_REQUIRED from the Supervisor stops cleanly', async () => {
 
 // --- persistent role conversations --------------------------------------
 
-test('Supervisor keeps ONE conversation: captured on the first decide, resumed on every later one', async () => {
+test('Gemini Supervisor uses a fresh physical conversation for every decision while the workflow remains continuous', async () => {
   const callAgy = makeConversationalCallAgy([
     { action: 'NEXT_TASK', task_card: validTaskCardObject() },
     { decision: 'PASS', findings: ['ok'], required_changes: [], rationale: 'exact' },
@@ -223,12 +226,11 @@ test('Supervisor keeps ONE conversation: captured on the first decide, resumed o
 
   const sup = callAgy.calls.filter((c) => c.role === 'supervisor');
   assert.ok(sup.length >= 2, 'supervisor decided more than once');
-  assert.equal(sup[0].conversationId, null, 'first decide creates the conversation');
-  assert.equal(sup[0].assigned, 'sup-conv-1');
-  for (const c of sup.slice(1)) assert.equal(c.conversationId, 'sup-conv-1', 'later decides resume it');
+  for (const c of sup) assert.equal(c.conversationId, null, 'Gemini transcript is never resumed');
+  assert.ok(sup.every((c) => c.hasCheckpoint), 'each call receives local structured continuity');
 });
 
-test('Reviewer reuses one conversation across REWORK rounds of the same task', async () => {
+test('Reviewer uses a fresh provider call across REWORK rounds and carries only structured findings', async () => {
   const callAgy = makeConversationalCallAgy([
     { action: 'NEXT_TASK', task_card: validTaskCardObject() },
     { decision: 'REWORK', findings: ['x'], required_changes: ['strip it'], rationale: 'inexact' },
@@ -242,8 +244,7 @@ test('Reviewer reuses one conversation across REWORK rounds of the same task', a
   const rev = callAgy.calls.filter((c) => c.role === 'reviewer');
   assert.equal(rev.length, 2);
   assert.equal(rev[0].conversationId, null);
-  assert.equal(rev[0].assigned, 'rev-conv-1');
-  assert.equal(rev[1].conversationId, 'rev-conv-1', 'the rework review resumes the same conversation');
+  assert.equal(rev[1].conversationId, null, 'a stale Reviewer transcript is never resumed');
 });
 
 test('Reviewer gets a FRESH conversation for a different task', async () => {
@@ -264,7 +265,7 @@ test('Reviewer gets a FRESH conversation for a different task', async () => {
   assert.equal(rev[1].assigned, 'rev-conv-2');
 });
 
-test('session ownership is persisted to workflow state via writeWorkflowState', async () => {
+test('Gemini physical conversations are not persisted as workflow state', async () => {
   const persistence = makeFakePersistence();
   const callAgy = makeConversationalCallAgy([
     { action: 'NEXT_TASK', task_card: validTaskCardObject() },
@@ -274,13 +275,10 @@ test('session ownership is persisted to workflow state via writeWorkflowState', 
   const result = await run(callAgy, { persistence });
   assert.equal(result.status, 'WORKFLOW_DONE');
 
-  assert.ok(persistence.writes.length >= 1, 'workflow state was written');
-  const final = await persistence.readWorkflowState('wf-test');
-  assert.equal(final.supervisor.conversation_id, 'sup-conv-1');
-  assert.equal(final.reviewer.conversations['auto-a'], 'rev-conv-1');
+  assert.equal(persistence.writes.length, 0, 'physical conversation identity is not workflow state');
 });
 
-test('workflow state on disk is read back on resume so the SAME conversations continue', async () => {
+test('persisted Gemini physical conversation is ignored; Reviewer evidence always starts fresh', async () => {
   const persistence = makeFakePersistence();
   await persistence.writeWorkflowState('wf-test', {
     workflow_id: 'wf-test',
@@ -297,11 +295,12 @@ test('workflow state on disk is read back on resume so the SAME conversations co
 
   const sup = callAgy.calls.filter((c) => c.role === 'supervisor');
   const rev = callAgy.calls.filter((c) => c.role === 'reviewer');
-  assert.equal(sup[0].conversationId, 'pre-existing-sup', 'resumed the persisted Supervisor conversation');
-  assert.equal(rev[0].conversationId, 'pre-existing-rev', 'resumed the persisted Reviewer conversation');
+  assert.equal(sup[0].conversationId, null, 'does not resume a persisted Gemini transcript');
+  assert.ok(sup[0].hasCheckpoint, 'local checkpoint carries continuity instead');
+  assert.equal(rev[0].conversationId, null, 'does not resume stale Reviewer transcript');
 });
 
-test('fail closed: a Reviewer conversation that cannot be resumed aborts the workflow', async () => {
+test('stale persisted Reviewer conversation is ignored rather than poisoning a new task review', async () => {
   const persistence = makeFakePersistence();
   await persistence.writeWorkflowState('wf-test', {
     workflow_id: 'wf-test',
@@ -310,12 +309,11 @@ test('fail closed: a Reviewer conversation that cannot be resumed aborts the wor
   });
   const callAgy = makeConversationalCallAgy([
     { action: 'NEXT_TASK', task_card: validTaskCardObject() },
-    new AgyConversationResumeError('agy could not resume conversation gone-rev-conv'),
+    { decision: 'PASS', findings: ['ok'], required_changes: [], rationale: 'exact' },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
   ]);
-  await assert.rejects(
-    () => run(callAgy, { persistence }),
-    (err) => err.code === 'AGY_CONVERSATION_RESUME_FAILED',
-  );
+  const result = await run(callAgy, { persistence });
+  assert.equal(result.status, 'WORKFLOW_DONE');
 });
 
 test('live-smoke verdict: exact conversation id + advancing num_turns is the only pass', () => {

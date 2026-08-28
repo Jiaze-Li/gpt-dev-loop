@@ -1,6 +1,8 @@
 # SuperGPT (gpt-dev-loop)
 
-Autonomous multi-role coding engine coordinating **Gemini Supervisor**, **Claude Executor**, and **GPT-OSS Reviewer** with complete Git worktree isolation, automated verification gates, and safe automatic result delivery.
+Autonomous multi-role coding engine with role-routed Planner, Supervisor,
+Executor, and Reviewer providers; complete Git worktree isolation;
+deterministic verification gates; and safe automatic result delivery.
 
 > **"Normal coding UX, larger autonomous scope."**  
 > Run in any repository or linked worktree: provide natural-language instructions, and SuperGPT plans, isolates, executes, tests, reviews, and delivers verified changes back to your workspace.
@@ -13,7 +15,7 @@ Autonomous multi-role coding engine coordinating **Gemini Supervisor**, **Claude
 User Request / Front-Facing Agent
            │
            ▼
-    Natural Language Planner (Gemini via agy)
+    Natural Language Planner (RolePool)
            │
            ▼
     Invocation Workspace Snapshot (HEAD, staged, unstaged, untracked)
@@ -21,16 +23,16 @@ User Request / Front-Facing Agent
            ▼
     Isolated Git Worktree Sandbox (~/.supergpt/worktrees)
            │
-           ├──► Supervisor [gemini-3.7-flash-high] (Persistent workflow conversation)
+           ├──► Supervisor RolePool (Persistent workflow conversation)
            │          │ (Task Cards)
            │          ▼
-           ├──► Executor [Claude Code] (Fresh session per attempt)
+           ├──► Executor RolePool (Fresh session per attempt)
            │          │ (Code Edits)
            │          ▼
            ├──► Verification Gate [Shell / npm test] (Bounded diagnostics)
            │          │ (Git Evidence)
            │          ▼
-           └──► Reviewer [gpt-oss-120b-medium] (Persistent per-task conversation)
+           └──► Reviewer RolePool (Persistent per-task conversation)
                       │ (PASS / REWORK / HUMAN_REQUIRED)
                       ▼
     Safe Automatic Result Delivery (Pre-flight conflict check & verification)
@@ -44,13 +46,14 @@ Invocation Workspace (Approved changes applied, worktree cleaned up)
 ## Features
 
 - **Autonomous Multi-Role Loop**:
-  - **Supervisor**: Gemini 3.7 Flash High plans tasks, tracks progression, handles rework requests, and surfaces real domain ambiguities as `HUMAN_REQUIRED`.
-  - **Executor**: Claude Code executes task cards in clean worktrees with automatically symlinked dependencies.
-  - **Reviewer**: GPT-OSS 120B Medium independently audits Git diffs and gate verification evidence.
+  - **RolePools and failover**: Planner, Supervisor, Executor, and Reviewer are routed independently through provider health, quota, and effort policies.
+  - **Supervisor**: Tracks tasks, handles rework requests, and surfaces real domain ambiguities as `HUMAN_REQUIRED`.
+  - **Executor and Reviewer**: Execute task cards in clean worktrees and independently audit Git diffs plus Gate evidence.
 - **Persistent Role Conversations**: Single conversation ID maintained for the Supervisor across the entire workflow; per-task conversation IDs maintained across Reviewer rework rounds.
 - **Workspace Snapshotting**: Operates cleanly on dirty workspaces with untracked files without requiring `git stash` or manual commits. Pre-existing changes become the baseline and are never misclassified as model output.
 - **Safe Automatic Result Delivery**: Approved changes are delivered directly into the exact invocation workspace with atomic conflict detection. Unrelated dirty changes are preserved.
 - **Worktree Lifecycle**: Successfully delivered worktrees are pruned automatically; failed or `HUMAN_REQUIRED` runs are preserved for auditing and resumption.
+- **Human-visible progress**: Frontend observers show task, attempt, stage, active role/provider, Gate/Reviewer state, and terminal status without model calls.
 - **Multiple Front-End Surfaces**:
   - **CLI**: `bin/supergpt.js "<goal>"` supporting text or streaming JSON (`--output-format=json`).
   - **Antigravity Skill**: `.agents/skills/supergpt/SKILL.md` for AI pair programmers.
@@ -67,12 +70,12 @@ npm run doctor
 ```
 Verifies local availability of:
 - `git` (system version)
-- `node` (>= 18)
+- `node` (>= 20)
 - `agy` CLI (Google Antigravity CLI, authenticated)
 - `claude` (Claude Code CLI)
 
 ### 2. Run Tests
-Run the deterministic unit test suite (700 tests):
+Run the deterministic unit test suite (802 tests):
 ```bash
 npm test
 ```
@@ -116,12 +119,12 @@ When invoked with `--output-format=json`, SuperGPT streams typed events:
   - `supergpt.js`: Production CLI entrypoint.
   - `supergpt-mcp.js`: Model Context Protocol (MCP) server.
 - `src/`
-  - `orchestrator/`: Core state machine, planner, workspace snapshotting, result delivery, and persistent sessions.
+  - `orchestrator/`: Core state machine, RolePools, provider routing, workspace snapshotting, result delivery, and persistent sessions.
   - `agy/`: Headless Antigravity CLI client with fail-closed conversation resumption.
   - `adapters/`: Gate runner, git evidence collector, and executor adapters.
-  - `legacy/` (deprecated): Historical Chrome extension bridge and web automation transports.
+  - `bridge/` and `extension/`: Historical Chrome/browser bridge code, retained only as legacy source and not exposed by production entrypoints.
 - `skills/` / `.agents/skills/supergpt/`: Antigravity Skill definition.
-- `tests/`: 700 deterministic unit tests across all subsystem boundaries.
+- `tests/`: 802 deterministic unit tests across all subsystem boundaries.
 
 ---
 

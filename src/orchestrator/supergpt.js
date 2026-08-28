@@ -15,7 +15,8 @@
 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdir, writeFile, readFile } from 'node:fs/promises';
 
 import { runAutomatedWorkflow } from './automatedLoop.js';
 import { selectProviders } from './providerSelection.js';
@@ -27,6 +28,32 @@ import { deliverWorkflowResult } from './resultDelivery.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
+import { UsageTracker } from './usageTracker.js';
+import {
+  WorkflowStateManager,
+  readLiveWorkflowState,
+  readCanonicalProgress,
+  toCanonicalProgress,
+  waitForWorkflowState,
+  formatTransitionEvent,
+  WORKFLOW_STAGES,
+  WORKFLOW_STATUSES,
+} from './workflowState.js';
+import {
+  WorkflowLifecycleManager,
+  gcSuperGptResources,
+} from './workflowLifecycle.js';
+import {
+  TokenAnomalyMonitor,
+  TINY_WORKFLOW_BASELINE,
+  VERSIONED_BASELINES,
+  checkBaselineEnvironmentCompatibility,
+} from './tokenAnomalyMonitor.js';
+import {
+  OrganicReworkRecorder,
+  defaultOrganicReworkRecorder,
+  REWORK_VERIFICATION_STATUSES,
+} from './organicReworkRecorder.js';
 
 // The complete typed-event vocabulary emitted through onEvent. Every event
 // object is { type, timestamp, ...payload }.
@@ -42,6 +69,9 @@ export const SUPERGPT_EVENTS = Object.freeze({
   HUMAN_REQUIRED: 'human_required',
   DELIVERY_SUCCEEDED: 'delivery_succeeded',
   DELIVERY_FAILED: 'delivery_failed',
+  TOKEN_ANOMALY_DETECTED: 'token_anomaly_detected',
+  SUPERVISOR_PROVIDER_FAILED: 'supervisor_provider_failed',
+  SUPERVISOR_PROVIDER_SWITCHED: 'supervisor_provider_switched',
   WORKFLOW_FINISHED: 'workflow_finished',
 });
 
@@ -106,7 +136,49 @@ const EMPTY_RESULT = () => ({
   conversations: null,
   reason: null,
   question: null,
+  tokenUsage: null,
 });
+
+// Resume metadata is written by buildWorkspaceMetadata() in
+// scripts/run-agy-workflow.js. Keep the legacy field aliases only for
+// workflows created before the V1 metadata contract was finalized.
+export function restoreResumableWorkspace(meta) {
+  const worktreePath = meta?.isolated_worktree_path ?? meta?.worktree_path;
+  const sourceWorkspace = meta?.source_workspace ?? meta?.source_repo_root;
+  const baselineHead = meta?.source_head ?? meta?.baseline_head;
+
+  if (typeof worktreePath !== 'string' || worktreePath.trim() === '') {
+    throw new Error('resume metadata has no isolated worktree path');
+  }
+  if (typeof sourceWorkspace !== 'string' || sourceWorkspace.trim() === '') {
+    throw new Error('resume metadata has no source workspace');
+  }
+  if (typeof baselineHead !== 'string' || baselineHead.trim() === '') {
+    throw new Error('resume metadata has no baseline head');
+  }
+
+  const sourceBranch = meta.source_branch ?? 'HEAD';
+  return {
+    worktree: {
+      worktree_path: worktreePath,
+      source_workspace: sourceWorkspace,
+      source_repo_root: sourceWorkspace,
+      source_branch: sourceBranch,
+      baseline_head: baselineHead,
+      isolatedWorktree: true,
+    },
+    baseline: {
+      repo_root: sourceWorkspace,
+      branch: sourceBranch,
+      head: baselineHead,
+      clean: true,
+    },
+  };
+}
+
+export function workflowRuntimeDirectory(workflowId) {
+  return path.join(SUPERGPT_WORKTREE_ROOT, workflowId, 'persistence');
+}
 
 // runSuperGPT — the single programmatic entrypoint.
 //
@@ -119,8 +191,22 @@ const EMPTY_RESULT = () => ({
 //   signal        AbortSignal; aborting cancels the run cleanly
 //   env           environment object (default process.env)
 //
+const ACTIVE_WORKFLOWS = new Map();
+
+function isProcessAlive(pid) {
+  if (!pid || typeof pid !== 'number') return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+// runSuperGPT — the single programmatic entrypoint.
+//
 // Returns { status, summary, deliveredFiles, workflowId, conversations,
-// reason, question }. status is one of WORKFLOW_DONE | HUMAN_REQUIRED |
+// reason, question, tokenUsage }. status is one of WORKFLOW_DONE | HUMAN_REQUIRED |
 // CANCELLED | FAILED.
 export async function runSuperGPT({
   goal,
@@ -130,10 +216,21 @@ export async function runSuperGPT({
   outputFormat,
   signal,
   env = process.env,
+  workflowId: explicitWorkflowId,
+  isResume = false,
+  answer = null,
   _pipeline = defaultPipeline,
 } = {}) {
-  const workflowId = `wf-agy-${randomUUID()}`;
+  const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   const result = { ...EMPTY_RESULT(), workflowId };
+
+  const workflowStateManager = new WorkflowStateManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
+  workflowStateManager.startHeartbeat(1000);
+  const lifecycleManager = new WorkflowLifecycleManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd });
+  const usageTracker = new UsageTracker();
+
+  // Conservative GC in background: clean up any stale abandoned resources
+  gcSuperGptResources({ root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd }).catch(() => {});
 
   const write = outputFormat ? (s) => process.stdout.write(`${s}\n`) : null;
   const emit = (type, data = {}) => {
@@ -159,6 +256,8 @@ export async function runSuperGPT({
   if (signal?.aborted) {
     result.status = 'CANCELLED';
     result.reason = 'AbortSignal was already aborted before the run started';
+    workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason: result.reason });
+    workflowStateManager.stopHeartbeat();
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status });
     return result;
   }
@@ -168,32 +267,103 @@ export async function runSuperGPT({
     goal: goal ?? null,
     planPath: planPath ?? null,
     cwd,
+    isResume,
   });
 
+  const internalAbort = new AbortController();
   let onAbort;
   const abortPromise = new Promise((_resolve, reject) => {
-    onAbort = () => reject(new CancellationError());
+    onAbort = () => {
+      internalAbort.abort();
+      reject(new CancellationError());
+    };
   });
-  if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  if (signal) {
+    if (signal.aborted) {
+      internalAbort.abort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+
+  ACTIVE_WORKFLOWS.set(workflowId, {
+    abortController: internalAbort,
+    workflowStateManager,
+    lifecycleManager,
+  });
 
   try {
     const pipelineResult = await Promise.race([
-      Promise.resolve().then(() => _pipeline({ goal, planPath, cwd, env, emit, signal, workflowId })),
+      Promise.resolve().then(() =>
+        _pipeline({
+          goal,
+          planPath,
+          cwd,
+          env,
+          emit,
+          signal: internalAbort.signal,
+          workflowId,
+          workflowStateManager,
+          lifecycleManager,
+          usageTracker,
+          isResume,
+          answer,
+        })
+      ),
       abortPromise,
     ]);
     Object.assign(result, pipelineResult, { workflowId });
+
+    // Zero-model-token token anomaly / regression check
+    const attemptsByTask = {};
+    for (const record of usageTracker.records) {
+      if ((record.role === 'executor' || record.role === 'reviewer') && record.taskId && Number.isFinite(record.attempt)) {
+        attemptsByTask[record.taskId] = Math.max(attemptsByTask[record.taskId] ?? 0, record.attempt);
+      }
+    }
+    const anomalyReport = usageTracker.checkAnomalies({
+      workflowContext: {
+        tasksCount: workflowStateManager?.state?.taskTotal ?? (Object.keys(attemptsByTask).length || 1),
+        attemptsByTask,
+        plannerCalls: usageTracker.summary().planner.calls,
+      },
+    });
+
+    if (!result.tokenUsage) {
+      result.tokenUsage = usageTracker.summary();
+    }
+    if (anomalyReport.hasAnomalies) {
+      result.tokenUsage.anomalies = anomalyReport.anomalies;
+      result.tokenUsage.hasAnomalies = true;
+      result.tokenUsage.anomalyBanner = anomalyReport.formattedBanner;
+      emit(SUPERGPT_EVENTS.TOKEN_ANOMALY_DETECTED, {
+        anomalies: anomalyReport.anomalies,
+        banner: anomalyReport.formattedBanner,
+      });
+      if (write && anomalyReport.formattedBanner) {
+        try {
+          write(`\n${anomalyReport.formattedBanner}\n`);
+        } catch {
+          /* ignore stream error */
+        }
+      }
+    }
   } catch (err) {
-    if (err instanceof CancellationError || signal?.aborted) {
+    if (err instanceof CancellationError || signal?.aborted || internalAbort.signal.aborted) {
       result.status = 'CANCELLED';
       result.reason = 'run cancelled by AbortSignal';
+      workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason: result.reason });
       emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status });
       return result;
     }
     result.status = 'FAILED';
     result.reason = err?.message ?? String(err);
+    workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: result.reason });
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, reason: result.reason });
     return result;
   } finally {
+    ACTIVE_WORKFLOWS.delete(workflowId);
+    workflowStateManager.stopHeartbeat();
     if (signal) signal.removeEventListener('abort', onAbort);
   }
 
@@ -204,42 +374,100 @@ export async function runSuperGPT({
 // The real end-to-end pipeline. Mirrors scripts/run-agy-workflow.js's main()
 // but reports progress through `emit` instead of console formatting, and
 // returns the structured result rather than setting process.exitCode.
-async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflowId }) {
+async function defaultPipeline({
+  goal,
+  planPath,
+  cwd,
+  env,
+  emit,
+  signal,
+  workflowId,
+  workflowStateManager,
+  lifecycleManager,
+  usageTracker,
+  isResume = false,
+  answer = null,
+}) {
+  workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
+
   const metadataPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
-  const { worktree, baseline } = await establishIsolatedWorkspace({
-    sourceCwd: cwd,
-    workflowId,
-    recordMetadata: async (meta) => {
-      await mkdir(SUPERGPT_WORKTREE_ROOT, { recursive: true });
-      await writeFile(metadataPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
-    },
-  });
+  let worktree, baseline;
+
+  if (isResume && existsSync(metadataPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      ({ worktree, baseline } = restoreResumableWorkspace(meta));
+      lifecycleManager?.trackWorktree(worktree.worktree_path);
+    } catch (err) {
+      if (lifecycleManager) await lifecycleManager.onInitFailed();
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: `resume failed: ${err.message}` });
+      throw err;
+    }
+  } else {
+    try {
+      const established = await establishIsolatedWorkspace({
+        sourceCwd: cwd,
+        workflowId,
+        recordMetadata: async (meta) => {
+          await mkdir(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+          await writeFile(metadataPath, `${JSON.stringify({ ...meta, goal, plan_path: planPath }, null, 2)}\n`, 'utf8');
+        },
+      });
+      worktree = established.worktree;
+      baseline = established.baseline;
+      lifecycleManager?.trackWorktree(worktree.worktree_path);
+    } catch (err) {
+      if (lifecycleManager) await lifecycleManager.onInitFailed();
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: err.message });
+      throw err;
+    }
+  }
+
   const repoRoot = worktree.worktree_path;
   throwIfAborted(signal);
 
+  // Production role runtime is assembled before the first model invocation.
+  // Planning is therefore subject to the same policy/quota/health routing as
+  // every subsequent workflow role.
+  // Provider/session persistence is runtime state, never user-project output.
+  // Keeping it outside the isolated worktree prevents it being interpreted as
+  // an untracked change and delivered into the invocation workspace.
+  const persistence = new Persistence(workflowRuntimeDirectory(workflowId));
+  const selection = selectProviders({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, onEvent: (event) => emit(event.type, event) });
+
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'planning' });
-  const planArg = planPath ?? goal;
-  const resolved = await resolveWorkflowPlan({
-    planArg,
-    cwd: repoRoot,
-    callAgy: defaultCallAgy,
-    log: () => {},
-  });
+  workflowStateManager?.startStage(WORKFLOW_STAGES.PLANNING);
+  let planArg = planPath ?? goal;
+  if (answer && !planPath) {
+    planArg = `${planArg}\n\n[User Clarification / Answer]:\n${answer}`;
+  }
+  const resolved = (await selection.runtime.invoke('planner', {
+    resolve: (call) => resolveWorkflowPlan({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
+  }, { operationId: workflowId })).value;
   if (resolved.status === 'AMBIGUOUS') {
     emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason: 'plan_ambiguous', question: resolved.question });
+    await lifecycleManager?.onWorkflowSuspended('plan_ambiguous');
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+      reason: 'The instruction is ambiguous and needs clarification before execution.',
+      question: resolved.question,
+    });
     return {
       ...EMPTY_RESULT(),
       status: 'HUMAN_REQUIRED',
       reason: 'The instruction is ambiguous and needs clarification before execution.',
       question: resolved.question,
+      tokenUsage: usageTracker?.summary() ?? null,
     };
   }
-  const plan = resolved.plan;
+  let plan = resolved.plan;
+  if (answer) {
+    plan = `${plan}\n\n[Human Decision / Answer]:\n${answer}`;
+    workflowStateManager?.recordProgress({ humanAnswer: answer });
+  }
+  workflowStateManager?.recordProgress({ taskTotal: resolved.tasks?.length ?? 1 });
   throwIfAborted(signal);
 
-  const persistence = new Persistence(path.join(repoRoot, '.gpt-dev-loop', 'workflows'));
-  const selection = selectProviders({ env, callAgy: defaultCallAgy, persistence, workflowId });
   const { supervisorSession, createReviewerSession, windowSession } = selection;
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'executing' });
@@ -260,8 +488,12 @@ async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflo
     workflowId,
     supervisorSession,
     createReviewerSession,
-    createClaudeSessionManager: ({ taskId }) =>
-      createClaudeSessionManager({ workflowId, taskId, persistence, cwd: repoRoot }),
+    createClaudeSessionManager: ({ taskId }) => selection.createExecutorSessionManager({
+      workflowId, taskId, persistence, cwd: repoRoot,
+      onRoutingDecision: (routing) => workflowStateManager?.setRouting(routing),
+      onProcessStarted: (details) => workflowStateManager?.recordProviderProcessStart(details),
+      onProcessExited: (details) => workflowStateManager?.recordProviderProcessExit(details),
+    }),
     gateRunner,
     windowSession,
     persistence,
@@ -273,6 +505,8 @@ async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflo
       commit_sha: worktree.baseline_head,
     },
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
+    workflowStateManager,
+    usageTracker,
     log: (line) => {
       const event = translateLogLine(line);
       if (!event) return;
@@ -280,6 +514,21 @@ async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflo
       emit(type, payload);
       if (type === SUPERGPT_EVENTS.REVIEW_FINISHED && payload.decision === 'REWORK') {
         emit(SUPERGPT_EVENTS.REWORK_REQUESTED, { taskId: payload.taskId, attempt: payload.attempt });
+      }
+    },
+    onTaskCompleted: async ({ taskId }) => {
+      try {
+        const { execFile } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        const execFileAsync = promisify(execFile);
+        await execFileAsync('git', ['add', '-A'], { cwd: repoRoot });
+        await execFileAsync('git', ['commit', '-m', `chore(supergpt): complete task ${taskId}`], { cwd: repoRoot });
+        const { stdout: newHead } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
+        if (baseline && newHead) {
+          baseline.head = newHead.trim();
+        }
+      } catch {
+        /* ignore if clean */
       }
     },
   });
@@ -291,21 +540,32 @@ async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflo
       reason: loopResult.reason ?? null,
       question: loopResult.question ?? null,
     });
+    await lifecycleManager?.onWorkflowSuspended(loopResult.reason ?? 'human_required');
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+      reason: loopResult.reason ?? null,
+      question: loopResult.question ?? null,
+    });
     return {
       ...EMPTY_RESULT(),
       status: 'HUMAN_REQUIRED',
       reason: loopResult.reason ?? null,
       question: loopResult.question ?? null,
       conversations,
+      tokenUsage: usageTracker?.summary() ?? null,
     };
   }
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'delivery' });
+  workflowStateManager?.startStage(WORKFLOW_STAGES.APPLYING);
   let delivery;
   try {
     delivery = await deliverWorkflowResult({ worktree });
   } catch (err) {
     emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: err.message });
+    await lifecycleManager?.onWorkflowSuspended('delivery_failed');
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+      reason: `delivery failed: ${err.message}`,
+    });
     return {
       ...EMPTY_RESULT(),
       status: 'HUMAN_REQUIRED',
@@ -313,11 +573,17 @@ async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflo
       reason: `delivery failed: ${err.message}`,
       question: 'Resolve the delivery problem in the isolated worktree, then resume.',
       conversations,
+      tokenUsage: usageTracker?.summary() ?? null,
     };
   }
 
   if (delivery.status === 'HUMAN_REQUIRED') {
     emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: 'conflict', conflicts: delivery.conflicts });
+    await lifecycleManager?.onWorkflowSuspended('delivery_conflict');
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+      reason: 'The approved changes conflict with the invocation workspace.',
+      question: 'Resolve the conflicting files in the invocation workspace, then resume.',
+    });
     return {
       ...EMPTY_RESULT(),
       status: 'HUMAN_REQUIRED',
@@ -326,8 +592,15 @@ async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflo
       reason: 'The approved changes conflict with the invocation workspace.',
       question: 'Resolve the conflicting files in the invocation workspace, then resume.',
       conversations,
+      tokenUsage: usageTracker?.summary() ?? null,
     };
   }
+
+  // Delivery succeeded! Clean up resources automatically (B6)
+  if (lifecycleManager) {
+    await lifecycleManager.onWorkflowDelivered();
+  }
+  workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, { summary: loopResult.summary });
 
   emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles: delivery.changed_files ?? [] });
   return {
@@ -336,5 +609,178 @@ async function defaultPipeline({ goal, planPath, cwd, env, emit, signal, workflo
     summary: loopResult.summary ?? null,
     deliveredFiles: delivery.changed_files ?? [],
     conversations,
+    tokenUsage: usageTracker?.summary() ?? null,
   };
 }
+
+export function supergptStatus({ workflowId, root = SUPERGPT_WORKTREE_ROOT } = {}) {
+  return readLiveWorkflowState({ workflowId, root });
+}
+
+export function supergptWait({ workflowId, root = SUPERGPT_WORKTREE_ROOT, predicate, timeoutMs, intervalMs } = {}) {
+  return waitForWorkflowState({ workflowId, root, predicate, timeoutMs, intervalMs });
+}
+
+export async function supergptStop({
+  workflowId,
+  reason = 'stopped by user',
+  root = SUPERGPT_WORKTREE_ROOT,
+} = {}) {
+  if (!workflowId) throw new Error('supergptStop requires a workflowId');
+
+  const running = ACTIVE_WORKFLOWS.get(workflowId);
+  if (running) {
+    running.abortController?.abort();
+    running.workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason, stopInitiator: 'user' });
+    running.workflowStateManager?.stopHeartbeat();
+    ACTIVE_WORKFLOWS.delete(workflowId);
+  }
+
+  const liveState = readLiveWorkflowState({ workflowId, root });
+  const pidsKilled = [];
+  if (liveState && Array.isArray(liveState.activeProcesses)) {
+    for (const proc of liveState.activeProcesses) {
+      if (proc?.pid && isProcessAlive(proc.pid)) {
+        try {
+          process.kill(proc.pid, 'SIGTERM');
+          pidsKilled.push(proc.pid);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  const statePath = path.join(root, `${workflowId}.state.json`);
+  if (existsSync(statePath)) {
+    try {
+      const raw = readFileSync(statePath, 'utf8');
+      const current = JSON.parse(raw);
+      current.workflowStatus = WORKFLOW_STATUSES.STOPPED;
+      current.stoppedReason = reason;
+      current.stoppedAt = new Date().toISOString();
+      current.stopInitiator = 'user';
+      if (current.stageStatuses) {
+        if (current.stageStatuses.executor === 'running') current.stageStatuses.executor = 'stopped';
+        if (current.stageStatuses.reviewer === 'running') current.stageStatuses.reviewer = 'stopped';
+      }
+      writeFileSync(statePath, `${JSON.stringify(current, null, 2)}\n`, 'utf8');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return {
+    workflowId,
+    status: WORKFLOW_STATUSES.STOPPED,
+    reason,
+    pidsKilled,
+  };
+}
+
+export async function supergptResume({
+  workflowId,
+  answer = null,
+  cwd,
+  onEvent,
+  outputFormat,
+  signal,
+  env = process.env,
+  _pipeline = defaultPipeline,
+} = {}) {
+  if (!workflowId) throw new Error('supergptResume requires a workflowId');
+
+  const root = SUPERGPT_WORKTREE_ROOT;
+  const metadataPath = path.join(root, `${workflowId}.workspace.json`);
+  if (!existsSync(metadataPath)) {
+    throw new Error(`Cannot resume workflow "${workflowId}": workspace metadata not found at ${metadataPath}`);
+  }
+
+  let meta;
+  try {
+    meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
+  } catch (err) {
+    throw new Error(`Cannot resume workflow "${workflowId}": corrupted workspace metadata (${err.message})`);
+  }
+
+  const effectiveCwd = cwd ?? meta.source_workspace ?? meta.source_repo_root ?? process.cwd();
+
+  return runSuperGPT({
+    workflowId,
+    isResume: true,
+    answer,
+    goal: meta.goal ?? null,
+    planPath: meta.plan_path ?? null,
+    cwd: effectiveCwd,
+    onEvent,
+    outputFormat,
+    signal,
+    env,
+    _pipeline,
+  });
+}
+
+export function supergptFormatProgress(state) {
+  if (!state) return 'SUPERGPT: no active workflow';
+  const manager = new WorkflowStateManager({ workflowId: state.workflowId || 'unknown' });
+  manager.state = { ...manager.state, ...state };
+  return manager.formatProgressBlock();
+}
+
+export async function supergptPlan({
+  goal,
+  planPath,
+  cwd = process.cwd(),
+  constraints,
+  callAgy = defaultCallAgy,
+  _resolveWorkflowPlan = resolveWorkflowPlan,
+} = {}) {
+  let planArg = planPath ?? goal;
+  if (!planArg) {
+    throw new Error('supergptPlan requires either "goal" or "planPath"');
+  }
+  if (constraints) {
+    planArg = `${planArg}\n\n[Constraints]:\n${constraints}`;
+  }
+  const resolved = await _resolveWorkflowPlan({
+    planArg,
+    cwd: path.resolve(cwd),
+    callAgy,
+    log: () => {},
+  });
+
+  if (resolved.status === 'AMBIGUOUS') {
+    return {
+      status: 'AMBIGUOUS',
+      summary: null,
+      planText: null,
+      tasks: null,
+      question: resolved.question,
+    };
+  }
+
+  return {
+    status: 'READY',
+    summary: resolved.summary ?? null,
+    planText: resolved.plan ?? null,
+    tasks: resolved.tasks ?? null,
+    question: null,
+  };
+}
+
+export {
+  WorkflowStateManager,
+  WorkflowLifecycleManager,
+  UsageTracker,
+  gcSuperGptResources,
+  formatTransitionEvent,
+  toCanonicalProgress,
+  readCanonicalProgress,
+  TokenAnomalyMonitor,
+  TINY_WORKFLOW_BASELINE,
+  VERSIONED_BASELINES,
+  checkBaselineEnvironmentCompatibility,
+  OrganicReworkRecorder,
+  defaultOrganicReworkRecorder,
+  REWORK_VERIFICATION_STATUSES,
+};

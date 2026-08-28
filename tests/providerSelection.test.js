@@ -57,6 +57,16 @@ test('only AGY_REVIEWER_MODEL set -> Supervisor still falls back to its default'
   assert.equal(s.reviewerModel, 'gemini-3.6-flash-high');
 });
 
+test('Codex is an explicit Supervisor provider and does not affect the agy Reviewer', () => {
+  const s = selectProviders({
+    env: { SUPERVISOR_PROVIDER: 'codex', REVIEWER_PROVIDER: 'agy', SUPERGPT_CODEX_SUPERVISOR_MODEL: 'codex-test' },
+    callAgy: makeFakeCallAgy({}),
+    codexCall: async () => ({ text: JSON.stringify({ action: 'WORKFLOW_DONE', summary: 'done' }), usage: null, durationMs: 1 }),
+  });
+  assert.equal(s.supervisorModel, 'codex-test');
+  assert.equal(s.reviewerModel, 'gpt-oss-120b-medium');
+});
+
 test('Supervisor and Reviewer provider calls receive their OWN resolved model id', async () => {
   const supCall = makeFakeCallAgy([{ action: 'NEXT_TASK', task_card: validTaskCardObject() }]);
   const revCall = makeFakeCallAgy([{ decision: 'PASS', findings: [], required_changes: [], rationale: 'ok' }]);
@@ -79,18 +89,44 @@ test('Supervisor and Reviewer provider calls receive their OWN resolved model id
   assert.equal(revCall.calls[0].model, 'gpt-oss-120b-medium');
 });
 
-test('fail closed: supervisor provider not agy', () => {
-  assert.throws(
-    () => selectProviders({ env: { SUPERVISOR_PROVIDER: 'chrome', REVIEWER_PROVIDER: 'agy' } }),
-    /requires SUPERVISOR_PROVIDER=agy and REVIEWER_PROVIDER=agy/,
-  );
+test('legacy fixed-provider environment values do not bypass role routing', () => {
+  const selected = selectProviders({ env: { SUPERVISOR_PROVIDER: 'chrome', REVIEWER_PROVIDER: 'agy' } });
+  assert.ok(selected.runtime);
 });
 
-test('fail closed: reviewer provider unset', () => {
-  assert.throws(
-    () => selectProviders({ env: { SUPERVISOR_PROVIDER: 'agy' } }),
-    /requires SUPERVISOR_PROVIDER=agy and REVIEWER_PROVIDER=agy/,
-  );
+test('role routing has safe defaults when legacy provider variables are absent', () => {
+  const selected = selectProviders({ env: {} });
+  assert.ok(selected.runtime);
+});
+
+test('Planner physical invocation records native usage exactly once with immutable call identity', async () => {
+  const { UsageTracker } = await import('../src/orchestrator/usageTracker.js');
+  const usageTracker = new UsageTracker();
+  const selected = selectProviders({
+    env: { SUPERGPT_CODEX_MODEL: 'codex-planner-test' },
+    usageTracker,
+    codexCall: async () => ({
+      text: JSON.stringify({ status: 'READY' }),
+      usage: { input_tokens: 101, output_tokens: 17, cache_read_tokens: 9 },
+      durationMs: 7,
+    }),
+  });
+
+  await selected.runtime.invoke('planner', {
+    resolve: async (call) => call({ prompt: 'plan the work' }),
+  });
+
+  assert.equal(usageTracker.records.length, 1);
+  const [record] = usageTracker.records;
+  assert.equal(record.role, 'planner');
+  assert.match(record.callId, /^call-codex-plan-/);
+  assert.equal(record.requestedFamily, 'codex:default');
+  assert.equal(record.resolvedModel, 'codex-planner-test');
+  assert.equal(record.inputTokens, 101);
+  assert.equal(record.outputTokens, 17);
+  assert.equal(record.cachedTokens, 9);
+  assert.deepEqual(record.providerMetadata, { provider: 'codex', conversationId: null, exitCode: null });
+  assert.equal(usageTracker.summary().planner.calls, 1);
 });
 
 test('nullWindowSession opens nothing and satisfies the loop tab invariant', async () => {

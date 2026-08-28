@@ -119,7 +119,6 @@ test('claude executor adapter: parses a DONE report into execution_report shape'
   assert.equal(calls.length, 1);
   assert.equal(calls[0].command, 'claude');
 });
-
 test('claude executor adapter: sends the Task Card as the prompt over stdin', async () => {
   const { spawn } = makeFakeSpawn({ stdout: reportText() });
   let writtenChild;
@@ -259,4 +258,54 @@ test('claude executor adapter: a hung process throws EXECUTOR_TIMEOUT', async ()
     assert.equal(err.code, ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT);
     return true;
   });
+});
+
+test('claude executor adapter: extracts usage and cost from json output and triggers process hooks', async () => {
+  const jsonStdout = JSON.stringify({
+    result: reportText({ status: 'DONE' }),
+    total_cost_usd: 0.05,
+    usage: {
+      input_tokens: 4200,
+      output_tokens: 350,
+      cache_read_input_tokens: 1500,
+      cache_creation_input_tokens: 500,
+    },
+    modelUsage: {
+      'claude-sonnet-5': { inputTokens: 4200, outputTokens: 350 },
+    },
+  });
+
+  const activityEvents = [];
+  let startedPid = null;
+  const { spawn, calls } = makeFakeSpawn({ stdout: jsonStdout });
+
+  const adapter = createClaudeExecutorAdapter({
+    model: 'sonnet',
+    spawn: (...args) => {
+      const child = spawn(...args);
+      child.pid = 9999;
+      return child;
+    },
+    onActivity: (act) => activityEvents.push(act),
+    onProcessStarted: (pid) => { startedPid = pid; },
+  });
+
+  const report = await adapter.execute(demoTaskCard());
+
+  assert.equal(report.status, 'DONE');
+  assert.equal(report.costUsd, 0.05);
+  assert.equal(report.model, 'claude-sonnet-5');
+  assert.deepEqual(report.usage, {
+    input_tokens: 4200,
+    output_tokens: 350,
+    cache_read_tokens: 1500,
+    cache_creation_tokens: 500,
+    total_tokens: 4550,
+  });
+  assert.equal(startedPid, 9999);
+  assert.ok(activityEvents.length > 0);
+  assert.ok(calls[0].args.includes('--model'));
+  assert.ok(calls[0].args.includes('sonnet'));
+  assert.ok(calls[0].args.includes('--output-format'));
+  assert.ok(calls[0].args.includes('json'));
 });

@@ -18,7 +18,7 @@ async function connect(overrides = {}) {
   return client;
 }
 
-test('lists supergpt_run, supergpt_plan, and supergpt_status with schemas', async () => {
+test('lists the frontend-neutral prepare/run/plan/status contract with schemas', async () => {
   const client = await connect({
     runSuperGptFn: async () => ({}),
     resolveWorkflowPlanFn: async () => ({}),
@@ -26,11 +26,23 @@ test('lists supergpt_run, supergpt_plan, and supergpt_status with schemas', asyn
   });
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
-  assert.deepEqual(names, ['supergpt_plan', 'supergpt_run', 'supergpt_status']);
+  assert.deepEqual(names, [
+    'supergpt_plan',
+    'supergpt_prepare',
+    'supergpt_resume',
+    'supergpt_run',
+    'supergpt_start',
+    'supergpt_status',
+    'supergpt_stop',
+    'supergpt_wait',
+  ]);
 
   const plan = tools.find((t) => t.name === 'supergpt_plan');
   assert.deepEqual(Object.keys(plan.inputSchema.properties).sort(), ['cwd', 'goal']);
   assert.ok(plan.inputSchema.required.includes('goal'));
+
+  const prepare = tools.find((t) => t.name === 'supergpt_prepare');
+  assert.ok(prepare.description.includes('Task Cards'));
 
   const run = tools.find((t) => t.name === 'supergpt_run');
   assert.deepEqual(Object.keys(run.inputSchema.properties).sort(), ['cwd', 'goal', 'planPath']);
@@ -193,4 +205,66 @@ test('readWorkflowStatus parses *.workspace.json, skips junk, and filters by id'
     readTextFile: async (p) => files[p.split('/').pop()],
   });
   assert.deepEqual(one.map((w) => w.workflow_id), ['wf-agy-1']);
+});
+
+test('supergpt_resume invokes resumeSuperGptFn with workflowId and answer', async () => {
+  let calledWith = null;
+  const client = await connect({
+    resumeSuperGptFn: async (args) => {
+      calledWith = args;
+      return { status: 'WORKFLOW_DONE', summary: 'resumed ok', deliveredFiles: ['a.txt'] };
+    },
+  });
+
+  const res = await client.callTool({
+    name: 'supergpt_resume',
+    arguments: { workflowId: 'wf-test-res', answer: 'use Option A' },
+  });
+
+  assert.equal(calledWith.workflowId, 'wf-test-res');
+  assert.equal(calledWith.answer, 'use Option A');
+  assert.equal(res.structuredContent.status, 'WORKFLOW_DONE');
+  assert.equal(res.structuredContent.summary, 'resumed ok');
+  await client.close();
+});
+
+test('supergpt_stop invokes stopSuperGptFn with workflowId and reason', async () => {
+  let calledWith = null;
+  const client = await connect({
+    stopSuperGptFn: async (args) => {
+      calledWith = args;
+      return { workflowId: args.workflowId, status: 'STOPPED', reason: args.reason, pidsKilled: [123] };
+    },
+  });
+
+  const res = await client.callTool({
+    name: 'supergpt_stop',
+    arguments: { workflowId: 'wf-test-stop', reason: 'user cancelled' },
+  });
+
+  assert.equal(calledWith.workflowId, 'wf-test-stop');
+  assert.equal(calledWith.reason, 'user cancelled');
+  assert.equal(res.structuredContent.status, 'STOPPED');
+  assert.deepEqual(res.structuredContent.pidsKilled, [123]);
+  await client.close();
+});
+
+test('supergpt_wait invokes waitSuperGptFn and returns formattedProgress', async () => {
+  let calledWith = null;
+  const client = await connect({
+    waitSuperGptFn: async (args) => {
+      calledWith = args;
+      return { workflowStatus: 'DONE', stage: 'DONE', workflowId: args.workflowId };
+    },
+  });
+
+  const res = await client.callTool({
+    name: 'supergpt_wait',
+    arguments: { workflowId: 'wf-test-wait', timeoutMs: 5000, targetStatus: 'DONE' },
+  });
+
+  assert.equal(calledWith.workflowId, 'wf-test-wait');
+  assert.equal(res.structuredContent.status, 'DONE');
+  assert.match(res.structuredContent.formattedProgress, /SUPERGPT ⟳ DONE/);
+  await client.close();
 });

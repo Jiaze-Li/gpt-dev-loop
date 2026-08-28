@@ -69,6 +69,82 @@ ${repositoryState}`,
   };
 }
 
+export const CLAUDE_MODELS = Object.freeze({
+  DEFAULT: 'sonnet',
+  ESCALATED: 'opus',
+});
+
+const ARCHITECTURAL_RE = /\b(architectural(\s+refactor|\s+change|\s+redesign)?|high\s+complexity|cross-cutting|deep\s+debugging|security-critical)\b/i;
+
+/**
+ * Deterministic classifier for Claude executor model selection (A5).
+ * Defaults to Sonnet; escalates to Opus when justified.
+ */
+export function classifyExecutorModel(taskCard, { sessionNumber = 1, feedback = '', env = process.env } = {}) {
+  const defaultModel = env?.CLAUDE_DEFAULT_MODEL || CLAUDE_MODELS.DEFAULT;
+  const escalatedModel = env?.CLAUDE_ESCALATED_MODEL || CLAUDE_MODELS.ESCALATED;
+
+  if (env?.FORCE_CLAUDE_MODEL) {
+    return {
+      model: env.FORCE_CLAUDE_MODEL,
+      escalated: env.FORCE_CLAUDE_MODEL === escalatedModel,
+      escalationReason: 'forced via FORCE_CLAUDE_MODEL environment variable',
+    };
+  }
+
+  if (taskCard?.executor_model) {
+    const isEsc = taskCard.executor_model === escalatedModel;
+    return {
+      model: taskCard.executor_model,
+      escalated: isEsc,
+      escalationReason: isEsc ? 'explicitly requested in task card' : null,
+    };
+  }
+
+  // 1. Explicit high complexity or architectural flags
+  if (taskCard?.complexity === 'high' || taskCard?.complexity === 'complex' || taskCard?.high_risk === true || taskCard?.architectural === true) {
+    return {
+      model: escalatedModel,
+      escalated: true,
+      escalationReason: 'task explicitly classified as high complexity/architectural risk',
+    };
+  }
+
+  // 2. Goal or scope text indicates architectural complexity or cross-cutting refactor
+  const combinedText = `${taskCard?.goal ?? ''} ${taskCard?.scope ?? ''}`;
+  if (ARCHITECTURAL_RE.test(combinedText)) {
+    return {
+      model: escalatedModel,
+      escalated: true,
+      escalationReason: 'task goal or scope indicates architectural complexity',
+    };
+  }
+
+  // 3. Repeated valid REWORK: if sessionNumber >= 3, default executor is struggling
+  if (sessionNumber >= 3) {
+    return {
+      model: escalatedModel,
+      escalated: true,
+      escalationReason: `repeated rework (attempt ${sessionNumber}) indicates default executor is insufficient`,
+    };
+  }
+
+  // 4. Feedback from previous attempt indicates deep debugging required
+  if (sessionNumber > 1 && feedback && ARCHITECTURAL_RE.test(feedback)) {
+    return {
+      model: escalatedModel,
+      escalated: true,
+      escalationReason: 'rework feedback indicates difficult debugging/architectural issues',
+    };
+  }
+
+  return {
+    model: defaultModel,
+    escalated: false,
+    escalationReason: null,
+  };
+}
+
 export function createClaudeSessionManager({
   workflowId,
   taskId,
@@ -76,6 +152,10 @@ export function createClaudeSessionManager({
   createExecutor = createClaudeExecutorAdapter,
   cwd = process.cwd(),
   spawn = nodeSpawn,
+  env = process.env,
+  onRoutingDecision,
+  onProcessStarted,
+  onProcessExited,
 } = {}) {
   let sessionCount = 0;
 
@@ -84,19 +164,67 @@ export function createClaudeSessionManager({
       sessionCount += 1;
       const sessionNumber = sessionCount;
 
+      let feedback = 'none recorded';
       let taskCardForSession = taskCard;
       if (sessionNumber > 1) {
-        const state = await persistence.readState(workflowId, taskId);
-        const feedback = state?.last_error ?? 'none recorded';
+        const state = await persistence?.readState?.(workflowId, taskId);
+        feedback = state?.last_error ?? 'none recorded';
         const repositoryState = await currentRepositoryState({ cwd, spawn });
         taskCardForSession = buildReworkTaskCard(taskCard, { sessionNumber, feedback, repositoryState });
+      }
+
+      const routing = classifyExecutorModel(taskCard, { sessionNumber, feedback, env });
+
+      if (typeof onRoutingDecision === 'function') {
+        try {
+          onRoutingDecision({
+            workflowId,
+            taskId,
+            sessionNumber,
+            ...routing,
+          });
+        } catch {
+          /* ignore callback error */
+        }
+      }
+
+      if (persistence && typeof persistence.writeState === 'function') {
+        try {
+          await persistence.writeState({
+            workflow_id: workflowId,
+            task_id: taskId,
+            executor_model: routing.model,
+            model_escalated: routing.escalated,
+            escalation_reason: routing.escalationReason,
+          });
+        } catch {
+          /* best effort state recording */
+        }
       }
 
       // A fresh executor per call: starts a new Claude session, waits for
       // it to finish, and collects its Execution Report. Never reuses a
       // previous call's executor/process.
-      const executor = createExecutor({ cwd });
-      return executor.execute(taskCardForSession);
+      const processContext = { role: 'executor', taskId, attempt: sessionNumber, provider: 'claude', requestedFamily: 'claude:default', resolvedModel: routing.model };
+      const executor = createExecutor({
+        cwd, model: routing.model,
+        onProcessStarted: (pid) => onProcessStarted?.({ ...processContext, pid }),
+        onProcessExited: (details) => onProcessExited?.({ ...processContext, ...details }),
+      });
+      const report = await executor.execute(taskCardForSession);
+
+      // Ensure report has routing metadata attached
+      try {
+        Object.defineProperties(report, {
+          model: { value: report.model || routing.model, writable: true, configurable: true, enumerable: false },
+          modelEscalated: { value: routing.escalated, writable: true, configurable: true, enumerable: false },
+          escalationReason: { value: routing.escalationReason, writable: true, configurable: true, enumerable: false },
+        });
+      } catch {
+        /* best effort */
+      }
+
+      return report;
     },
   };
 }

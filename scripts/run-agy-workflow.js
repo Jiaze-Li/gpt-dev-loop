@@ -351,7 +351,9 @@ async function main() {
     return defaultCallAgy(opts);
   };
 
-  const persistence = new Persistence(path.join(repoRoot, '.gpt-dev-loop', 'workflows'));
+  // Runtime/provider state belongs to SuperGPT's owned runtime root, not the
+  // invocation worktree (whose untracked changes are eligible for delivery).
+  const persistence = new Persistence(path.join(SUPERGPT_WORKTREE_ROOT, workflowId, 'persistence'));
 
   let selection;
   try {

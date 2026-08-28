@@ -8,6 +8,7 @@
 // executor in is the caller's job.
 
 import { spawn as nodeSpawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
 
 const REPORT_FIELDS = [
@@ -52,7 +53,11 @@ function parseRepositoryContext(raw) {
 }
 
 // TASK_PROTOCOL.md §3 template, filled from the in-memory task_card object.
-function renderTaskCard(taskCard) {
+export function renderTaskCard(taskCard) {
+  const rework = taskCard.rework_feedback;
+  const reworkFeedback = rework
+    ? `\n\n## rework_feedback\nThis is a rework attempt. Correct these Reviewer-identified issues; do not preserve an intentional first-attempt defect.\n\nfindings:\n${renderList(rework.findings)}\n\nrequired_changes:\n${renderList(rework.required_changes)}\n\nrationale:\n${rework.rationale ?? 'none'}`
+    : '';
   return `## task_id
 ${taskCard.task_id}
 
@@ -81,13 +86,13 @@ ${renderList(taskCard.acceptance_criteria)}
 ${renderList((taskCard.verification_commands ?? []).map((command) => `\`${command}\``))}
 
 ## completion_signal
-${taskCard.completion_signal}`;
+${taskCard.completion_signal}${reworkFeedback}`;
 }
 
 // Instructs the CLI to act as Executor and reply with nothing but an
 // EXECUTION_REPORT.md §3-shaped document, so parseExecutionReport can
 // recover it deterministically.
-function buildPrompt(taskCard) {
+export function buildPrompt(taskCard) {
   return `You are the Executor in an automated dev loop. Act on the Task Card below exactly as scoped — respect allowed_files/forbidden_files and acceptance_criteria — then run the listed verification_commands yourself.
 
 Reply with ONLY an Execution Report: one Markdown document, one "## field_name" heading per field, in exactly this order: task_id, repository_context, status, changed_files, tests_run, test_results, issues, next_recommendation. repository_context.commit_sha must be the commit you actually left the repo at, which is not necessarily the Task Card's commit_sha. No text before or after it.
@@ -137,7 +142,7 @@ function parseList(raw) {
 
 // Splits the executor's reply on "## field_name" headings (TASK_PROTOCOL.md
 // §1 convention) and validates it against EXECUTION_REPORT.md §2.
-function parseExecutionReport(taskId, text) {
+export function parseExecutionReport(taskId, text) {
   const headingRe = /^##\s+(\w+)\s*$/gm;
   const matches = [...text.matchAll(headingRe)];
   if (matches.length === 0) {
@@ -190,14 +195,23 @@ function parseExecutionReport(taskId, text) {
   };
 }
 
-function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn }) {
+function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActivity, onProcessStarted, onProcessExited }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
       child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (err) {
+      onProcessExited?.({ spawnError: err.message, timeoutDurationMs: timeoutMs });
       reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not start "${command}": ${err.message}`));
       return;
+    }
+
+    if (typeof onProcessStarted === 'function' && child.pid) {
+      try {
+        onProcessStarted(child.pid);
+      } catch {
+        /* ignore hook errors */
+      }
     }
 
     const stdoutChunks = [];
@@ -219,15 +233,40 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn }) {
 
     child.on('error', (err) => {
       finish(() =>
+        (onProcessExited?.({ pid: child.pid ?? null, spawnError: err.message, timeoutDurationMs: timeoutMs }),
         reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not run "${command}": ${err.message}`))
+        )
       );
     });
 
-    child.stdout?.on('data', (chunk) => stdoutChunks.push(chunk));
-    child.stderr?.on('data', (chunk) => stderrChunks.push(chunk));
+    child.stdout?.on('data', (chunk) => {
+      stdoutChunks.push(chunk);
+      if (typeof onActivity === 'function') {
+        try {
+          onActivity({ stream: 'stdout', chunk });
+        } catch {
+          /* ignore hook errors */
+        }
+      }
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderrChunks.push(chunk);
+      if (typeof onActivity === 'function') {
+        try {
+          onActivity({ stream: 'stderr', chunk });
+        } catch {
+          /* ignore hook errors */
+        }
+      }
+    });
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       finish(() => {
+        onProcessExited?.({
+          pid: child.pid ?? null, exitCode: code, signal: signal ?? null,
+          timeoutInitiator: timedOut ? 'internal' : null, timeoutDurationMs: timedOut ? timeoutMs : null,
+          stdoutTail: Buffer.concat(stdoutChunks).toString('utf8'), stderrTail: Buffer.concat(stderrChunks).toString('utf8'),
+        });
         if (timedOut) {
           reject(
             new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`)
@@ -253,16 +292,41 @@ export function createClaudeExecutorAdapter({
   // must be pre-authorized or every task reports BLOCKED before it can
   // touch allowed_files. acceptEdits still leaves Bash and other
   // permission classes gated normally — only file edits are auto-accepted.
-  args = ['-p', '--output-format', 'text', '--permission-mode', 'acceptEdits'],
+  args,
+  model = 'sonnet',
   cwd = process.cwd(),
   env = process.env,
   timeoutMs = 10 * 60 * 1000,
   spawn = nodeSpawn,
+  onActivity,
+  onProcessStarted,
+  onProcessExited,
 } = {}) {
+  const resolvedArgs = args ?? [
+    '-p',
+    '--output-format',
+    'json',
+    '--permission-mode',
+    'acceptEdits',
+    ...(model ? ['--model', model] : []),
+  ];
+
   return {
+    model,
     async execute(taskCard) {
       const prompt = buildPrompt(taskCard);
-      const result = await runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn });
+      const result = await runProcess({
+        command,
+        args: resolvedArgs,
+        cwd,
+        env,
+        prompt,
+        timeoutMs,
+        spawn,
+        onActivity,
+        onProcessStarted,
+        onProcessExited,
+      });
 
       if (result.code !== 0) {
         throw new AdapterError(
@@ -271,7 +335,66 @@ export function createClaudeExecutorAdapter({
         );
       }
 
-      return parseExecutionReport(taskCard.task_id, result.stdout);
+      let reportText = result.stdout;
+      let usage = null;
+      let costUsd = null;
+      let modelUsed = model;
+
+      try {
+        const parsed = JSON.parse(result.stdout.trim());
+        if (parsed && typeof parsed === 'object') {
+          if (typeof parsed.result === 'string') {
+            reportText = parsed.result;
+          }
+          if (parsed.usage && typeof parsed.usage === 'object') {
+            usage = {
+              input_tokens: parsed.usage.input_tokens ?? 0,
+              output_tokens: parsed.usage.output_tokens ?? 0,
+              cache_read_tokens: parsed.usage.cache_read_input_tokens ?? 0,
+              cache_creation_tokens: parsed.usage.cache_creation_input_tokens ?? 0,
+              total_tokens: (parsed.usage.input_tokens ?? 0) + (parsed.usage.output_tokens ?? 0),
+            };
+          }
+          if (Number.isFinite(parsed.total_cost_usd)) {
+            costUsd = parsed.total_cost_usd;
+          }
+          if (parsed.modelUsage && typeof parsed.modelUsage === 'object') {
+            const keys = Object.keys(parsed.modelUsage);
+            if (keys.length > 0) modelUsed = keys[0];
+          }
+        }
+      } catch {
+        /* plain text fallback */
+      }
+
+      const report = parseExecutionReport(taskCard.task_id, reportText);
+      const callId = `call-claude-exe-${randomUUID()}`;
+      try {
+        Object.defineProperty(report, 'callId', {
+          value: callId,
+          writable: true,
+          configurable: true,
+          enumerable: false,
+        });
+      } catch {
+        report.callId = callId;
+      }
+      if (usage) {
+        try {
+          Object.defineProperty(usage, 'callId', {
+            value: callId,
+            writable: true,
+            configurable: true,
+            enumerable: false,
+          });
+        } catch {
+          usage.callId = callId;
+        }
+        report.usage = usage;
+      }
+      if (costUsd !== null) report.costUsd = costUsd;
+      if (usage || costUsd !== null) report.model = modelUsed;
+      return report;
     },
   };
 }

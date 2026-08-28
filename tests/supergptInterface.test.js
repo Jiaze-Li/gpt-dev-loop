@@ -24,7 +24,7 @@ function collector() {
   return { events, onEvent: (e) => events.push(e) };
 }
 
-test('SUPERGPT_EVENTS carries exactly the 12 documented event types', () => {
+test('SUPERGPT_EVENTS carries the documented event types', () => {
   assert.deepEqual(
     new Set(Object.values(SUPERGPT_EVENTS)),
     new Set([
@@ -39,6 +39,9 @@ test('SUPERGPT_EVENTS carries exactly the 12 documented event types', () => {
       'human_required',
       'delivery_succeeded',
       'delivery_failed',
+      'token_anomaly_detected',
+      'supervisor_provider_failed',
+      'supervisor_provider_switched',
       'workflow_finished',
     ]),
   );

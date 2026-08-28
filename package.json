@@ -1,31 +1,27 @@
 {
   "name": "gpt-dev-loop",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
-  "description": "Phase 1 PoC: deterministic text handshake between local code and an authenticated ChatGPT web session.",
+  "description": "SuperGPT V1: local autonomous coding workflow with role-routed providers and deterministic delivery.",
   "type": "module",
   "bin": {
-    "gpt-loop": "./bin/gpt-loop.js",
     "supergpt": "bin/supergpt.js",
-    "supergpt-mcp": "bin/supergpt-mcp.js",
-    "gpt-loop-mcp": "./bin/gpt-loop-mcp.js",
-    "gpt-loop-run": "./bin/gpt-loop-run.js"
+    "supergpt-mcp": "bin/supergpt-mcp.js"
   },
   "scripts": {
-    "ask": "node ./bin/gpt-loop.js ask",
     "doctor": "node ./scripts/doctor.js",
-    "mcp": "node ./bin/gpt-loop-mcp.js",
     "test": "node --test tests/*.test.js",
-    "test:cdp-live": "node ./scripts/test-cdp-live.js",
-    "test:delete-conversation-live": "node ./scripts/test-delete-conversation-live.js"
+    "install-global": "node ./bin/install-plugin.js",
+    "uninstall-global": "node ./bin/install-plugin.js --uninstall",
+    "benchmark": "node ./bin/benchmark-tokens.js",
+    "benchmark:live": "node ./bin/benchmark-tokens.js --live",
+    "probe:provider-overhead": "node ./bin/probe-provider-overhead.js"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "playwright": "^1.47.0",
-    "ws": "^8.21.3",
     "zod": "^4.4.3"
   }
 }

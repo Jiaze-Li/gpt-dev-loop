@@ -24,6 +24,7 @@
 // renderEvidence so the Reviewer sees the exact same rendered inputs the
 // Chrome Reviewer does — no second rendering path.
 
+import { randomUUID } from 'node:crypto';
 import { callAgy as defaultCallAgy } from '../../agy/agyClient.js';
 import {
   AgyTimeoutError,
@@ -43,11 +44,17 @@ function invalid(message) {
   return new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT, message);
 }
 
-export function buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt } = {}) {
+export function buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
+  const checkpointBlock = checkpoint && Array.isArray(checkpoint.prior_required_changes)
+    ? `\n## Structured Prior Finding (continuity only)
+Prior required changes are not current evidence and must not be repeated mechanically. Mark one resolved when this attempt's evidence demonstrates resolution; emit REWORK only for a currently unresolved finding.
+${checkpoint.prior_required_changes.length ? checkpoint.prior_required_changes.map((o) => `- ${o}`).join('\n') : '- none'}\n`
+    : '';
+
   return `You are the Reviewer in an automated development loop. Judge whether the Execution Report satisfies the Task Card's acceptance_criteria, using the evidence. Judge intent-alignment — do not merely restate the gate pass/fail shown in the evidence.
 
 This is attempt ${attempt ?? 'unknown'} for this task.
-
+${checkpointBlock}
 Reply with ONLY one JSON object, no prose, no code fence. Shape:
 
 {
@@ -144,8 +151,8 @@ export function createAgyReviewerProvider({
     // exactly it. The returned Review Result carries `conversationId` — the
     // id agy actually used — so the caller can capture it on the first
     // review() and reuse it for every rework of the same task.
-    async review(taskCard, executionReport, evidence, { attempt, conversationId } = {}) {
-      const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt });
+    async review(taskCard, executionReport, evidence, { attempt, conversationId, checkpoint } = {}) {
+      const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
 
       let result;
       try {
@@ -162,10 +169,22 @@ export function createAgyReviewerProvider({
         if (err instanceof AgyStructuredOutputError) throw invalid(err.message);
         throw err;
       }
-      return {
+      const callId = `call-agy-rev-${randomUUID()}`;
+      const reviewResult = {
         ...parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null),
         conversationId: result.conversationId ?? null,
       };
+      const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };
+      try {
+        Object.defineProperties(reviewResult, {
+          callId: { value: callId, writable: true, configurable: true, enumerable: false },
+          usage: { value: usageWithCallId, writable: true, configurable: true, enumerable: false },
+          durationMs: { value: result.durationMs ?? null, writable: true, configurable: true, enumerable: false },
+        });
+      } catch {
+        /* best effort */
+      }
+      return reviewResult;
     },
   };
 }

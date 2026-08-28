@@ -1,4 +1,4 @@
-# Phase 1 — Usage
+# HISTORY / LEGACY — Phase 1 browser-bridge usage
 
 This covers only the Phase 1 handshake PoC described in `PHASE-1-HANDSHAKE.md`.
 It does not describe the Claude/Codex adapters or the review loop — those are

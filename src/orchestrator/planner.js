@@ -243,6 +243,7 @@ Reply with ONLY one JSON object, no prose, no code fence. Shape:
 }
 
 Rules:
+- The "status" property must be exactly "READY" or "AMBIGUOUS" (never "SUCCESS", "DONE", or other strings).
 - Use AMBIGUOUS only for a genuine architecture / product / scope decision you cannot responsibly make from the repository context. A merely underspecified detail you can reasonably choose is NOT ambiguous.
 - Every READY task must name concrete allowed_files and at least one verification command that exits non-zero on failure.
 - Keep the plan bounded: the smallest set of tasks that satisfies the instruction.

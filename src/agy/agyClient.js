@@ -139,6 +139,8 @@ function extractText(json) {
  * @param {string} [opts.executable]        binary name/path (default "agy")
  * @param {string} [opts.jsonSchema]        value for --json-schema
  * @param {string} [opts.conversationId]    resume this conversation (fail-closed)
+ * @param {boolean} [opts.disableSlashCommands] disable agy slash/skill expansion
+ * @param {string} [opts.agent]             optional dedicated agy agent name
  * @param {string} [opts.cwd]               working dir for the child
  * @param {Function} [opts.spawn]           injectable spawn (for tests)
  * @returns {Promise<{model:string, exitCode:number, text:string|null,
@@ -152,6 +154,8 @@ export async function callAgy({
   executable = 'agy',
   jsonSchema,
   conversationId,
+  disableSlashCommands = true,
+  agent,
   cwd,
   spawn = nodeSpawn,
 } = {}) {
@@ -177,9 +181,10 @@ export async function callAgy({
   const args = [
     `--print=${prompt}`,
     '--output-format', 'json',
-    '--disable-slash-commands',
     '--model', model,
   ];
+  if (disableSlashCommands) args.push('--disable-slash-commands');
+  if (typeof agent === 'string' && agent.trim() !== '') args.push('--agent', agent.trim());
   if (typeof jsonSchema === 'string' && jsonSchema.length > 0) {
     args.push('--json-schema', jsonSchema);
   }
@@ -283,6 +288,8 @@ export async function callAgy({
     }
   }
 
+  const usage = json && typeof json === 'object' && json.usage && typeof json.usage === 'object' ? json.usage : null;
+
   return {
     model,
     exitCode: code,
@@ -291,5 +298,6 @@ export async function callAgy({
     stdout: trimmed,
     durationMs: Date.now() - startedAt,
     conversationId: returnedConversationId,
+    usage,
   };
 }
