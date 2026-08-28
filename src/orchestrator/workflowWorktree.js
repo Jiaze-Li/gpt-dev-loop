@@ -51,6 +51,10 @@ import { realpathSync, existsSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { createWorkspaceSnapshot, WorkspaceSnapshotError } from './workspaceSnapshot.js';
+
+export { WorkspaceSnapshotError };
+
 // Default SuperGPT-managed location — outside any user working tree.
 export const SUPERGPT_WORKTREE_ROOT = path.join(os.homedir(), '.supergpt', 'worktrees');
 
@@ -108,6 +112,10 @@ export function createWorkflowWorktree({
   gitBin = 'git',
   spawn = nodeSpawn,
   worktreeRoot = SUPERGPT_WORKTREE_ROOT,
+  // Collaborator that captures the invocation workspace's dirty state and
+  // re-applies it as a snapshot commit inside the new worktree. Injectable
+  // for tests; defaults to the real git-backed implementation.
+  snapshot = createWorkspaceSnapshot({ gitBin, spawn }),
 } = {}) {
   async function git(args, cwd) {
     let result;
@@ -240,6 +248,32 @@ export function createWorkflowWorktree({
         /* best-effort for synthetic or restricted test environments */
       }
 
+      // --- invocation workspace snapshot --------------------------------
+      //
+      // The worktree is currently a pristine checkout of baselineHead. The
+      // user may have been running SuperGPT with staged/unstaged/untracked
+      // changes in the invocation workspace — that IS the target project
+      // state. Re-apply it as a single snapshot commit so the isolated
+      // worktree reflects the user's real starting point, then treat the
+      // snapshot commit as the baseline everything downstream diffs against.
+      // Any failure here (size guard, patch conflict) is pre-execution:
+      // tear the half-built worktree down and fail closed.
+      let effectiveBaseline = baselineHead;
+      let snapshotResult = null;
+      try {
+        snapshotResult = await snapshot.captureAndApply({
+          sourceCwd,
+          worktreePath,
+          baselineHead,
+        });
+        if (snapshotResult && snapshotResult.snapshot_commit) {
+          effectiveBaseline = snapshotResult.snapshot_commit;
+        }
+      } catch (err) {
+        await safeRemoveWorktree(worktreePath, sourceRepoRoot);
+        throw err;
+      }
+
       // --- mechanical invariant verification (fail closed) ---------------
       //
       // The worktree now exists on disk. Any invariant failure below is a
@@ -282,10 +316,10 @@ export function createWorkflowWorktree({
         }
 
         const wtHeadResult = await git(['rev-parse', 'HEAD'], worktreePath);
-        if (wtHeadResult.code !== 0 || wtHeadResult.stdout.trim() !== baselineHead) {
+        if (wtHeadResult.code !== 0 || wtHeadResult.stdout.trim() !== effectiveBaseline) {
           invariant(
             'baseline_head',
-            `the new worktree's HEAD "${wtHeadResult.stdout.trim()}" does not equal the captured workflow baseline "${baselineHead}"`,
+            `the new worktree's HEAD "${wtHeadResult.stdout.trim()}" does not equal the captured workflow baseline "${effectiveBaseline}"`,
             { worktree_path: worktreePath }
           );
         }
@@ -316,8 +350,15 @@ export function createWorkflowWorktree({
         // linked worktree of this repo shares.
         repository_identity: repositoryIdentity,
         source_branch: sourceBranch,
+        // The invocation workspace's real HEAD, before any snapshot commit.
         source_head: baselineHead,
-        baseline_head: baselineHead,
+        // What everything downstream (Git Evidence, task card) diffs against:
+        // the snapshot commit when the invocation workspace was dirty,
+        // otherwise the plain HEAD.
+        baseline_head: effectiveBaseline,
+        snapshot_commit: snapshotResult?.snapshot_commit ?? null,
+        snapshot_tracked_files: snapshotResult?.tracked ?? 0,
+        snapshot_untracked_files: snapshotResult?.untracked ?? 0,
         worktree_path: worktreePath,
       };
     },

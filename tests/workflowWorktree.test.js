@@ -7,6 +7,11 @@ import {
   WorkflowWorktreeError,
   WORKFLOW_WORKTREE_ERROR_CODES,
 } from '../src/orchestrator/workflowWorktree.js';
+import { WorkspaceSnapshotError } from '../src/orchestrator/workspaceSnapshot.js';
+
+// Default injected snapshot collaborator: the invocation workspace was
+// pristine, so nothing is applied and the baseline stays the plain HEAD.
+const PRISTINE_SNAPSHOT = { captureAndApply: async () => null };
 
 // Scripted `git`, keyed by "<cwd>::<args>" with a bare "<args>" fallback.
 function makeFakeGit(responses, { spawnError = null } = {}) {
@@ -58,9 +63,9 @@ const WT_OK = {
   [`${WT}::status --porcelain=v1`]: { stdout: '' },
 };
 
-function subject(responses, opts) {
+function subject(responses, opts, { snapshot = PRISTINE_SNAPSHOT } = {}) {
   const { spawn, calls } = makeFakeGit(responses, opts);
-  return { wt: createWorkflowWorktree({ spawn, worktreeRoot: WT_ROOT }), calls };
+  return { wt: createWorkflowWorktree({ spawn, worktreeRoot: WT_ROOT, snapshot }), calls };
 }
 
 test('primary checkout invocation: creates a SuperGPT-managed worktree and returns safe metadata', async () => {
@@ -74,6 +79,9 @@ test('primary checkout invocation: creates a SuperGPT-managed worktree and retur
     source_branch: 'main',
     source_head: HEAD,
     baseline_head: HEAD,
+    snapshot_commit: null,
+    snapshot_tracked_files: 0,
+    snapshot_untracked_files: 0,
     worktree_path: WT,
   });
   assert.ok(calls.some((c) => c.args === `worktree add --detach ${WT} ${HEAD}` && c.cwd === SRC));
@@ -100,7 +108,7 @@ test('linked worktree invocation: source_workspace stays the linked worktree, no
     [`${LWT}::status --porcelain=v1`]: { stdout: '' },
   };
   const { spawn } = makeFakeGit(responses);
-  const wt = createWorkflowWorktree({ spawn, worktreeRoot: WT_ROOT });
+  const wt = createWorkflowWorktree({ spawn, worktreeRoot: WT_ROOT, snapshot: PRISTINE_SNAPSHOT });
   const meta = await wt.establish({ sourceCwd: LINKED, workflowId: 'wf-9' });
   assert.equal(meta.source_workspace, LINKED);
   assert.equal(meta.source_repo_root, LINKED);
@@ -128,8 +136,8 @@ test('multiple linked worktrees of the same repository each isolate against thei
   const HEAD_A = 'aaaa111111111111111111111111111111111111';
   const HEAD_B = 'bbbb222222222222222222222222222222222222';
 
-  const a = createWorkflowWorktree({ spawn: makeFakeGit(mk('/src/wt-a', '/managed/wt-a-wf-a', HEAD_A, 'feat-a')).spawn, worktreeRoot: WT_ROOT });
-  const b = createWorkflowWorktree({ spawn: makeFakeGit(mk('/src/wt-b', '/managed/wt-b-wf-b', HEAD_B, 'feat-b')).spawn, worktreeRoot: WT_ROOT });
+  const a = createWorkflowWorktree({ spawn: makeFakeGit(mk('/src/wt-a', '/managed/wt-a-wf-a', HEAD_A, 'feat-a')).spawn, worktreeRoot: WT_ROOT, snapshot: PRISTINE_SNAPSHOT });
+  const b = createWorkflowWorktree({ spawn: makeFakeGit(mk('/src/wt-b', '/managed/wt-b-wf-b', HEAD_B, 'feat-b')).spawn, worktreeRoot: WT_ROOT, snapshot: PRISTINE_SNAPSHOT });
 
   const ma = await a.establish({ sourceCwd: '/src/wt-a', workflowId: 'wf-a' });
   const mb = await b.establish({ sourceCwd: '/src/wt-b', workflowId: 'wf-b' });
@@ -239,6 +247,50 @@ test('missing git binary: fails closed with GIT_UNAVAILABLE', async () => {
     () => wt.establish({ sourceCwd: SRC, workflowId: 'wf-1' }),
     (err) => err.code === WORKFLOW_WORKTREE_ERROR_CODES.GIT_UNAVAILABLE
   );
+});
+
+test('dirty invocation workspace: snapshot commit becomes the baseline the worktree is pinned to', async () => {
+  const SNAP = 'snap0000000000000000000000000000000000000';
+  const { spawn, calls } = makeFakeGit({
+    ...SOURCE_OK,
+    ...WT_OK,
+    // After the snapshot commit the worktree HEAD is the snapshot commit.
+    [`${WT}::rev-parse --show-toplevel`]: { stdout: `${WT}\n` },
+    [`${WT}::rev-parse --git-common-dir`]: { stdout: `${SRC}/.git\n` },
+    [`${WT}::rev-parse HEAD`]: { stdout: `${SNAP}\n` },
+    [`${WT}::status --porcelain=v1`]: { stdout: '' },
+  });
+  let received;
+  const snapshot = {
+    captureAndApply: async (args) => {
+      received = args;
+      return { snapshot_commit: SNAP, tracked: 2, untracked: 1, total_bytes: 42 };
+    },
+  };
+  const wt = createWorkflowWorktree({ spawn, worktreeRoot: WT_ROOT, snapshot });
+  const meta = await wt.establish({ sourceCwd: SRC, workflowId: 'wf-1' });
+  assert.deepEqual(received, { sourceCwd: SRC, worktreePath: WT, baselineHead: HEAD });
+  assert.equal(meta.source_head, HEAD);
+  assert.equal(meta.baseline_head, SNAP);
+  assert.equal(meta.snapshot_commit, SNAP);
+  assert.equal(meta.snapshot_tracked_files, 2);
+  assert.equal(meta.snapshot_untracked_files, 1);
+  assert.ok(!calls.some((c) => c.args.startsWith('worktree remove')));
+});
+
+test('snapshot guard failure (oversized file) fails closed and tears the worktree down', async () => {
+  const { spawn, calls } = makeFakeGit({ ...SOURCE_OK, ...WT_OK });
+  const snapshot = {
+    captureAndApply: async () => {
+      throw new WorkspaceSnapshotError('EXCESSIVE_FILE_SIZE', 'file too big', { path: 'big.bin' });
+    },
+  };
+  const wt = createWorkflowWorktree({ spawn, worktreeRoot: WT_ROOT, snapshot });
+  await assert.rejects(
+    () => wt.establish({ sourceCwd: SRC, workflowId: 'wf-1' }),
+    (err) => err instanceof WorkspaceSnapshotError && err.code === 'EXCESSIVE_FILE_SIZE'
+  );
+  assert.ok(calls.some((c) => c.args === `worktree remove --force ${WT}` && c.cwd === SRC));
 });
 
 test('establish() requires a workflow id (no silent default)', async () => {
