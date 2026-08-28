@@ -242,3 +242,15 @@ test('captureTerminalSnapshot & generateTerminalAcceptanceReport: terminal snaps
   assert.equal(report2.acceptance, 'PASS');
   assert.deepEqual(report1, report2);
 });
+
+test('terminal acceptance is PASS only for DONE, never any other terminal status', () => {
+  for (const status of ['HUMAN_REQUIRED', 'FAILED', 'TIMEOUT', 'STALLED', 'STOPPED']) {
+    const report = generateTerminalAcceptanceReport({ state: {
+      workflowId: `wf-${status}`, workflowStatus: status, stage: status,
+      activeProcesses: [], taskAttempts: [], tokenUsage: {},
+    } });
+    assert.notEqual(report.acceptance, 'PASS', status);
+    assert.equal(report.acceptance, 'NOT_ACCEPTED', status);
+    assert.equal(report.valid, false, status);
+  }
+});

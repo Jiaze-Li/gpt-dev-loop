@@ -72,3 +72,14 @@ test('adapter attaches observation immediately when a frontend start returns wor
   assert.match(messages[0], /SuperGPT.*Task 1\/2/);
   result.observer.stop();
 });
+
+test('adapter uses the public control-service start path and survives observer disconnect/reattach', async () => {
+  const messages = []; let starts = 0;
+  const service = { start: async () => { starts += 1; return { workflowId: 'wf-public', status: 'RUNNING' }; }, status: () => state({ workflowId: 'wf-public' }) };
+  const adapter = new GenericFrontendAdapter({ controlService: service });
+  const started = await adapter.startAndObserve({ render: (message) => messages.push(message) });
+  assert.equal(starts, 1); assert.equal(started.workflowId, 'wf-public'); assert.match(messages[0], /Task 1\/2.*EXECUTOR/);
+  started.observer.stop();
+  const reattached = adapter.observeProgress({ workflowId: 'wf-public', render: () => {} });
+  assert.equal(reattached.workflowId, 'wf-public'); reattached.stop();
+});

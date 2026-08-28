@@ -55,13 +55,12 @@ export async function installGlobal({
     try {
       const raw = await readFile(mcpConfigFile, 'utf8');
       config = JSON.parse(raw);
-      if (!config.mcpServers || typeof config.mcpServers !== 'object') {
-        config.mcpServers = {};
-      }
-    } catch {
-      config = { mcpServers: {} };
+      if (!config || typeof config !== 'object') throw new Error('config must be a JSON object');
+    } catch (err) {
+      throw new Error(`Refusing to overwrite existing invalid MCP config ${mcpConfigFile}: ${err.message}`);
     }
   }
+  if (!config.mcpServers || typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers)) config.mcpServers = {};
 
   // 3. Register supergpt MCP server
   config.mcpServers.supergpt = {

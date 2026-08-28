@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "gpt-dev-loop": {
+    "supergpt": {
       "command": "node",
-      "args": ["bin/gpt-loop-mcp.js"]
+      "args": ["bin/supergpt-mcp.js"]
     }
   }
 }

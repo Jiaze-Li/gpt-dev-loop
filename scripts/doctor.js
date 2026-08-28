@@ -10,7 +10,7 @@
 import { execSync as nodeExecSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { existsSync, accessSync, constants } from 'node:fs';
+import { existsSync, accessSync, constants, readFileSync } from 'node:fs';
 import os from 'node:os';
 import { SUPERGPT_WORKTREE_ROOT } from '../src/orchestrator/workflowWorktree.js';
 import { resolveAgySupervisorModel, resolveAgyReviewerModel } from '../src/agy/agyConfig.js';
@@ -75,6 +75,18 @@ export function checkRuntimeDir({ root = SUPERGPT_WORKTREE_ROOT } = {}) {
   }
 }
 
+// Production source checkouts must not activate the retired browser bridge.
+export function checkRepoMcpConfig({ configFile = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '.mcp.json') } = {}) {
+  try {
+    const config = JSON.parse(readFileSync(configFile, 'utf8'));
+    const servers = config?.mcpServers ?? {};
+    const legacy = Object.entries(servers).some(([name, value]) => name === 'gpt-dev-loop' || String(value?.args ?? '').includes('gpt-loop-mcp'));
+    return legacy
+      ? { name: 'repo_mcp_config', ok: false, error: 'legacy ask_gpt MCP bridge is active' }
+      : { name: 'repo_mcp_config', ok: Boolean(servers.supergpt), version: 'supergpt only' };
+  } catch (err) { return { name: 'repo_mcp_config', ok: false, error: err.message }; }
+}
+
 export function checkModels({ env = process.env } = {}) {
   try {
     const supervisor = resolveAgySupervisorModel(env);
@@ -102,6 +114,7 @@ export function runDoctor({ execSync, log, env } = {}) {
     checkNode({ env: environment }),
     checkAgy({ execSync: exec }),
     checkClaude({ execSync: exec }),
+    checkRepoMcpConfig(),
   ];
 
   const ok = results.every((r) => r.ok);

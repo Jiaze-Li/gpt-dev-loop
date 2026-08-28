@@ -700,9 +700,10 @@ export function generateTerminalAcceptanceReport({
   const attempts = Array.isArray(s.taskAttempts) ? s.taskAttempts : [];
   const usage = s.tokenUsage ?? {};
 
+  const accepted = s.workflowStatus === WORKFLOW_STATUSES.DONE;
   return {
-    acceptance: 'PASS',
-    valid: true,
+    acceptance: accepted ? 'PASS' : 'NOT_ACCEPTED',
+    valid: accepted,
     workflowId: s.workflowId,
     workflowStatus: s.workflowStatus,
     summary: s.summary,

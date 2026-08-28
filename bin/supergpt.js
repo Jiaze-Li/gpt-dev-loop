@@ -309,6 +309,10 @@ async function main() {
   const onEvent = (event) => {
     if (renderer) {
       renderer.emitTransition(event);
+      if (event.workflowId) {
+        const live = readCanonicalProgress({ workflowId: event.workflowId });
+        if (live) renderer.updateState(live);
+      }
     }
   };
 

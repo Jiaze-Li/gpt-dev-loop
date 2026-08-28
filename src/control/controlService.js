@@ -7,6 +7,7 @@
 import {
   supergptPlan,
   runSuperGPT,
+  startSuperGPT,
   supergptResume,
   supergptStop,
   supergptWait,
@@ -77,7 +78,7 @@ export class SuperGptControlService {
   }
 
   async start(options = {}) {
-    return this.run(options);
+    return startSuperGPT({ ...options, env: this.env });
   }
 
   status({ workflowId, root = this.root } = {}) {
@@ -99,7 +100,7 @@ export class SuperGptControlService {
     const raw = await supergptWait({
       workflowId,
       root,
-      predicate: (s) => (targetStatus ? s.workflowStatus === targetStatus : predicate ? predicate(s) : true),
+      predicate: (s) => (targetStatus ? s.workflowStatus === targetStatus : predicate ? predicate(s) : ['DONE', 'HUMAN_REQUIRED', 'FAILED', 'TIMEOUT', 'STALLED', 'STOPPED'].includes(s.workflowStatus)),
       timeoutMs,
       intervalMs,
     });

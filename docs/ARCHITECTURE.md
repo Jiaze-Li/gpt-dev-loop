@@ -33,6 +33,12 @@ The stable operations are `supergpt_prepare`, `supergpt_plan`,
 `supergpt_run`/`supergpt_start`, `supergpt_status`, `supergpt_wait`,
 `supergpt_resume`, and `supergpt_stop`.
 
+`supergpt_start` is non-blocking: it immediately returns `{ status: "RUNNING",
+workflowId }` while Core owns the asynchronous workflow and records all terminal
+failures durably. `supergpt_run` is the blocking convenience operation.
+`supergpt_wait` without a target waits for a terminal state; with `targetStatus`
+it waits for that status.
+
 `supergpt_prepare` accepts raw natural-language intent and returns the small
 portable `supergpt.request/v1` object. Planning then creates internal task
 cards. This makes a fresh Gemini, Claude, Codex, or generic frontend
@@ -60,6 +66,12 @@ last-progress and last-activity formatting are also local. They create zero
 provider/model calls. Stopping or disconnecting an observer only stops its
 timer: workflow state, provider children, isolation and delivery remain Core
 owned. Terminal state stops the observer cleanly.
+
+Supervisor continuity is logical structured continuity, not a promise of one
+persistent physical provider conversation; `agy:gemini` uses `CHECKPOINT_FRESH`.
+Reviewer provider context is fresh per attempt with structured continuity rather
+than transcript replay. Executors are RoleRouter-selected from Sonnet, Codex, or
+Opus rather than always Claude.
 
 Normal internal reports and task artifacts are optional/viewable evidence,
 never approval prompts or a workflow dependency. A frontend must label them

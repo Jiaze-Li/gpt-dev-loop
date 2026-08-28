@@ -26,6 +26,7 @@ import { z } from 'zod';
 
 import {
   runSuperGPT,
+  startSuperGPT,
   supergptResume,
   supergptStop,
   supergptWait,
@@ -114,6 +115,7 @@ export async function readWorkflowStatus({
 
 export function createSuperGptMcpServer({
   runSuperGptFn = runSuperGPT,
+  startSuperGptFn = startSuperGPT,
   resumeSuperGptFn = supergptResume,
   stopSuperGptFn = supergptStop,
   waitSuperGptFn = supergptWait,
@@ -243,7 +245,7 @@ export function createSuperGptMcpServer({
   server.registerTool(
     'supergpt_start',
     {
-      description: 'Alias for supergpt_run. Starts an autonomous SuperGPT development workflow.',
+      description: 'Non-blocking start. Returns RUNNING and workflowId immediately; Core owns the workflow lifetime.',
       inputSchema: {
         goal: z.string().min(1).optional().describe('natural-language instruction'),
         planPath: z.string().min(1).optional().describe('path to an existing plan file'),
@@ -251,16 +253,15 @@ export function createSuperGptMcpServer({
       },
       outputSchema: {
         status: z.string(),
-        summary: z.string().nullable(),
-        deliveredFiles: z.array(z.string()),
         workflowId: z.string().nullable(),
-        reason: z.string().nullable(),
-        question: z.string().nullable(),
-        tokenUsage: z.record(z.string(), z.any()).nullable().optional(),
-        events: z.array(z.record(z.string(), z.any())),
       },
     },
-    runHandler,
+    async ({ goal, planPath, cwd: runCwd }) => {
+      if (!goal && !planPath) throw new Error('supergpt_start requires either "goal" or "planPath"');
+      const started = startSuperGptFn({ goal, planPath, cwd: runCwd ? path.resolve(runCwd) : cwd });
+      const structured = { status: 'RUNNING', workflowId: started.workflowId };
+      return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
+    },
   );
 
   server.registerTool(
@@ -289,7 +290,7 @@ export function createSuperGptMcpServer({
     'supergpt_wait',
     {
       description:
-        'Wait locally for a SuperGPT workflow to complete or transition to a target status/stage. Consumes zero model tokens.',
+        'Wait locally with zero model tokens. Without targetStatus, waits until terminal; with targetStatus, waits for that status.',
       inputSchema: {
         workflowId: z.string().min(1).describe('workflow id to wait for'),
         timeoutMs: z.number().optional().describe('maximum milliseconds to wait (default: 60000)'),
@@ -306,7 +307,7 @@ export function createSuperGptMcpServer({
       const state = await waitSuperGptFn({
         workflowId,
         timeoutMs,
-        predicate: (s) => (targetStatus ? s.workflowStatus === targetStatus : true),
+        predicate: (s) => (targetStatus ? s.workflowStatus === targetStatus : ['DONE', 'HUMAN_REQUIRED', 'FAILED', 'TIMEOUT', 'STALLED', 'STOPPED'].includes(s.workflowStatus)),
       });
       const structured = {
         workflowId,

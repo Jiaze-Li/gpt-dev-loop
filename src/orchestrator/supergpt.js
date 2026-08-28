@@ -371,6 +371,17 @@ export async function runSuperGPT({
   return result;
 }
 
+// Start is intentionally separate from run: Core retains the promise and all
+// lifecycle ownership while callers get a durable id without waiting for work.
+export function startSuperGPT(options = {}) {
+  const workflowId = options.workflowId ?? `wf-agy-${randomUUID()}`;
+  const run = runSuperGPT({ ...options, workflowId });
+  // runSuperGPT converts workflow failures into durable terminal state/result;
+  // this final catch is only a last-resort guard against an unhandled rejection.
+  run.catch(() => {});
+  return { status: WORKFLOW_STATUSES.RUNNING, workflowId };
+}
+
 // The real end-to-end pipeline. Mirrors scripts/run-agy-workflow.js's main()
 // but reports progress through `emit` instead of console formatting, and
 // returns the structured result rather than setting process.exitCode.

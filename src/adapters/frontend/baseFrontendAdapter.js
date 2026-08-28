@@ -57,8 +57,8 @@ export class BaseFrontendAdapter {
   // operation.  The returned workflow id is immediately observed locally;
   // disconnecting this adapter stops only its subscription, never the run.
   async startAndObserve({ start, render, intervalMs, ...request } = {}) {
-    if (typeof start !== 'function') throw new Error('startAndObserve requires a start function');
-    const started = await start(request);
+    const startWorkflow = start ?? ((options) => this.controlService.start(options));
+    const started = await startWorkflow(request);
     const workflowId = started?.workflowId;
     if (!workflowId) throw new Error('SuperGPT start did not return a workflowId');
     const observer = this.observeProgress({ workflowId, render, intervalMs });

@@ -54,3 +54,22 @@ test('installGlobal: registers MCP server and copies skill cleanly', async () =>
     await rm(tmpConfig, { recursive: true, force: true });
   }
 });
+
+test('installer preserves unrelated configuration and fails closed on malformed JSON', async () => {
+  const tmp = path.join('/tmp', `supergpt-preserve-${Date.now()}`);
+  const skill = path.join(tmp, 'skill.md');
+  await mkdir(tmp, { recursive: true }); await writeFile(skill, '# skill');
+  const config = path.join(tmp, 'mcp_config.json');
+  try {
+    await writeFile(config, JSON.stringify({ arbitrary: { keep: true }, mcpServers: { other: { command: 'other', args: ['x'] } } }, null, 2));
+    await installGlobal({ configDir: tmp, mcpBin: '/bin/supergpt', sourceSkill: skill });
+    const parsed = JSON.parse(await readFile(config, 'utf8'));
+    assert.deepEqual(parsed.arbitrary, { keep: true });
+    assert.deepEqual(parsed.mcpServers.other, { command: 'other', args: ['x'] });
+    await uninstallGlobal({ configDir: tmp });
+    assert.deepEqual(JSON.parse(await readFile(config, 'utf8')).mcpServers.other, { command: 'other', args: ['x'] });
+    const malformed = '{ definitely malformed'; await writeFile(config, malformed);
+    await assert.rejects(() => installGlobal({ configDir: tmp, mcpBin: '/bin/supergpt', sourceSkill: skill }), /Refusing to overwrite/);
+    assert.equal(await readFile(config, 'utf8'), malformed);
+  } finally { await rm(tmp, { recursive: true, force: true }); }
+});

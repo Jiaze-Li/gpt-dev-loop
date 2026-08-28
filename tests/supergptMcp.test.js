@@ -128,6 +128,26 @@ test('supergpt_run drives runSuperGPT and returns result + collected events', as
   await client.close();
 });
 
+test('supergpt_start returns RUNNING before the injected workflow completes', async () => {
+  let release;
+  const completed = new Promise((resolve) => { release = resolve; });
+  let invoked = false;
+  const client = await connect({
+    startSuperGptFn: ({ goal, cwd }) => {
+      invoked = true;
+      assert.equal(goal, 'slow work'); assert.equal(cwd, '/tmp/ws');
+      completed.then(() => {});
+      return { status: 'RUNNING', workflowId: 'wf-live' };
+    },
+  });
+  const result = await client.callTool({ name: 'supergpt_start', arguments: { goal: 'slow work', cwd: '/tmp/ws' } });
+  assert.equal(invoked, true);
+  assert.equal(result.structuredContent.status, 'RUNNING');
+  assert.equal(result.structuredContent.workflowId, 'wf-live');
+  release();
+  await client.close();
+});
+
 test('supergpt_run reports HUMAN_REQUIRED with the question, not an error', async () => {
   const client = await connect({
     runSuperGptFn: async () => ({
@@ -266,5 +286,14 @@ test('supergpt_wait invokes waitSuperGptFn and returns formattedProgress', async
   assert.equal(calledWith.workflowId, 'wf-test-wait');
   assert.equal(res.structuredContent.status, 'DONE');
   assert.match(res.structuredContent.formattedProgress, /SUPERGPT ⟳ DONE/);
+  await client.close();
+});
+
+test('supergpt_wait without target waits for a terminal state', async () => {
+  let predicate;
+  const client = await connect({ waitSuperGptFn: async (args) => { predicate = args.predicate; return { workflowStatus: 'DONE', stage: 'DONE', workflowId: args.workflowId }; } });
+  await client.callTool({ name: 'supergpt_wait', arguments: { workflowId: 'wf-terminal' } });
+  assert.equal(predicate({ workflowStatus: 'RUNNING' }), false);
+  assert.equal(predicate({ workflowStatus: 'DONE' }), true);
   await client.close();
 });

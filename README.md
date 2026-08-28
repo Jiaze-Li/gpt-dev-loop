@@ -23,7 +23,7 @@ User Request / Front-Facing Agent
            ▼
     Isolated Git Worktree Sandbox (~/.supergpt/worktrees)
            │
-           ├──► Supervisor RolePool (Persistent workflow conversation)
+           ├──► Supervisor RolePool (logical continuity via checkpoints)
            │          │ (Task Cards)
            │          ▼
            ├──► Executor RolePool (Fresh session per attempt)
@@ -32,7 +32,7 @@ User Request / Front-Facing Agent
            ├──► Verification Gate [Shell / npm test] (Bounded diagnostics)
            │          │ (Git Evidence)
            │          ▼
-           └──► Reviewer RolePool (Persistent per-task conversation)
+           └──► Reviewer RolePool (fresh provider context per attempt)
                       │ (PASS / REWORK / HUMAN_REQUIRED)
                       ▼
     Safe Automatic Result Delivery (Pre-flight conflict check & verification)
@@ -49,7 +49,7 @@ Invocation Workspace (Approved changes applied, worktree cleaned up)
   - **RolePools and failover**: Planner, Supervisor, Executor, and Reviewer are routed independently through provider health, quota, and effort policies.
   - **Supervisor**: Tracks tasks, handles rework requests, and surfaces real domain ambiguities as `HUMAN_REQUIRED`.
   - **Executor and Reviewer**: Execute task cards in clean worktrees and independently audit Git diffs plus Gate evidence.
-- **Persistent Role Conversations**: Single conversation ID maintained for the Supervisor across the entire workflow; per-task conversation IDs maintained across Reviewer rework rounds.
+- **Structured role continuity**: Supervisor continuity is logical, not one persistent physical conversation (`agy:gemini` uses `CHECKPOINT_FRESH`); Reviewer context is fresh per attempt with structured continuity. Executor is RoleRouter-selected (Sonnet, Codex, or Opus).
 - **Workspace Snapshotting**: Operates cleanly on dirty workspaces with untracked files without requiring `git stash` or manual commits. Pre-existing changes become the baseline and are never misclassified as model output.
 - **Safe Automatic Result Delivery**: Approved changes are delivered directly into the exact invocation workspace with atomic conflict detection. Unrelated dirty changes are preserved.
 - **Worktree Lifecycle**: Successfully delivered worktrees are pruned automatically; failed or `HUMAN_REQUIRED` runs are preserved for auditing and resumption.
@@ -57,7 +57,7 @@ Invocation Workspace (Approved changes applied, worktree cleaned up)
 - **Multiple Front-End Surfaces**:
   - **CLI**: `bin/supergpt.js "<goal>"` supporting text or streaming JSON (`--output-format=json`).
   - **Antigravity Skill**: `.agents/skills/supergpt/SKILL.md` for AI pair programmers.
-  - **MCP Server**: `bin/supergpt-mcp.js` exposing `supergpt_run`, `supergpt_plan`, and `supergpt_status`.
+  - **MCP Server**: `bin/supergpt-mcp.js` exposing non-blocking `supergpt_start`, blocking `supergpt_run`, and local status/wait monitoring.
 
 ---
 

@@ -94,7 +94,7 @@ test('runDoctor aggregates a passing report when all prerequisites are present',
 
   assert.equal(report.ok, true);
   assert.equal(report.status, 'pass');
-  assert.deepEqual(Object.keys(report.results).sort(), ['agy', 'claude', 'git', 'node']);
+  assert.deepEqual(Object.keys(report.results).sort(), ['agy', 'claude', 'git', 'node', 'repo_mcp_config']);
   assert.equal(report.results.git.ok, true);
   assert.ok(lines.includes('doctor: all prerequisites satisfied'));
 });
