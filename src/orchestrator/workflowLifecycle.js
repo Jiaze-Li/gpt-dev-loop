@@ -280,6 +280,7 @@ export async function gcSuperGptResources({
     // Check associated workflow state if exists
     let isActiveProcess = false;
     let isFinishedWorkflow = false;
+    let isResumable = false;
 
     // Try finding workflow ID from folder name
     const match = name.match(/-wf-(?:agy-)?[a-zA-Z0-9_-]+/);
@@ -300,14 +301,47 @@ export async function gcSuperGptResources({
           if (['DONE', 'CLEANED', 'STOPPED'].includes(state.workflowStatus)) {
             isFinishedWorkflow = true;
           }
+          // A workflow suspended for a human is deliberately idle (no child
+          // process) but holds un-delivered edits and is explicitly
+          // resumable — it must NOT be treated as age-expired garbage.
+          if (state.workflowStatus === 'HUMAN_REQUIRED') {
+            isResumable = true;
+          }
         } catch {
           /* best effort state check */
+        }
+      }
+
+      // Explicit resumable markers survive even without a readable state file.
+      const controlFile = path.join(root, `${wfId}.control.json`);
+      if (existsSync(controlFile)) {
+        try {
+          const c = JSON.parse(await readFile(controlFile, 'utf8'));
+          if (c.resumable === true || c.phase === 'delivery_ready') isResumable = true;
+        } catch {
+          /* best effort */
+        }
+      }
+      const resourcesFile = path.join(root, `${wfId}.resources.json`);
+      if (existsSync(resourcesFile)) {
+        try {
+          const r = JSON.parse(await readFile(resourcesFile, 'utf8'));
+          if (r.status === 'PRESERVED') isResumable = true;
+        } catch {
+          /* best effort */
         }
       }
     }
 
     if (isActiveProcess) {
       // Actively running workflow — leave intact!
+      continue;
+    }
+
+    // A finished workflow is disposable regardless of resumable markers
+    // (delivered/stopped state is authoritative). Otherwise, an explicitly
+    // resumable workflow is protected from age-based collection.
+    if (!isFinishedWorkflow && isResumable) {
       continue;
     }
 

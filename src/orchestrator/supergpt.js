@@ -54,6 +54,17 @@ import {
   defaultOrganicReworkRecorder,
   REWORK_VERIFICATION_STATUSES,
 } from './organicReworkRecorder.js';
+import {
+  claimOwner,
+  requestStop,
+  readControl,
+  isStopRequested,
+  isOwnerAlive,
+  saveCheckpoint,
+  markDeliveryReady,
+  clearControl,
+} from './workflowControl.js';
+import { advanceTaskBaseline } from './taskBaseline.js';
 
 // The complete typed-event vocabulary emitted through onEvent. Every event
 // object is { type, timestamp, ...payload }.
@@ -179,6 +190,13 @@ export function restoreResumableWorkspace(meta) {
   };
 }
 
+// True when a resumed workflow had every engineering/review task approved and
+// only delivery was blocked — resume must go straight to delivery and never
+// replan or re-execute an accepted task.
+export function shouldResumeFromDelivery(control) {
+  return control?.phase === 'delivery_ready';
+}
+
 export function workflowRuntimeDirectory(workflowId) {
   return path.join(SUPERGPT_WORKTREE_ROOT, workflowId, 'persistence');
 }
@@ -294,6 +312,24 @@ export async function runSuperGPT({
     lifecycleManager,
   });
 
+  // Cross-process ownership: record this process as the owning orchestrator
+  // and poll the durable control file so a `supergpt stop` issued from a
+  // different CLI/MCP process reaches this abort controller. The owner is the
+  // only party that can actually tear the pipeline down and await shutdown.
+  claimOwner({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+  let stopReason = null;
+  const stopWatcher = setInterval(() => {
+    try {
+      if (!internalAbort.signal.aborted && isStopRequested({ root: SUPERGPT_WORKTREE_ROOT, workflowId })) {
+        stopReason = readControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId })?.stop?.reason ?? 'stopped by user';
+        internalAbort.abort();
+      }
+    } catch {
+      /* ignore — control polling is best-effort */
+    }
+  }, 400);
+  if (typeof stopWatcher.unref === 'function') stopWatcher.unref();
+
   try {
     // Do not race cancellation against the pipeline: doing so reports a
     // stopped workflow while its provider child can still edit/deliver.
@@ -355,8 +391,11 @@ export async function runSuperGPT({
   } catch (err) {
     if (err instanceof CancellationError || signal?.aborted || internalAbort.signal.aborted) {
       result.status = 'CANCELLED';
-      result.reason = 'run cancelled by AbortSignal';
-      workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason: result.reason });
+      result.reason = stopReason ?? 'run cancelled by AbortSignal';
+      workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.STOPPED, {
+        reason: result.reason,
+        stopInitiator: 'user',
+      });
       emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status });
       return result;
     }
@@ -366,9 +405,15 @@ export async function runSuperGPT({
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, reason: result.reason });
     return result;
   } finally {
+    clearInterval(stopWatcher);
     ACTIVE_WORKFLOWS.delete(workflowId);
     workflowStateManager.stopHeartbeat();
     if (signal) signal.removeEventListener('abort', onAbort);
+  }
+
+  // A fully delivered workflow needs no durable control record any more.
+  if (result.status === 'WORKFLOW_DONE') {
+    clearControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
   }
 
   emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, summary: result.summary ?? null });
@@ -442,6 +487,82 @@ async function defaultPipeline({
   const repoRoot = worktree.worktree_path;
   throwIfAborted(signal);
 
+  const control = isResume ? readControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }) : null;
+
+  // Shared delivery tail — used by both the normal end-of-loop path and the
+  // delivery-ready resume fast path below. Defined here so it closes over the
+  // restored `worktree`.
+  async function deliverAndFinish({ summary, conversations }) {
+    emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'delivery' });
+    workflowStateManager?.startStage(WORKFLOW_STAGES.APPLYING);
+    // Persist the delivery-ready checkpoint BEFORE touching the source
+    // workspace: if this process dies mid-delivery, a resume still skips
+    // straight back here instead of replanning/re-executing accepted tasks.
+    markDeliveryReady({ root: SUPERGPT_WORKTREE_ROOT, workflowId, summary });
+    let delivery;
+    try {
+      throwIfAborted(signal);
+      delivery = await deliverWorkflowResult({ worktree });
+    } catch (err) {
+      emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: err.message });
+      await lifecycleManager?.onWorkflowSuspended('delivery_failed');
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason: `delivery failed: ${err.message}`,
+      });
+      return {
+        ...EMPTY_RESULT(),
+        status: 'HUMAN_REQUIRED',
+        summary: summary ?? null,
+        reason: `delivery failed: ${err.message}`,
+        question: 'Resolve the delivery problem in the isolated worktree, then resume.',
+        conversations,
+        tokenUsage: usageTracker?.summary() ?? null,
+      };
+    }
+
+    if (delivery.status === 'HUMAN_REQUIRED') {
+      emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: 'conflict', conflicts: delivery.conflicts });
+      await lifecycleManager?.onWorkflowSuspended('delivery_conflict');
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason: 'The approved changes conflict with the invocation workspace.',
+        question: 'Resolve the conflicting files in the invocation workspace, then resume.',
+      });
+      return {
+        ...EMPTY_RESULT(),
+        status: 'HUMAN_REQUIRED',
+        summary: summary ?? null,
+        deliveredFiles: delivery.changed_files ?? [],
+        reason: 'The approved changes conflict with the invocation workspace.',
+        question: 'Resolve the conflicting files in the invocation workspace, then resume.',
+        conversations,
+        tokenUsage: usageTracker?.summary() ?? null,
+      };
+    }
+
+    if (lifecycleManager) {
+      await lifecycleManager.onWorkflowDelivered();
+    }
+    clearControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, { summary: summary ?? null });
+    emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles: delivery.changed_files ?? [] });
+    return {
+      ...EMPTY_RESULT(),
+      status: 'WORKFLOW_DONE',
+      summary: summary ?? null,
+      deliveredFiles: delivery.changed_files ?? [],
+      conversations,
+      tokenUsage: usageTracker?.summary() ?? null,
+    };
+  }
+
+  // Delivery-ready resume: every engineering/review task was already
+  // approved and only delivery was blocked (e.g. a delivery conflict).
+  // Resume straight from delivery — never replan or re-run Executor/Reviewer.
+  if (shouldResumeFromDelivery(control)) {
+    emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'delivery' });
+    return deliverAndFinish({ summary: control.summary ?? null, conversations: null });
+  }
+
   // Production role runtime is assembled before the first model invocation.
   // Planning is therefore subject to the same policy/quota/health routing as
   // every subsequent workflow role.
@@ -490,6 +611,7 @@ async function defaultPipeline({
     gitEvidenceCollector: createGitEvidenceCollector(),
     cwd: repoRoot,
     baseline,
+    signal,
   });
   const gateRunner = {
     async run(commands) {
@@ -523,6 +645,8 @@ async function defaultPipeline({
     workflowStateManager,
     usageTracker,
     signal,
+    checkpoint: control?.checkpoint ?? null,
+    onCheckpoint: (cp) => saveCheckpoint({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, cp),
     log: (line) => {
       const event = translateLogLine(line);
       if (!event) return;
@@ -533,19 +657,15 @@ async function defaultPipeline({
       }
     },
     onTaskCompleted: async ({ taskId }) => {
-      try {
-        const { execFile } = await import('node:child_process');
-        const { promisify } = await import('node:util');
-        const execFileAsync = promisify(execFile);
-        await execFileAsync('git', ['add', '-A'], { cwd: repoRoot });
-        await execFileAsync('git', ['commit', '-m', `chore(supergpt): complete task ${taskId}`], { cwd: repoRoot });
-        const { stdout: newHead } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot });
-        if (baseline && newHead) {
-          baseline.head = newHead.trim();
-        }
-      } catch {
-        /* ignore if clean */
-      }
+      const { execFile } = await import('node:child_process');
+      const exec = (args) => new Promise((resolve) => {
+        execFile('git', args, { cwd: repoRoot }, (err, stdout, stderr) => {
+          resolve({ code: err ? (err.code ?? 1) : 0, stdout: stdout ?? '', stderr: stderr ?? (err ? err.message : '') });
+        });
+      });
+      // Throws TaskBaselineError on a real git failure (hook / config / write
+      // error) — a clean tree is the only silently-tolerated no-op.
+      await advanceTaskBaseline({ repoRoot, taskId, baseline, exec });
     },
   });
 
@@ -573,63 +693,7 @@ async function defaultPipeline({
     };
   }
 
-  emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'delivery' });
-  workflowStateManager?.startStage(WORKFLOW_STAGES.APPLYING);
-  let delivery;
-  try {
-    throwIfAborted(signal);
-    delivery = await deliverWorkflowResult({ worktree });
-  } catch (err) {
-    emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: err.message });
-    await lifecycleManager?.onWorkflowSuspended('delivery_failed');
-    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
-      reason: `delivery failed: ${err.message}`,
-    });
-    return {
-      ...EMPTY_RESULT(),
-      status: 'HUMAN_REQUIRED',
-      summary: loopResult.summary ?? null,
-      reason: `delivery failed: ${err.message}`,
-      question: 'Resolve the delivery problem in the isolated worktree, then resume.',
-      conversations,
-      tokenUsage: usageTracker?.summary() ?? null,
-    };
-  }
-
-  if (delivery.status === 'HUMAN_REQUIRED') {
-    emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: 'conflict', conflicts: delivery.conflicts });
-    await lifecycleManager?.onWorkflowSuspended('delivery_conflict');
-    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
-      reason: 'The approved changes conflict with the invocation workspace.',
-      question: 'Resolve the conflicting files in the invocation workspace, then resume.',
-    });
-    return {
-      ...EMPTY_RESULT(),
-      status: 'HUMAN_REQUIRED',
-      summary: loopResult.summary ?? null,
-      deliveredFiles: delivery.changed_files ?? [],
-      reason: 'The approved changes conflict with the invocation workspace.',
-      question: 'Resolve the conflicting files in the invocation workspace, then resume.',
-      conversations,
-      tokenUsage: usageTracker?.summary() ?? null,
-    };
-  }
-
-  // Delivery succeeded! Clean up resources automatically (B6)
-  if (lifecycleManager) {
-    await lifecycleManager.onWorkflowDelivered();
-  }
-  workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, { summary: loopResult.summary });
-
-  emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles: delivery.changed_files ?? [] });
-  return {
-    ...EMPTY_RESULT(),
-    status: 'WORKFLOW_DONE',
-    summary: loopResult.summary ?? null,
-    deliveredFiles: delivery.changed_files ?? [],
-    conversations,
-    tokenUsage: usageTracker?.summary() ?? null,
-  };
+  return deliverAndFinish({ summary: loopResult.summary ?? null, conversations });
 }
 
 export function supergptStatus({ workflowId, root = SUPERGPT_WORKTREE_ROOT } = {}) {
@@ -640,52 +704,97 @@ export function supergptWait({ workflowId, root = SUPERGPT_WORKTREE_ROOT, predic
   return waitForWorkflowState({ workflowId, root, predicate, timeoutMs, intervalMs });
 }
 
+const OWNER_TERMINAL_STATUSES = new Set(['STOPPED', 'DONE', 'FAILED', 'HUMAN_REQUIRED']);
+
 export async function supergptStop({
   workflowId,
   reason = 'stopped by user',
   root = SUPERGPT_WORKTREE_ROOT,
+  waitForOwnerMs = 15000,
+  _sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  _now = () => Date.now(),
 } = {}) {
   if (!workflowId) throw new Error('supergptStop requires a workflowId');
 
+  // 1. Durable, cross-process stop request. The owning orchestrator — even in
+  //    a different CLI/MCP process — polls this file and aborts itself,
+  //    tearing down its own pipeline and awaiting shutdown before it
+  //    publishes a terminal state.
+  requestStop({ root, workflowId, reason });
+
+  const control = readControl({ root, workflowId });
+  const ownerPid = control?.owner?.pid ?? null;
+  const ownerAlive = isOwnerAlive(control);
+  const foreignLiveOwner = ownerAlive && ownerPid !== process.pid;
+
+  // 2. Same-process owner: abort directly and let its own teardown run.
   const running = ACTIVE_WORKFLOWS.get(workflowId);
   if (running) {
     running.abortController?.abort();
-    running.workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason, stopInitiator: 'user' });
-    running.workflowStateManager?.stopHeartbeat();
-    ACTIVE_WORKFLOWS.delete(workflowId);
   }
 
-  const liveState = readLiveWorkflowState({ workflowId, root });
-  const pidsKilled = [];
-  if (liveState && Array.isArray(liveState.activeProcesses)) {
-    for (const proc of liveState.activeProcesses) {
-      if (proc?.pid && isProcessAlive(proc.pid)) {
-        try {
-          process.kill(proc.pid, 'SIGTERM');
-          pidsKilled.push(proc.pid);
-        } catch {
-          /* ignore */
-        }
+  // 3. Foreign, live owner: wait (bounded) for it to acknowledge by
+  //    publishing a terminal state. Its own pipeline shutdown completes
+  //    before that write, so no Reviewer/delivery runs afterwards.
+  let ownerAcknowledged = false;
+  if (foreignLiveOwner) {
+    const deadline = _now() + waitForOwnerMs;
+    while (_now() < deadline) {
+      const st = readLiveWorkflowState({ workflowId, root });
+      if (st && OWNER_TERMINAL_STATUSES.has(st.workflowStatus)) {
+        ownerAcknowledged = true;
+        break;
       }
+      // Owner died mid-stop (crash): stop waiting and fail closed below.
+      if (!isOwnerAlive(readControl({ root, workflowId }))) break;
+      await _sleep(200);
     }
   }
 
-  const statePath = path.join(root, `${workflowId}.state.json`);
-  if (existsSync(statePath)) {
-    try {
-      const raw = readFileSync(statePath, 'utf8');
-      const current = JSON.parse(raw);
-      current.workflowStatus = WORKFLOW_STATUSES.STOPPED;
-      current.stoppedReason = reason;
-      current.stoppedAt = new Date().toISOString();
-      current.stopInitiator = 'user';
-      if (current.stageStatuses) {
-        if (current.stageStatuses.executor === 'running') current.stageStatuses.executor = 'stopped';
-        if (current.stageStatuses.reviewer === 'running') current.stageStatuses.reviewer = 'stopped';
+  // 4. Fail-closed fallback for a stale/reused/dead owner PID, a same-process
+  //    stop, or a foreign owner that did not acknowledge in time: terminate
+  //    any recorded live child and force the persisted state to STOPPED so
+  //    nothing downstream can observe a non-terminal workflow.
+  const pidsKilled = [];
+  if (!ownerAcknowledged) {
+    if (running) {
+      running.workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason, stopInitiator: 'user' });
+      running.workflowStateManager?.stopHeartbeat();
+      ACTIVE_WORKFLOWS.delete(workflowId);
+    }
+
+    const liveState = readLiveWorkflowState({ workflowId, root });
+    if (liveState && Array.isArray(liveState.activeProcesses)) {
+      for (const proc of liveState.activeProcesses) {
+        // Never signal our own PID or a stale/reused one we can't attribute.
+        if (proc?.pid && proc.pid !== process.pid && isProcessAlive(proc.pid)) {
+          try {
+            process.kill(proc.pid, 'SIGTERM');
+            pidsKilled.push(proc.pid);
+          } catch {
+            /* ignore */
+          }
+        }
       }
-      writeFileSync(statePath, `${JSON.stringify(current, null, 2)}\n`, 'utf8');
-    } catch {
-      /* ignore */
+    }
+
+    const statePath = path.join(root, `${workflowId}.state.json`);
+    if (existsSync(statePath)) {
+      try {
+        const current = JSON.parse(readFileSync(statePath, 'utf8'));
+        current.workflowStatus = WORKFLOW_STATUSES.STOPPED;
+        current.stoppedReason = reason;
+        current.stoppedAt = new Date().toISOString();
+        current.stopInitiator = 'user';
+        current.activeProcesses = [];
+        if (current.stageStatuses) {
+          if (current.stageStatuses.executor === 'running') current.stageStatuses.executor = 'stopped';
+          if (current.stageStatuses.reviewer === 'running') current.stageStatuses.reviewer = 'stopped';
+        }
+        writeFileSync(statePath, `${JSON.stringify(current, null, 2)}\n`, 'utf8');
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -694,6 +803,9 @@ export async function supergptStop({
     status: WORKFLOW_STATUSES.STOPPED,
     reason,
     pidsKilled,
+    ownerPid,
+    ownerAlive,
+    ownerAcknowledged,
   };
 }
 

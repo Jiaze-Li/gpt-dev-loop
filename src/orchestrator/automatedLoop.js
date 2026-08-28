@@ -338,6 +338,13 @@ export async function runAutomatedWorkflow({
   usageTracker = null,
   onTaskCompleted = null,
   signal = null,
+  // Deterministic loop-resume support. `checkpoint` (if given) rehydrates
+  // the exact suspension point — accepted-task history, the mid-flight task
+  // card, its attempt counter and latest Review Result — so a resumed run
+  // never replans or re-executes an already-accepted task. `onCheckpoint` is
+  // called after every state-advancing transition with the current snapshot.
+  checkpoint = null,
+  onCheckpoint = null,
 }) {
   const throwIfAborted = () => {
     if (signal?.aborted) throw new Error('automated workflow cancelled');
@@ -357,6 +364,39 @@ export async function runAutomatedWorkflow({
   let claudeManager = null;
   let attemptCount = 0;
   let supervisorTabId = null;
+
+  const persistCheckpoint = async () => {
+    if (typeof onCheckpoint !== 'function') return;
+    try {
+      await onCheckpoint({
+        history: history.map((entry) => ({ ...entry })),
+        currentTaskCard: currentTaskCard ?? null,
+        currentTaskId: currentTaskCard?.task_id ?? null,
+        attempt: attemptCount,
+        latestReviewResult: latestReviewResult ?? null,
+      });
+    } catch {
+      /* checkpoint persistence is best-effort — never break the loop */
+    }
+  };
+
+  if (checkpoint && typeof checkpoint === 'object') {
+    if (Array.isArray(checkpoint.history)) history.push(...checkpoint.history);
+    // Only rehydrate a mid-flight task when the last Review Result was not a
+    // PASS. An accepted task is already in `history`; re-seeding it as
+    // current would make the loop re-run its Executor/Reviewer.
+    if (checkpoint.currentTaskCard && checkpoint.latestReviewResult?.decision !== 'PASS') {
+      currentTaskCard = checkpoint.currentTaskCard;
+      attemptCount = Number.isFinite(checkpoint.attempt) ? checkpoint.attempt : 0;
+      latestReviewResult = checkpoint.latestReviewResult ?? null;
+      claudeManager = createClaudeSessionManager({ taskId: currentTaskCard.task_id });
+      reviewerSession = createReviewerSession();
+      reviewerCreated = false;
+      log(`loop checkpoint restored: task=${currentTaskCard.task_id} attempt=${attemptCount} completed=${history.length}`);
+    } else {
+      log(`loop checkpoint restored: completed=${history.length} (no mid-flight task)`);
+    }
+  }
 
   throwIfAborted();
   const { windowId, initialTabId } = await windowSession.create();
@@ -620,13 +660,13 @@ export async function runAutomatedWorkflow({
       history.push({ task_id: currentTaskCard.task_id, decision: 'PASS', attempts: attemptCount });
       workflowStateManager?.recordCompletedTask({ taskId: currentTaskCard.task_id, decision: 'PASS', attempts: attemptCount });
       if (typeof onTaskCompleted === 'function') {
-        try {
-          await onTaskCompleted({ taskId: currentTaskCard.task_id, taskCard: currentTaskCard });
-        } catch (err) {
-          log(`onTaskCompleted error: ${err.message}`);
-        }
+        // A failure here (e.g. a real task-baseline commit error) corrupts
+        // task-scoped evidence for every following task — it must abort the
+        // workflow, not be logged and ignored.
+        await onTaskCompleted({ taskId: currentTaskCard.task_id, taskCard: currentTaskCard });
       }
     }
+    await persistCheckpoint();
     return { done: false };
   }
 
@@ -796,11 +836,22 @@ export async function runAutomatedWorkflow({
       claudeManager = createClaudeSessionManager({ taskId: currentTaskCard.task_id });
       attemptCount = 0;
       latestReviewResult = null;
+      await persistCheckpoint();
 
       const outcome = await runAttempt();
       if (outcome.done) return outcome.result;
     }
   } catch (err) {
+    if (signal?.aborted) {
+      // A cancellation is not a workflow failure: leave terminal-state
+      // classification to the caller, which reports CANCELLED/STOPPED.
+      if (!keepOpenOnFailure) {
+        await closeReviewer().catch(() => {});
+        await supervisorSession.close().catch(() => {});
+        await windowSession.close(windowId).catch(() => {});
+      }
+      throw err;
+    }
     workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: err.message });
     if (workflowStateManager) {
       log(workflowStateManager.formatFailureBanner(err.message, { retrying: false }));

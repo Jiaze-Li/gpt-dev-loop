@@ -11,14 +11,53 @@
 // Workflow Manager never imports this file — per ADAPTER_INTERFACE.md §4 it
 // only knows the `run(verification_commands) -> evidence` signature; wiring
 // a real gate runner in is the caller's job.
+//
+// Cancellation: a verification command can be arbitrarily long-running or
+// hung. `run()` takes an AbortSignal and OWNS every shell process it spawns
+// — on abort it terminates the whole process tree (SIGTERM, then SIGKILL
+// after a short grace) and rejects with GateCancelledError, so a same-process
+// stop or Ctrl-C completes promptly and no gate PASS can be produced after
+// cancellation.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 
-function runShellCommand(command, { cwd, env, spawn }) {
+export class GateCancelledError extends Error {
+  constructor(message = 'gate verification cancelled') {
+    super(message);
+    this.name = 'GateCancelledError';
+    this.code = 'GATE_CANCELLED';
+  }
+}
+
+function killTree(child, signal) {
+  if (!child || child.killed || child.exitCode !== null) return;
+  try {
+    // Negative pid => the whole process group started by { detached: true }.
+    process.kill(-child.pid, signal);
+  } catch {
+    try {
+      child.kill(signal);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new GateCancelledError());
+      return;
+    }
+
     let child;
     try {
-      child = spawn('/bin/sh', ['-c', command], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn('/bin/sh', ['-c', command], {
+        cwd,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true, // own process group so we can tear down the whole tree
+      });
     } catch (err) {
       reject(err);
       return;
@@ -26,11 +65,39 @@ function runShellCommand(command, { cwd, env, spawn }) {
 
     const stdoutChunks = [];
     const stderrChunks = [];
+    let settled = false;
+    let killTimer = null;
+    let onAbort = null;
 
-    child.on('error', (err) => reject(err));
+    const cleanup = () => {
+      if (killTimer) clearTimeout(killTimer);
+      if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+    };
+
+    onAbort = () => {
+      if (settled) return;
+      killTree(child, 'SIGTERM');
+      killTimer = setTimeout(() => killTree(child, 'SIGKILL'), killGraceMs);
+      if (typeof killTimer.unref === 'function') killTimer.unref();
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    });
     child.stdout?.on('data', (chunk) => stdoutChunks.push(chunk));
     child.stderr?.on('data', (chunk) => stderrChunks.push(chunk));
-    child.on('close', (code) => {
+    child.on('close', (code, closeSignal) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (signal?.aborted) {
+        reject(new GateCancelledError(`gate command terminated by cancellation (${closeSignal || code})`));
+        return;
+      }
       resolve({
         code,
         stdout: Buffer.concat(stdoutChunks).toString('utf8'),
@@ -40,13 +107,21 @@ function runShellCommand(command, { cwd, env, spawn }) {
   });
 }
 
-export function createGateRunner({ gitEvidenceCollector, cwd = process.cwd(), env = process.env, spawn = nodeSpawn, baseline = null } = {}) {
+export function createGateRunner({
+  gitEvidenceCollector,
+  cwd = process.cwd(),
+  env = process.env,
+  spawn = nodeSpawn,
+  baseline = null,
+  signal = null,
+} = {}) {
   return {
-    async run(verificationCommands) {
+    async run(verificationCommands, { signal: runSignal = signal } = {}) {
       const commands = verificationCommands ?? [];
       const results = [];
       for (const command of commands) {
-        const { code, stdout, stderr } = await runShellCommand(command, { cwd, env, spawn });
+        if (runSignal?.aborted) throw new GateCancelledError();
+        const { code, stdout, stderr } = await runShellCommand(command, { cwd, env, spawn, signal: runSignal });
         const pass = code === 0;
         const raw = (stdout + stderr).trim() || (pass ? 'ok' : `exit code ${code}`);
         const output = raw.length > 4000
@@ -55,6 +130,7 @@ export function createGateRunner({ gitEvidenceCollector, cwd = process.cwd(), en
         results.push({ command, pass, output });
       }
 
+      if (runSignal?.aborted) throw new GateCancelledError();
       const testResults = { pass: results.every((result) => result.pass), results };
       return gitEvidenceCollector.collect_evidence({ cwd, testResults, baseline });
     },
