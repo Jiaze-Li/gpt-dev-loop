@@ -9,10 +9,12 @@ import { CodexFrontendAdapter } from '../src/adapters/frontend/codexAdapter.js';
 const repoUrl = new URL('..', import.meta.url);
 
 test('installed skill and frontend rules default normal autonomous execution to non-blocking supergpt_start', async () => {
-  const skill = await readFile(new URL('.agents/skills/supergpt/SKILL.md', repoUrl), 'utf8');
+  const rootSkill = await readFile(new URL('skills/supergpt/SKILL.md', repoUrl), 'utf8');
+  const agentSkill = await readFile(new URL('.agents/skills/supergpt/SKILL.md', repoUrl), 'utf8');
   const rule = await readFile(new URL('.agents/rules/supergpt.md', repoUrl), 'utf8');
   const instructions = [
-    skill,
+    rootSkill,
+    agentSkill,
     rule,
     new GeminiFrontendAdapter().generateSkillDefinition(),
     new ClaudeFrontendAdapter().generateClaudeInstructions(),
@@ -26,6 +28,8 @@ test('installed skill and frontend rules default normal autonomous execution to 
     assert.match(text, /blocking convenience API/i);
   }
 
-  assert.doesNotMatch(skill, /\| \*"Use SuperGPT to implement X"\*[\s\S]*?\| If sufficiently clear, call `supergpt_run/);
+  assert.doesNotMatch(rootSkill, /Call `supergpt_run` with the goal/);
+  assert.doesNotMatch(agentSkill, /Call `supergpt_run` with the goal/);
+  assert.doesNotMatch(agentSkill, /\| \*"Use SuperGPT to implement X"\*[\s\S]*?\| If sufficiently clear, call `supergpt_run/);
   assert.doesNotMatch(rule, /normal autonomous chat\/frontend execution, invoke `supergpt_run/);
 });

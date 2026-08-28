@@ -47,6 +47,11 @@
 import { AdapterError, ADAPTER_ERROR_CODES } from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
 import { defaultOrganicReworkRecorder } from './organicReworkRecorder.js';
+import {
+  runPreflight as defaultRunPreflight,
+  buildHumanRequiredEvidence,
+  FAILURE_CATEGORIES,
+} from './preflight.js';
 
 function defaultLog(line) {
   console.log(`gpt-loop: ${line}`);
@@ -328,6 +333,9 @@ export async function runAutomatedWorkflow({
   maxAttemptsPerTask = 3,
   keepOpenOnFailure = false,
   keepOpenOnSuccess = false,
+  sourceWorkspace = null,
+  repoRoot = null,
+  runPreflightFn = defaultRunPreflight,
   // Bounded rate-limit recovery knobs (see RateLimitStopError et al above).
   // maxRetries — automatic cooldown/retry attempts before a resumable stop.
   // cooldownMs / cooldownJitterMs — conservative escalating backoff base and
@@ -357,6 +365,8 @@ export async function runAutomatedWorkflow({
   } = rateLimitRecovery;
   const history = [];
   let latestReviewResult = null;
+  let latestGateEvidence = null;
+  const seenBlockers = new Map();
   let currentTaskCard = null;
   let reviewerSession = null;
   let reviewerCreated = false;
@@ -480,18 +490,90 @@ export async function runAutomatedWorkflow({
   // create) -> Reviewer.review() round for currentTaskCard. Returns
   // { done: false } to let the outer loop go back to the Supervisor with
   // the fresh Review Result, or { done: true, result } if the
-  // maxAttemptsPerTask guard tripped.
+  // maxAttemptsPerTask guard tripped or an environment blocker occurred.
   async function runAttempt() {
     throwIfAborted();
+
+    // 1. DETERMINISTIC PREFLIGHT CHECK (Zero model tokens)
+    log(`preflight started: task=${currentTaskCard.task_id}`);
+    workflowStateManager?.startStage(WORKFLOW_STAGES.PREFLIGHT, {
+      taskId: currentTaskCard.task_id,
+      taskName: currentTaskCard.goal,
+      attempt: attemptCount + 1,
+    });
+
+    const effectiveRepoRoot = repoRoot || (repositoryContext?.repo_root ?? process.cwd());
+    const preflight = await runPreflightFn({
+      taskCard: currentTaskCard,
+      cwd: effectiveRepoRoot,
+      sourceWorkspace,
+      env: process.env,
+    });
+
+    if (preflight.status === 'BLOCKED') {
+      log(`preflight blocked: task=${currentTaskCard.task_id} blockers=${JSON.stringify(preflight.blockers)}`);
+      const primary = preflight.blockers[0] || { detail: 'Preflight check failed' };
+      const fingerprint = primary.fingerprint || 'PREFLIGHT_BLOCKED';
+      seenBlockers.set(fingerprint, (seenBlockers.get(fingerprint) || 0) + 1);
+
+      const evidence = buildHumanRequiredEvidence({
+        workflowId,
+        taskCard: currentTaskCard,
+        attempt: attemptCount || 1,
+        stage: WORKFLOW_STAGES.PREFLIGHT,
+        blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+        rootCause: primary.detail,
+        preflightResult: preflight,
+        blockerFingerprint: fingerprint,
+        blockerCount: seenBlockers.get(fingerprint),
+        filesInvolved: preflight.blockers.map((b) => b.resource).filter(Boolean),
+        recommendedAction: primary.remediation,
+        history,
+      });
+
+      return {
+        done: true,
+        result: {
+          status: 'HUMAN_REQUIRED',
+          reason: primary.detail,
+          question: `Preflight capability check blocked execution of task "${currentTaskCard.task_id}": ${primary.detail}. Remediate the environment issue before resuming.`,
+          taskId: currentTaskCard.task_id,
+          evidence,
+          blockers: preflight.blockers,
+          blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+          history,
+        },
+      };
+    }
+
+    log(`preflight passed: task=${currentTaskCard.task_id}`);
+    if (preflight.snapshots?.length > 0) {
+      currentTaskCard.auxiliary_snapshots = preflight.snapshots;
+    }
+
     attemptCount += 1;
     if (attemptCount > maxAttemptsPerTask) {
+      const maxAttemptEvidence = buildHumanRequiredEvidence({
+        workflowId,
+        taskCard: currentTaskCard,
+        attempt: maxAttemptsPerTask,
+        stage: WORKFLOW_STAGES.REVIEWER,
+        blockerCategory: FAILURE_CATEGORIES.IMPLEMENTATION,
+        rootCause: `Task "${currentTaskCard.task_id}" reached maxAttemptsPerTask (${maxAttemptsPerTask}) without a PASS.`,
+        latestGateResult: latestGateEvidence ?? null,
+        latestReviewerDecision: latestReviewResult?.decision ?? null,
+        latestReviewerRequiredChanges: latestReviewResult?.required_changes ?? null,
+        history,
+      });
       return {
         done: true,
         result: {
           status: 'HUMAN_REQUIRED',
           reason: `Task "${currentTaskCard.task_id}" reached maxAttemptsPerTask (${maxAttemptsPerTask}) without a PASS.`,
-          question: 'This task has been reworked the maximum allowed number of times and still has not passed review. How should this be handled?',
+          question: `Task "${currentTaskCard.task_id}" reached maximum rework attempts (${maxAttemptsPerTask}). Latest Reviewer required changes: ${JSON.stringify(latestReviewResult?.required_changes || [])}. How should this be handled?`,
           taskId: currentTaskCard.task_id,
+          evidence: maxAttemptEvidence,
+          blockerCategory: FAILURE_CATEGORIES.IMPLEMENTATION,
           history,
         },
       };
@@ -506,17 +588,20 @@ export async function runAutomatedWorkflow({
     // A fresh Executor deliberately has no conversational memory. Carry the
     // last Reviewer verdict in the task payload so a CONTINUE_REWORK can
     // actually correct the defect it identified instead of repeating the
-    // original attempt verbatim.
-    const executorTaskCard = latestReviewResult?.decision === 'REWORK'
-      ? {
-          ...currentTaskCard,
-          rework_feedback: {
-            findings: latestReviewResult.findings ?? [],
-            required_changes: latestReviewResult.required_changes ?? [],
-            rationale: latestReviewResult.rationale ?? null,
-          },
-        }
-      : currentTaskCard;
+    // original attempt verbatim. Also expose read-only auxiliary snapshots.
+    const executorTaskCard = {
+      ...currentTaskCard,
+      ...(currentTaskCard.auxiliary_snapshots ? { auxiliary_snapshots: currentTaskCard.auxiliary_snapshots } : {}),
+      ...(latestReviewResult?.decision === 'REWORK'
+        ? {
+            rework_feedback: {
+              findings: latestReviewResult.findings ?? [],
+              required_changes: latestReviewResult.required_changes ?? [],
+              rationale: latestReviewResult.rationale ?? null,
+            },
+          }
+        : {}),
+    };
     const executionReport = await claudeManager.execute(executorTaskCard, { signal });
     throwIfAborted();
     log(`claude attempt completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
@@ -546,11 +631,57 @@ export async function runAutomatedWorkflow({
     log(`gate started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
     workflowStateManager?.startStage(WORKFLOW_STAGES.GATE);
     const evidence = await gateRunner.run(currentTaskCard.verification_commands);
+    latestGateEvidence = evidence;
     throwIfAborted();
     log(`gate completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
     if (workflowStateManager) {
       workflowStateManager.state.stageStatuses.gate = evidence.pass ? 'PASS' : 'FAIL';
       workflowStateManager.recordProgress();
+    }
+
+    // Check if Gate failed due to an environment/toolchain issue
+    const envFailure = (evidence.results || []).find(
+      (r) => !r.pass && (
+        r.output?.includes('command not found') ||
+        r.output?.includes('exit code 127') ||
+        /ENOENT|EACCES|No such file or directory/i.test(r.output || '')
+      )
+    );
+
+    if (envFailure) {
+      const cmdName = envFailure.command.trim().split(/\s+/)[0];
+      const fingerprint = `GATE_ENV:${cmdName}`;
+      seenBlockers.set(fingerprint, (seenBlockers.get(fingerprint) || 0) + 1);
+
+      const gateEnvEvidence = buildHumanRequiredEvidence({
+        workflowId,
+        taskCard: currentTaskCard,
+        attempt: attemptCount,
+        stage: WORKFLOW_STAGES.GATE,
+        blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+        rootCause: `Gate verification command failed to execute: ${envFailure.command} (${envFailure.output})`,
+        failingGateCommand: envFailure.command,
+        exitCode: 127,
+        stderrTail: envFailure.output,
+        latestGateResult: evidence,
+        blockerFingerprint: fingerprint,
+        blockerCount: seenBlockers.get(fingerprint),
+        recommendedAction: `Ensure command '${cmdName}' is installed and executable in the environment.`,
+        history,
+      });
+
+      return {
+        done: true,
+        result: {
+          status: 'HUMAN_REQUIRED',
+          reason: `Gate command execution failed: ${envFailure.command} (${envFailure.output})`,
+          question: `Gate verification command failed due to an environment blocker: ${envFailure.output}. Fix the environment requirement, then resume.`,
+          taskId: currentTaskCard.task_id,
+          evidence: gateEnvEvidence,
+          blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+          history,
+        },
+      };
     }
 
     if (!reviewerCreated) {
@@ -771,15 +902,34 @@ export async function runAutomatedWorkflow({
         // of these being persistent conversations (inside a window that is
         // left open too) is that a human (or a resumed run) can pick the
         // same conversation/tab back up.
+        const supervisorEvidence = buildHumanRequiredEvidence({
+          workflowId,
+          taskCard: currentTaskCard,
+          attempt: attemptCount,
+          stage: WORKFLOW_STAGES.SUPERVISOR,
+          blockerCategory: FAILURE_CATEGORIES.REVIEW,
+          rootCause: decision.reason || 'Supervisor requested human intervention',
+          latestGateResult: latestGateEvidence ?? null,
+          latestReviewerDecision: latestReviewResult?.decision ?? null,
+          latestReviewerRequiredChanges: latestReviewResult?.required_changes ?? null,
+          recommendedAction: decision.question || 'Provide human decision to resolve ambiguity or policy question.',
+          history,
+        });
+
         workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
           reason: decision.reason,
           question: decision.question,
+          evidence: supervisorEvidence,
+          blockerCategory: FAILURE_CATEGORIES.REVIEW,
         });
         return {
           status: 'HUMAN_REQUIRED',
           reason: decision.reason,
           question: decision.question,
+          evidence: supervisorEvidence,
+          blockerCategory: FAILURE_CATEGORIES.REVIEW,
           history,
+          ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
           tokenUsage: usageTracker?.summary() ?? null,
         };
       }

@@ -19,6 +19,7 @@ import { appendProviderProcessDiagnostic } from './providerProcessTelemetry.js';
 export const WORKFLOW_STAGES = Object.freeze({
   INIT: 'INIT',
   PLANNING: 'PLANNING',
+  PREFLIGHT: 'PREFLIGHT',
   SUPERVISOR: 'SUPERVISOR',
   EXECUTOR: 'EXECUTOR',
   GATE: 'GATE',
@@ -109,6 +110,8 @@ export class WorkflowStateManager {
       error: null,
       question: null,
       summary: null,
+      evidence: null,
+      blockers: [],
     };
   }
 
@@ -294,6 +297,9 @@ export class WorkflowStateManager {
     if (details.stopInitiator) this.state.stopInitiator = details.stopInitiator;
     if (details.question) this.state.question = details.question;
     if (details.summary) this.state.summary = details.summary;
+    if (details.evidence) this.state.evidence = details.evidence;
+    if (details.blockers) this.state.blockers = details.blockers;
+    if (details.blockerCategory) this.state.blockerCategory = details.blockerCategory;
     this.stopHeartbeat();
     this.notify();
     this.persist();
@@ -354,6 +360,21 @@ export class WorkflowStateManager {
 
     if (s.modelEscalated) {
       lines.push(`Model         ${s.executorModel} (Escalated: ${s.escalationReason || 'yes'})`);
+    }
+
+    if (s.workflowStatus === WORKFLOW_STATUSES.HUMAN_REQUIRED && s.evidence) {
+      const ev = s.evidence;
+      lines.push('');
+      lines.push('--- HUMAN_REQUIRED EVIDENCE ---');
+      if (ev.blockerCategory) lines.push(`Category:     ${ev.blockerCategory}`);
+      if (ev.rootCause) lines.push(`Root Cause:   ${ev.rootCause}`);
+      if (ev.failingGateCommand) lines.push(`Failing Cmd:  ${ev.failingGateCommand}`);
+      if (ev.exitCode !== null && ev.exitCode !== undefined) lines.push(`Exit Code:    ${ev.exitCode}`);
+      if (ev.latestReviewerDecision) lines.push(`Reviewer:     ${ev.latestReviewerDecision}`);
+      if (ev.latestReviewerRequiredChanges && ev.latestReviewerRequiredChanges.length > 0) {
+        lines.push(`Required:     ${Array.isArray(ev.latestReviewerRequiredChanges) ? ev.latestReviewerRequiredChanges.join('; ') : ev.latestReviewerRequiredChanges}`);
+      }
+      if (ev.recommendedAction) lines.push(`Action:       ${ev.recommendedAction}`);
     }
 
     return lines.join('\n');
@@ -440,20 +461,40 @@ export async function waitForWorkflowState({
 export function formatTransitionEvent(event) {
   if (!event || !event.type) return null;
   switch (event.type) {
+    case 'workflow_started':
+      return `▶ WORKFLOW_STARTED: ${event.workflowId || ''}`;
+    case 'planning_started':
+      return `▶ PLANNING_STARTED`;
+    case 'planning_completed':
+      return `✔ PLANNING_COMPLETED`;
     case 'task_started':
       return `▶ TASK_STARTED: ${event.taskId || 'next task'}`;
+    case 'preflight_started':
+      return `  ↳ PREFLIGHT_STARTED: ${event.taskId || ''}`;
+    case 'preflight_passed':
+      return `  ✔ PREFLIGHT_PASSED`;
+    case 'preflight_blocked':
+      return `  ✖ PREFLIGHT_BLOCKED: ${event.reason || (event.blockers?.[0]?.detail ?? 'blocker detected')}`;
     case 'task_attempt_started':
+    case 'executor_started':
       return `  ↳ EXECUTOR_STARTED: ${event.taskId} (Attempt ${event.attempt || 1})`;
+    case 'gate_started':
+    case 'verification_started':
+      return `  ↳ GATE_STARTED: ${event.taskId || ''} (Attempt ${event.attempt || 1})`;
     case 'verification_finished':
       return event.result === 'PASS' ? `  ✔ GATE_PASS` : `  ✖ GATE_FAIL`;
+    case 'reviewer_started':
+      return `  ↳ REVIEWER_STARTED: ${event.taskId || ''} (Attempt ${event.attempt || 1})`;
     case 'review_finished':
       return event.decision === 'PASS'
         ? `  ✔ REVIEWER_PASS`
-        : `  ↺ REVIEWER_REWORK: ${Array.isArray(event.requiredChanges) ? event.requiredChanges.join('; ') : 'rework needed'}`;
+        : `  ↺ REVIEWER_REWORK: ${Array.isArray(event.requiredChanges) ? event.requiredChanges.join('; ') : (event.requiredChanges || 'rework needed')}`;
     case 'rework_requested':
       return `  ↺ CONTINUE_REWORK: ${event.taskId ? `${event.taskId} ` : ''}(Attempt ${event.attempt || 2})`;
     case 'human_required':
       return `⏸ HUMAN_REQUIRED: ${event.question || event.reason}`;
+    case 'delivery_started':
+      return `▶ DELIVERY_STARTED`;
     case 'delivery_succeeded':
       return `✔ DELIVERY_SUCCEEDED: ${(event.changedFiles || []).length} files delivered`;
     case 'delivery_failed':
@@ -525,6 +566,9 @@ export function toCanonicalProgress(rawState, now = Date.now()) {
     summary: rawState.summary ?? null,
     reason: rawState.error ?? rawState.reason ?? null,
     question: rawState.question ?? null,
+    evidence: rawState.evidence ?? null,
+    blockers: rawState.blockers ?? [],
+    blockerCategory: rawState.blockerCategory ?? null,
     deliveredFiles: rawState.deliveredFiles ?? [],
     activeProcesses: rawState.activeProcesses ?? [],
   };

@@ -71,14 +71,22 @@ import { advanceTaskBaseline } from './taskBaseline.js';
 // object is { type, timestamp, ...payload }.
 export const SUPERGPT_EVENTS = Object.freeze({
   WORKFLOW_STARTED: 'workflow_started',
+  PLANNING_STARTED: 'planning_started',
+  PLANNING_COMPLETED: 'planning_completed',
   STAGE_CHANGED: 'stage_changed',
   TASK_STARTED: 'task_started',
+  PREFLIGHT_STARTED: 'preflight_started',
+  PREFLIGHT_PASSED: 'preflight_passed',
+  PREFLIGHT_BLOCKED: 'preflight_blocked',
   TASK_ATTEMPT_STARTED: 'task_attempt_started',
+  GATE_STARTED: 'gate_started',
   VERIFICATION_STARTED: 'verification_started',
   VERIFICATION_FINISHED: 'verification_finished',
+  REVIEWER_STARTED: 'reviewer_started',
   REVIEW_FINISHED: 'review_finished',
   REWORK_REQUESTED: 'rework_requested',
   HUMAN_REQUIRED: 'human_required',
+  DELIVERY_STARTED: 'delivery_started',
   DELIVERY_SUCCEEDED: 'delivery_succeeded',
   DELIVERY_FAILED: 'delivery_failed',
   TOKEN_ANOMALY_DETECTED: 'token_anomaly_detected',
@@ -102,6 +110,15 @@ export function translateLogLine(line) {
   if ((m = line.match(/^task selected: (\S+)$/))) {
     return { type: SUPERGPT_EVENTS.TASK_STARTED, taskId: m[1] };
   }
+  if ((m = line.match(/^preflight started: task=(\S+)$/))) {
+    return { type: SUPERGPT_EVENTS.PREFLIGHT_STARTED, taskId: m[1] };
+  }
+  if ((m = line.match(/^preflight passed: task=(\S+)$/))) {
+    return { type: SUPERGPT_EVENTS.PREFLIGHT_PASSED, taskId: m[1] };
+  }
+  if ((m = line.match(/^preflight blocked: task=(\S+) blockers=(.*)$/))) {
+    return { type: SUPERGPT_EVENTS.PREFLIGHT_BLOCKED, taskId: m[1], detail: m[2] };
+  }
   if ((m = line.match(/^claude attempt started: task=(\S+) attempt=(\d+)$/))) {
     return { type: SUPERGPT_EVENTS.TASK_ATTEMPT_STARTED, taskId: m[1], attempt: Number(m[2]) };
   }
@@ -113,6 +130,12 @@ export function translateLogLine(line) {
   }
   if ((m = line.match(/^gate result: (\w+)$/))) {
     return { type: SUPERGPT_EVENTS.VERIFICATION_FINISHED, result: m[1] };
+  }
+  if ((m = line.match(/^reviewer created: task=(\S+)$/))) {
+    return { type: SUPERGPT_EVENTS.STAGE_CHANGED, stage: 'reviewer', taskId: m[1] };
+  }
+  if ((m = line.match(/^review started: task=(\S+) attempt=(\d+)$/))) {
+    return { type: SUPERGPT_EVENTS.REVIEWER_STARTED, taskId: m[1], attempt: Number(m[2]) };
   }
   if ((m = line.match(/^review completed: task=(\S+) attempt=(\d+) decision=(\w+)$/))) {
     return { type: SUPERGPT_EVENTS.REVIEW_FINISHED, taskId: m[1], attempt: Number(m[2]), decision: m[3] };
@@ -574,6 +597,7 @@ async function defaultPipeline({
   const selection = selectProviders({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal, onEvent: (event) => emit(event.type, event) });
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'planning' });
+  emit(SUPERGPT_EVENTS.PLANNING_STARTED);
   workflowStateManager?.startStage(WORKFLOW_STAGES.PLANNING);
   let planArg = planPath ?? goal;
   if (answer && !planPath) {
@@ -597,6 +621,7 @@ async function defaultPipeline({
       tokenUsage: usageTracker?.summary() ?? null,
     };
   }
+  emit(SUPERGPT_EVENTS.PLANNING_COMPLETED, { tasksCount: resolved.tasks?.length ?? 1 });
   let plan = resolved.plan;
   if (answer) {
     plan = `${plan}\n\n[Human Decision / Answer]:\n${answer}`;
@@ -642,6 +667,7 @@ async function defaultPipeline({
       branch: worktree.source_branch,
       commit_sha: worktree.baseline_head,
     },
+    sourceWorkspace: worktree.source_workspace || cwd,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
     workflowStateManager,
     usageTracker,
@@ -678,22 +704,31 @@ async function defaultPipeline({
     emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, {
       reason: loopResult.reason ?? null,
       question: loopResult.question ?? null,
+      evidence: loopResult.evidence ?? null,
+      blockers: loopResult.blockers ?? [],
     });
     await lifecycleManager?.onWorkflowSuspended(loopResult.reason ?? 'human_required');
     workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
       reason: loopResult.reason ?? null,
       question: loopResult.question ?? null,
+      evidence: loopResult.evidence ?? null,
+      blockers: loopResult.blockers ?? [],
+      blockerCategory: loopResult.blockerCategory ?? null,
     });
     return {
       ...EMPTY_RESULT(),
       status: 'HUMAN_REQUIRED',
       reason: loopResult.reason ?? null,
       question: loopResult.question ?? null,
+      evidence: loopResult.evidence ?? null,
+      blockers: loopResult.blockers ?? [],
+      blockerCategory: loopResult.blockerCategory ?? null,
       conversations,
       tokenUsage: usageTracker?.summary() ?? null,
     };
   }
 
+  emit(SUPERGPT_EVENTS.DELIVERY_STARTED);
   return deliverAndFinish({ summary: loopResult.summary ?? null, conversations });
 }
 
@@ -725,7 +760,7 @@ export async function supergptWatch({
   workflowId,
   root = SUPERGPT_WORKTREE_ROOT,
   intervalMs = 1000,
-  timeoutMs = 300000,
+  timeoutMs = Infinity,
   signal = null,
   onProgress = null,
   _readState = readLiveWorkflowState,
@@ -734,6 +769,7 @@ export async function supergptWatch({
 } = {}) {
   if (!workflowId) throw new Error('supergptWatch requires a workflowId');
 
+  const effectiveTimeout = timeoutMs === null || timeoutMs === undefined ? Infinity : timeoutMs;
   const startTime = _now();
   let progressSeq = 1;
 
@@ -768,7 +804,7 @@ export async function supergptWatch({
     }
   }
 
-  while (!signal?.aborted && (_now() - startTime < timeoutMs)) {
+  while (!signal?.aborted && (effectiveTimeout === Infinity || _now() - startTime < effectiveTimeout)) {
     if (canonical?.terminal) {
       break;
     }
@@ -797,6 +833,19 @@ export async function supergptWatch({
     }
   }
 
+  // If terminal was reached, emit a final progress notification to ensure frontend received critical terminal state
+  if (canonical?.terminal && typeof onProgress === 'function') {
+    try {
+      await onProgress({
+        progress: progressSeq++,
+        canonical,
+        formattedProgress: renderGenericProgress(canonical),
+      });
+    } catch {
+      /* ignore notification error */
+    }
+  }
+
   const finalFormatted = canonical ? renderGenericProgress(canonical) : 'SUPERGPT: workflow state not found';
   return {
     workflowId,
@@ -806,6 +855,9 @@ export async function supergptWatch({
     summary: canonical?.summary ?? null,
     reason: canonical?.reason ?? null,
     question: canonical?.question ?? null,
+    evidence: canonical?.evidence ?? null,
+    blockers: canonical?.blockers ?? [],
+    blockerCategory: canonical?.blockerCategory ?? null,
     deliveredFiles: canonical?.deliveredFiles ?? [],
     canonicalProgress: canonical,
     cancelled: Boolean(signal?.aborted),

@@ -111,7 +111,7 @@ export class SuperGptControlService {
   async watch({
     workflowId,
     intervalMs = 1000,
-    timeoutMs = 300000,
+    timeoutMs = Infinity,
     signal,
     onProgress,
     root = this.root,

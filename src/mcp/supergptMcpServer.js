@@ -106,6 +106,9 @@ export async function readWorkflowStatus({
       reason: live?.reason ?? live?.error ?? null,
       question: live?.question ?? null,
       summary: live?.summary ?? null,
+      evidence: live?.evidence ?? null,
+      blockers: live?.blockers ?? [],
+      blockerCategory: live?.blockerCategory ?? null,
       formattedProgress: live ? renderGenericProgress(canonical || live) : null,
       canonicalProgress: canonical,
     };
@@ -304,6 +307,7 @@ export function createSuperGptMcpServer({
         status: z.string(),
         stage: z.string(),
         formattedProgress: z.string(),
+        evidence: z.record(z.string(), z.any()).nullable().optional(),
       },
     },
     async ({ workflowId, timeoutMs = 60000, targetStatus }) => {
@@ -317,6 +321,7 @@ export function createSuperGptMcpServer({
         status: state.workflowStatus,
         stage: state.stage,
         formattedProgress: renderGenericProgress(toCanonicalProgress(state) || state),
+        evidence: state.evidence ?? null,
       };
       return {
         content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
@@ -333,7 +338,7 @@ export function createSuperGptMcpServer({
       inputSchema: {
         workflowId: z.string().min(1, 'workflowId must not be empty').describe('workflow id to watch'),
         intervalMs: z.number().optional().describe('refresh interval in milliseconds (default: 1000)'),
-        timeoutMs: z.number().optional().describe('maximum milliseconds to watch before returning (default: 300000)'),
+        timeoutMs: z.number().optional().describe('optional maximum milliseconds to watch before returning (default: runs until terminal or cancelled)'),
       },
       outputSchema: {
         workflowId: z.string(),
@@ -343,19 +348,22 @@ export function createSuperGptMcpServer({
         summary: z.string().nullable().optional(),
         reason: z.string().nullable().optional(),
         question: z.string().nullable().optional(),
+        evidence: z.record(z.string(), z.any()).nullable().optional(),
+        blockers: z.array(z.record(z.string(), z.any())).optional(),
+        blockerCategory: z.string().nullable().optional(),
         deliveredFiles: z.array(z.string()).optional(),
         canonicalProgress: z.record(z.string(), z.any()).nullable().optional(),
         cancelled: z.boolean().optional(),
       },
     },
-    async ({ workflowId, intervalMs = 1000, timeoutMs = 300000 }, extra) => {
+    async ({ workflowId, intervalMs = 1000, timeoutMs }, extra) => {
       const progressToken = extra?._meta?.progressToken;
       const structured = await watchSuperGptFn({
         workflowId,
         intervalMs,
         timeoutMs,
         signal: extra?.signal,
-        onProgress: async ({ progress, formattedProgress }) => {
+        onProgress: async ({ progress, formattedProgress, canonical }) => {
           if (typeof extra?.sendNotification === 'function') {
             try {
               await extra.sendNotification({
@@ -364,6 +372,7 @@ export function createSuperGptMcpServer({
                   progressToken: progressToken ?? workflowId,
                   progress,
                   message: formattedProgress,
+                  data: canonical ?? undefined,
                 },
               });
             } catch {
