@@ -1,5 +1,5 @@
 // Deterministic tests for the external SuperGPT interface. The real
-// pipeline (Chrome / agy / git worktrees) is never exercised here — every
+// pipeline (agy / git worktrees) is never exercised here — every
 // test injects a fake `_pipeline`, or drives the pure helpers directly.
 
 import test from 'node:test';
