@@ -8,6 +8,7 @@ import {
   AgyTimeoutError,
   AgyExitError,
   AgyOutputError,
+  AgyConversationResumeError,
   DEFAULT_AGY_MODEL,
 } from '../src/agy/agyClient.js';
 import { makeFakeSpawn } from './fixtures/fakeAgyProcess.mjs';
@@ -161,6 +162,88 @@ test('regression: resolveAgyLiveConfig honors AGY_MODEL and precedence', () => {
   assert.equal(resolveAgyLiveConfig({}, ['supervisor']).model, 'gemini-3.7-flash-high');
   assert.equal(resolveAgyLiveConfig({}, ['reviewer']).model, 'gpt-oss-120b-medium');
   assert.equal(resolveAgyLiveConfig({ AGY_REVIEWER_MODEL: 'gemini-3.6-flash-low' }, ['reviewer']).model, 'gemini-3.6-flash-low');
+});
+
+// --- conversationId: resume support + fail-closed validation ---
+
+test('conversationId: passes --conversation=<id> to the agy CLI', async () => {
+  const spawn = makeFakeSpawn({
+    code: 0,
+    stdout: JSON.stringify({ text: 'hi', conversation_id: 'abc' }),
+  });
+  const out = await callAgy({ prompt: 'ping', conversationId: 'abc', timeoutMs: 1000, spawn });
+  const { args } = spawn.calls[0];
+  assert.ok(args.includes('--conversation=abc'), 'attached --conversation flag');
+  assert.ok(!args.includes('--conversation'), 'no detached --conversation token');
+  assert.equal(out.conversationId, 'abc');
+});
+
+test('conversationId: extracted from json.conversation_id on a fresh call', async () => {
+  const spawn = makeFakeSpawn({
+    code: 0,
+    stdout: JSON.stringify({ text: 'hi', conversation_id: 'fresh-123' }),
+  });
+  const out = await callAgy({ prompt: 'ping', timeoutMs: 1000, spawn });
+  assert.equal(out.conversationId, 'fresh-123');
+  assert.ok(!spawn.calls[0].args.some((a) => a.startsWith('--conversation')));
+});
+
+test('conversationId: null when the envelope carries no id', async () => {
+  const spawn = makeFakeSpawn({ code: 0, stdout: JSON.stringify({ text: 'hi' }) });
+  const out = await callAgy({ prompt: 'ping', timeoutMs: 1000, spawn });
+  assert.equal(out.conversationId, null);
+});
+
+test('conversationId: fail-closed when resumed id mismatches', async () => {
+  const spawn = makeFakeSpawn({
+    code: 0,
+    stdout: JSON.stringify({ text: 'hi', conversation_id: 'other' }),
+  });
+  await assert.rejects(
+    () => callAgy({ prompt: 'ping', conversationId: 'abc', timeoutMs: 1000, spawn }),
+    (err) => {
+      assert.ok(err instanceof AgyConversationResumeError);
+      assert.equal(err.code, 'AGY_CONVERSATION_RESUME_FAILED');
+      return true;
+    },
+  );
+});
+
+test('conversationId: fail-closed when resume returns no id', async () => {
+  const spawn = makeFakeSpawn({ code: 0, stdout: JSON.stringify({ text: 'hi' }) });
+  await assert.rejects(
+    () => callAgy({ prompt: 'ping', conversationId: 'abc', timeoutMs: 1000, spawn }),
+    (err) => err instanceof AgyConversationResumeError && err.code === 'AGY_CONVERSATION_RESUME_FAILED',
+  );
+});
+
+test('conversationId: fail-closed when stderr says conversation not found', async () => {
+  const spawn = makeFakeSpawn({ code: 2, stderr: 'Error: conversation abc not found' });
+  await assert.rejects(
+    () => callAgy({ prompt: 'ping', conversationId: 'abc', timeoutMs: 1000, spawn }),
+    (err) => {
+      assert.ok(err instanceof AgyConversationResumeError);
+      assert.equal(err.code, 'AGY_CONVERSATION_RESUME_FAILED');
+      return true;
+    },
+  );
+});
+
+test('conversationId: unrelated nonzero exit still surfaces as AgyExitError', async () => {
+  const spawn = makeFakeSpawn({ code: 3, stderr: 'rate limited' });
+  await assert.rejects(
+    () => callAgy({ prompt: 'ping', conversationId: 'abc', timeoutMs: 1000, spawn }),
+    (err) => err instanceof AgyExitError && err.code === 'AGY_NONZERO_EXIT',
+  );
+});
+
+test('conversationId: empty string is rejected before spawning', async () => {
+  const spawn = makeFakeSpawn({ code: 0, stdout: '{}' });
+  await assert.rejects(
+    () => callAgy({ prompt: 'ping', conversationId: '   ', spawn }),
+    (err) => err instanceof AgyError && err.code === 'AGY_BAD_INPUT',
+  );
+  assert.equal(spawn.calls.length, 0);
 });
 
 test('input validation: empty prompt rejects before spawning', async () => {

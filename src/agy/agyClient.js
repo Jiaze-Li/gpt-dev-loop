@@ -82,6 +82,35 @@ export class AgyOutputError extends AgyError {
   }
 }
 
+// Raised when a conversation resume was requested (`conversationId`) but `agy`
+// could not resume it, or resumed a *different* conversation. SuperGPT needs
+// explicit turn-to-turn continuity, so any ambiguity here fails closed.
+export class AgyConversationResumeError extends AgyError {
+  constructor(message) {
+    super(message, { code: 'AGY_CONVERSATION_RESUME_FAILED', exitCode: 69 });
+    this.name = 'AgyConversationResumeError';
+  }
+}
+
+// stderr wording that means "the conversation id you asked me to resume does
+// not exist". agy's exact phrasing is version-dependent; match loosely.
+const CONVERSATION_NOT_FOUND_RE = /conversation\b[^\n]*\b(not\s*found|does\s*not\s*exist|unknown|no\s*such|invalid)/i;
+
+// Pull the conversation id out of the json envelope, tolerant of field naming.
+function extractConversationId(json) {
+  if (!json || typeof json !== 'object') return null;
+  const candidates = [
+    json.conversation_id,
+    json.conversationId,
+    json.conversation && json.conversation.id,
+    json.session_id,
+  ];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.length > 0) return c;
+  }
+  return null;
+}
+
 function truncate(text) {
   if (typeof text !== 'string') return '';
   return text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
@@ -109,10 +138,12 @@ function extractText(json) {
  * @param {number} [opts.timeoutMs]         hard wall-clock cap
  * @param {string} [opts.executable]        binary name/path (default "agy")
  * @param {string} [opts.jsonSchema]        value for --json-schema
+ * @param {string} [opts.conversationId]    resume this conversation (fail-closed)
  * @param {string} [opts.cwd]               working dir for the child
  * @param {Function} [opts.spawn]           injectable spawn (for tests)
  * @returns {Promise<{model:string, exitCode:number, text:string|null,
- *                     json:any, stdout:string, durationMs:number}>}
+ *                     json:any, stdout:string, durationMs:number,
+ *                     conversationId:string|null}>}
  */
 export async function callAgy({
   prompt,
@@ -120,6 +151,7 @@ export async function callAgy({
   timeoutMs = DEFAULT_AGY_TIMEOUT_MS,
   executable = 'agy',
   jsonSchema,
+  conversationId,
   cwd,
   spawn = nodeSpawn,
 } = {}) {
@@ -128,6 +160,13 @@ export async function callAgy({
   }
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new AgyError('callAgy requires a positive timeoutMs', { code: 'AGY_BAD_INPUT' });
+  }
+  const resumeConversationId =
+    typeof conversationId === 'string' && conversationId.trim() !== '' ? conversationId.trim() : null;
+  if (conversationId !== undefined && resumeConversationId === null) {
+    throw new AgyError('callAgy conversationId must be a non-empty string when provided', {
+      code: 'AGY_BAD_INPUT',
+    });
   }
 
   // agy v1.1.22: the prompt MUST be attached to the flag as `--print=<prompt>`.
@@ -143,6 +182,11 @@ export async function callAgy({
   ];
   if (typeof jsonSchema === 'string' && jsonSchema.length > 0) {
     args.push('--json-schema', jsonSchema);
+  }
+  // Attached form (`--conversation=<id>`) for the same reason as --print: the
+  // id can never be misparsed as a following flag regardless of ordering.
+  if (resumeConversationId !== null) {
+    args.push(`--conversation=${resumeConversationId}`);
   }
 
   const startedAt = Date.now();
@@ -202,6 +246,13 @@ export async function callAgy({
     throw new AgyTimeoutError(timeoutMs);
   }
   if (code !== 0) {
+    // A resume that failed because the id is unknown must surface as a
+    // resume failure, not a generic non-zero exit.
+    if (resumeConversationId !== null && CONVERSATION_NOT_FOUND_RE.test(stderr || '')) {
+      throw new AgyConversationResumeError(
+        `agy could not resume conversation ${resumeConversationId}: ${truncate(stderr)}`,
+      );
+    }
     throw new AgyExitError(code, stderr, { durationMs: Date.now() - startedAt, stdout });
   }
 
@@ -217,6 +268,21 @@ export async function callAgy({
     throw new AgyOutputError('agy stdout was not valid JSON');
   }
 
+  const returnedConversationId = extractConversationId(json);
+
+  if (resumeConversationId !== null) {
+    if (returnedConversationId === null) {
+      throw new AgyConversationResumeError(
+        `agy resumed conversation ${resumeConversationId} but returned no conversation_id`,
+      );
+    }
+    if (returnedConversationId !== resumeConversationId) {
+      throw new AgyConversationResumeError(
+        `agy resumed a different conversation: expected ${resumeConversationId}, got ${returnedConversationId}`,
+      );
+    }
+  }
+
   return {
     model,
     exitCode: code,
@@ -224,5 +290,6 @@ export async function callAgy({
     json,
     stdout: trimmed,
     durationMs: Date.now() - startedAt,
+    conversationId: returnedConversationId,
   };
 }

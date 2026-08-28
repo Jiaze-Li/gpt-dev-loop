@@ -47,7 +47,7 @@
 // scripts/run-agy-workflow.js wires it in explicitly.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { realpathSync, existsSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -227,6 +227,17 @@ export function createWorkflowWorktree({
           `"git worktree add --detach ${worktreePath} ${baselineHead}" failed: ${addResult.stderr.trim() || addResult.stdout.trim()}`,
           { worktree_path: worktreePath }
         );
+      }
+
+      // Link dependency tree into isolated worktree if present in source workspace
+      try {
+        const srcNm = path.join(sourceRepoRoot, 'node_modules');
+        const dstNm = path.join(worktreePath, 'node_modules');
+        if (existsSync(srcNm) && !existsSync(dstNm)) {
+          symlinkSync(srcNm, dstNm);
+        }
+      } catch {
+        /* best-effort for synthetic or restricted test environments */
       }
 
       // --- mechanical invariant verification (fail closed) ---------------
