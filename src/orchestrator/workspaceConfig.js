@@ -29,9 +29,20 @@ export function loadWorkspaceConfig(workspaceCwd = process.cwd()) {
 
   try {
     const raw = fs.readFileSync(configPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return { externalReadRoots: [] };
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseErr) {
+      throw new ExternalReadRootConfigError(
+        `Malformed workspace configuration in .supergpt/config.json: ${parseErr.message}. Fix or remove the file.`,
+        { configPath, reason: "invalid_json", error: parseErr.message }
+      );
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new ExternalReadRootConfigError(
+        `Invalid workspace configuration in .supergpt/config.json: expected a JSON object.`,
+        { configPath, reason: "invalid_shape" }
+      );
     }
 
     const rawRoots = parsed.externalReadRoots || parsed.approvedExternalRoots || parsed.external_read_roots;
@@ -63,6 +74,9 @@ export function loadWorkspaceConfig(workspaceCwd = process.cwd()) {
       closeoutCommands,
     };
   } catch (err) {
+    if (err instanceof ExternalReadRootConfigError) {
+      throw err;
+    }
     return { externalReadRoots: [], closeoutCommands: [] };
   }
 }

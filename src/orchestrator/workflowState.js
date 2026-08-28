@@ -300,6 +300,9 @@ export class WorkflowStateManager {
     if (details.evidence) this.state.evidence = details.evidence;
     if (details.blockers) this.state.blockers = details.blockers;
     if (details.blockerCategory) this.state.blockerCategory = details.blockerCategory;
+    if (details.pending_verification || details.pendingVerification) {
+      this.state.pending_verification = details.pending_verification || details.pendingVerification;
+    }
     this.stopHeartbeat();
     this.notify();
     this.persist();

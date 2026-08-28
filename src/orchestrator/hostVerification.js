@@ -8,7 +8,7 @@
 
 import { execSync as nodeExecSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync, lstatSync, readlinkSync } from 'node:fs';
 import path from 'node:path';
 
 import { createGateRunner } from './adapters/gateRunner.js';
@@ -21,8 +21,20 @@ export function getHostEvidenceDir(workflowId, root = SUPERGPT_WORKTREE_ROOT) {
 }
 
 /**
- * Computes a fingerprint/hash of the worktree git state (HEAD + status porcelain)
- * to detect worktree modifications after evidence capture.
+ * Deterministically computes SHA-256 hash of a list of commands.
+ */
+export function hashCommandSet(commands = []) {
+  const normalized = Array.isArray(commands) ? commands.map((c) => String(c).trim()).filter(Boolean) : [];
+  return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+}
+
+/**
+ * Computes a deterministic full relevant-worktree content fingerprint:
+ * - HEAD revision
+ * - Tracked files and tree state (git ls-files -s)
+ * - Deterministic hash of working tree dirty/staged/untracked content
+ * - Mode/type and link targets
+ * - Excludes runtime auxiliary directories (.git, host_evidence, persistence, node_modules)
  */
 export function computeWorktreeFingerprint(worktreePath, execSync = nodeExecSync) {
   try {
@@ -32,13 +44,87 @@ export function computeWorktreeFingerprint(worktreePath, execSync = nodeExecSync
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
 
-    const status = execSync('git status --porcelain', {
+    // Tracked index state (stage + mode + object hash + path)
+    const stagedIndex = execSync('git ls-files --stage', {
       cwd: worktreePath,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
 
-    return crypto.createHash('sha256').update(`${head}\n${status}`).digest('hex');
+    // Modified, staged, and untracked (non-ignored) file paths
+    const statusOutput = execSync('git status --porcelain', {
+      cwd: worktreePath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+
+    const statusLines = statusOutput.split('\n').filter((l) => Boolean(l && l.trim()));
+    const fileEntries = [];
+
+    for (const rawLine of statusLines) {
+      const line = rawLine.padEnd(4, ' ');
+      const statusCode = line.slice(0, 2);
+      let filePath = line.slice(3).trim();
+      // Handle rename: "R  orig -> new"
+      if (filePath.includes(' -> ')) {
+        filePath = filePath.split(' -> ')[1].trim();
+      }
+      // Strip quotes if git quoted the path
+      if (filePath.startsWith('"') && filePath.endsWith('"')) {
+        filePath = filePath.slice(1, -1);
+      }
+
+      // Exclude runtime auxiliary / evidence directories
+      if (
+        filePath.startsWith('host_evidence/') ||
+        filePath.startsWith('persistence/') ||
+        filePath.startsWith('.supergpt/') ||
+        filePath.startsWith('node_modules/')
+      ) {
+        continue;
+      }
+
+      const fullPath = path.join(worktreePath, filePath);
+      let fileContentHash = 'ABSENT';
+      let modeOrType = 'NONE';
+
+      if (existsSync(fullPath)) {
+        try {
+          const lstat = lstatSync(fullPath);
+          if (lstat.isSymbolicLink()) {
+            modeOrType = 'SYMLINK';
+            fileContentHash = readlinkSync(fullPath);
+          } else if (lstat.isDirectory()) {
+            modeOrType = 'DIR';
+            fileContentHash = 'DIR';
+          } else {
+            modeOrType = `MODE_${(lstat.mode || 0).toString(8)}`;
+            const buf = readFileSync(fullPath);
+            fileContentHash = crypto.createHash('sha256').update(buf).digest('hex');
+          }
+        } catch {
+          fileContentHash = 'UNREADABLE';
+        }
+      }
+
+      fileEntries.push({
+        path: filePath,
+        status: statusCode,
+        mode: modeOrType,
+        contentHash: fileContentHash,
+      });
+    }
+
+    // Deterministic sort by path
+    fileEntries.sort((a, b) => a.path.localeCompare(b.path));
+
+    const payload = JSON.stringify({
+      head,
+      stagedIndex,
+      fileEntries,
+    });
+
+    return crypto.createHash('sha256').update(payload).digest('hex');
   } catch (err) {
     return null;
   }
@@ -47,6 +133,7 @@ export function computeWorktreeFingerprint(worktreePath, execSync = nodeExecSync
 /**
  * Executes trusted host gate verification.
  * NO arbitrary command input permitted from frontend.
+ * Restricted to valid workflow states (HUMAN_REQUIRED with frozen pending_verification).
  */
 export async function supergptVerify({
   workflowId,
@@ -75,32 +162,33 @@ export async function supergptVerify({
     throw new Error(`Isolated worktree path does not exist for workflow "${workflowId}": ${worktreePath}`);
   }
 
-  // Load frozen verification commands from metadata / state
   const state = readLiveWorkflowState({ workflowId, root });
-  let commandsToRun = [];
-
-  if (state?.evidence?.failingGateCommand) {
-    commandsToRun.push(state.evidence.failingGateCommand);
+  if (!state) {
+    throw new Error(`Workflow runtime state not found for "${workflowId}"`);
   }
 
-  // Also include frozen closeout commands or task verification commands if present
-  if (Array.isArray(meta.closeout_verification_commands) && meta.closeout_verification_commands.length > 0) {
-    for (const cmd of meta.closeout_verification_commands) {
-      if (!commandsToRun.includes(cmd)) commandsToRun.push(cmd);
-    }
+  // Restrict supergpt_verify to valid workflow states
+  if (state.workflowStatus === 'DONE') {
+    throw new Error(`WORKFLOW_ALREADY_DONE: Cannot run host verification on completed workflow "${workflowId}"`);
+  }
+  if (state.workflowStatus === 'RUNNING') {
+    throw new Error(`WORKFLOW_ACTIVELY_RUNNING: Cannot run host verification while workflow "${workflowId}" is actively running`);
   }
 
-  if (commandsToRun.length === 0 && Array.isArray(state?.pendingVerificationCommands)) {
-    commandsToRun = [...state.pendingVerificationCommands];
+  // Load exact frozen pending verification context
+  const pending = state.pending_verification || state.pendingVerification || null;
+  const pendingCommands = Array.isArray(pending?.commands)
+    ? pending.commands
+    : (Array.isArray(state.pendingVerificationCommands) ? state.pendingVerificationCommands : null);
+
+  if (!pendingCommands || pendingCommands.length === 0) {
+    throw new Error(`NO_PENDING_HOST_VERIFICATION: Workflow "${workflowId}" has no frozen pending verification context`);
   }
 
-  // Fallback to closeout commands or swift test/npm test from repository context
-  if (commandsToRun.length === 0) {
-    commandsToRun = ['swift test'];
-  }
-
-  // Deduplicate commands
-  commandsToRun = [...new Set(commandsToRun.filter(Boolean))];
+  const taskId = pending?.task_id || pending?.taskId || state.taskId || 'unknown-task';
+  const generation = pending?.generation ?? state.attempt ?? 1;
+  const commandsToRun = pendingCommands.map((c) => String(c).trim()).filter(Boolean);
+  const commandsHash = pending?.commands_hash || pending?.commandsHash || hashCommandSet(commandsToRun);
 
   const gateRunner = injectedGateRunner || createGateRunner({
     gitEvidenceCollector: createGitEvidenceCollector(),
@@ -116,8 +204,11 @@ export async function supergptVerify({
 
   const rawPayload = JSON.stringify({
     workflowId,
+    taskId,
+    generation,
     worktree: worktreePath,
     commands: commandsToRun,
+    commandsHash,
     results: evidence.results || [],
     pass: Boolean(evidence.pass),
     capturedAt,
@@ -129,15 +220,19 @@ export async function supergptVerify({
 
   const hostEvidence = {
     workflowId,
+    taskId,
+    generation,
     evidenceId,
     pass: Boolean(evidence.pass),
     commands: commandsToRun,
+    commandsHash,
     results: evidence.results || [],
     capturedAt,
     worktree: worktreePath,
     worktreeFingerprint,
     hash,
     evidence,
+    consumed: false,
   };
 
   // Persist durably under workflow runtime state
@@ -150,11 +245,13 @@ export async function supergptVerify({
 }
 
 /**
- * Reads and validates persisted host gate evidence.
- * If worktree changed or evidence is malformed, rejects as stale/invalid.
+ * Reads and validates persisted host gate evidence against a task card and worktree state.
+ * If worktree changed, evidence is malformed, or does not match the task/commands, rejects.
  */
 export function getValidHostEvidence({
   workflowId,
+  taskId = null,
+  verificationCommands = null,
   root = SUPERGPT_WORKTREE_ROOT,
   execSync = nodeExecSync,
 } = {}) {
@@ -173,11 +270,23 @@ export function getValidHostEvidence({
     return null;
   }
 
+  if (hostEvidence.consumed === true) {
+    return {
+      stale: true,
+      valid: false,
+      reason: 'EVIDENCE_ALREADY_CONSUMED',
+      hostEvidence,
+    };
+  }
+
   // Verify hash integrity
   const rawPayload = JSON.stringify({
     workflowId: hostEvidence.workflowId,
+    taskId: hostEvidence.taskId,
+    generation: hostEvidence.generation,
     worktree: hostEvidence.worktree,
     commands: hostEvidence.commands,
+    commandsHash: hostEvidence.commandsHash,
     results: hostEvidence.results || [],
     pass: hostEvidence.pass,
     capturedAt: hostEvidence.capturedAt,
@@ -188,11 +297,42 @@ export function getValidHostEvidence({
     return null; // Forged or tampered evidence rejected
   }
 
+  // If taskId check is requested:
+  if (taskId && hostEvidence.taskId && hostEvidence.taskId !== taskId) {
+    return {
+      stale: true,
+      valid: false,
+      reason: 'TASK_ID_MISMATCH',
+      hostEvidence,
+    };
+  }
+
+  // If verificationCommands check is requested:
+  if (Array.isArray(verificationCommands)) {
+    const expectedNormalized = verificationCommands.map((c) => String(c).trim()).filter(Boolean);
+    const actualNormalized = (hostEvidence.commands || []).map((c) => String(c).trim()).filter(Boolean);
+    const expectedHash = hashCommandSet(expectedNormalized);
+
+    const matchesCommands =
+      expectedNormalized.length === actualNormalized.length &&
+      expectedNormalized.every((cmd, idx) => cmd === actualNormalized[idx]);
+
+    if (!matchesCommands || hostEvidence.commandsHash !== expectedHash) {
+      return {
+        stale: true,
+        valid: false,
+        reason: 'COMMANDS_MISMATCH',
+        hostEvidence,
+      };
+    }
+  }
+
   // Verify worktree has not changed since evidence capture
   const currentFingerprint = computeWorktreeFingerprint(hostEvidence.worktree, execSync);
   if (currentFingerprint !== hostEvidence.worktreeFingerprint) {
     return {
       stale: true,
+      valid: false,
       reason: 'WORKTREE_MUTATED_AFTER_VERIFICATION',
       hostEvidence,
     };
@@ -203,4 +343,33 @@ export function getValidHostEvidence({
     valid: true,
     hostEvidence,
   };
+}
+
+/**
+ * Marks a persisted host gate evidence record as consumed so it cannot satisfy subsequent tasks.
+ */
+export function markHostEvidenceConsumed({
+  workflowId,
+  evidenceId = null,
+  root = SUPERGPT_WORKTREE_ROOT,
+} = {}) {
+  if (!workflowId) return;
+  const evidenceDir = getHostEvidenceDir(workflowId, root);
+  const latestPath = path.join(evidenceDir, 'latest.json');
+  if (!existsSync(latestPath)) return;
+
+  try {
+    const hostEvidence = JSON.parse(readFileSync(latestPath, 'utf8'));
+    if (evidenceId && hostEvidence.evidenceId !== evidenceId) return;
+    hostEvidence.consumed = true;
+    writeFileSync(latestPath, JSON.stringify(hostEvidence, null, 2), 'utf8');
+    if (hostEvidence.evidenceId) {
+      const specificPath = path.join(evidenceDir, `${hostEvidence.evidenceId}.json`);
+      if (existsSync(specificPath)) {
+        writeFileSync(specificPath, JSON.stringify(hostEvidence, null, 2), 'utf8');
+      }
+    }
+  } catch {
+    /* best effort */
+  }
 }

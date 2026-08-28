@@ -744,6 +744,18 @@ async function defaultPipeline({
     },
   };
 
+  let frozenCloseoutCommands = [];
+  try {
+    if (existsSync(metadataPath)) {
+      const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      if (Array.isArray(meta.closeout_verification_commands)) {
+        frozenCloseoutCommands = meta.closeout_verification_commands;
+      }
+    }
+  } catch {
+    /* ignore best effort */
+  }
+
   const loopResult = await runAutomatedWorkflow({
     workflowId,
     supervisorSession,
@@ -768,6 +780,8 @@ async function defaultPipeline({
     externalReadRoots: resolvedApprovedRoots,
     approvedExternalRoots: resolvedApprovedRoots,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
+    closeoutVerificationCommands: frozenCloseoutCommands,
+    taskTotal: resolved.tasks?.length ?? 1,
     workflowStateManager,
     usageTracker,
     signal,
@@ -813,6 +827,7 @@ async function defaultPipeline({
       evidence: loopResult.evidence ?? null,
       blockers: loopResult.blockers ?? [],
       blockerCategory: loopResult.blockerCategory ?? null,
+      pending_verification: loopResult.pending_verification ?? null,
     });
     return {
       ...EMPTY_RESULT(),
@@ -822,6 +837,7 @@ async function defaultPipeline({
       evidence: loopResult.evidence ?? null,
       blockers: loopResult.blockers ?? [],
       blockerCategory: loopResult.blockerCategory ?? null,
+      pending_verification: loopResult.pending_verification ?? null,
       conversations,
       tokenUsage: usageTracker?.summary() ?? null,
     };

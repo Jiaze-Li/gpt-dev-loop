@@ -37,7 +37,8 @@ import {
   buildHumanRequiredEvidence,
   FAILURE_CATEGORIES,
 } from './preflight.js';
-import { getValidHostEvidence } from './hostVerification.js';
+import { getValidHostEvidence, markHostEvidenceConsumed, hashCommandSet } from './hostVerification.js';
+import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 
 function defaultLog(line) {
   console.log(`gpt-loop: ${line}`);
@@ -205,6 +206,8 @@ export async function runAutomatedWorkflow({
   usageTracker = null,
   onTaskCompleted = null,
   signal = null,
+  closeoutVerificationCommands = [],
+  taskTotal = null,
   // Deterministic loop-resume support. `checkpoint` (if given) rehydrates
   // the exact suspension point — accepted-task history, the mid-flight task
   // card, its attempt counter and latest Review Result — so a resumed run
@@ -338,7 +341,9 @@ export async function runAutomatedWorkflow({
 
   async function closeReviewer() {
     if (reviewerSession) {
-      await reviewerSession.close();
+      if (typeof reviewerSession.close === 'function') {
+        await reviewerSession.close();
+      }
       reviewerSession = null;
       reviewerCreated = false;
       reviewerTabId = null;
@@ -494,9 +499,20 @@ export async function runAutomatedWorkflow({
 
     // Consume trusted host Gate evidence if available and valid
     let evidence;
-    const hostEvidenceCheck = getValidHostEvidence({ workflowId });
+    const evidenceRoot = workflowStateManager?.root || SUPERGPT_WORKTREE_ROOT;
+    const hostEvidenceCheck = getValidHostEvidence({
+      workflowId,
+      taskId: currentTaskCard.task_id,
+      verificationCommands: currentTaskCard.verification_commands,
+      root: evidenceRoot,
+    });
     if (hostEvidenceCheck?.valid && hostEvidenceCheck.hostEvidence?.pass) {
       log(`gate: consuming valid trusted host verification evidence (id=${hostEvidenceCheck.hostEvidence.evidenceId})`);
+      markHostEvidenceConsumed({
+        workflowId,
+        evidenceId: hostEvidenceCheck.hostEvidence.evidenceId,
+        root: evidenceRoot,
+      });
       evidence = hostEvidenceCheck.hostEvidence.evidence || {
         pass: true,
         results: hostEvidenceCheck.hostEvidence.results,
@@ -545,6 +561,19 @@ export async function runAutomatedWorkflow({
         history,
       });
 
+      const pendingVerification = {
+        task_id: currentTaskCard.task_id,
+        commands: [...currentTaskCard.verification_commands],
+        commands_hash: hashCommandSet(currentTaskCard.verification_commands),
+        reason: envFailure.output || envFailure.command,
+        generation: attemptCount,
+      };
+
+      if (workflowStateManager) {
+        workflowStateManager.state.pending_verification = pendingVerification;
+        workflowStateManager.persist();
+      }
+
       return {
         done: true,
         result: {
@@ -554,6 +583,7 @@ export async function runAutomatedWorkflow({
           taskId: currentTaskCard.task_id,
           evidence: gateEnvEvidence,
           blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+          pending_verification: pendingVerification,
           history,
         },
       };
@@ -850,7 +880,22 @@ export async function runAutomatedWorkflow({
 
       // decision.action === 'NEXT_TASK'
       await closeReviewer(); // closes the PREVIOUS task's reviewer tab, if any — conversation itself is left in the account, not deleted
-      currentTaskCard = decision.task_card;
+      currentTaskCard = { ...decision.task_card };
+
+      // Determine if this is the final planned task
+      const isFinalTask =
+        (typeof taskTotal === 'number' && taskTotal > 0 && history.length === taskTotal - 1) ||
+        (currentTaskCard.is_final_task === true) ||
+        (Array.isArray(currentTaskCard.remaining_tasks) && currentTaskCard.remaining_tasks.length === 0);
+
+      if (isFinalTask && Array.isArray(closeoutVerificationCommands) && closeoutVerificationCommands.length > 0) {
+        const originalCommands = Array.isArray(currentTaskCard.verification_commands)
+          ? currentTaskCard.verification_commands
+          : [];
+        currentTaskCard.verification_commands = [...new Set([...originalCommands, ...closeoutVerificationCommands])];
+        log(`injected closeout verification commands into final task ${currentTaskCard.task_id}: ${JSON.stringify(currentTaskCard.verification_commands)}`);
+      }
+
       log(`task selected: ${currentTaskCard.task_id}`);
       // reviewerSession is instantiated now but its create(taskId) — the
       // call that actually opens the background ChatGPT tab, INSIDE the
