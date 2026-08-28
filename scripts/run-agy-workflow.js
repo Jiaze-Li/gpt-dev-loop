@@ -37,6 +37,7 @@ import {
 } from '../src/orchestrator/workflowWorktree.js';
 import { callAgy as defaultCallAgy } from '../src/agy/agyClient.js';
 import { Persistence } from '../src/orchestrator/persistence.js';
+import { deliverWorkflowResult } from '../src/orchestrator/resultDelivery.js';
 
 // --- compact status stream -------------------------------------------------
 
@@ -383,15 +384,44 @@ async function main() {
         console.log(`  Reviewer    ${cId} (task: ${tId})`);
       }
     }
-  } else {
-    console.log(`reason:   ${result.reason ?? ''}`);
-    console.log(`question: ${result.question ?? ''}`);
-    process.exitCode = 1;
+
+    // Automatic safe delivery: carry the approved changes back into the
+    // invocation workspace. Fails closed — a conflict with the user's own
+    // in-flight edits, or any git/fs error, leaves the isolated worktree
+    // intact and exits HUMAN_REQUIRED. A safe delivery cleans the worktree
+    // up automatically.
+    console.log('');
+    let delivery;
+    try {
+      delivery = await deliverWorkflowResult({ worktree });
+    } catch (err) {
+      console.error(`delivery: HUMAN_REQUIRED (${err.code ?? err.name}) — ${err.message}`);
+      console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
+      process.exitCode = 1;
+      return;
+    }
+
+    if (delivery.status === 'HUMAN_REQUIRED') {
+      console.error('delivery: HUMAN_REQUIRED — the approved changes conflict with the invocation workspace');
+      for (const c of delivery.conflicts) {
+        console.error(`  conflict  ${c.reason}${c.path ? ` — ${c.path}` : ''}`);
+      }
+      console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(`delivery: DELIVERED — ${delivery.changed_files.length} file(s) into ${buildWorkspaceMetadata({ worktree }).source_workspace}`);
+    for (const f of delivery.changed_files) console.log(`  delivered  ${f}`);
+    console.log(`Worktree    ${worktree.worktree_path} (delivered, cleaned up)`);
+    return;
   }
-  // Conservative deterministic lifecycle: SuperGPT never auto-deletes the
-  // isolated worktree. WORKFLOW_DONE results are not yet applied back to the
-  // user's branch (no automatic merge/cherry-pick); HUMAN_REQUIRED / failure
-  // need the tree for resume/debug. Always report where it is.
+
+  console.log(`reason:   ${result.reason ?? ''}`);
+  console.log(`question: ${result.question ?? ''}`);
+  process.exitCode = 1;
+  // HUMAN_REQUIRED / failure need the isolated worktree for resume/debug —
+  // never auto-deleted. Always report where it is.
   console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
 }
 
