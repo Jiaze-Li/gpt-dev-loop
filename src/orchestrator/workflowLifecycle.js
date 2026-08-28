@@ -317,6 +317,9 @@ export async function gcSuperGptResources({
       if (existsSync(controlFile)) {
         try {
           const c = JSON.parse(await readFile(controlFile, 'utf8'));
+          if (c?.owner?.pid && isProcessAlive(c.owner.pid)) {
+            isActiveProcess = true;
+          }
           if (c.resumable === true || c.phase === 'delivery_ready') isResumable = true;
         } catch {
           /* best effort */

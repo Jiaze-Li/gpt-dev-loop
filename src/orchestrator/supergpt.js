@@ -31,7 +31,7 @@ import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
 import { loadWorkspaceConfig, resolveApprovedExternalRoots, loadAndValidateExternalRoots, ExternalReadRootConfigError } from './workspaceConfig.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from './runtimeIdentity.js';
-import { supergptVerify, hashCommandSet, computeWorktreeFingerprint, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
+import { supergptVerify, hashCommandSet, computeWorktreeFingerprint, isValidWorktreeFingerprint, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
 import {
   WorkflowStateManager,
   readLiveWorkflowState,
@@ -274,6 +274,8 @@ export async function runSuperGPT({
   _resolveWorkflowPlan,
   _selectProviders,
   _createGateRunner,
+  _execSync,
+  _computeWorktreeFingerprint,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   const result = { ...EMPTY_RESULT(), workflowId };
@@ -431,6 +433,8 @@ export async function runSuperGPT({
           _resolveWorkflowPlan,
           _selectProviders,
           _createGateRunner,
+          _execSync,
+          _computeWorktreeFingerprint,
         })
       );
     throwIfAborted(internalAbort.signal);
@@ -534,6 +538,8 @@ async function defaultPipeline({
   _resolveWorkflowPlan,
   _selectProviders,
   _createGateRunner,
+  _execSync,
+  _computeWorktreeFingerprint,
 }) {
   workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
@@ -605,6 +611,7 @@ async function defaultPipeline({
   throwIfAborted(signal);
 
   const control = isResume ? readControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }) : null;
+  const getFingerprint = (p) => (_computeWorktreeFingerprint ? _computeWorktreeFingerprint(p) : computeWorktreeFingerprint(p, _execSync));
   const readFrozenCloseoutCommands = () => {
     try {
       const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
@@ -628,12 +635,14 @@ async function defaultPipeline({
     // Every delivery attempt validates durable closeout proof against current
     // bytes; stale/missing proof reruns only the frozen deterministic gate.
     const commands = readFrozenCloseoutCommands();
-    const currentFingerprint = computeWorktreeFingerprint(worktree.worktree_path);
+    const currentFingerprint = getFingerprint(worktree.worktree_path);
     const prior = readControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId })?.closeout_verification_evidence;
     const proofValid = prior?.pass === true && prior.workflow_id === workflowId &&
       prior.verification_identity === CLOSEOUT_VERIFICATION_ID &&
       prior.commands_hash === hashCommandSet(commands) &&
       JSON.stringify(prior.commands) === JSON.stringify(commands) &&
+      isValidWorktreeFingerprint(currentFingerprint) &&
+      isValidWorktreeFingerprint(prior.worktree_fingerprint) &&
       prior.worktree_fingerprint === currentFingerprint;
     if (!proofValid) {
       if (commands.length === 0) {
@@ -649,9 +658,18 @@ async function defaultPipeline({
         workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason: envBlocked ? 'Closeout verification is blocked by the environment.' : 'Closeout Gate verification failed on final repository state.', pending_verification: pending });
         return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason: envBlocked ? 'Closeout verification is blocked by the environment.' : 'Closeout Gate verification failed on final repository state.', pending_verification: pending, conversations };
       }
+      const postGateFingerprint = getFingerprint(worktree.worktree_path);
+      if (!isValidWorktreeFingerprint(postGateFingerprint)) {
+        const reason = 'WORKTREE_FINGERPRINT_UNAVAILABLE: Worktree fingerprint computation failed after closeout Gate verification.';
+        workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+          reason,
+          actionCode: 'WORKTREE_FINGERPRINT_UNAVAILABLE',
+        });
+        return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
+      }
       recordCloseoutVerificationEvidence({ root: SUPERGPT_WORKTREE_ROOT, workflowId, evidence: {
         evidence_id: `closeout-${Date.now()}`, pass: true, commands, commands_hash: hashCommandSet(commands),
-        worktree_fingerprint: computeWorktreeFingerprint(worktree.worktree_path), captured_at: new Date().toISOString(), workflow_id: workflowId, verification_identity: CLOSEOUT_VERIFICATION_ID,
+        worktree_fingerprint: postGateFingerprint, captured_at: new Date().toISOString(), workflow_id: workflowId, verification_identity: CLOSEOUT_VERIFICATION_ID,
       }});
     }
     let delivery;
@@ -839,18 +857,26 @@ async function defaultPipeline({
     approvedExternalRoots: resolvedApprovedRoots,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
     closeoutVerificationCommands: frozenCloseoutCommands,
-    onCloseoutPass: async (proof) => recordCloseoutVerificationEvidence({
-      root: SUPERGPT_WORKTREE_ROOT, workflowId, evidence: {
-        ...proof,
-        worktree_fingerprint: computeWorktreeFingerprint(worktree.worktree_path),
-      },
-    }),
+    onCloseoutPass: async (proof) => {
+      const fingerprint = getFingerprint(worktree.worktree_path);
+      if (isValidWorktreeFingerprint(fingerprint)) {
+        recordCloseoutVerificationEvidence({
+          root: SUPERGPT_WORKTREE_ROOT,
+          workflowId,
+          evidence: {
+            ...proof,
+            worktree_fingerprint: fingerprint,
+          },
+        });
+      }
+    },
     taskTotal: resolved.tasks?.length ?? 1,
     workflowStateManager,
     usageTracker,
     signal,
     checkpoint: control?.checkpoint ?? null,
     onCheckpoint: (cp) => saveCheckpoint({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, cp),
+    _execSync,
     log: (line) => {
       const event = translateLogLine(line);
       if (!event) return;
@@ -1185,6 +1211,8 @@ export async function supergptResume({
   _resolveWorkflowPlan,
   _selectProviders,
   _createGateRunner,
+  _execSync,
+  _computeWorktreeFingerprint,
 } = {}) {
   if (!workflowId) throw new Error('supergptResume requires a workflowId');
 
@@ -1226,6 +1254,8 @@ export async function supergptResume({
     _resolveWorkflowPlan,
     _selectProviders,
     _createGateRunner,
+    _execSync,
+    _computeWorktreeFingerprint,
   });
 }
 
@@ -1295,4 +1325,5 @@ export {
   WORKFLOW_STAGES,
   WORKFLOW_STATUSES,
   ExternalReadRootConfigError,
+  isValidWorktreeFingerprint,
 };

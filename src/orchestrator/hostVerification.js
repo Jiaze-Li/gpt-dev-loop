@@ -33,6 +33,10 @@ export function hashCommandSet(commands = []) {
   return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
 }
 
+export function isValidWorktreeFingerprint(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 /**
  * Computes a deterministic full relevant-worktree content fingerprint:
  * - HEAD revision
@@ -342,7 +346,25 @@ export function getValidHostEvidence({
   }
 
   // Verify worktree has not changed since evidence capture
+  if (!isValidWorktreeFingerprint(hostEvidence.worktreeFingerprint)) {
+    return {
+      stale: true,
+      valid: false,
+      reason: 'WORKTREE_FINGERPRINT_UNAVAILABLE',
+      hostEvidence,
+    };
+  }
+
   const currentFingerprint = computeWorktreeFingerprint(hostEvidence.worktree, execSync);
+  if (!isValidWorktreeFingerprint(currentFingerprint)) {
+    return {
+      stale: true,
+      valid: false,
+      reason: 'WORKTREE_FINGERPRINT_UNAVAILABLE',
+      hostEvidence,
+    };
+  }
+
   if (currentFingerprint !== hostEvidence.worktreeFingerprint) {
     return {
       stale: true,

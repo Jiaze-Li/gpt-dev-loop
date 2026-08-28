@@ -22,6 +22,7 @@
 import path from 'node:path';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
+import { isValidWorktreeFingerprint } from './hostVerification.js';
 
 export function controlPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
   if (!workflowId) throw new Error('controlPath requires a workflowId');
@@ -88,7 +89,9 @@ export function markDeliveryReady({ root = SUPERGPT_WORKTREE_ROOT, workflowId, s
 // stays usable only while its command set and worktree fingerprint still
 // match at the next delivery attempt.
 export function recordCloseoutVerificationEvidence({ root = SUPERGPT_WORKTREE_ROOT, workflowId, evidence } = {}) {
-  if (!evidence || evidence.pass !== true) return readControl({ root, workflowId });
+  if (!evidence || evidence.pass !== true || !isValidWorktreeFingerprint(evidence.worktree_fingerprint)) {
+    return readControl({ root, workflowId });
+  }
   return writeControl({ root, workflowId }, { closeout_verification_evidence: evidence });
 }
 

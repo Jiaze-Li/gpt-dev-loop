@@ -216,6 +216,7 @@ export async function runAutomatedWorkflow({
   // called after every state-advancing transition with the current snapshot.
   checkpoint = null,
   onCheckpoint = null,
+  _execSync,
 }) {
   const throwIfAborted = () => {
     if (signal?.aborted) throw new Error('automated workflow cancelled');
@@ -857,6 +858,7 @@ export async function runAutomatedWorkflow({
             verificationIdentity: CLOSEOUT_VERIFICATION_ID,
             verificationCommands: closeoutVerificationCommands,
             root: evidenceRoot,
+            execSync: _execSync,
           });
 
           let closeoutEvidence;
