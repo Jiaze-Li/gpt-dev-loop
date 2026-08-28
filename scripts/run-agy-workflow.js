@@ -294,7 +294,14 @@ export async function resolveWorkflowPlan({
   if (result.status === 'AMBIGUOUS') {
     return { status: 'AMBIGUOUS', question: result.question, source: 'nl' };
   }
-  return { plan: result.planText, summary: result.summary, tasks: result.tasks, source: 'nl' };
+  return {
+    plan: result.planText,
+    summary: result.summary,
+    tasks: result.tasks,
+    closeoutVerificationCommands: result.closeoutVerificationCommands ?? [],
+    closeoutPolicySources: result.closeoutPolicySources ?? [],
+    source: 'nl',
+  };
 }
 
 // --- run -----------------------------------------------------------------

@@ -38,11 +38,13 @@ export function runDeterministicBenchmark({
   simulateAnomaly = null, // null | 'duplicate' | 'inflation' | 'excess_calls' | 'env_mismatch'
 } = {}) {
   const tracker = new UsageTracker();
-  const currentEnv = getEnvironmentMetadata();
+  const baseline = scenario === 'single'
+    ? VERSIONED_BASELINES['single-attempt']
+    : VERSIONED_BASELINES['rework-attempt'];
 
-  if (simulateAnomaly === 'env_mismatch') {
-    currentEnv.supervisorModel = 'gemini-2.0-flash-experimental';
-  }
+  const currentEnv = simulateAnomaly === 'env_mismatch'
+    ? { ...getEnvironmentMetadata(), supervisorModel: 'gemini-2.0-flash-experimental' }
+    : { ...baseline?.environment, ...getEnvironmentMetadata(), claudeCliVersion: baseline?.environment?.claudeCliVersion || getEnvironmentMetadata().claudeCliVersion };
 
   if (scenario === 'single') {
     // 1 task / 1 attempt
@@ -173,10 +175,6 @@ export function runDeterministicBenchmark({
       });
     }
   }
-
-  const baseline = scenario === 'single'
-    ? VERSIONED_BASELINES['single-attempt']
-    : VERSIONED_BASELINES['rework-attempt'];
 
   const monitor = new TokenAnomalyMonitor();
   const report = monitor.analyze({

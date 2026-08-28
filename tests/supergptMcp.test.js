@@ -34,6 +34,7 @@ test('lists the frontend-neutral prepare/run/plan/status contract with schemas',
     'supergpt_start',
     'supergpt_status',
     'supergpt_stop',
+    'supergpt_verify',
     'supergpt_wait',
     'supergpt_watch',
   ]);

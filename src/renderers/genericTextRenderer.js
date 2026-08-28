@@ -46,6 +46,10 @@ export function renderGenericProgress(stateOrCanonical) {
     lines.push(`Last activity ${formatTime(c.timing.lastActivityAt)}`);
   }
 
+  if (c.staleRuntimeWarning || stateOrCanonical?.staleRuntimeWarning) {
+    lines.push('', `[WARNING] ${c.staleRuntimeWarning || stateOrCanonical.staleRuntimeWarning}`);
+  }
+
   if (c.executor.escalated) {
     lines.push(`Model         ${c.executor.model} (Escalated: ${c.executor.escalationReason || 'yes'})`);
   }

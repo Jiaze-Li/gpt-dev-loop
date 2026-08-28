@@ -15,11 +15,17 @@ import {
   readFileSync,
   writeFileSync,
   mkdirSync,
-  readlinkSync,
-  readdirSync,
   accessSync,
   constants,
 } from 'node:fs';
+
+import {
+  deriveSafeRecommendation,
+  sanitizeRecommendationText,
+  HUMAN_REQUIRED_ACTION_CODES,
+} from './humanRequiredPolicy.js';
+
+export { HUMAN_REQUIRED_ACTION_CODES, sanitizeRecommendationText };
 
 export const FAILURE_CATEGORIES = Object.freeze({
   IMPLEMENTATION: 'IMPLEMENTATION',
@@ -611,17 +617,31 @@ export function buildHumanRequiredEvidence({
   const resolvedTaskId = taskId ?? taskCard?.task_id ?? null;
   const resolvedTaskName = taskName ?? taskCard?.goal ?? null;
 
-  const defaultChoices = blockerCategory === FAILURE_CATEGORIES.IMPLEMENTATION
-    ? [
-        'Provide design/implementation guidance and resume',
-        'Modify task acceptance criteria and resume',
-        'Stop workflow',
-      ]
-    : [
-        'Fix the blocker in the environment and resume',
-        'Update verification commands or tooling and resume',
-        'Stop workflow',
-      ];
+  const isExternalRoot = blockerFingerprint?.startsWith('SYMLINK_OUTSIDE_WORKSPACE') ||
+    preflightResult?.blockers?.some((b) => b.type === PREFLIGHT_BLOCKER_TYPES.SYMLINK_OUTSIDE_WORKSPACE);
+  const isVerifBlocker = Boolean(failingGateCommand) ||
+    blockerCategory === FAILURE_CATEGORIES.ENVIRONMENT ||
+    blockerCategory === FAILURE_CATEGORIES.CAPABILITY ||
+    blockerCategory === FAILURE_CATEGORIES.VERIFICATION ||
+    preflightResult?.blockers?.some((b) =>
+      b.type === PREFLIGHT_BLOCKER_TYPES.TOOLCHAIN_UNAVAILABLE ||
+      b.type === PREFLIGHT_BLOCKER_TYPES.COMMAND_UNAVAILABLE ||
+      b.type === PREFLIGHT_BLOCKER_TYPES.COMMAND_PERMISSION
+    );
+
+  const safePolicy = deriveSafeRecommendation({
+    blockerCategory,
+    failingGateCommand,
+    rootCause,
+    isExternalRootBlocker: isExternalRoot,
+    isVerificationOrToolchainBlocker: isVerifBlocker,
+  });
+
+  const finalActionCode = safePolicy.actionCode;
+  const finalRecommendedAction = sanitizeRecommendationText(recommendedAction || safePolicy.recommendedAction);
+  const finalAvailableChoices = Array.isArray(availableChoices) && availableChoices.length > 0
+    ? availableChoices.map(sanitizeRecommendationText)
+    : safePolicy.availableChoices;
 
   return {
     workflowId: workflowId ?? null,
@@ -630,6 +650,7 @@ export function buildHumanRequiredEvidence({
     attempt,
     stage,
     blockerCategory,
+    actionCode: finalActionCode,
     rootCause,
     preflightResult: preflightResult ?? null,
     failingGateCommand: failingGateCommand ?? null,
@@ -643,12 +664,8 @@ export function buildHumanRequiredEvidence({
     blockerCount,
     remediationAttempted: remediationAttempted ?? null,
     filesInvolved: Array.isArray(filesInvolved) ? filesInvolved : [],
-    recommendedAction: recommendedAction ?? (
-      blockerCategory === FAILURE_CATEGORIES.IMPLEMENTATION
-        ? 'Review required changes and provide guidance for rework, then resume.'
-        : 'Address the environment/capability requirement on the host, then resume.'
-    ),
-    availableChoices: Array.isArray(availableChoices) && availableChoices.length > 0 ? availableChoices : defaultChoices,
+    recommendedAction: finalRecommendedAction,
+    availableChoices: finalAvailableChoices,
     attemptHistorySummary: Array.isArray(history) ? history : [],
   };
 }

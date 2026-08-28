@@ -30,6 +30,8 @@ import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/r
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
 import { loadWorkspaceConfig, resolveApprovedExternalRoots, loadAndValidateExternalRoots, ExternalReadRootConfigError } from './workspaceConfig.js';
+import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from './runtimeIdentity.js';
+import { supergptVerify, getValidHostEvidence } from './hostVerification.js';
 import {
   WorkflowStateManager,
   readLiveWorkflowState,
@@ -554,6 +556,12 @@ async function defaultPipeline({
       resolvedApprovedRoots = [...externalReadRoots, ...approvedExternalRoots];
       // Deduplicate
       resolvedApprovedRoots = [...new Set(resolvedApprovedRoots)];
+      const runtimeIdentity = getCurrentRuntimeIdentity();
+      const workspaceConfig = loadWorkspaceConfig(cwd);
+      const closeoutCommands = [
+        ...(workspaceConfig.closeoutCommands || []),
+      ];
+
       const established = await establishIsolatedWorkspace({
         sourceCwd: cwd,
         workflowId,
@@ -561,7 +569,14 @@ async function defaultPipeline({
           await mkdir(SUPERGPT_WORKTREE_ROOT, { recursive: true });
           await writeFile(
             metadataPath,
-            `${JSON.stringify({ ...meta, goal, plan_path: planPath, external_read_roots: resolvedApprovedRoots }, null, 2)}\n`,
+            `${JSON.stringify({
+              ...meta,
+              goal,
+              plan_path: planPath,
+              external_read_roots: resolvedApprovedRoots,
+              runtime_identity: runtimeIdentity,
+              closeout_verification_commands: closeoutCommands,
+            }, null, 2)}\n`,
             'utf8'
           );
         },
@@ -598,20 +613,9 @@ async function defaultPipeline({
     } catch (err) {
       emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: err.message });
       await lifecycleManager?.onWorkflowSuspended('delivery_failed');
-      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
-        reason: `delivery failed: ${err.message}`,
-      });
-      return {
-        ...EMPTY_RESULT(),
-        status: 'HUMAN_REQUIRED',
-        summary: summary ?? null,
-        reason: `delivery failed: ${err.message}`,
-        question: 'Resolve the delivery problem in the isolated worktree, then resume.',
-        conversations,
-        tokenUsage: usageTracker?.summary() ?? null,
-      };
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: `delivery failed: ${err.message}` });
+      throw err;
     }
-
     if (delivery.status === 'HUMAN_REQUIRED') {
       emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: 'conflict', conflicts: delivery.conflicts });
       await lifecycleManager?.onWorkflowSuspended('delivery_conflict');
@@ -635,13 +639,17 @@ async function defaultPipeline({
       await lifecycleManager.onWorkflowDelivered();
     }
     clearControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
-    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, { summary: summary ?? null });
-    emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles: delivery.changed_files ?? [] });
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {
+      summary: summary ?? null,
+      deliveredFiles: delivery.delivered ?? delivery.changed_files ?? [],
+    });
+    emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles: delivery.delivered ?? delivery.changed_files ?? [] });
+    emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'done' });
     return {
       ...EMPTY_RESULT(),
       status: 'WORKFLOW_DONE',
-      summary: summary ?? null,
-      deliveredFiles: delivery.changed_files ?? [],
+      summary,
+      deliveredFiles: delivery.delivered ?? delivery.changed_files ?? [],
       conversations,
       tokenUsage: usageTracker?.summary() ?? null,
     };
@@ -690,6 +698,27 @@ async function defaultPipeline({
     };
   }
   emit(SUPERGPT_EVENTS.PLANNING_COMPLETED, { tasksCount: resolved.tasks?.length ?? 1 });
+
+  // If the planner identified closeout commands, update workflow metadata to freeze them
+  if (Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0) {
+    try {
+      if (existsSync(metadataPath)) {
+        const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
+        const mergedCloseout = [...new Set([
+          ...(meta.closeout_verification_commands || []),
+          ...resolved.closeoutVerificationCommands,
+        ])];
+        meta.closeout_verification_commands = mergedCloseout;
+        if (resolved.closeoutPolicySources?.length > 0) {
+          meta.closeout_policy_sources = resolved.closeoutPolicySources;
+        }
+        writeFileSync(metadataPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+      }
+    } catch {
+      /* ignore best effort */
+    }
+  }
+
   let plan = resolved.plan;
   if (answer) {
     plan = `${plan}\n\n[Human Decision / Answer]:\n${answer}`;
@@ -802,8 +831,33 @@ async function defaultPipeline({
   return deliverAndFinish({ summary: loopResult.summary ?? null, conversations });
 }
 
+export { supergptVerify };
+
 export function supergptStatus({ workflowId, root = SUPERGPT_WORKTREE_ROOT } = {}) {
-  return readLiveWorkflowState({ workflowId, root });
+  const live = readLiveWorkflowState({ workflowId, root });
+  if (!live) return null;
+
+  const metaPath = path.join(root, `${workflowId}.workspace.json`);
+  let meta = null;
+  if (existsSync(metaPath)) {
+    try {
+      meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const workflowIdentity = meta?.runtime_identity ?? live?.runtime_identity ?? null;
+  const currentIdentity = getCurrentRuntimeIdentity();
+  const runtimeCheck = compareRuntimeIdentity(workflowIdentity, currentIdentity);
+
+  return {
+    ...live,
+    runtime_identity: workflowIdentity,
+    staleRuntime: runtimeCheck.staleRuntime,
+    staleRuntimeWarning: runtimeCheck.warning,
+    runtimeCheck,
+  };
 }
 
 export function supergptWait({ workflowId, root = SUPERGPT_WORKTREE_ROOT, predicate, timeoutMs, intervalMs } = {}) {

@@ -51,8 +51,14 @@ function invalidPlan(message) {
   return new PlannerError('PLANNER_INVALID_OUTPUT', message);
 }
 
-// Well-known project config / manifest files worth surfacing to the planner.
+// Well-known project config / manifest / testing policy files worth surfacing to the planner.
 const CONFIG_FILE_CANDIDATES = [
+  'AGENTS.md',
+  'CLAUDE.md',
+  '.supergpt/config.json',
+  'docs/architecture/TESTING_STRATEGY.md',
+  'docs/TESTING_STRATEGY.md',
+  'TESTING.md',
   'tsconfig.json',
   'jsconfig.json',
   'jest.config.js',
@@ -71,8 +77,22 @@ const CONFIG_FILE_CANDIDATES = [
   'requirements.txt',
   'go.mod',
   'Cargo.toml',
+  'Package.swift',
   'README.md',
 ];
+
+// Specific testing policy candidate files to inspect and boundedly ingest for the planner
+const POLICY_FILE_CANDIDATES = [
+  'AGENTS.md',
+  'CLAUDE.md',
+  '.supergpt/config.json',
+  'docs/architecture/TESTING_STRATEGY.md',
+  'docs/TESTING_STRATEGY.md',
+  'TESTING.md',
+];
+
+// Maximum byte limit for ingested testing policy files (bounded context)
+const MAX_POLICY_FILE_BYTES = 4096;
 
 // --- default (real) repository probes ------------------------------------
 
@@ -168,6 +188,18 @@ export async function collectRepositoryContext({
     if (typeof body === 'string') configFiles.push(candidate);
   }
 
+  // Bounded inspection of testing policy files
+  const policyContexts = [];
+  for (const candidate of POLICY_FILE_CANDIDATES) {
+    let content = await readFn(candidate);
+    if (typeof content === 'string' && content.trim()) {
+      if (content.length > MAX_POLICY_FILE_BYTES) {
+        content = `${content.slice(0, MAX_POLICY_FILE_BYTES)}\n...[truncated ${content.length - MAX_POLICY_FILE_BYTES} bytes]...`;
+      }
+      policyContexts.push({ path: candidate, content: content.trim() });
+    }
+  }
+
   const repository_name = (pkg && pkg.name) || path.basename(cwd) || 'unknown';
 
   const summary = {
@@ -178,6 +210,7 @@ export async function collectRepositoryContext({
     files: files.slice(0, maxFilesListed),
     files_truncated: files.length > maxFilesListed,
     config_files: configFiles,
+    policy_contexts: policyContexts,
   };
   summary.promptBlock = formatRepositoryContextBlock(summary);
   return summary;
@@ -207,8 +240,16 @@ export function formatRepositoryContextBlock(summary = {}) {
     '',
     `top-level entries: ${(s.top_level_entries ?? []).join(', ') || '(none)'}`,
     `config files: ${(s.config_files ?? []).join(', ') || '(none)'}`,
-    '',
   );
+
+  if (Array.isArray(s.policy_contexts) && s.policy_contexts.length > 0) {
+    lines.push('', 'repository testing / project policy files:');
+    for (const p of s.policy_contexts) {
+      lines.push(`--- ${p.path} ---`, p.content, '------------------------');
+    }
+  }
+
+  lines.push('');
 
   const files = s.files ?? [];
   const total = s.file_count ?? files.length;
@@ -239,6 +280,8 @@ Reply with ONLY one JSON object, no prose, no code fence. Shape:
       "verification_commands": ["<shell command that exits non-zero on failure>", "..."]
     }
   ],
+  "closeout_verification_commands": ["<final suite command such as 'swift test' or 'npm test'>"], // OPTIONAL
+  "closeout_policy_sources": ["<path to policy file such as 'docs/architecture/TESTING_STRATEGY.md'>"], // OPTIONAL
   "question": "<the single most important question a human must answer>"  // REQUIRED iff status == "AMBIGUOUS"
 }
 
@@ -246,6 +289,7 @@ Rules:
 - The "status" property must be exactly "READY" or "AMBIGUOUS" (never "SUCCESS", "DONE", or other strings).
 - Use AMBIGUOUS only for a genuine architecture / product / scope decision you cannot responsibly make from the repository context. A merely underspecified detail you can reasonably choose is NOT ambiguous.
 - Every READY task must name concrete allowed_files and at least one verification command that exits non-zero on failure.
+- If repository testing policy specifies full closeout testing (e.g. full swift test or comprehensive suite only at closeout), emit them in closeout_verification_commands and keep earlier tasks focused on targeted verification.
 - Keep the plan bounded: the smallest set of tasks that satisfies the instruction.
 - plan_text must stand alone — the Supervisor sees only plan_text, never this prompt or the repository context below.
 
@@ -305,7 +349,22 @@ export function parsePlannerJson(obj) {
     };
   });
 
-  return { status: 'READY', planText: obj.plan_text.trim(), summary: obj.summary.trim(), tasks };
+  const closeoutVerificationCommands = Array.isArray(obj.closeout_verification_commands)
+    ? obj.closeout_verification_commands.map(String).map((c) => c.trim()).filter(Boolean)
+    : [];
+
+  const closeoutPolicySources = Array.isArray(obj.closeout_policy_sources)
+    ? obj.closeout_policy_sources.map(String).map((s) => s.trim()).filter(Boolean)
+    : [];
+
+  return {
+    status: 'READY',
+    planText: obj.plan_text.trim(),
+    summary: obj.summary.trim(),
+    tasks,
+    closeoutVerificationCommands,
+    closeoutPolicySources,
+  };
 }
 
 function mapPlannerAgyError(err) {

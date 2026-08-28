@@ -37,6 +37,7 @@ import {
   buildHumanRequiredEvidence,
   FAILURE_CATEGORIES,
 } from './preflight.js';
+import { getValidHostEvidence } from './hostVerification.js';
 
 function defaultLog(line) {
   console.log(`gpt-loop: ${line}`);
@@ -490,7 +491,21 @@ export async function runAutomatedWorkflow({
 
     log(`gate started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
     workflowStateManager?.startStage(WORKFLOW_STAGES.GATE);
-    const evidence = await gateRunner.run(currentTaskCard.verification_commands);
+
+    // Consume trusted host Gate evidence if available and valid
+    let evidence;
+    const hostEvidenceCheck = getValidHostEvidence({ workflowId });
+    if (hostEvidenceCheck?.valid && hostEvidenceCheck.hostEvidence?.pass) {
+      log(`gate: consuming valid trusted host verification evidence (id=${hostEvidenceCheck.hostEvidence.evidenceId})`);
+      evidence = hostEvidenceCheck.hostEvidence.evidence || {
+        pass: true,
+        results: hostEvidenceCheck.hostEvidence.results,
+        changed_files: [],
+        git_diff: '',
+      };
+    } else {
+      evidence = await gateRunner.run(currentTaskCard.verification_commands);
+    }
     latestGateEvidence = evidence;
     throwIfAborted();
     log(`gate completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);

@@ -27,32 +27,29 @@ results** — not to drive each step.
 | *"Use SuperGPT to implement X"* / *"用 SuperGPT 实现 X"* | If sufficiently clear, call `supergpt_start({ goal, cwd })`, then immediately attach `supergpt_watch({ workflowId })` until terminal. |
 | *"现在做到哪了？"* / *"What's the status?"* | Call `supergpt_status({ workflowId })`. Output the on-demand snapshot without LLM calls. |
 | *"停掉。"* / *"Stop it."* | Call `supergpt_stop({ workflowId })`. Confirm safe termination. |
+| *"验证一下"* / *"Run host verification"* | Call `supergpt_verify({ workflowId })` to run Gate verification on the host inside the preserved isolated worktree without consuming model tokens. |
 | *"继续。"* / *"Resume."* | Call `supergpt_resume({ workflowId, answer, cwd })`. |
 
-### Handling HUMAN_REQUIRED
+### Handling HUMAN_REQUIRED & Host Verification
 
-When SuperGPT encounters a genuine human question, it halts safely and returns `status: "HUMAN_REQUIRED"` with `question` and `reason`.
+When SuperGPT encounters a genuine human question or environment blocker, it halts safely and returns `status: "HUMAN_REQUIRED"` with `question`, `reason`, `actionCode`, and `evidence`.
 
-1. **Present the question verbatim**:
-   ```
-   SuperGPT needs one decision:
-   <question>
-   ```
-2. **Wait for user answer**: Do not guess or make architectural decisions on the user's behalf.
-3. **Resume the workflow**:
-   Call `supergpt_resume({ workflowId, answer: "<user_answer>", cwd })`. The exact same worktree, state, and conversations will resume automatically.
+1. **Safety Invariant**: A front-agent or human must NEVER manually sync, merge, cherry-pick, or copy changes from the isolated worktree into the source workspace before final acceptance. Delivery is owned solely by SuperGPT at `WORKFLOW_DONE`.
+2. **Environment / Gate Command Blocker**: If Gate verification failed due to host toolchain or command permissions, run trusted host verification via `supergpt_verify({ workflowId })`. When PASS evidence is captured, call `supergpt_resume({ workflowId, cwd })` to continue automatically.
+3. **Ambiguity / Guidance**: If clarification is needed, present the question verbatim, collect the answer, and resume with `supergpt_resume({ workflowId, answer: "<user_answer>", cwd })`.
 
 ## MCP Tools Reference
 
 All tools operate locally or delegate to the isolated SuperGPT orchestrator:
 
-- `supergpt_plan`: Turn an instruction into a bounded plan **without executing**. Returns `status: "READY"` (summary + tasks) or `"AMBIGUOUS"` (one question).
+- `supergpt_plan`: Turn an instruction into a bounded plan **without executing**. Returns `status: "READY"` (summary + tasks) or `"AMBIGUOUS"` (one question). Ingests repository closeout testing policies.
 - `supergpt_start`: Non-blocking normal entrypoint. Returns exactly `{ status: "RUNNING", workflowId }`; immediately attach `supergpt_watch({ workflowId })` to stream progress until terminal.
-- `supergpt_watch`: Long-running local watcher with streaming MCP progress notifications (heartbeat, elapsed time, stage transitions) until terminal. Consumes 0 model tokens.
+- `supergpt_watch`: Long-running local watcher with streaming MCP progress notifications (heartbeat, elapsed time, stage transitions, stale-runtime warnings) until terminal. Consumes 0 model tokens.
+- `supergpt_verify`: Trusted zero-model host Gate runner that runs pending/closeout verification commands in the preserved isolated worktree, creating immutable structured evidence consumed by resume.
 - `supergpt_run`: Blocking convenience API for callers that explicitly want one call to wait for the full terminal result.
-- `supergpt_status`: On-demand snapshot of SuperGPT workflows with live state, progress block, and process health without calling an LLM. Pass `workflowId` to narrow.
+- `supergpt_status`: On-demand snapshot of SuperGPT workflows with live state, progress block, stale-runtime mismatch warnings, and process health without calling an LLM. Pass `workflowId` to narrow.
 - `supergpt_wait`: Wait locally for state transition (zero model tokens).
-- `supergpt_resume`: Resume a suspended workflow, applying the user's clarification / answer.
+- `supergpt_resume`: Resume a suspended workflow, applying the user's clarification / answer and consuming valid host verification evidence.
 - `supergpt_stop`: Safely abort an active workflow and kill active children without leaving orphan processes.
 
 ## Progress UX

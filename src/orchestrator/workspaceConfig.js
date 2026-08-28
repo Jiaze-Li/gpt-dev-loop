@@ -44,12 +44,26 @@ export function loadWorkspaceConfig(workspaceCwd = process.cwd()) {
       }
     }
 
+    const rawCloseout = parsed.verification?.closeoutCommands ||
+      parsed.verification?.closeout_commands ||
+      parsed.closeoutCommands ||
+      parsed.closeout_verification_commands;
+    const closeoutCommands = [];
+    if (Array.isArray(rawCloseout)) {
+      for (const item of rawCloseout) {
+        if (typeof item === "string" && item.trim()) {
+          closeoutCommands.push(item.trim());
+        }
+      }
+    }
+
     return {
       ...parsed,
       externalReadRoots,
+      closeoutCommands,
     };
   } catch (err) {
-    return { externalReadRoots: [] };
+    return { externalReadRoots: [], closeoutCommands: [] };
   }
 }
 

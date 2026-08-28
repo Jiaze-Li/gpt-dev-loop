@@ -32,6 +32,7 @@ import {
   supergptStop,
   supergptWait,
   supergptWatch,
+  supergptVerify,
   supergptFormatProgress,
   toCanonicalProgress,
 } from '../orchestrator/supergpt.js';
@@ -40,6 +41,7 @@ import { resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import { compileSuperGptRequest } from '../control/requestCompiler.js';
+import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from '../orchestrator/runtimeIdentity.js';
 
 const WORKSPACE_METADATA_SUFFIX = '.workspace.json';
 
@@ -82,12 +84,20 @@ export async function readWorkflowStatus({
 
     const canonical = live ? toCanonicalProgress(live) : null;
 
+    const workflowIdentity = meta?.runtime_identity ?? live?.runtime_identity ?? null;
+    const currentIdentity = getCurrentRuntimeIdentity();
+    const runtimeCheck = compareRuntimeIdentity(workflowIdentity, currentIdentity);
+
     const merged = {
       workflow_id: meta.workflow_id,
       source_workspace: meta.source_workspace,
       source_branch: meta.source_branch,
       worktree_path: meta.worktree_path,
       created_at: meta.created_at,
+      runtime_identity: workflowIdentity,
+      staleRuntime: runtimeCheck.staleRuntime,
+      staleRuntimeWarning: runtimeCheck.warning,
+      runtimeCheck,
       status: live?.workflowStatus ?? 'UNKNOWN',
       stage: live?.stage ?? 'UNKNOWN',
       taskIndex: live?.taskIndex ?? null,
@@ -463,6 +473,52 @@ export function createSuperGptMcpServer({
         content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
         structuredContent: result,
       };
+    },
+  );
+
+  server.registerTool(
+    'supergpt_verify',
+    {
+      description:
+        'Run trusted host Gate verification against the preserved isolated worktree for a workflow. Executes frozen verification commands with zero model tokens, records durable immutable evidence, and invalidates on worktree mutation.',
+      inputSchema: {
+        workflowId: z.string().min(1).describe('workflow id to run host verification for'),
+      },
+      outputSchema: {
+        workflowId: z.string(),
+        evidenceId: z.string(),
+        pass: z.boolean(),
+        commands: z.array(z.string()),
+        results: z.array(z.record(z.string(), z.any())),
+        capturedAt: z.string(),
+        worktree: z.string(),
+        hash: z.string(),
+      },
+    },
+    async ({ workflowId }) => {
+      try {
+        const result = await supergptVerify({ workflowId });
+        const structured = {
+          workflowId: result.workflowId,
+          evidenceId: result.evidenceId,
+          pass: result.pass,
+          commands: result.commands,
+          results: result.results,
+          capturedAt: result.capturedAt,
+          worktree: result.worktree,
+          hash: result.hash,
+        };
+        return {
+          content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+          structuredContent: structured,
+          isError: !result.pass,
+        };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: `Host verification failed: ${err.message}` }],
+          isError: true,
+        };
+      }
     },
   );
 
