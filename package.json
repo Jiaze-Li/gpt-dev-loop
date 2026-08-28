@@ -6,6 +6,7 @@
   "type": "module",
   "bin": {
     "gpt-loop": "./bin/gpt-loop.js",
+    "supergpt": "bin/supergpt.js",
     "gpt-loop-mcp": "./bin/gpt-loop-mcp.js",
     "gpt-loop-run": "./bin/gpt-loop-run.js"
   },
