@@ -7,7 +7,7 @@ export function decideAutoRoute(goal = '') {
   if (/\b(do not|don't|dont|without)\s+use\s+supergpt\b/.test(text)) return { mode: AUTO_ROUTE.BYPASS, route: false };
   if (/\b(use|run|via)\s+supergpt\b/.test(text)) return { mode: AUTO_ROUTE.FORCE, route: true };
 
-  const engineering = /\b(implement|build|fix|refactor|migrate|upgrade|replace)\b/.test(text);
+  const engineering = /\b(create|implement|build|fix|refactor|migrate|upgrade|replace)\b/.test(text);
   const scopeSignals = [
     /\b(server|client|frontend|backend|api|database|schema|module|component|repository|repo)\b/,
     /\b(test|acceptance|compatib|migration|preserve|rollback)\b/,

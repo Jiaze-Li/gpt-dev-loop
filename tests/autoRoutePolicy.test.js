@@ -9,4 +9,5 @@ test('AutoRoutePolicy FORCE, BYPASS, and conservative AUTO contracts', () => {
   assert.equal(decideAutoRoute('Explain this stack trace').route, false);
   assert.equal(decideAutoRoute('Summarize this long non-engineering document about history and literature').route, false);
   assert.equal(decideAutoRoute('Build server and client settings components with tests').route, true);
+  assert.equal(decideAutoRoute('Create a module with node:test coverage and run tests').route, true);
 });
