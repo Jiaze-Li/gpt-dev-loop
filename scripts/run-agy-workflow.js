@@ -374,6 +374,15 @@ async function main() {
   console.log(`run-agy-workflow: ${result.status}`);
   if (result.status === 'WORKFLOW_DONE') {
     console.log(result.summary ?? '');
+    const snap = selection.sessionStore?.snapshot?.();
+    if (snap) {
+      console.log('');
+      console.log('Conversations:');
+      console.log(`  Supervisor  ${snap.supervisor?.conversation_id ?? '(none)'}`);
+      for (const [tId, cId] of Object.entries(snap.reviewer?.conversations ?? {})) {
+        console.log(`  Reviewer    ${cId} (task: ${tId})`);
+      }
+    }
   } else {
     console.log(`reason:   ${result.reason ?? ''}`);
     console.log(`question: ${result.question ?? ''}`);
