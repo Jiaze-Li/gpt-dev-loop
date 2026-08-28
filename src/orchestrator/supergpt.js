@@ -29,6 +29,7 @@ import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
+import { loadWorkspaceConfig, resolveApprovedExternalRoots } from './workspaceConfig.js';
 import {
   WorkflowStateManager,
   readLiveWorkflowState,
@@ -356,6 +357,11 @@ export async function runSuperGPT({
   }, 400);
   if (typeof stopWatcher.unref === 'function') stopWatcher.unref();
 
+  const resolvedExternalRoots = resolveApprovedExternalRoots({
+    cwd,
+    explicitRoots: [...(Array.isArray(externalReadRoots) ? externalReadRoots : []), ...(Array.isArray(approvedExternalRoots) ? approvedExternalRoots : [])],
+  });
+
   try {
     // Do not race cancellation against the pipeline: doing so reports a
     // stopped workflow while its provider child can still edit/deliver.
@@ -375,8 +381,8 @@ export async function runSuperGPT({
           usageTracker,
           isResume,
           answer,
-          externalReadRoots,
-          approvedExternalRoots,
+          externalReadRoots: resolvedExternalRoots,
+          approvedExternalRoots: resolvedExternalRoots,
         })
       );
     throwIfAborted(internalAbort.signal);
@@ -483,12 +489,21 @@ async function defaultPipeline({
 
   const metadataPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
   let worktree, baseline;
+  let resolvedApprovedRoots = [];
 
   if (isResume && existsSync(metadataPath)) {
     try {
       const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
       ({ worktree, baseline } = restoreResumableWorkspace(meta));
       lifecycleManager?.trackWorktree(worktree.worktree_path);
+      const persistedRoots = Array.isArray(meta.external_read_roots)
+        ? meta.external_read_roots
+        : (Array.isArray(meta.approved_external_roots) ? meta.approved_external_roots : []);
+      resolvedApprovedRoots = resolveApprovedExternalRoots({
+        cwd: worktree.source_workspace || cwd || process.cwd(),
+        explicitRoots: [...externalReadRoots, ...approvedExternalRoots],
+        persistedRoots,
+      });
     } catch (err) {
       if (lifecycleManager) await lifecycleManager.onInitFailed();
       workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: `resume failed: ${err.message}` });
@@ -496,12 +511,20 @@ async function defaultPipeline({
     }
   } else {
     try {
+      resolvedApprovedRoots = resolveApprovedExternalRoots({
+        cwd: cwd || process.cwd(),
+        explicitRoots: [...externalReadRoots, ...approvedExternalRoots],
+      });
       const established = await establishIsolatedWorkspace({
         sourceCwd: cwd,
         workflowId,
         recordMetadata: async (meta) => {
           await mkdir(SUPERGPT_WORKTREE_ROOT, { recursive: true });
-          await writeFile(metadataPath, `${JSON.stringify({ ...meta, goal, plan_path: planPath }, null, 2)}\n`, 'utf8');
+          await writeFile(
+            metadataPath,
+            `${JSON.stringify({ ...meta, goal, plan_path: planPath, external_read_roots: resolvedApprovedRoots }, null, 2)}\n`,
+            'utf8'
+          );
         },
       });
       worktree = established.worktree;
@@ -674,8 +697,8 @@ async function defaultPipeline({
       commit_sha: worktree.baseline_head,
     },
     sourceWorkspace: worktree.source_workspace || cwd,
-    externalReadRoots,
-    approvedExternalRoots,
+    externalReadRoots: resolvedApprovedRoots,
+    approvedExternalRoots: resolvedApprovedRoots,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
     workflowStateManager,
     usageTracker,
@@ -981,6 +1004,8 @@ export async function supergptResume({
   workflowId,
   answer = null,
   cwd,
+  externalReadRoots = [],
+  approvedExternalRoots = [],
   onEvent,
   outputFormat,
   signal,
@@ -1003,6 +1028,9 @@ export async function supergptResume({
   }
 
   const effectiveCwd = cwd ?? meta.source_workspace ?? meta.source_repo_root ?? process.cwd();
+  const persistedRoots = Array.isArray(meta.external_read_roots)
+    ? meta.external_read_roots
+    : (Array.isArray(meta.approved_external_roots) ? meta.approved_external_roots : []);
 
   return runSuperGPT({
     workflowId,
@@ -1011,6 +1039,11 @@ export async function supergptResume({
     goal: meta.goal ?? null,
     planPath: meta.plan_path ?? null,
     cwd: effectiveCwd,
+    externalReadRoots: [
+      ...persistedRoots,
+      ...(Array.isArray(externalReadRoots) ? externalReadRoots : []),
+      ...(Array.isArray(approvedExternalRoots) ? approvedExternalRoots : []),
+    ],
     onEvent,
     outputFormat,
     signal,

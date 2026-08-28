@@ -196,7 +196,7 @@ export function createSuperGptMcpServer({
     },
   );
 
-  const runHandler = async ({ goal, planPath, cwd: runCwd }) => {
+  const runHandler = async ({ goal, planPath, cwd: runCwd, externalReadRoots }) => {
     if (!goal && !planPath) {
       throw new Error('supergpt_run requires either "goal" or "planPath"');
     }
@@ -205,6 +205,7 @@ export function createSuperGptMcpServer({
       goal,
       planPath,
       cwd: runCwd ? path.resolve(runCwd) : cwd,
+      externalReadRoots,
       onEvent: (event) => events.push(event),
     });
     const structured = {
@@ -233,6 +234,7 @@ export function createSuperGptMcpServer({
         goal: z.string().min(1).optional().describe('natural-language instruction'),
         planPath: z.string().min(1).optional().describe('path to an existing plan file (takes precedence over goal)'),
         cwd: z.string().optional().describe('invocation workspace (default: server cwd)'),
+        externalReadRoots: z.array(z.string()).optional().describe('optional explicit approved external read-only roots relative to invocation workspace'),
       },
       outputSchema: {
         status: z.string(),
@@ -256,15 +258,21 @@ export function createSuperGptMcpServer({
         goal: z.string().min(1).optional().describe('natural-language instruction'),
         planPath: z.string().min(1).optional().describe('path to an existing plan file'),
         cwd: z.string().optional().describe('invocation workspace (default: server cwd)'),
+        externalReadRoots: z.array(z.string()).optional().describe('optional explicit approved external read-only roots relative to invocation workspace'),
       },
       outputSchema: {
         status: z.string(),
         workflowId: z.string().nullable(),
       },
     },
-    async ({ goal, planPath, cwd: runCwd }) => {
+    async ({ goal, planPath, cwd: runCwd, externalReadRoots }) => {
       if (!goal && !planPath) throw new Error('supergpt_start requires either "goal" or "planPath"');
-      const started = startSuperGptFn({ goal, planPath, cwd: runCwd ? path.resolve(runCwd) : cwd });
+      const started = startSuperGptFn({
+        goal,
+        planPath,
+        cwd: runCwd ? path.resolve(runCwd) : cwd,
+        externalReadRoots,
+      });
       const structured = { status: 'RUNNING', workflowId: started.workflowId };
       return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
     },
@@ -399,6 +407,7 @@ export function createSuperGptMcpServer({
         workflowId: z.string().min(1).describe('id of the suspended workflow to resume'),
         answer: z.string().optional().describe('user decision / answer to the question if status was HUMAN_REQUIRED'),
         cwd: z.string().optional().describe('workspace directory'),
+        externalReadRoots: z.array(z.string()).optional().describe('optional explicit approved external read-only roots relative to invocation workspace'),
       },
       outputSchema: {
         status: z.string(),
@@ -411,12 +420,13 @@ export function createSuperGptMcpServer({
         events: z.array(z.record(z.string(), z.any())),
       },
     },
-    async ({ workflowId, answer, cwd: runCwd }) => {
+    async ({ workflowId, answer, cwd: runCwd, externalReadRoots }) => {
       const events = [];
       const result = await resumeSuperGptFn({
         workflowId,
         answer,
         cwd: runCwd ? path.resolve(runCwd) : cwd,
+        externalReadRoots,
         onEvent: (event) => events.push(event),
       });
       const structured = {
