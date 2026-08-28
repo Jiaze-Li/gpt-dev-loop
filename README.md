@@ -75,7 +75,7 @@ Verifies local availability of:
 - `claude` (Claude Code CLI)
 
 ### 2. Run Tests
-Run the deterministic unit test suite (802 tests):
+Run the deterministic unit test suite (524 tests):
 ```bash
 npm test
 ```
@@ -123,7 +123,7 @@ When invoked with `--output-format=json`, SuperGPT streams typed events:
   - `agy/`: Headless Antigravity CLI client with fail-closed conversation resumption.
   - `adapters/`: Gate runner, git evidence collector, and executor adapters.
 - `skills/` / `.agents/skills/supergpt/`: Antigravity Skill definition.
-- `tests/`: 802 deterministic unit tests across all subsystem boundaries.
+- `tests/`: 524 deterministic unit tests across all subsystem boundaries.
 
 ---
 

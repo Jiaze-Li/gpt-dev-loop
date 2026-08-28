@@ -179,8 +179,8 @@ input; it never changes Core semantics.
 ## History and v1.1
 
 The legacy Chrome/ChatGPT Web bridge, extension transport, browser tabs, and
-DOM selectors are explicitly **HISTORY/LEGACY**, not part of the production
-SuperGPT entrypoints or active RoleRouter composition. They must not be
-presented by doctor or current installation instructions as production
-architecture. v1.1 is limited to parallel task DAG execution with isolated
-task worktrees and an explicit integration task; it is not implemented in V1.
+DOM selectors have been physically purged from the V1 codebase; their record is
+retained solely as historical documentation in `docs/handoff/archive/` and in
+Git history. They are not part of the production SuperGPT entrypoints or active
+RoleRouter composition. v1.1 is limited to parallel task DAG execution with
+isolated task worktrees and an explicit integration task; it is not implemented in V1.

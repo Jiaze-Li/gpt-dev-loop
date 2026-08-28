@@ -211,15 +211,9 @@ Later:
 ./install codex
 ```
 
-## Phase 9 — Chrome extension browser bridge
+## Phase 9 — Chrome extension browser bridge (Retired / Historical)
 
-Status: **done** (2026-08-25). Added an opt-in `GPT_BROWSER_MODE=extension`
-transport: a Manifest V3 Chrome extension drives the user's own
-already-logged-in ChatGPT tab through a loopback-only local bridge server,
-so gpt-loop no longer has to launch or attach to Chrome itself. The
-Playwright `launch`/`cdp` transport stays the default and is unchanged; the
-GPT reviewer adapter's `review()` signature is unchanged. Full design and
-implementation record: `docs/handoff/archive/2026-08-25-chrome-extension-bridge.md`.
+Status: **retired and physically purged in V1**. The Chrome extension and browser bridge architecture was replaced by SuperGPT V1's local Orchestrator, multi-role provider adapters, and MCP control plane. Full historical design record remains preserved in `docs/handoff/archive/2026-08-25-chrome-extension-bridge.md` and Git history.
 
 ## Pilot strategy
 
