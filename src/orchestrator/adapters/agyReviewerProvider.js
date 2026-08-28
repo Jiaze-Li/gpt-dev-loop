@@ -64,7 +64,7 @@ function renderEvidence(evidence) {
   sections.push(`### gate results\noverall pass: ${evidence?.pass ?? 'unknown'}\n${results.length ? results.map((result) => `- \`${result.command}\`: ${result.pass ? 'pass' : 'fail'} — ${result.output ?? ''}`).join('\n') : 'none'}`);
   return sections.join('\n\n');
 }
-function renderReviewInputs(taskCard, executionReport, evidence) {
+export function renderReviewInputs(taskCard, executionReport, evidence) {
   return `# Task Card (TASK_PROTOCOL.md)\n\n${renderTaskCard(taskCard)}\n\n# Execution Report (EXECUTION_REPORT.md)\n\n${renderExecutionReport(executionReport)}\n\n# Evidence\n\n${renderEvidence(evidence)}`;
 }
 

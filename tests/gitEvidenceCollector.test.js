@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 
 import { createGitEvidenceCollector, DIFF_STATUS } from '../src/adapters/gate/git-evidence/index.js';
 import { GitEvidenceError, GIT_EVIDENCE_ERROR_CODES } from '../src/adapters/gate/git-evidence/errors.js';
-import { createGptReviewerAdapter } from '../src/orchestrator/adapters/gptReviewerAdapter.js';
+import { createAgyReviewerProvider } from '../src/orchestrator/adapters/agyReviewerProvider.js';
 
 // Fake child_process.spawn keyed by the exact `git <args>` invocation, like
 // a scripted git binary. Each entry can be { code, stdout, stderr } or
@@ -280,31 +280,18 @@ test('git evidence collector output is directly consumable by the GPT Reviewer A
   });
 
   let capturedPrompt;
-  const reviewer = createGptReviewerAdapter({
-    askGptFn: async (prompt) => {
+  const reviewer = createAgyReviewerProvider({
+    callAgy: async ({ prompt }) => {
       capturedPrompt = prompt;
-      return `@@ task_id
-demo-task
-
-@@ repository_context
-repository_name: gpt-dev-loop
-repository_url: https://github.com/example/gpt-dev-loop.git
-branch: main
-commit_sha: abc123def
-
-@@ decision
-PASS
-
-@@ findings
-- looks fine
-
-@@ required_changes
-none
-
-@@ rationale
-matches acceptance_criteria`;
+      return {
+        text: JSON.stringify({
+          decision: 'PASS',
+          findings: ['looks fine'],
+          required_changes: [],
+          rationale: 'matches acceptance_criteria',
+        }),
+      };
     },
-    config: {},
   });
 
   const taskCard = {
@@ -336,6 +323,6 @@ matches acceptance_criteria`;
   assert.match(capturedPrompt, /head: abc123def/);
   assert.match(capturedPrompt, /\+added line/);
   assert.match(capturedPrompt, /`npm test`: pass/);
-  assert.match(capturedPrompt, /Commit:\nabc123def/);
+  assert.match(capturedPrompt, /commit_sha: abc123def/);
   assert.match(capturedPrompt, /diff status\nCHANGED/);
 });

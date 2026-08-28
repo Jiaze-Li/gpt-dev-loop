@@ -3,14 +3,8 @@
 // Deterministic evidence collection — gathers the actual code-change
 // evidence (repository context, current commit, changed files, diff,
 // working-tree status) that docs/workflow/ARCHITECTURE.md §5 and
-// STATE_MACHINE.md §1 REVIEWING call "Git evidence", so the Reviewer
-// Adapter (src/orchestrator/adapters/gptReviewerAdapter.js) has real
-// evidence to judge instead of only pass/fail test results.
-//
-// This module is standalone: it does not import, and is not imported by,
-// the core Workflow Manager, the Executor Adapter, the Reviewer Adapter, or
-// the MCP/browser bridge. A caller wires it in explicitly, then passes its
-// output as the `evidence` argument those already accept.
+// STATE_MACHINE.md §1 REVIEWING call "Git evidence", so Reviewer
+// providers have real evidence to judge instead of only pass/fail test results.
 //
 // Signature: collect_evidence(context) -> Evidence
 

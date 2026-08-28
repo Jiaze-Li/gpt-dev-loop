@@ -1,34 +1,18 @@
-// Automated orchestration loop (Issue #2, step 4) — first fully-automatic
-// end-to-end wiring of the primitives already built in earlier steps:
+// Automated orchestration loop — autonomous Supervisor-Executor-Reviewer development loop:
 //
-//   SupervisorSession   (src/bridge/supervisorSession.js)   — one persistent
-//                        ChatGPT conversation for the whole workflow
-//   ReviewerSession     (src/bridge/reviewerSession.js)     — one persistent
-//                        ChatGPT conversation per task, reused across every
-//                        REWORK round of that task
-//   ClaudeSessionManager(src/orchestrator/adapters/claudeSessionManager.js)
-//                        — a brand-new Claude session for every single
-//                        execute() call (initial attempt and every rework)
-//   gate runner          (src/orchestrator/adapters/gateRunner.js)  — runs
-//                        verification_commands and collects evidence
+//   SupervisorSession   — manages Task Card generation and workflow decisions
+//                         with logical continuity and failover across providers
+//   ReviewerSession     — audits task execution reports and gate evidence per attempt
+//   ExecutorAdapter     — executes task cards in isolated worktrees (Claude/Codex)
+//   GateRunner          — executes deterministic verification commands and collects Git evidence
 //
-// This file does not reimplement any of the above. It only sequences them:
+// This file sequences the multi-role development loop:
 //
 //   Supervisor.decide() -> NEXT_TASK
-//     -> Claude.execute() -> gate.run() -> Reviewer.review()
-//     -> Supervisor.decide() again, now carrying that Review Result
-//     -> CONTINUE_REWORK  loops back to a fresh Claude.execute() on the
-//                         SAME task, through the SAME ReviewerSession
-//     -> NEXT_TASK/WORKFLOW_DONE/HUMAN_REQUIRED ends that task
-//
-// Deliberately bypasses workflowManager.js/stateMachine.js: that state
-// machine drives EXECUTING/VERIFYING/REWORK/REVIEWING for one task straight
-// through to a terminal state without ever consulting the Supervisor
-// per-attempt. This loop's whole point is the opposite — the Supervisor is
-// asked to approve (or refuse) every single rework round via
-// CONTINUE_REWORK, per Issue #2's spec. Reusing workflowManager.js's
-// internal auto-retry would silently drop that consultation, so this is a
-// new, separate thin controller instead of a change to that file.
+//     -> Executor.execute() -> gate.run() -> Reviewer.review()
+//     -> Supervisor.decide() again, carrying the Review Result
+//     -> CONTINUE_REWORK  loops back to Executor.execute() on the SAME task
+//     -> NEXT_TASK / WORKFLOW_DONE / HUMAN_REQUIRED transitions the workflow
 //
 // Legal supervisor-decision / workflow-state pairing (enforced below by
 // assertLegalTransition, independent of whatever parseSupervisorDecision
@@ -47,6 +31,7 @@
 import { AdapterError, ADAPTER_ERROR_CODES } from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
 import { defaultOrganicReworkRecorder } from './organicReworkRecorder.js';
+import { nullWindowSession } from './agyProviderSessions.js';
 import {
   runPreflight as defaultRunPreflight,
   buildHumanRequiredEvidence,
@@ -68,15 +53,13 @@ export function reviewerReworkNonConvergence(previous, current, evidence) {
 
 // --- Bounded rate-limit recovery ---------------------------------------
 //
-// ChatGPT's own "You're making requests too quickly" throttle (surfaced by
-// the extension as RATE_LIMITED — see extension/domActions.js isRateLimited)
+// Provider rate-limit throttling (surfaced as PROVIDER_RATE_LIMITED or RATE_LIMITED)
 // is NOT a task failure, a review verdict, a send failure, or a gate
 // failure. When it hits a Reviewer review (or a Supervisor decision), the
 // ONLY correct response is to wait for the throttle to clear and re-issue
-// the SAME GPT request — never to rerun Claude, rerun the deterministic
-// gate, bump the task attempt counter, spin up a new Reviewer conversation,
-// or ask the Supervisor for a fresh decision. All of that surrounding state
-// is deliberately left untouched here.
+// the request — never to rerun the Executor, rerun the deterministic
+// gate, bump the task attempt counter, or ask the Supervisor for a fresh decision.
+// All of that surrounding state is deliberately left untouched here.
 //
 // Recovery is strictly bounded (maxRetries) with a conservative escalating
 // cooldown; once the budget is spent the workflow stops with a resumable
@@ -89,30 +72,19 @@ class RateLimitStopError extends Error {
   }
 }
 
-// Duck-typed so this module stays free of a hard dependency on
-// src/bridge/errors.js — the bridge maps RATE_LIMITED to a RateLimitedError
-// whose `.name` is exactly this, and the underlying banner text is stable.
+// Duck-typed so this module stays free of external bridge dependencies —
+// rate limit errors are identified by code / name / message pattern.
 function isRateLimitError(err) {
-  return err?.name === 'RateLimitedError' || err?.code === 'RATE_LIMITED' || /making requests too quickly/i.test(err?.message ?? '');
+  return err?.name === 'RateLimitedError' || err?.code === 'RATE_LIMITED' || err?.code === 'PROVIDER_RATE_LIMITED' || /making requests too quickly|rate.?limit/i.test(err?.message ?? '');
 }
 
-// requirement: only auto-retry when the failure stage PROVES the GPT
-// request was rejected before the user message was ever confirmed sent —
-// otherwise a retry risks a duplicate submission into the same
-// conversation. The extension throws RATE_LIMITED from a handful of
-// distinct stages (extension/domActions.js); only these two are strictly
-// pre-send. "while waiting for a reply" (and anything unrecognized) is
-// treated as possibly-already-sent and is NOT auto-retried.
+// Auto-retry when the failure stage proves the provider request was rejected pre-send.
 function rateLimitedBeforeSend(err) {
-  return /looking for the composer|waiting for the page to become ready/i.test(err?.message ?? '');
+  return /looking for the composer|waiting for the page to become ready|preflight/i.test(err?.message ?? '');
 }
 
 function rateLimitCooldownMs(err, retry, baseMs, jitterMs) {
-  // Prefer an explicit cooldown if the throttle ever surfaces one. ChatGPT's
-  // banner currently does not (there is no Retry-After to read), so in
-  // practice this always falls through to the conservative backoff below —
-  // it is here so a future UI-provided cooldown is used automatically.
-  const retryAfter = Number(err?.retryAfterMs);
+  const retryAfter = Number(err?.retryAfterMs ?? err?.retryAfter);
   if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter, baseMs * 4);
   // Conservative escalating backoff: base, 2·base, 3·base … plus 0…jitter of
   // randomness so repeated retries never resynchronize into a tight burst.
@@ -173,149 +145,33 @@ function assertLegalTransition(decision, hasPendingRework) {
 //
 //   workflowId               — string, threaded into ClaudeSessionManager's
 //                               persistence key and this loop's history
-//   supervisorSession         — a SupervisorSession-shaped object:
+// runAutomatedWorkflow drives one workflow, start to finish, across the
+// multi-role Planner/Supervisor/Executor/Reviewer pipeline:
+//
+//   workflowId               — string identifying the workflow instance
+//   supervisorSession        — a SupervisorSession-shaped object:
 //                               { create(), decide(context), close() }.
 //                               create() is called once at the start of
-//                               this function; close() is called only on
+//                               this function; close() is called on
 //                               WORKFLOW_DONE.
-//   createReviewerSession()   — returns a fresh ReviewerSession-shaped
+//   createReviewerSession()  — returns a fresh ReviewerSession-shaped
 //                               object: { create(taskId), review(taskId,
 //                               taskCard, executionReport, evidence),
-//                               close() }. Called once per task (a new task
-//                               gets a new session; the same task's rework
-//                               rounds reuse the one already created).
+//                               close() }. Called once per task; the same
+//                               task's rework rounds reuse the session.
 //   createClaudeSessionManager({ taskId }) — returns an Executor-Adapter-
 //                               shaped object: { execute(taskCard) ->
-//                               execution_report }. Called once per task;
-//                               every execute() call on the object it
-//                               returns is a fresh Claude session per that
-//                               object's own contract.
-//   gateRunner                — { run(verification_commands) -> evidence },
-//                               unchanged from ADAPTER_INTERFACE.md §3.
-//   windowSession             — a windowSession-shaped object:
-//                               { create() -> { windowId, initialTabId },
-//                               activateTab(tabId) -> { tabId, active,
-//                               windowId, windowFocused }, close(windowId),
-//                               closeTab(tabId), listTabs(windowId) ->
-//                               [{ windowId, tabId, active, status, urlState,
-//                               openerTabId }] }. closeTab/listTabs are used
-//                               only for the initial-placeholder-tab cleanup
-//                               and stage-diagnostic logging described below
-//                               — neither sends a GPT request. See src/bridge/windowSession.js
-//                               for the real extension-backed implementation
-//                               (thin wrappers over the windowCreate/
-//                               windowActivateTab/windowClose wire actions
-//                               proven live by
-//                               scripts/test-background-automation-window-live.js).
-//                               Required — every Supervisor/Reviewer tab this
-//                               loop opens lives inside the ONE dedicated,
-//                               permanently unfocused window this creates, so
-//                               the user's own foreground Chrome window/tab is
-//                               never touched. create() is called exactly
-//                               once, at the very start of this function;
-//                               activateTab(tabId) is called immediately
-//                               before every supervisorSession.decide() and
-//                               every reviewerSession.review() so the target
-//                               tab is `active` inside the automation window
-//                               (never the globally-active tab) without ever
-//                               focusing that window — a reply
-//                               windowFocused !== false or active !== true
-//                               aborts the whole workflow (assertWindowInvariant
-//                               above) rather than silently proceeding.
-//                               close(windowId) is called once the workflow
-//                               reaches WORKFLOW_DONE (after both sessions'
-//                               own close()) and, best-effort, on any error
-//                               that escapes this loop — never on
-//                               HUMAN_REQUIRED, which deliberately leaves the
-//                               window/tabs open for a resumed run.
-//   persistence                — optional Persistence-shaped object
-//                               ({ writeState }); when given, Reviewer
-//                               feedback is written to
-//                               { workflow_id, task_id, last_error } before
-//                               every rework attempt so
-//                               ClaudeSessionManager's own rework-prompt
-//                               logic (which reads exactly that state) can
-//                               fold it in. Required if any task actually
-//                               goes through a rework round; omit only for
-//                               workflows you're certain will PASS first
-//                               try.
-//   workflowGoal/repositoryContext — passed straight through to
-//                               buildSupervisorPrompt via decide().
-//   maxAttemptsPerTask         — bounded-retry safety guard (default 3):
-//                               the maximum number of Claude execute()
-//                               attempts (initial + every rework) for a
-//                               single task before this loop stops itself
-//                               and returns HUMAN_REQUIRED, instead of
-//                               following CONTINUE_REWORK forever.
-//   keepOpenOnFailure          — debug-only (default false, unchanged
-//                               production semantics). When true, the
-//                               best-effort cleanup an unexpected error
-//                               normally triggers (closeReviewer/
-//                               supervisorSession.close/windowSession.close)
-//                               is skipped, and the preserved windowId/
-//                               supervisorTabId/reviewerTabId are logged
-//                               instead, before the error is rethrown —
-//                               added only for
-//                               scripts/test-automated-loop-live.js's
-//                               --keep-open-on-failure flag, so a live
-//                               failure can be inspected in the actual
-//                               ChatGPT tabs instead of racing a teardown
-//                               that already happened. Sends no extra GPT
-//                               requests either way — this only changes
-//                               whether the existing close() calls run.
-//   keepOpenOnSuccess          — debug-only (default false, unchanged
-//                               production semantics). Same skip, but for
-//                               the WORKFLOW_DONE cleanup — added only for
-//                               scripts/test-automated-loop-live.js's
-//                               --keep-open flag (manual inspection of the
-//                               final ChatGPT state after a successful run).
-//                               Never applies to HUMAN_REQUIRED, which
-//                               already preserves everything under its own,
-//                               unrelated resume contract (see below) —
-//                               these two flags never touch that branch.
-//   log                        — optional (line) => void, called at each
-//                               loop stage (task selected, claude attempt
-//                               started/completed, gate started/completed,
-//                               reviewer created, review started/completed,
-//                               supervisor decision) for operational
-//                               visibility. Never passed prompt/reply
-//                               content — task/attempt/decision identifiers
-//                               only. Defaults to a "gpt-loop: " prefixed
-//                               console.log, matching this codebase's other
-//                               stderr/stdout log lines.
-//
-// Automation window tab-count invariant (diagnostic finding, 2026-08-27):
-// chrome.windows.create() always creates one initial tab of its own,
-// navigated to config.chatgptUrl as a side effect of opening the window at
-// all (see windowSession.create()'s doc comment). Left alone, that initial
-// tab sits in the automation window forever as an unused, idle ChatGPT tab
-// nobody ever addresses — on top of the real Supervisor tab
-// supervisorSession.create() then opens, and later the real Reviewer tab —
-// which is why a live window was observed holding 3 tabs where only 2
-// (Supervisor + Reviewer) are ever actually used. This loop closes that
-// initial placeholder tab (via windowSession.closeTab) immediately after the
-// real Supervisor tab is confirmed up, restoring the intended invariant:
-// exactly 1 working tab after Supervisor creation, 2 while a Reviewer tab is
-// also open, 1 again after the Reviewer tab closes. Chosen over the
-// alternative (reusing the initial tab itself AS the Supervisor tab) because
-// it needs no new branch in createSupervisorTab's proven create+readiness
-// logic — it only adds one extra close() call after that logic already
-// succeeded.
-//
-// Reviewer tab lifecycle is deliberately LAZY (live E2E finding,
-// 2026-08-27): createReviewerSession() is called at NEXT_TASK to get a
-// ReviewerSession-shaped object, but that object's own create(taskId) —
-// which is what actually opens the background ChatGPT tab — is NOT called
-// until immediately before the first review() of that task, i.e. after
-// Claude execute() and gate.run() have both already completed. Opening the
-// tab any earlier left it sitting idle in the background for the entire
-// Claude execution + gate run, which was long enough to trip ChatGPT's own
-// idle/rate handling in the already-observed live failure. Same-task
-// REWORK rounds reuse that one already-created ReviewerSession exactly as
-// before; a new NEXT_TASK still closes the previous task's tab and defers
-// creating the next one the same way. If the maxAttemptsPerTask guard
-// trips (or HUMAN_REQUIRED intervenes) before any review() call, no
-// Reviewer tab was ever opened for that task.
+//                               execution_report }. Called once per task.
+//   gateRunner               — { run(verification_commands) -> evidence },
+//                               collects command execution evidence.
+//   windowSession            — optional window/session lifecycle placeholder,
+//                               defaults to nullWindowSession.
+//   persistence              — optional Persistence-shaped object ({ writeState }).
+//   workflowGoal/repositoryContext — passed through to the Supervisor via decide().
+//   maxAttemptsPerTask       — bounded-retry safety guard (default 3):
+//                               the maximum number of execution attempts before
+//                               stopping as HUMAN_REQUIRED.
+//   log                      — optional (line) => void operational logger.
 //
 // Returns one of:
 //   { status: 'WORKFLOW_DONE', summary, history }
@@ -326,7 +182,7 @@ export async function runAutomatedWorkflow({
   createReviewerSession,
   createClaudeSessionManager,
   gateRunner,
-  windowSession,
+  windowSession = nullWindowSession,
   persistence,
   workflowGoal,
   repositoryContext,

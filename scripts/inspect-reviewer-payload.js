@@ -28,8 +28,8 @@ import { pathToFileURL } from 'node:url';
 import { createGitEvidenceCollector } from '../src/adapters/gate/git-evidence/index.js';
 import {
   buildAgyReviewPrompt,
+  renderReviewInputs,
 } from '../src/orchestrator/adapters/agyReviewerProvider.js';
-import { renderReviewInputs } from '../src/orchestrator/adapters/gptReviewerAdapter.js';
 
 export function sizeOf(text) {
   const s = typeof text === 'string' ? text : '';

@@ -1,8 +1,7 @@
-# HISTORY / LEGACY — Phase 1 browser-bridge usage
+# [HISTORICAL / RETIRED] — Phase 1 browser-bridge usage
+> **Notice**: The Phase 1 browser bridge implementation described below was retired and physically removed in SuperGPT V1. This document is kept for historical context only.
 
-This covers only the Phase 1 handshake PoC described in `PHASE-1-HANDSHAKE.md`.
-It does not describe the Claude/Codex adapters or the review loop — those are
-later phases.
+This covers only the early Phase 1 handshake PoC described in `PHASE-1-HANDSHAKE.md`.
 
 ## What this is
 

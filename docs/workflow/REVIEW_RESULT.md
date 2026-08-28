@@ -7,27 +7,13 @@ originating [TASK_PROTOCOL.md](./TASK_PROTOCOL.md) Task Card. It is the
 output of [WORKFLOW.md](./WORKFLOW.md)'s `GPT REVIEW` step, and its
 `decision` field drives the `PASS / REWORK` branch that follows.
 
-Implemented by `src/orchestrator/adapters/gptReviewerAdapter.js`
-(`buildReviewPrompt`/`parseReviewResult`), reused as-is by the task-scoped
-`ReviewerSession` (`src/bridge/reviewerSession.js`).
+Implemented by Reviewer providers (`src/orchestrator/adapters/agyReviewerProvider.js`,
+`src/orchestrator/adapters/claudeReviewerProvider.js`,
+`src/orchestrator/adapters/codexReviewerProvider.js`).
 
 ## 1. Format convention
 
-Render-stable plaintext, **not** Markdown headings: one `@@ field_name`
-marker per field, snake_case, in the exact order listed below. State "none"
-rather than omitting a marker with nothing under it.
-
-This mirrors the Supervisor protocol's own wire format
-(`src/orchestrator/supervisorProtocol.js`) for the same reason: a Reviewer
-reply crosses through ChatGPT's *rendered* assistant DOM
-(`extension/domActions.js` reads `.innerText`, not raw markdown source), and
-ChatGPT renders a literal `## field_name` line as an actual heading element
-whose `innerText` is just `field_name` — the `##` characters never reach the
-parser (observed live, 2026-08-27). `@@ field_name` is not special to
-Markdown, so it survives that rendering unchanged. `parseReviewResult` fails
-closed — never repairs a malformed reply — on a missing marker, a duplicate
-marker, markers out of order, an invalid `decision`, or a `task_id`
-mismatch.
+Structured section markers / JSON: one `@@ field_name` marker per field (or typed JSON object), snake_case, in the exact order listed below. State "none" rather than omitting a marker with nothing under it. Parsers fail closed — never repair a malformed reply — on a missing field, duplicate field, invalid `decision`, or a `task_id` mismatch.
 
 ## 2. Required fields
 

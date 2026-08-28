@@ -1,3 +1,6 @@
+# [HISTORICAL ARCHIVE / RETIRED]
+> **Notice**: The Chrome Extension / ChatGPT Web browser bridge architecture described below has been physically removed from SuperGPT V1 and remains recorded here for historical reference only. Full implementation history remains preserved in Git history.
+
 权威设计：docs/ROADMAP.md Phase 9「Chrome extension browser bridge」
 
 ## 目标

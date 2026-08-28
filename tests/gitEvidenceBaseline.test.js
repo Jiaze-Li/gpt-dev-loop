@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
 import { createGitEvidenceCollector, DIFF_STATUS } from '../src/adapters/gate/git-evidence/index.js';
-import { renderReviewInputs } from '../src/orchestrator/adapters/gptReviewerAdapter.js';
+import { renderReviewInputs } from '../src/orchestrator/adapters/agyReviewerProvider.js';
 
 function makeFakeGit(responses) {
   const calls = [];

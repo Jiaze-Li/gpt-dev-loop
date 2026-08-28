@@ -21,20 +21,9 @@
 // ChatGPT, does not touch SupervisorSession, does not touch Claude/Reviewer,
 // and does not implement any loop.
 //
-// Wire format — render-stable plaintext, NOT Markdown headings. The
-// Supervisor's reply is not read as raw text: it is read from ChatGPT's
-// rendered assistant DOM node (extension/domActions.js's `.markdown`
-// innerText). ChatGPT renders a literal "## field_name" line as an actual
-// <h2> DOM element, and that element's innerText is just "field_name" — the
-// "##" characters never reach this parser. Every OTHER document in this
-// system (Task Cards via taskCard.js, Execution Reports via
-// claudeExecutorAdapter.js, Review Results via gptReviewerAdapter.js) is
-// exchanged as a file or as Claude/Reviewer plain-text output, never
-// through ChatGPT's rendered Markdown DOM, so "##" headings survive there.
-// Only the Supervisor's replies cross that specific rendering boundary, so
-// only this protocol uses a delimiter Markdown does not treat specially:
-// "@@ field_name", which ChatGPT renders as a literal, unmodified text
-// line.
+// Wire format — structured section markers:
+// "@@ field_name" markers delimit each section unambiguously across model
+// providers and structured text responses.
 //
 //   <ACTION KEYWORD, alone on the first line>
 //

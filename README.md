@@ -122,7 +122,6 @@ When invoked with `--output-format=json`, SuperGPT streams typed events:
   - `orchestrator/`: Core state machine, RolePools, provider routing, workspace snapshotting, result delivery, and persistent sessions.
   - `agy/`: Headless Antigravity CLI client with fail-closed conversation resumption.
   - `adapters/`: Gate runner, git evidence collector, and executor adapters.
-  - `bridge/` and `extension/`: Historical Chrome/browser bridge code, retained only as legacy source and not exposed by production entrypoints.
 - `skills/` / `.agents/skills/supergpt/`: Antigravity Skill definition.
 - `tests/`: 802 deterministic unit tests across all subsystem boundaries.
 

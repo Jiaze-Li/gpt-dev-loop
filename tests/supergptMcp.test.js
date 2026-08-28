@@ -1,5 +1,5 @@
 // Deterministic tests for the SuperGPT MCP server. The real pipeline
-// (Chrome / agy / git worktrees) is never exercised — every dependency is
+// (agy / git worktrees) is never exercised — every dependency is
 // injected.
 
 import test from 'node:test';

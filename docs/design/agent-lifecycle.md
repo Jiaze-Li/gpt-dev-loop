@@ -1,57 +1,28 @@
-# Agent Lifecycle — Current State & Next-Stage Design
+# Agent Lifecycle — SuperGPT V1 Architecture
 
-## 1. Current Capabilities
+## 1. Capabilities
 
-gpt-dev-loop currently has the following working end-to-end:
+SuperGPT orchestrates an autonomous multi-role loop:
 
-- Task Card
-- Workflow state machine
-- Claude execution
-- GPT reviewer
-- Chrome extension bridge
-- Real Chrome + ChatGPT login-state closed-loop validation
-
-Current flow:
-
-```
-PENDING
-  → EXECUTING
-  → VERIFYING
-  → REVIEWING
-  → COMPLETE
-```
+- Natural Language Planner (RolePool)
+- Task Cards & Execution Reports
+- Isolated Git worktrees
+- Role-routed Executor (Claude / Codex)
+- Deterministic Gate Runner & Git Evidence Collector
+- Role-routed Reviewer (agy Gemini / Claude / Codex)
+- Safe automatic result delivery
 
 ## 2. Current Architecture
 
-gpt-dev-loop is a locally-run control program.
-
-It is responsible for:
-
-- Workflow management
-- State transitions
-- Dispatching the Claude executor
-- Dispatching the GPT reviewer
-
 ```
-gpt-dev-loop
-    |
-    +-- Claude Executor
-    |       |
-    |       +-- Claude Code
-    |
-    +-- GPT Reviewer
-            |
-            +-- Chrome Extension
-                    |
-                    +-- ChatGPT Web
+SuperGPT Orchestrator / MCP Control Plane
+    │
+    ├──► Planner (RolePool: Codex / Gemini / Claude)
+    ├──► Supervisor (RolePool: Gemini / Codex / Claude)
+    ├──► Executor (RolePool: Claude Sonnet/Opus / Codex)
+    ├──► Verification Gate (Shell / npm test)
+    └──► Reviewer (RolePool: Gemini / Codex / Claude)
 ```
-
-## 3. Architecture Principles
-
-- Claude and GPT do not communicate directly.
-- All agent interaction passes through gpt-dev-loop.
-- The Chrome extension is only a communication adapter for the GPT reviewer.
-- Claude plugins/MCP (if present) are responsible only for capability access, not lifecycle management.
 
 ## 4. Next-Stage Design: Claude Session Manager
 
