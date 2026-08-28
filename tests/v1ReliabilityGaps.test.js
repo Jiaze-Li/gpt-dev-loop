@@ -1212,7 +1212,7 @@ test('Hardening G & H. Resume with different Planner task count retains frozen c
   );
 
   // Read frozen metadata on resume
-  const meta = JSON.parse(readFileSync(path.join(tmpRoot, `${workflowId}.workspace.json`), 'utf8'));
+  const meta = JSON.parse(fs.readFileSync(path.join(tmpRoot, `${workflowId}.workspace.json`), 'utf8'));
   assert.deepEqual(meta.closeout_verification_commands, ['swift test --filter FrozenPolicyTest']);
 
   // Even if a new planner run would suggest 10 tasks or different closeout commands, workflow uses frozen policy
