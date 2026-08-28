@@ -21,7 +21,7 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
 
 import { runAutomatedWorkflow } from '../src/orchestrator/automatedLoop.js';
 import { selectProviders } from '../src/orchestrator/providerSelection.js';
@@ -38,6 +38,11 @@ import {
 import { callAgy as defaultCallAgy } from '../src/agy/agyClient.js';
 import { Persistence } from '../src/orchestrator/persistence.js';
 import { deliverWorkflowResult } from '../src/orchestrator/resultDelivery.js';
+import {
+  collectRepositoryContext,
+  generatePlan,
+  PlannerError,
+} from '../src/orchestrator/planner.js';
 
 // --- compact status stream -------------------------------------------------
 
@@ -245,12 +250,56 @@ export function formatReviewEvidenceDiagnostics(evidence, { promptChars, promptB
   return lines;
 }
 
+// --- plan resolution ----------------------------------------------------
+//
+// The single CLI argument is EITHER an existing plan file (read verbatim,
+// backward-compatible) OR a natural-language instruction. When it is not a
+// readable file we run the Planner against the given repository, which returns
+// a READY plan (used as the workflow goal) or surfaces an AMBIGUOUS question
+// that must be answered by a human before any execution starts.
+export async function resolveWorkflowPlan({
+  planArg,
+  cwd,
+  callAgy,
+  collect = collectRepositoryContext,
+  generate = generatePlan,
+  statFile = stat,
+  readPlanFile = (p) => readFile(p, 'utf8'),
+  log = () => {},
+} = {}) {
+  if (typeof planArg !== 'string' || planArg.trim() === '') {
+    throw new PlannerError('PLANNER_BAD_INPUT', 'a plan file path or a natural-language instruction is required');
+  }
+
+  const resolvedPath = path.resolve(cwd ?? process.cwd(), planArg);
+  let isFile = false;
+  try {
+    isFile = (await statFile(resolvedPath)).isFile();
+  } catch {
+    isFile = false;
+  }
+
+  if (isFile) {
+    return { plan: await readPlanFile(resolvedPath), source: 'file' };
+  }
+
+  log('planner: collecting repository context');
+  const repoContext = await collect({ cwd });
+  log('planner: generating plan from natural-language instruction');
+  const result = await generate({ userIntent: planArg, repoContext, callAgy });
+
+  if (result.status === 'AMBIGUOUS') {
+    return { status: 'AMBIGUOUS', question: result.question, source: 'nl' };
+  }
+  return { plan: result.planText, summary: result.summary, tasks: result.tasks, source: 'nl' };
+}
+
 // --- run -----------------------------------------------------------------
 
 async function main() {
   const planPath = process.argv[2];
   if (!planPath) {
-    console.error('usage: SUPERVISOR_PROVIDER=agy REVIEWER_PROVIDER=agy node scripts/run-agy-workflow.js <plan.txt>');
+    console.error('usage: SUPERVISOR_PROVIDER=agy REVIEWER_PROVIDER=agy node scripts/run-agy-workflow.js <plan.txt | "instruction">');
     process.exitCode = 1;
     return;
   }
@@ -313,12 +362,35 @@ async function main() {
     return;
   }
 
-  const plan = await readFile(path.resolve(planPath), 'utf8');
+  let plan;
+  let planSource = 'file';
+  try {
+    const resolved = await resolveWorkflowPlan({
+      planArg: planPath,
+      cwd: repoRoot,
+      callAgy: defaultCallAgy,
+      log: (m) => console.log(m),
+    });
+    if (resolved.status === 'AMBIGUOUS') {
+      console.error('\nrun-agy-workflow: HUMAN_REQUIRED — the instruction is ambiguous');
+      console.error(`question: ${resolved.question}`);
+      console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
+      process.exitCode = 1;
+      return;
+    }
+    plan = resolved.plan;
+    planSource = resolved.source;
+  } catch (err) {
+    console.error(`\nrun-agy-workflow: FAILED (${err.code ?? err.name}) — ${err.message}`);
+    console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
+    process.exitCode = 1;
+    return;
+  }
 
   const { supervisorModel, reviewerModel, supervisorSession, createReviewerSession, windowSession } = selection;
 
   console.log('SUPERGPT');
-  console.log(`plan       ${path.resolve(planPath)}`);
+  console.log(planSource === 'file' ? `plan       ${path.resolve(planPath)}` : `plan       (generated from instruction)`);
   console.log('');
   console.log(formatRoleRoster({ supervisorModel, reviewerModel }));
   console.log('');
