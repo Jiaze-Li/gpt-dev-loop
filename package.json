@@ -13,6 +13,7 @@
   },
   "scripts": {
     "ask": "node ./bin/gpt-loop.js ask",
+    "doctor": "node ./scripts/doctor.js",
     "mcp": "node ./bin/gpt-loop-mcp.js",
     "test": "node --test tests/*.test.js",
     "test:cdp-live": "node ./scripts/test-cdp-live.js",
