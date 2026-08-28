@@ -84,6 +84,14 @@ export function markDeliveryReady({ root = SUPERGPT_WORKTREE_ROOT, workflowId, s
   return writeControl({ root, workflowId }, { phase: 'delivery_ready', summary, resumable: true });
 }
 
+// Durable closeout proof. It intentionally survives a delivery conflict: it
+// stays usable only while its command set and worktree fingerprint still
+// match at the next delivery attempt.
+export function recordCloseoutVerificationEvidence({ root = SUPERGPT_WORKTREE_ROOT, workflowId, evidence } = {}) {
+  if (!evidence || evidence.pass !== true) return readControl({ root, workflowId });
+  return writeControl({ root, workflowId }, { closeout_verification_evidence: evidence });
+}
+
 export function markResumable({ root = SUPERGPT_WORKTREE_ROOT, workflowId, resumable = true } = {}) {
   return writeControl({ root, workflowId }, { resumable });
 }

@@ -37,7 +37,7 @@ import {
   buildHumanRequiredEvidence,
   FAILURE_CATEGORIES,
 } from './preflight.js';
-import { getValidHostEvidence, markHostEvidenceConsumed, hashCommandSet } from './hostVerification.js';
+import { getValidHostEvidence, markHostEvidenceConsumed, hashCommandSet, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 
 function defaultLog(line) {
@@ -207,6 +207,7 @@ export async function runAutomatedWorkflow({
   onTaskCompleted = null,
   signal = null,
   closeoutVerificationCommands = [],
+  onCloseoutPass = null,
   taskTotal = null,
   // Deterministic loop-resume support. `checkpoint` (if given) rehydrates
   // the exact suspension point — accepted-task history, the mid-flight task
@@ -852,6 +853,8 @@ export async function runAutomatedWorkflow({
           const evidenceRoot = workflowStateManager?.root || SUPERGPT_WORKTREE_ROOT;
           const hostEvidenceCheck = getValidHostEvidence({
             workflowId,
+            taskId: CLOSEOUT_VERIFICATION_ID,
+            verificationIdentity: CLOSEOUT_VERIFICATION_ID,
             verificationCommands: closeoutVerificationCommands,
             root: evidenceRoot,
           });
@@ -859,11 +862,6 @@ export async function runAutomatedWorkflow({
           let closeoutEvidence;
           if (hostEvidenceCheck?.valid && hostEvidenceCheck.hostEvidence?.pass) {
             log(`closeout gate: consuming valid trusted host verification evidence (id=${hostEvidenceCheck.hostEvidence.evidenceId})`);
-            markHostEvidenceConsumed({
-              workflowId,
-              evidenceId: hostEvidenceCheck.hostEvidence.evidenceId,
-              root: evidenceRoot,
-            });
             closeoutEvidence = hostEvidenceCheck.hostEvidence.evidence || {
               pass: true,
               results: hostEvidenceCheck.hostEvidence.results,
@@ -892,7 +890,7 @@ export async function runAutomatedWorkflow({
               const fingerprint = `GATE_ENV:${cmdName}`;
               seenBlockers.set(fingerprint, (seenBlockers.get(fingerprint) || 0) + 1);
 
-              const closeoutTaskId = currentTaskCard?.task_id || 'closeout-verification';
+              const closeoutTaskId = CLOSEOUT_VERIFICATION_ID;
               const gateEnvEvidence = buildHumanRequiredEvidence({
                 workflowId,
                 taskCard: currentTaskCard || { task_id: closeoutTaskId, goal: 'Closeout Verification' },
@@ -912,6 +910,7 @@ export async function runAutomatedWorkflow({
 
               const pendingVerification = {
                 task_id: closeoutTaskId,
+                verification_identity: CLOSEOUT_VERIFICATION_ID,
                 commands: [...closeoutVerificationCommands],
                 commands_hash: hashCommandSet(closeoutVerificationCommands),
                 reason: envFailure.output || envFailure.command,
@@ -971,6 +970,18 @@ export async function runAutomatedWorkflow({
               };
             }
           }
+          const proof = {
+            evidence_id: hostEvidenceCheck?.valid ? hostEvidenceCheck.hostEvidence.evidenceId : `closeout-${Date.now()}`,
+            pass: true,
+            commands: [...closeoutVerificationCommands],
+            commands_hash: hashCommandSet(closeoutVerificationCommands),
+            worktree_fingerprint: null,
+            captured_at: new Date().toISOString(),
+            workflow_id: workflowId,
+            verification_identity: CLOSEOUT_VERIFICATION_ID,
+          };
+          // defaultPipeline supplies the authoritative worktree fingerprint.
+          await onCloseoutPass?.(proof, closeoutEvidence);
         }
 
         workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {

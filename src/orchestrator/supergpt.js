@@ -31,7 +31,7 @@ import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
 import { loadWorkspaceConfig, resolveApprovedExternalRoots, loadAndValidateExternalRoots, ExternalReadRootConfigError } from './workspaceConfig.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from './runtimeIdentity.js';
-import { supergptVerify, getValidHostEvidence } from './hostVerification.js';
+import { supergptVerify, hashCommandSet, computeWorktreeFingerprint, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
 import {
   WorkflowStateManager,
   readLiveWorkflowState,
@@ -66,6 +66,7 @@ import {
   isOwnerAlive,
   saveCheckpoint,
   markDeliveryReady,
+  recordCloseoutVerificationEvidence,
   clearControl,
 } from './workflowControl.js';
 import { advanceTaskBaseline } from './taskBaseline.js';
@@ -271,6 +272,8 @@ export async function runSuperGPT({
   approvedExternalRoots = [],
   _pipeline = defaultPipeline,
   _resolveWorkflowPlan,
+  _selectProviders,
+  _createGateRunner,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   const result = { ...EMPTY_RESULT(), workflowId };
@@ -426,6 +429,8 @@ export async function runSuperGPT({
           externalReadRoots: resolvedExternalRoots,
           approvedExternalRoots: resolvedExternalRoots,
           _resolveWorkflowPlan,
+          _selectProviders,
+          _createGateRunner,
         })
       );
     throwIfAborted(internalAbort.signal);
@@ -527,6 +532,8 @@ async function defaultPipeline({
   externalReadRoots = [],
   approvedExternalRoots = [],
   _resolveWorkflowPlan,
+  _selectProviders,
+  _createGateRunner,
 }) {
   workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
@@ -598,6 +605,14 @@ async function defaultPipeline({
   throwIfAborted(signal);
 
   const control = isResume ? readControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }) : null;
+  const readFrozenCloseoutCommands = () => {
+    try {
+      const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      return Array.isArray(meta.closeout_verification_commands)
+        ? meta.closeout_verification_commands.map((c) => String(c).trim()).filter(Boolean)
+        : [];
+    } catch { return []; }
+  };
 
   // Shared delivery tail — used by both the normal end-of-loop path and the
   // delivery-ready resume fast path below. Defined here so it closes over the
@@ -609,6 +624,36 @@ async function defaultPipeline({
     // workspace: if this process dies mid-delivery, a resume still skips
     // straight back here instead of replanning/re-executing accepted tasks.
     markDeliveryReady({ root: SUPERGPT_WORKTREE_ROOT, workflowId, summary });
+    // delivery_ready is a resumable routing hint, not verification proof.
+    // Every delivery attempt validates durable closeout proof against current
+    // bytes; stale/missing proof reruns only the frozen deterministic gate.
+    const commands = readFrozenCloseoutCommands();
+    const currentFingerprint = computeWorktreeFingerprint(worktree.worktree_path);
+    const prior = readControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId })?.closeout_verification_evidence;
+    const proofValid = prior?.pass === true && prior.workflow_id === workflowId &&
+      prior.verification_identity === CLOSEOUT_VERIFICATION_ID &&
+      prior.commands_hash === hashCommandSet(commands) &&
+      JSON.stringify(prior.commands) === JSON.stringify(commands) &&
+      prior.worktree_fingerprint === currentFingerprint;
+    if (!proofValid) {
+      if (commands.length === 0) {
+        const reason = 'MISSING_CLOSEOUT_VERIFICATION_POLICY: SuperGPT cannot safely deliver code without an executable final verification policy.';
+        workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, actionCode: 'MISSING_CLOSEOUT_VERIFICATION_POLICY' });
+        return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
+      }
+      const rerunGate = (_createGateRunner || createGateRunner)({ gitEvidenceCollector: createGitEvidenceCollector(), cwd: worktree.worktree_path, baseline, signal });
+      const rerun = await rerunGate.run(commands);
+      if (!rerun.pass) {
+        const envBlocked = (rerun.results || []).find((r) => !r.pass && /command not found|exit code 127|ENOENT|EACCES|No such file or directory/i.test(r.output || ''));
+        const pending = envBlocked ? { task_id: CLOSEOUT_VERIFICATION_ID, verification_identity: CLOSEOUT_VERIFICATION_ID, commands, commands_hash: hashCommandSet(commands) } : null;
+        workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason: envBlocked ? 'Closeout verification is blocked by the environment.' : 'Closeout Gate verification failed on final repository state.', pending_verification: pending });
+        return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason: envBlocked ? 'Closeout verification is blocked by the environment.' : 'Closeout Gate verification failed on final repository state.', pending_verification: pending, conversations };
+      }
+      recordCloseoutVerificationEvidence({ root: SUPERGPT_WORKTREE_ROOT, workflowId, evidence: {
+        evidence_id: `closeout-${Date.now()}`, pass: true, commands, commands_hash: hashCommandSet(commands),
+        worktree_fingerprint: computeWorktreeFingerprint(worktree.worktree_path), captured_at: new Date().toISOString(), workflow_id: workflowId, verification_identity: CLOSEOUT_VERIFICATION_ID,
+      }});
+    }
     let delivery;
     try {
       throwIfAborted(signal);
@@ -673,7 +718,7 @@ async function defaultPipeline({
   // Keeping it outside the isolated worktree prevents it being interpreted as
   // an untracked change and delivered into the invocation workspace.
   const persistence = new Persistence(workflowRuntimeDirectory(workflowId));
-  const selection = selectProviders({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal, onEvent: (event) => emit(event.type, event) });
+  const selection = (_selectProviders || selectProviders)({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal, onEvent: (event) => emit(event.type, event) });
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'planning' });
   emit(SUPERGPT_EVENTS.PLANNING_STARTED);
@@ -739,12 +784,21 @@ async function defaultPipeline({
     workflowStateManager?.recordProgress({ humanAnswer: answer });
   }
   workflowStateManager?.recordProgress({ taskTotal: resolved.tasks?.length ?? 1 });
+  // The initial planning/policy-freezing phase is the last point at which a
+  // new workflow may source a policy.  Never execute without one.
+  const frozenAfterPlanning = readFrozenCloseoutCommands();
+  if (frozenAfterPlanning.length === 0) {
+    const reason = 'MISSING_CLOSEOUT_VERIFICATION_POLICY: SuperGPT cannot safely deliver code without an executable final verification policy.';
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, actionCode: 'MISSING_CLOSEOUT_VERIFICATION_POLICY' });
+    await lifecycleManager?.onWorkflowSuspended('missing_closeout_verification_policy');
+    return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, tokenUsage: usageTracker?.summary() ?? null };
+  }
   throwIfAborted(signal);
 
   const { supervisorSession, createReviewerSession, windowSession } = selection;
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'executing' });
-  const baseGate = createGateRunner({
+  const baseGate = (_createGateRunner || createGateRunner)({
     gitEvidenceCollector: createGitEvidenceCollector(),
     cwd: repoRoot,
     baseline,
@@ -758,22 +812,7 @@ async function defaultPipeline({
     },
   };
 
-  let frozenCloseoutCommands = [];
-  try {
-    if (existsSync(metadataPath)) {
-      const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
-      if (Array.isArray(meta.closeout_verification_commands)) {
-        frozenCloseoutCommands = meta.closeout_verification_commands;
-      }
-    }
-  } catch {
-    /* ignore best effort */
-  }
-
-  // If this is a new workflow, use the resolved closeout commands if metadata was empty
-  if (!isResume && (!frozenCloseoutCommands || frozenCloseoutCommands.length === 0) && Array.isArray(resolved.closeoutVerificationCommands)) {
-    frozenCloseoutCommands = resolved.closeoutVerificationCommands;
-  }
+  const frozenCloseoutCommands = readFrozenCloseoutCommands();
 
   const loopResult = await runAutomatedWorkflow({
     workflowId,
@@ -800,6 +839,12 @@ async function defaultPipeline({
     approvedExternalRoots: resolvedApprovedRoots,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
     closeoutVerificationCommands: frozenCloseoutCommands,
+    onCloseoutPass: async (proof) => recordCloseoutVerificationEvidence({
+      root: SUPERGPT_WORKTREE_ROOT, workflowId, evidence: {
+        ...proof,
+        worktree_fingerprint: computeWorktreeFingerprint(worktree.worktree_path),
+      },
+    }),
     taskTotal: resolved.tasks?.length ?? 1,
     workflowStateManager,
     usageTracker,
@@ -1138,6 +1183,8 @@ export async function supergptResume({
   env = process.env,
   _pipeline = defaultPipeline,
   _resolveWorkflowPlan,
+  _selectProviders,
+  _createGateRunner,
 } = {}) {
   if (!workflowId) throw new Error('supergptResume requires a workflowId');
 
@@ -1177,6 +1224,8 @@ export async function supergptResume({
     env,
     _pipeline,
     _resolveWorkflowPlan,
+    _selectProviders,
+    _createGateRunner,
   });
 }
 

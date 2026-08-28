@@ -19,6 +19,7 @@ import {
   supergptVerify,
   getValidHostEvidence,
   computeWorktreeFingerprint,
+  CLOSEOUT_VERIFICATION_ID,
 } from '../src/orchestrator/hostVerification.js';
 import {
   deriveSafeRecommendation,
@@ -186,6 +187,29 @@ test('5. Host Gate Verification: supergptVerify executes gate commands and persi
   assert.equal(mutatedCheck.reason, 'WORKTREE_MUTATED_AFTER_VERIFICATION');
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('closeout host evidence requires the dedicated identity, not matching task commands', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-closeout-identity-'));
+  const workflowId = 'wf-closeout-identity';
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  execSync('git init -b main', { cwd: repo });
+  execSync('git config user.name Test && git config user.email test@example.com', { cwd: repo });
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+  execSync('git add . && git commit -m init', { cwd: repo });
+  fs.writeFileSync(path.join(root, `${workflowId}.workspace.json`), JSON.stringify({ isolated_worktree_path: repo }));
+  const writeState = (pending) => fs.writeFileSync(path.join(root, `${workflowId}.state.json`), JSON.stringify({ workflowStatus: 'HUMAN_REQUIRED', pending_verification: pending }));
+  const gate = { run: async (commands) => ({ pass: true, results: commands.map((command) => ({ command, pass: true })) }) };
+
+  writeState({ task_id: 'task-a', commands: ['npm test'] });
+  await supergptVerify({ workflowId, root, gateRunner: gate });
+  assert.equal(getValidHostEvidence({ workflowId, root, taskId: CLOSEOUT_VERIFICATION_ID, verificationIdentity: CLOSEOUT_VERIFICATION_ID, verificationCommands: ['npm test'] }).valid, false);
+
+  writeState({ task_id: CLOSEOUT_VERIFICATION_ID, verification_identity: CLOSEOUT_VERIFICATION_ID, commands: ['npm test'] });
+  await supergptVerify({ workflowId, root, gateRunner: gate });
+  assert.equal(getValidHostEvidence({ workflowId, root, taskId: CLOSEOUT_VERIFICATION_ID, verificationIdentity: CLOSEOUT_VERIFICATION_ID, verificationCommands: ['npm test'] }).valid, true);
+  fs.rmSync(root, { recursive: true, force: true });
 });
 
 test('6. Safe HUMAN_REQUIRED Recommendation Policy: strict action codes and anti-sync invariant', () => {

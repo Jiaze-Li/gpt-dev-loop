@@ -4,7 +4,7 @@ Autonomous multi-role coding engine with role-routed Planner, Supervisor,
 Executor, and Reviewer providers; complete Git worktree isolation;
 deterministic verification gates; and safe automatic result delivery.
 
-> **"Normal coding UX, larger autonomous scope."**  
+> **"Normal coding UX, larger autonomous scope."**
 > Run in any repository or linked worktree: provide natural-language instructions, and SuperGPT plans, isolates, executes, tests, reviews, and delivers verified changes back to your workspace.
 
 ---

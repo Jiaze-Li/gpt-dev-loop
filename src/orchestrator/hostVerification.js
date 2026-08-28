@@ -16,6 +16,11 @@ import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { readLiveWorkflowState } from './workflowState.js';
 
+// Closeout is a workflow-level assertion, never an implementation task.  A
+// stable identity prevents a task's otherwise-identical host evidence from
+// authorising final delivery.
+export const CLOSEOUT_VERIFICATION_ID = '__supergpt_closeout__';
+
 export function getHostEvidenceDir(workflowId, root = SUPERGPT_WORKTREE_ROOT) {
   return path.join(root, workflowId, 'host_evidence');
 }
@@ -185,6 +190,7 @@ export async function supergptVerify({
   }
 
   const taskId = pending?.task_id || pending?.taskId || state.taskId || 'unknown-task';
+  const verificationIdentity = pending?.verification_identity || pending?.verificationIdentity || taskId;
   const generation = pending?.generation ?? state.attempt ?? 1;
   const commandsToRun = pendingCommands.map((c) => String(c).trim()).filter(Boolean);
   const commandsHash = pending?.commands_hash || pending?.commandsHash || hashCommandSet(commandsToRun);
@@ -195,15 +201,17 @@ export async function supergptVerify({
     baseline: { head: meta.baseline_head || 'HEAD', clean: true, repo_root: worktreePath },
   });
 
-  const capturedAt = new Date().toISOString();
-  const worktreeFingerprint = computeWorktreeFingerprint(worktreePath, execSync);
-
   // Run gate verification on the host in the isolated worktree
   const evidence = await gateRunner.run(commandsToRun);
+  // The proof represents the bytes which actually passed, not the bytes
+  // present before a command potentially generated/modified output.
+  const capturedAt = new Date().toISOString();
+  const worktreeFingerprint = computeWorktreeFingerprint(worktreePath, execSync);
 
   const rawPayload = JSON.stringify({
     workflowId,
     taskId,
+    verificationIdentity,
     generation,
     worktree: worktreePath,
     commands: commandsToRun,
@@ -220,6 +228,7 @@ export async function supergptVerify({
   const hostEvidence = {
     workflowId,
     taskId,
+    verificationIdentity,
     generation,
     evidenceId,
     pass: Boolean(evidence.pass),
@@ -250,6 +259,7 @@ export async function supergptVerify({
 export function getValidHostEvidence({
   workflowId,
   taskId = null,
+  verificationIdentity = null,
   verificationCommands = null,
   root = SUPERGPT_WORKTREE_ROOT,
   execSync = nodeExecSync,
@@ -282,6 +292,7 @@ export function getValidHostEvidence({
   const rawPayload = JSON.stringify({
     workflowId: hostEvidence.workflowId,
     taskId: hostEvidence.taskId,
+    verificationIdentity: hostEvidence.verificationIdentity,
     generation: hostEvidence.generation,
     worktree: hostEvidence.worktree,
     commands: hostEvidence.commands,
@@ -304,6 +315,10 @@ export function getValidHostEvidence({
       reason: 'TASK_ID_MISMATCH',
       hostEvidence,
     };
+  }
+
+  if (verificationIdentity && hostEvidence.verificationIdentity !== verificationIdentity) {
+    return { stale: true, valid: false, reason: 'VERIFICATION_IDENTITY_MISMATCH', hostEvidence };
   }
 
   // If verificationCommands check is requested:
