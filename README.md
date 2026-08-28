@@ -1,94 +1,130 @@
-# gpt-dev-loop
+# SuperGPT (gpt-dev-loop)
 
-Local, agent-agnostic development loop that lets a coding agent such as Claude Code implement work, push evidence to GitHub, ask an existing ChatGPT web session for review, and continue automatically until the goal is complete or human input is required.
+Autonomous multi-role coding engine coordinating **Gemini Supervisor**, **Claude Executor**, and **GPT-OSS Reviewer** with complete Git worktree isolation, automated verification gates, and safe automatic result delivery.
 
-## Why this project exists
+> **"Normal coding UX, larger autonomous scope."**  
+> Run in any repository or linked worktree: provide natural-language instructions, and SuperGPT plans, isolates, executes, tests, reviews, and delivers verified changes back to your workspace.
 
-The target workflow is simple:
+---
 
-1. A human and ChatGPT discuss requirements, architecture, domain semantics, and acceptance criteria.
-2. The agreed plan is written into the target repository, typically as a `SPEC.md` or equivalent task document.
-3. The human tells the coding agent to start.
-4. The coding agent implements a bounded step, runs tests, and produces Git evidence.
-5. The loop asks ChatGPT to independently inspect the repository / commit diff and review the actual changes.
-6. `PASS` / `CONTINUE` leads to the next step; `REWORK` leads to another implementation pass; `DONE` ends the run; `HUMAN_REQUIRED` stops for a real product/domain decision.
-7. The human receives a final report instead of manually copy-pasting prompts and review feedback between agents.
-
-## Core design principles
-
-- **No OpenAI API dependency for the reviewer path.** The intended reviewer transport uses the user's existing ChatGPT web session rather than the separately billed OpenAI API.
-- **Mechanical handoff.** Claude ↔ ChatGPT transport should be ordinary local code, not another model, screenshots, vision, or an agent driving browser UI interactively.
-- **GitHub is evidence.** ChatGPT should inspect actual repository state and diffs instead of trusting the executor's natural-language summary.
-- **Human owns WHAT / WHY.** Product intent, architecture choices, domain decisions, and final acceptance stay with the human.
-- **GPT owns review / planning guidance.** ChatGPT acts as high-quality planner/reviewer.
-- **Coding agent owns execution.** Claude Code is the first executor; Codex and other agents should be pluggable later.
-- **Local-first and portable.** The project lives in its own Git repository, keeps an independent development history, and should be installable on a new machine with minimal setup.
-- **Thin adapters.** Claude-specific integration should not become the core architecture.
-
-## Intended user experience
-
-After initial setup, normal usage should feel like:
+## High-Level Architecture
 
 ```text
-Human + ChatGPT -> agree on SPEC.md
-Human -> "execute this spec"
-Claude -> implement -> test -> commit/push -> ask GPT
-GPT -> inspect GitHub -> PASS / REWORK / CONTINUE / DONE / HUMAN_REQUIRED
-Claude -> continue automatically
-...
-Claude -> final report to human
+User Request / Front-Facing Agent
+           │
+           ▼
+    Natural Language Planner (Gemini via agy)
+           │
+           ▼
+    Invocation Workspace Snapshot (HEAD, staged, unstaged, untracked)
+           │
+           ▼
+    Isolated Git Worktree Sandbox (~/.supergpt/worktrees)
+           │
+           ├──► Supervisor [gemini-3.7-flash-high] (Persistent workflow conversation)
+           │          │ (Task Cards)
+           │          ▼
+           ├──► Executor [Claude Code] (Fresh session per attempt)
+           │          │ (Code Edits)
+           │          ▼
+           ├──► Verification Gate [Shell / npm test] (Bounded diagnostics)
+           │          │ (Git Evidence)
+           │          ▼
+           └──► Reviewer [gpt-oss-120b-medium] (Persistent per-task conversation)
+                      │ (PASS / REWORK / HUMAN_REQUIRED)
+                      ▼
+    Safe Automatic Result Delivery (Pre-flight conflict check & verification)
+           │
+           ▼
+Invocation Workspace (Approved changes applied, worktree cleaned up)
 ```
 
-The user should not need to remember bridge ports, background `serve` commands, browser selectors, or special login commands during normal operation. If the ChatGPT login is missing or expired, the integration should detect that and ask for the minimum necessary intervention.
+---
 
-## V1 scope
+## Features
 
-V1 should deliberately stay small:
+- **Autonomous Multi-Role Loop**:
+  - **Supervisor**: Gemini 3.7 Flash High plans tasks, tracks progression, handles rework requests, and surfaces real domain ambiguities as `HUMAN_REQUIRED`.
+  - **Executor**: Claude Code executes task cards in clean worktrees with automatically symlinked dependencies.
+  - **Reviewer**: GPT-OSS 120B Medium independently audits Git diffs and gate verification evidence.
+- **Persistent Role Conversations**: Single conversation ID maintained for the Supervisor across the entire workflow; per-task conversation IDs maintained across Reviewer rework rounds.
+- **Workspace Snapshotting**: Operates cleanly on dirty workspaces with untracked files without requiring `git stash` or manual commits. Pre-existing changes become the baseline and are never misclassified as model output.
+- **Safe Automatic Result Delivery**: Approved changes are delivered directly into the exact invocation workspace with atomic conflict detection. Unrelated dirty changes are preserved.
+- **Worktree Lifecycle**: Successfully delivered worktrees are pruned automatically; failed or `HUMAN_REQUIRED` runs are preserved for auditing and resumption.
+- **Multiple Front-End Surfaces**:
+  - **CLI**: `bin/supergpt.js "<goal>"` supporting text or streaming JSON (`--output-format=json`).
+  - **Antigravity Skill**: `.agents/skills/supergpt/SKILL.md` for AI pair programmers.
+  - **MCP Server**: `bin/supergpt-mcp.js` exposing `supergpt_run`, `supergpt_plan`, and `supergpt_status`.
 
-1. Provide one reliable machine-level tool, conceptually `ask_gpt(message)`, that sends text to an existing ChatGPT web session and returns the response as text.
-2. Package that capability for Claude Code so it is available from the normal Claude workflow.
-3. Define a development-loop skill/workflow: read spec -> implement -> test -> commit/push -> ask GPT -> continue/rework/stop.
-4. Use Git commit coordinates and repository paths as the review contract so large diffs are not copied through the handoff channel.
-5. Add minimal safety: retry limit, explicit stop states, Git anchors, and no completion without reviewer approval.
-6. Run deterministic end-to-end pilots before adding a large state machine or orchestration framework.
+---
 
-## Non-goals for V1
+## Quickstart
 
-- Rebuilding a full autonomous-agent platform.
-- Reproducing all of `supergpt` immediately.
-- Heavy task-card schemas before natural-language contracts prove insufficient.
-- Cost dashboards, complex scheduling, or multi-agent routing before the core loop is reliable.
-- Letting the coding agent visually operate ChatGPT through screenshots and mouse actions.
+### 1. Check Prerequisites
+Run the built-in diagnostic doctor:
+```bash
+npm run doctor
+```
+Verifies local availability of:
+- `git` (system version)
+- `node` (>= 18)
+- `agy` CLI (Google Antigravity CLI, authenticated)
+- `claude` (Claude Code CLI)
 
-## Relationship to `supergpt`
-
-`supergpt` remains an important reference implementation. This project intentionally reuses its strongest ideas—Git evidence, independent review, deterministic gates, rework loops, retry bounds, and auditability—while changing the user-facing architecture.
-
-The key difference is control placement:
-
-- `supergpt`: external orchestrator launches and controls both planner/reviewer and executor.
-- `gpt-dev-loop`: the coding environment is the user-facing control surface, while a local core enforces the review loop and exposes a reviewer bridge.
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/DECISIONS.md`](docs/DECISIONS.md) for the detailed boundary.
-
-## Planned portability
-
-The core should remain independent of a specific coding agent:
-
-```text
-core/
-bridge/
-adapters/
-  claude/
-  codex/       # future
+### 2. Run Tests
+Run the deterministic unit test suite (700 tests):
+```bash
+npm test
 ```
 
-Claude Code is the first integration. A future Codex integration should reuse the same core and reviewer bridge rather than fork the project.
+### 3. CLI Usage
 
-## Security note
+Run a coding task from natural language:
+```bash
+node bin/supergpt.js "Add a healthcheck endpoint with unit tests"
+```
 
-This repository is public. Never commit ChatGPT cookies, browser profiles, session data, authentication tokens, API keys, private repository credentials, or other local secrets. Local auth/profile state must stay outside Git and be ignored by default.
+Stream machine-readable typed events (NDJSON):
+```bash
+node bin/supergpt.js "Add a healthcheck endpoint with unit tests" --output-format=json
+```
 
-## Status
+Run from an explicit plan file:
+```bash
+node bin/supergpt.js --plan=plan.txt
+```
 
-**Design baseline / pre-implementation.** The requirements and architecture are being frozen before the first proof of concept.
+---
+
+## Machine-Readable Event Stream
+
+When invoked with `--output-format=json`, SuperGPT streams typed events:
+- `workflow_started`
+- `stage_changed` (`workspace`, `planning`, `executing`, `supervisor`, `delivery`)
+- `task_started` / `task_attempt_started`
+- `verification_started` / `verification_finished`
+- `review_finished` (`PASS`, `REWORK`, `HUMAN_REQUIRED`)
+- `rework_requested`
+- `delivery_succeeded` / `delivery_failed`
+- `workflow_finished`
+
+---
+
+## Project Structure
+
+- `bin/`
+  - `supergpt.js`: Production CLI entrypoint.
+  - `supergpt-mcp.js`: Model Context Protocol (MCP) server.
+- `src/`
+  - `orchestrator/`: Core state machine, planner, workspace snapshotting, result delivery, and persistent sessions.
+  - `agy/`: Headless Antigravity CLI client with fail-closed conversation resumption.
+  - `adapters/`: Gate runner, git evidence collector, and executor adapters.
+  - `legacy/` (deprecated): Historical Chrome extension bridge and web automation transports.
+- `skills/` / `.agents/skills/supergpt/`: Antigravity Skill definition.
+- `tests/`: 700 deterministic unit tests across all subsystem boundaries.
+
+---
+
+## License
+
+MIT

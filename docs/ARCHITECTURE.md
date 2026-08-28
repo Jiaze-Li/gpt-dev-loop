@@ -254,3 +254,17 @@ Policy belongs in configuration, including:
 - structured vs natural-language review output.
 
 The architecture should not assume one permanent answer to these choices.
+
+## 11. Modern Headless Architecture (SuperGPT Production)
+
+The modern production architecture operates entirely headless through the Google Antigravity CLI (`agy`) and local Claude Code without any browser extension, DOM interaction, or open tabs:
+
+1. **Invocation State**: The user or agent invokes SuperGPT from any workspace. `src/orchestrator/workspaceSnapshot.js` captures HEAD, staged changes, unstaged changes, and untracked files into an isolated git worktree (`~/.supergpt/worktrees`).
+2. **Planner**: `src/orchestrator/planner.js` uses Gemini via `agy` to decompose natural-language intent into bounded, verification-ready tasks.
+3. **Supervisor**: `src/orchestrator/adapters/agySupervisorProvider.js` maintains a single persistent conversation across the workflow to guide task sequencing and evaluate rework.
+4. **Executor**: Clean Claude Code session per attempt in the isolated worktree with symlinked `node_modules`.
+5. **Gate**: `src/orchestrator/adapters/gateRunner.js` runs verification commands with output bounding to protect reviewer context.
+6. **Reviewer**: `src/orchestrator/adapters/agyReviewerProvider.js` independently audits git diffs in a persistent per-task conversation across rework cycles.
+7. **Delivery**: `src/orchestrator/resultDelivery.js` applies approved deltas safely back into the invocation workspace, preserving user dirty files and pruning the worktree.
+
+*(Note: The legacy Chrome extension and Playwright web bridge located in `src/adapters/gpt-reviewer/` and `src/extension-bridge/` are deprecated historical implementations preserved for reference).*
