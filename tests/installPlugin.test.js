@@ -73,3 +73,17 @@ test('installer preserves unrelated configuration and fails closed on malformed 
     assert.equal(await readFile(config, 'utf8'), malformed);
   } finally { await rm(tmp, { recursive: true, force: true }); }
 });
+
+test('installer copies the current non-blocking SuperGPT skill globally', async () => {
+  const tmp = path.join('/tmp', `supergpt-current-skill-${Date.now()}`);
+  try {
+    const result = await installGlobal({ configDir: tmp, mcpBin: '/bin/supergpt-mcp' });
+    const installed = await readFile(result.skillTargetFile, 'utf8');
+    assert.match(installed, /supergpt_start\(\{ goal, cwd \}\)/);
+    assert.match(installed, /status: "RUNNING", workflowId/);
+    assert.match(installed, /supergpt_run/);
+    assert.match(installed, /blocking convenience API/i);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});

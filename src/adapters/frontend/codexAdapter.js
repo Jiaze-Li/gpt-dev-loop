@@ -27,7 +27,8 @@ export class CodexFrontendAdapter extends BaseFrontendAdapter {
 
 Delegate complex autonomous coding tasks to SuperGPT via its MCP tools:
 - \`supergpt_plan\`: Generate plan without execution.
-- \`supergpt_run\`: Execute plan in isolated worktree and deliver approved changes.
+- \`supergpt_start\`: Normal non-blocking entrypoint. Call \`supergpt_start({ goal, cwd })\`; it immediately returns \`{ status: "RUNNING", workflowId }\`. Attach local progress observation and continue until terminal.
+- \`supergpt_run\`: Blocking convenience API for callers that explicitly want one call to wait for the full terminal result.
 - \`supergpt_status\`: Read local progress deterministically.
 - \`supergpt_resume\`: Resume on HUMAN_REQUIRED with user response.
 - \`supergpt_stop\`: Abort running workflow safely.

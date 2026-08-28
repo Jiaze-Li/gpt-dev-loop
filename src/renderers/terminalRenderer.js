@@ -77,7 +77,12 @@ export class TerminalRenderer {
   }
 
   updateState(rawState) {
-    this.currentCanonical = toCanonicalProgress(rawState);
+    // CLI observers already read canonical persisted progress. Avoid
+    // canonicalizing it a second time, which would discard task and role
+    // fields because canonical names differ from the raw state-file schema.
+    this.currentCanonical = rawState?.task && rawState?.timing
+      ? rawState
+      : toCanonicalProgress(rawState);
     if (this.isTTY) {
       this.renderLiveBlock();
     }

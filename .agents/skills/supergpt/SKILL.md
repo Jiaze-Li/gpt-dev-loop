@@ -22,8 +22,9 @@ results** — not to drive each step.
 | User Says | Front Agent Action |
 | --- | --- |
 | *"I want to implement X. Plan it first."* / *"先规划一下"* | Call `supergpt_plan({ goal, cwd })`. Show the concise plan summary and tasks. |
-| *"Looks good. Run it."* / *"可以，开始跑"* | Call `supergpt_run({ goal, cwd })` (or `supergpt_start`). |
-| *"Use SuperGPT to implement X"* / *"用 SuperGPT 实现 X"* | If sufficiently clear, call `supergpt_run({ goal, cwd })` directly. |
+| *Normal autonomous chat/frontend execution* | Call `supergpt_start({ goal, cwd })`; it immediately returns `{ status: "RUNNING", workflowId }`. Attach/observe local progress and continue until terminal. |
+| *"Looks good. Run it."* / *"可以，开始跑"* | Call `supergpt_start({ goal, cwd })`, then attach/observe local progress until terminal. |
+| *"Use SuperGPT to implement X"* / *"用 SuperGPT 实现 X"* | If sufficiently clear, call `supergpt_start({ goal, cwd })`, then attach/observe local progress until terminal. |
 | *"现在做到哪了？"* / *"What's the status?"* | Call `supergpt_status({ workflowId })`. Output the local progress block without LLM calls. |
 | *"停掉。"* / *"Stop it."* | Call `supergpt_stop({ workflowId })`. Confirm safe termination. |
 | *"继续。"* / *"Resume."* | Call `supergpt_resume({ workflowId, answer, cwd })`. |
@@ -46,7 +47,8 @@ When SuperGPT encounters a genuine human question, it halts safely and returns `
 All tools operate locally or delegate to the isolated SuperGPT orchestrator:
 
 - `supergpt_plan`: Turn an instruction into a bounded plan **without executing**. Returns `status: "READY"` (summary + tasks) or `"AMBIGUOUS"` (one question).
-- `supergpt_run` / `supergpt_start`: Run the full loop. Returns `{ status, summary, deliveredFiles, workflowId, reason, question, events, tokenUsage }`.
+- `supergpt_start`: Non-blocking normal entrypoint. Returns exactly `{ status: "RUNNING", workflowId }`; attach local observation and continue until terminal.
+- `supergpt_run`: Blocking convenience API for callers that explicitly want one call to wait for the full terminal result.
 - `supergpt_status`: Report on SuperGPT workflows with live state, progress block, and process health without calling an LLM. Pass `workflowId` to narrow.
 - `supergpt_wait`: Wait locally for state transition (zero model tokens).
 - `supergpt_resume`: Resume a suspended workflow, applying the user's clarification / answer.

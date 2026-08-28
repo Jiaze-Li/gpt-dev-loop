@@ -13,8 +13,11 @@ editing files yourself.
 
 ## Do
 
-- Invoke SuperGPT through the `supergpt_run` MCP tool, or the `supergpt`
-  CLI with `--output-format=json`.
+- For normal autonomous chat/frontend execution, invoke `supergpt_start({ goal, cwd })`.
+  It immediately returns `{ status: "RUNNING", workflowId }`; attach
+  local progress observation and continue until terminal.
+- Use `supergpt_run` only as a blocking convenience API when the caller
+  explicitly wants one call to wait for the full terminal result.
 - For a large or ambiguous request, call `supergpt_plan` first and confirm
   the summary + tasks with the user.
 - Let a run finish. SuperGPT is a Supervisor→Executor→Reviewer loop; it

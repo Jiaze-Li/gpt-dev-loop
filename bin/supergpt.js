@@ -19,6 +19,8 @@
 //   --no-spinner                              disable animated TTY spinner
 
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import {
   supergptPlan,
   runSuperGPT,
@@ -111,6 +113,63 @@ Options:
   --no-spinner                  Disable animated live UI spinner
   --help, -h                    Show this help text
 `;
+
+// The terminal card is deliberately driven by the canonical state file, not
+// by event payloads. Events are lossy presentation hints; persistence is the
+// durable source of truth. This timer is only an observer and never owns the
+// workflow or keeps the CLI process alive.
+export function startCanonicalStateFeed({
+  workflowId,
+  renderer,
+  readProgress = readCanonicalProgress,
+  intervalMs = 350,
+} = {}) {
+  if (!workflowId || !renderer) return { stop() {} };
+
+  let stopped = false;
+  const refresh = () => {
+    if (stopped) return;
+    try {
+      const canonical = readProgress({ workflowId });
+      if (canonical) renderer.updateState(canonical);
+    } catch {
+      // State persistence is best-effort while the workflow is starting.
+    }
+  };
+
+  refresh();
+  const timer = setInterval(refresh, intervalMs);
+  if (typeof timer.unref === 'function') timer.unref();
+
+  return {
+    refresh,
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
+// Kept separate so the CLI/runtime boundary can be exercised without a real
+// provider run. The observer's lifetime is bounded by the awaited runtime.
+export async function executeWorkflowWithLiveState({
+  run,
+  runArgs,
+  workflowId,
+  renderer,
+  readProgress,
+  intervalMs,
+  onFeedStart,
+} = {}) {
+  const stateFeed = startCanonicalStateFeed({ workflowId, renderer, readProgress, intervalMs });
+  onFeedStart?.(stateFeed);
+  try {
+    return await run({ ...runArgs, workflowId });
+  } finally {
+    stateFeed.stop();
+  }
+}
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -284,6 +343,7 @@ async function main() {
 
   const controller = new AbortController();
   let cancelling = false;
+  let activeStateFeed = null;
   const onSignal = (sig) => {
     if (cancelling) {
       if (renderer) renderer.cleanup();
@@ -293,6 +353,7 @@ async function main() {
     if (renderer) {
       renderer.cleanup();
     }
+    activeStateFeed?.stop();
     if (opts.outputFormat === 'text') {
       process.stderr.write(`\n[supergpt] ${sig} received — cancelling (press again to force-quit)…\n`);
     }
@@ -309,32 +370,41 @@ async function main() {
   const onEvent = (event) => {
     if (renderer) {
       renderer.emitTransition(event);
-      if (event.workflowId) {
-        const live = readCanonicalProgress({ workflowId: event.workflowId });
-        if (live) renderer.updateState(live);
-      }
     }
   };
 
   try {
     let result;
     if (opts.command === 'resume') {
-      result = await supergptResume({
+      result = await executeWorkflowWithLiveState({
+        workflowId: opts.workflowId,
+        renderer,
+        onFeedStart: (feed) => { activeStateFeed = feed; },
+        run: supergptResume,
+        runArgs: {
         workflowId: opts.workflowId,
         answer: opts.answer || null,
         cwd: effectiveCwd,
         outputFormat: opts.outputFormat === 'json' ? 'json' : null,
         signal: controller.signal,
         onEvent,
+        },
       });
     } else {
-      result = await runSuperGPT({
+      const workflowId = `wf-agy-${randomUUID()}`;
+      result = await executeWorkflowWithLiveState({
+        workflowId,
+        renderer,
+        onFeedStart: (feed) => { activeStateFeed = feed; },
+        run: runSuperGPT,
+        runArgs: {
         goal: opts.goal,
         planPath: opts.planPath,
         cwd: effectiveCwd,
         outputFormat: opts.outputFormat === 'json' ? 'json' : null,
         signal: controller.signal,
         onEvent,
+        },
       });
     }
 
@@ -357,7 +427,10 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  process.stderr.write(`supergpt: ${err?.stack || err?.message || err}\n`);
-  process.exitCode = 1;
-});
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) {
+  main().catch((err) => {
+    process.stderr.write(`supergpt: ${err?.stack || err?.message || err}\n`);
+    process.exitCode = 1;
+  });
+}
