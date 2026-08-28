@@ -11,6 +11,7 @@ import {
   supergptResume,
   supergptStop,
   supergptWait,
+  supergptWatch,
   supergptStatus,
   toCanonicalProgress,
   readCanonicalProgress,
@@ -105,6 +106,24 @@ export class SuperGptControlService {
       intervalMs,
     });
     return toCanonicalProgress(raw);
+  }
+
+  async watch({
+    workflowId,
+    intervalMs = 1000,
+    timeoutMs = 300000,
+    signal,
+    onProgress,
+    root = this.root,
+  } = {}) {
+    return supergptWatch({
+      workflowId,
+      root,
+      intervalMs,
+      timeoutMs,
+      signal,
+      onProgress,
+    });
   }
 
   async resume({

@@ -35,7 +35,12 @@ test('lists the frontend-neutral prepare/run/plan/status contract with schemas',
     'supergpt_status',
     'supergpt_stop',
     'supergpt_wait',
+    'supergpt_watch',
   ]);
+
+  const watch = tools.find((t) => t.name === 'supergpt_watch');
+  assert.deepEqual(Object.keys(watch.inputSchema.properties).sort(), ['intervalMs', 'timeoutMs', 'workflowId']);
+  assert.ok(watch.inputSchema.required.includes('workflowId'));
 
   const plan = tools.find((t) => t.name === 'supergpt_plan');
   assert.deepEqual(Object.keys(plan.inputSchema.properties).sort(), ['cwd', 'goal']);
@@ -297,3 +302,43 @@ test('supergpt_wait without target waits for a terminal state', async () => {
   assert.equal(predicate({ workflowStatus: 'DONE' }), true);
   await client.close();
 });
+
+test('supergpt_watch invokes watchSuperGptFn and streams progress notifications', async () => {
+  let calledWith = null;
+  const client = await connect({
+    watchSuperGptFn: async ({ workflowId, intervalMs, timeoutMs, onProgress }) => {
+      calledWith = { workflowId, intervalMs, timeoutMs };
+      if (onProgress) {
+        await onProgress({ progress: 1, formattedProgress: 'SUPERGPT ⟳ RUNNING\n\nTask 1/1\nStage EXECUTOR' });
+        await onProgress({ progress: 2, formattedProgress: 'SUPERGPT ⟳ DONE\n\nTask 1/1\nStage DONE' });
+      }
+      return {
+        workflowId,
+        status: 'DONE',
+        stage: 'DONE',
+        formattedProgress: 'SUPERGPT ⟳ DONE\n\nTask 1/1\nStage DONE',
+        summary: 'all tasks done',
+      };
+    },
+  });
+
+  const progressEvents = [];
+  const res = await client.callTool(
+    { name: 'supergpt_watch', arguments: { workflowId: 'wf-watch-test', intervalMs: 500, timeoutMs: 5000 } },
+    undefined,
+    { onprogress: (p) => progressEvents.push(p) }
+  );
+
+  assert.equal(calledWith.workflowId, 'wf-watch-test');
+  assert.equal(calledWith.intervalMs, 500);
+  assert.equal(calledWith.timeoutMs, 5000);
+  assert.equal(res.structuredContent.status, 'DONE');
+  assert.equal(res.structuredContent.summary, 'all tasks done');
+  assert.equal(progressEvents.length, 2);
+  assert.equal(progressEvents[0].progress, 1);
+  assert.match(progressEvents[0].message, /SUPERGPT ⟳ RUNNING/);
+  assert.equal(progressEvents[1].progress, 2);
+  assert.match(progressEvents[1].message, /SUPERGPT ⟳ DONE/);
+  await client.close();
+});
+

@@ -39,6 +39,7 @@ import {
   WORKFLOW_STAGES,
   WORKFLOW_STATUSES,
 } from './workflowState.js';
+import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import {
   WorkflowLifecycleManager,
   gcSuperGptResources,
@@ -704,6 +705,113 @@ export function supergptWait({ workflowId, root = SUPERGPT_WORKTREE_ROOT, predic
   return waitForWorkflowState({ workflowId, root, predicate, timeoutMs, intervalMs });
 }
 
+function abortableSleep(ms, signal) {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timeoutId;
+    const onAbort = () => {
+      clearTimeout(timeoutId);
+      resolve();
+    };
+    timeoutId = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+export async function supergptWatch({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+  intervalMs = 1000,
+  timeoutMs = 300000,
+  signal = null,
+  onProgress = null,
+  _readState = readLiveWorkflowState,
+  _now = () => Date.now(),
+  _sleep = abortableSleep,
+} = {}) {
+  if (!workflowId) throw new Error('supergptWatch requires a workflowId');
+
+  const startTime = _now();
+  let progressSeq = 1;
+
+  const getCanonical = () => {
+    const raw = _readState({ workflowId, root });
+    if (raw) return toCanonicalProgress(raw, _now());
+    return null;
+  };
+
+  let canonical = getCanonical();
+  if (!canonical) {
+    canonical = toCanonicalProgress({
+      workflowId,
+      workflowStatus: WORKFLOW_STATUSES.STARTING,
+      stage: WORKFLOW_STAGES.INIT,
+      startedAt: new Date(_now()).toISOString(),
+      heartbeatAt: new Date(_now()).toISOString(),
+      lastProgressAt: new Date(_now()).toISOString(),
+    }, _now());
+  }
+
+  // Initial immediate notification on attach
+  if (typeof onProgress === 'function') {
+    try {
+      await onProgress({
+        progress: progressSeq++,
+        canonical,
+        formattedProgress: renderGenericProgress(canonical),
+      });
+    } catch {
+      /* ignore notification error */
+    }
+  }
+
+  while (!signal?.aborted && (_now() - startTime < timeoutMs)) {
+    if (canonical?.terminal) {
+      break;
+    }
+    await _sleep(intervalMs, signal);
+    if (signal?.aborted) break;
+
+    const liveCanonical = getCanonical();
+    if (liveCanonical) {
+      canonical = liveCanonical;
+    }
+
+    if (typeof onProgress === 'function') {
+      try {
+        await onProgress({
+          progress: progressSeq++,
+          canonical,
+          formattedProgress: renderGenericProgress(canonical),
+        });
+      } catch {
+        /* ignore notification error */
+      }
+    }
+
+    if (canonical?.terminal) {
+      break;
+    }
+  }
+
+  const finalFormatted = canonical ? renderGenericProgress(canonical) : 'SUPERGPT: workflow state not found';
+  return {
+    workflowId,
+    status: canonical?.workflowStatus ?? (signal?.aborted ? 'CANCELLED' : 'UNKNOWN'),
+    stage: canonical?.stage ?? 'UNKNOWN',
+    formattedProgress: finalFormatted,
+    summary: canonical?.summary ?? null,
+    reason: canonical?.reason ?? null,
+    question: canonical?.question ?? null,
+    deliveredFiles: canonical?.deliveredFiles ?? [],
+    canonicalProgress: canonical,
+    cancelled: Boolean(signal?.aborted),
+  };
+}
+
 const OWNER_TERMINAL_STATUSES = new Set(['STOPPED', 'DONE', 'FAILED', 'HUMAN_REQUIRED']);
 
 export async function supergptStop({
@@ -914,4 +1022,6 @@ export {
   OrganicReworkRecorder,
   defaultOrganicReworkRecorder,
   REWORK_VERIFICATION_STATUSES,
+  WORKFLOW_STAGES,
+  WORKFLOW_STATUSES,
 };

@@ -476,9 +476,10 @@ export function formatTransitionEvent(event) {
  * Convert any live or persisted workflow state object into canonical progress format (PART 2).
  * Consumes zero model tokens.
  */
-export function toCanonicalProgress(rawState) {
+export function toCanonicalProgress(rawState, now = Date.now()) {
   if (!rawState) return null;
-  const elapsedMs = rawState.startedAt ? Math.max(0, Date.now() - new Date(rawState.startedAt).getTime()) : 0;
+  const currentNow = typeof now === 'number' ? now : (now instanceof Date ? now.getTime() : Date.now());
+  const elapsedMs = rawState.startedAt ? Math.max(0, currentNow - new Date(rawState.startedAt).getTime()) : 0;
   return {
     workflowId: rawState.workflowId ?? null,
     workflowStatus: rawState.workflowStatus ?? 'UNKNOWN',

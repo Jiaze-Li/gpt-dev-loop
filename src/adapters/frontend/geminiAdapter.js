@@ -47,10 +47,10 @@ results** — not to drive each step.
 | User Says | Front Agent Action |
 | --- | --- |
 | *"I want to implement X. Plan it first."* / *"先规划一下"* | Call \`supergpt_plan({ goal, cwd })\`. Show the concise plan summary and tasks. |
-| *Normal autonomous chat/frontend execution* | Call \`supergpt_start({ goal, cwd })\`; it immediately returns \`{ status: "RUNNING", workflowId }\`. Attach/observe local progress and continue until terminal. |
-| *"Looks good. Run it."* / *"可以，开始跑"* | Call \`supergpt_start({ goal, cwd })\`, then attach/observe local progress until terminal. |
-| *"Use SuperGPT to implement X"* / *"用 SuperGPT 实现 X"* | If sufficiently clear, call \`supergpt_start({ goal, cwd })\`, then attach/observe local progress until terminal. |
-| *"现在做到哪了？"* / *"What's the status?"* | Call \`supergpt_status({ workflowId })\`. Output the local progress block without LLM calls. |
+| *Normal autonomous chat/frontend execution* | Call \`supergpt_start({ goal, cwd })\` to receive \`workflowId\`, then immediately call \`supergpt_watch({ workflowId })\` to display live streaming progress until terminal. Do not repeatedly call \`supergpt_status\`. |
+| *"Looks good. Run it."* / *"可以，开始跑"* | Call \`supergpt_start({ goal, cwd })\`, then immediately attach \`supergpt_watch({ workflowId })\` until terminal. |
+| *"Use SuperGPT to implement X"* / *"用 SuperGPT 实现 X"* | If sufficiently clear, call \`supergpt_start({ goal, cwd })\`, then immediately attach \`supergpt_watch({ workflowId })\` until terminal. |
+| *"现在做到哪了？"* / *"What's the status?"* | Call \`supergpt_status({ workflowId })\`. Output the on-demand snapshot without LLM calls. |
 | *"停掉。"* / *"Stop it."* | Call \`supergpt_stop({ workflowId })\`. Confirm safe termination. |
 | *"继续。"* / *"Resume."* | Call \`supergpt_resume({ workflowId, answer, cwd })\`. |
 
@@ -70,6 +70,7 @@ When SuperGPT encounters a genuine human question, it halts safely and returns \
 ## Tool return behavior
 
 - \`supergpt_start\` is the normal non-blocking entrypoint and returns exactly \`{ status: "RUNNING", workflowId }\`.
+- \`supergpt_watch\` is the long-running local watcher tool that streams live progress updates via MCP notifications until terminal.
 - \`supergpt_run\` is a blocking convenience API for callers that explicitly want one call to wait for the full terminal result.
 `;
   }

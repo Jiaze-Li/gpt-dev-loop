@@ -53,6 +53,19 @@ export class BaseFrontendAdapter {
     }).start();
   }
 
+  // Long-running live watch stream with zero model tokens.
+  async watchProgress({ workflowId, render, intervalMs, timeoutMs, signal } = {}) {
+    return this.controlService.watch({
+      workflowId,
+      intervalMs,
+      timeoutMs,
+      signal,
+      onProgress: ({ formattedProgress, canonical }) => {
+        if (typeof render === 'function') render(formattedProgress, canonical);
+      },
+    });
+  }
+
   // Host integrations call this for their non-blocking `supergpt_start`
   // operation.  The returned workflow id is immediately observed locally;
   // disconnecting this adapter stops only its subscription, never the run.

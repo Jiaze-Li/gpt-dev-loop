@@ -22,10 +22,10 @@ results** — not to drive each step.
 | User Says | Front Agent Action |
 | --- | --- |
 | *"I want to implement X. Plan it first."* / *"先规划一下"* | Call `supergpt_plan({ goal, cwd })`. Show the concise plan summary and tasks. |
-| *Normal autonomous chat/frontend execution* | Call `supergpt_start({ goal, cwd })`; it immediately returns `{ status: "RUNNING", workflowId }`. Attach/observe local progress and continue until terminal. |
-| *"Looks good. Run it."* / *"可以，开始跑"* | Call `supergpt_start({ goal, cwd })`, then attach/observe local progress until terminal. |
-| *"Use SuperGPT to implement X"* / *"用 SuperGPT 实现 X"* | If sufficiently clear, call `supergpt_start({ goal, cwd })`, then attach/observe local progress until terminal. |
-| *"现在做到哪了？"* / *"What's the status?"* | Call `supergpt_status({ workflowId })`. Output the local progress block without LLM calls. |
+| *Normal autonomous chat/frontend execution* | Call `supergpt_start({ goal, cwd })` to receive `workflowId`, then immediately call `supergpt_watch({ workflowId })` to display live streaming progress until terminal. Do not repeatedly call `supergpt_status`. |
+| *"Looks good. Run it."* / *"可以，开始跑"* | Call `supergpt_start({ goal, cwd })`, then immediately attach `supergpt_watch({ workflowId })` until terminal. |
+| *"Use SuperGPT to implement X"* / *"用 SuperGPT 实现 X"* | If sufficiently clear, call `supergpt_start({ goal, cwd })`, then immediately attach `supergpt_watch({ workflowId })` until terminal. |
+| *"现在做到哪了？"* / *"What's the status?"* | Call `supergpt_status({ workflowId })`. Output the on-demand snapshot without LLM calls. |
 | *"停掉。"* / *"Stop it."* | Call `supergpt_stop({ workflowId })`. Confirm safe termination. |
 | *"继续。"* / *"Resume."* | Call `supergpt_resume({ workflowId, answer, cwd })`. |
 
@@ -47,9 +47,10 @@ When SuperGPT encounters a genuine human question, it halts safely and returns `
 All tools operate locally or delegate to the isolated SuperGPT orchestrator:
 
 - `supergpt_plan`: Turn an instruction into a bounded plan **without executing**. Returns `status: "READY"` (summary + tasks) or `"AMBIGUOUS"` (one question).
-- `supergpt_start`: Non-blocking normal entrypoint. Returns exactly `{ status: "RUNNING", workflowId }`; attach local observation and continue until terminal.
+- `supergpt_start`: Non-blocking normal entrypoint. Returns exactly `{ status: "RUNNING", workflowId }`; immediately attach `supergpt_watch({ workflowId })` to stream progress until terminal.
+- `supergpt_watch`: Long-running local watcher with streaming MCP progress notifications (heartbeat, elapsed time, stage transitions) until terminal. Consumes 0 model tokens.
 - `supergpt_run`: Blocking convenience API for callers that explicitly want one call to wait for the full terminal result.
-- `supergpt_status`: Report on SuperGPT workflows with live state, progress block, and process health without calling an LLM. Pass `workflowId` to narrow.
+- `supergpt_status`: On-demand snapshot of SuperGPT workflows with live state, progress block, and process health without calling an LLM. Pass `workflowId` to narrow.
 - `supergpt_wait`: Wait locally for state transition (zero model tokens).
 - `supergpt_resume`: Resume a suspended workflow, applying the user's clarification / answer.
 - `supergpt_stop`: Safely abort an active workflow and kill active children without leaving orphan processes.

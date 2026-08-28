@@ -30,8 +30,13 @@ Otherwise use the CLI.
 | Tool | Purpose |
 | --- | --- |
 | `supergpt_plan` | Turn an instruction into a bounded plan **without executing**. Returns `status: "READY"` (summary + tasks) or `"AMBIGUOUS"` (one question). |
-| `supergpt_run` | Run the full loop. Returns `{ status, summary, deliveredFiles, workflowId, reason, question, events }`. |
-| `supergpt_status` | List started workflows from safe workspace metadata. Pass `workflowId` to narrow. |
+| `supergpt_start` | Non-blocking normal entrypoint. Returns `{ status: "RUNNING", workflowId }` immediately. |
+| `supergpt_watch` | Long-running local watcher with streaming MCP progress notifications (heartbeat, elapsed time, stage transitions) until terminal. Consumes 0 model tokens. |
+| `supergpt_run` | Blocking convenience API for callers that explicitly want one call to wait for the full terminal result. |
+| `supergpt_status` | On-demand snapshot of workflows from safe workspace metadata. Pass `workflowId` to narrow. |
+| `supergpt_wait` | Wait locally for workflow completion/transition without streaming (0 model tokens). |
+| `supergpt_resume` | Resume a suspended workflow (e.g. after HUMAN_REQUIRED). |
+| `supergpt_stop` | Safely abort an active workflow and kill active children without leaving orphan processes. |
 
 ### CLI
 

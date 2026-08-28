@@ -10,7 +10,8 @@
 //                     Supervisor/Executor/Reviewer -> safe delivery),
 //                     returning the structured result plus every typed
 //                     event that was emitted.
-//   supergpt_start  — alias for supergpt_run.
+//   supergpt_start  — non-blocking workflow start returning RUNNING and workflowId.
+//   supergpt_watch  — watch active workflow locally with live streaming MCP progress notifications (0 tokens).
 //   supergpt_status — report on SuperGPT workflows with live state, progress block,
 //                     heartbeat, and process health without calling an LLM.
 //   supergpt_wait   — wait locally for workflow completion/transition (0 model tokens).
@@ -30,6 +31,7 @@ import {
   supergptResume,
   supergptStop,
   supergptWait,
+  supergptWatch,
   supergptFormatProgress,
   toCanonicalProgress,
 } from '../orchestrator/supergpt.js';
@@ -119,6 +121,7 @@ export function createSuperGptMcpServer({
   resumeSuperGptFn = supergptResume,
   stopSuperGptFn = supergptStop,
   waitSuperGptFn = supergptWait,
+  watchSuperGptFn = supergptWatch,
   resolveWorkflowPlanFn = resolveWorkflowPlan,
   readWorkflowStatusFn = readWorkflowStatus,
   callAgy = defaultCallAgy,
@@ -318,6 +321,62 @@ export function createSuperGptMcpServer({
       return {
         content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
         structuredContent: structured,
+      };
+    },
+  );
+
+  server.registerTool(
+    'supergpt_watch',
+    {
+      description:
+        'Watch an active SuperGPT workflow locally with live streaming MCP progress notifications (heartbeat, elapsed time, stage transitions) until terminal. Consumes 0 model tokens.',
+      inputSchema: {
+        workflowId: z.string().min(1, 'workflowId must not be empty').describe('workflow id to watch'),
+        intervalMs: z.number().optional().describe('refresh interval in milliseconds (default: 1000)'),
+        timeoutMs: z.number().optional().describe('maximum milliseconds to watch before returning (default: 300000)'),
+      },
+      outputSchema: {
+        workflowId: z.string(),
+        status: z.string(),
+        stage: z.string(),
+        formattedProgress: z.string(),
+        summary: z.string().nullable().optional(),
+        reason: z.string().nullable().optional(),
+        question: z.string().nullable().optional(),
+        deliveredFiles: z.array(z.string()).optional(),
+        canonicalProgress: z.record(z.string(), z.any()).nullable().optional(),
+        cancelled: z.boolean().optional(),
+      },
+    },
+    async ({ workflowId, intervalMs = 1000, timeoutMs = 300000 }, extra) => {
+      const progressToken = extra?._meta?.progressToken;
+      const structured = await watchSuperGptFn({
+        workflowId,
+        intervalMs,
+        timeoutMs,
+        signal: extra?.signal,
+        onProgress: async ({ progress, formattedProgress }) => {
+          if (typeof extra?.sendNotification === 'function') {
+            try {
+              await extra.sendNotification({
+                method: 'notifications/progress',
+                params: {
+                  progressToken: progressToken ?? workflowId,
+                  progress,
+                  message: formattedProgress,
+                },
+              });
+            } catch {
+              /* ignore notification delivery error */
+            }
+          }
+        },
+      });
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+        structuredContent: structured,
+        isError: ['FAILED', 'TIMEOUT', 'STALLED'].includes(structured.status),
       };
     },
   );

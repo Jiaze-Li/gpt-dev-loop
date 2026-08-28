@@ -28,8 +28,8 @@ export class ClaudeFrontendAdapter extends BaseFrontendAdapter {
 When the user asks to use SuperGPT (e.g. "Use SuperGPT to build X" or "Plan X with SuperGPT"):
 
 1. Use the \`supergpt_plan\` tool to create a structured plan first if the user requested planning.
-2. For normal autonomous execution, use \`supergpt_start({ goal, cwd })\`. It immediately returns \`{ status: "RUNNING", workflowId }\`; attach local progress observation and continue until terminal.
-3. Use \`supergpt_status\` to check progress without calling external LLMs.
+2. For normal autonomous execution, use \`supergpt_start({ goal, cwd })\`. It immediately returns \`{ status: "RUNNING", workflowId }\`; then immediately attach \`supergpt_watch({ workflowId })\` to display live streaming progress until terminal. Do NOT repeatedly reason and call \`supergpt_status\`.
+3. Use \`supergpt_status\` only for on-demand progress snapshots without calling external LLMs.
 4. If SuperGPT returns \`HUMAN_REQUIRED\`, ask the user the exact question and call \`supergpt_resume\` with their answer.
 5. Never micromanage SuperGPT or duplicate reviewer/worker logic.
 
