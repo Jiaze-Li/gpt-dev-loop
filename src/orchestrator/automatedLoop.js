@@ -846,8 +846,8 @@ export async function runAutomatedWorkflow({
       if (decision.action === 'WORKFLOW_DONE') {
         // Deterministic Core Closeout Gate Guard:
         // WORKFLOW_DONE from Supervisor is only a request to finish.
-        // If frozen closeout_verification_commands is non-empty, Core proves those exact commands
-        // have PASS evidence against the CURRENT worktree content before transitioning to DONE.
+        // If frozen closeout_verification_commands is non-empty, Core ALWAYS executes those frozen closeout commands
+        // against the current isolated worktree (or consumes matching trusted host evidence bound to current worktree).
         if (Array.isArray(closeoutVerificationCommands) && closeoutVerificationCommands.length > 0) {
           const evidenceRoot = workflowStateManager?.root || SUPERGPT_WORKTREE_ROOT;
           const hostEvidenceCheck = getValidHostEvidence({
@@ -856,22 +856,8 @@ export async function runAutomatedWorkflow({
             root: evidenceRoot,
           });
 
-          // Also check if the latest task Gate run already executed and passed all closeout commands
-          // on the current worktree content (e.g. final task injection)
-          let alreadySatisfiedByLatestGate = false;
-          if (latestGateEvidence?.pass && Array.isArray(currentTaskCard?.verification_commands)) {
-            const currentCommands = currentTaskCard.verification_commands;
-            const coversAllCloseout = closeoutVerificationCommands.every((c) => currentCommands.includes(c));
-            if (coversAllCloseout) {
-              alreadySatisfiedByLatestGate = true;
-            }
-          }
-
           let closeoutEvidence;
-          if (alreadySatisfiedByLatestGate) {
-            log(`closeout gate: already satisfied by latest task gate pass on current worktree`);
-            closeoutEvidence = latestGateEvidence;
-          } else if (hostEvidenceCheck?.valid && hostEvidenceCheck.hostEvidence?.pass) {
+          if (hostEvidenceCheck?.valid && hostEvidenceCheck.hostEvidence?.pass) {
             log(`closeout gate: consuming valid trusted host verification evidence (id=${hostEvidenceCheck.hostEvidence.evidenceId})`);
             markHostEvidenceConsumed({
               workflowId,
@@ -1028,21 +1014,6 @@ export async function runAutomatedWorkflow({
       // decision.action === 'NEXT_TASK'
       await closeReviewer(); // closes the PREVIOUS task's reviewer tab, if any — conversation itself is left in the account, not deleted
       currentTaskCard = { ...decision.task_card };
-
-      // Determine if this is the final planned task
-      const isFinalTask =
-        (typeof taskTotal === 'number' && taskTotal > 0 && history.length === taskTotal - 1) ||
-        (currentTaskCard.is_final_task === true) ||
-        (Array.isArray(currentTaskCard.remaining_tasks) && currentTaskCard.remaining_tasks.length === 0);
-
-      if (isFinalTask && Array.isArray(closeoutVerificationCommands) && closeoutVerificationCommands.length > 0) {
-        const originalCommands = Array.isArray(currentTaskCard.verification_commands)
-          ? currentTaskCard.verification_commands
-          : [];
-        currentTaskCard.verification_commands = [...new Set([...originalCommands, ...closeoutVerificationCommands])];
-        log(`injected closeout verification commands into final task ${currentTaskCard.task_id}: ${JSON.stringify(currentTaskCard.verification_commands)}`);
-      }
-
       log(`task selected: ${currentTaskCard.task_id}`);
       // reviewerSession is instantiated now but its create(taskId) — the
       // call that actually opens the background ChatGPT tab, INSIDE the

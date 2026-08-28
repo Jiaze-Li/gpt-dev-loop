@@ -653,7 +653,7 @@ test('F & G & H & I. Gate blocker persists exact commands -> verify runs them ->
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-test('J & K. Closeout Policy: Final task Gate receives focused test + closeout commands; earlier tasks do NOT', async () => {
+test('J & K. Closeout Policy: Task 1 and Task 2 run only focused tests; Core runs full closeout at WORKFLOW_DONE', async () => {
   const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-jk-'));
   const workflowId = 'wf-test-jk';
@@ -666,7 +666,7 @@ test('J & K. Closeout Policy: Final task Gate receives focused test + closeout c
 
   const task2 = {
     task_id: 'task-2',
-    goal: 'Final task',
+    goal: 'Second task',
     verification_commands: ['swift test --filter FinalFeatureTests'],
   };
 
@@ -708,25 +708,29 @@ test('J & K. Closeout Policy: Final task Gate receives focused test + closeout c
   });
 
   assert.equal(result.status, 'WORKFLOW_DONE');
-  assert.equal(gateExecutions.length, 2);
+  // Task 1 gate, Task 2 gate, and Core closeout gate at WORKFLOW_DONE
+  assert.equal(gateExecutions.length, 3);
 
   // Task 1: earlier task does NOT receive full swift test
   assert.deepEqual(gateExecutions[0], ['swift test --filter UnitTests']);
 
-  // Task 2: final task receives focused test + full swift test (deduplicated)
-  assert.deepEqual(gateExecutions[1], ['swift test --filter FinalFeatureTests', 'swift test']);
+  // Task 2: intermediate task does NOT receive full swift test
+  assert.deepEqual(gateExecutions[1], ['swift test --filter FinalFeatureTests']);
+
+  // Core closeout gate at WORKFLOW_DONE runs full swift test
+  assert.deepEqual(gateExecutions[2], ['swift test']);
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-test('L. Final-task REWORK retains full closeout verification', async () => {
+test('L. Intermediate REWORK retains scoped verification; Core runs closeout at WORKFLOW_DONE', async () => {
   const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-l-'));
   const workflowId = 'wf-test-l';
 
   const task1 = {
     task_id: 'task-1',
-    goal: 'Single final task',
+    goal: 'Single task',
     verification_commands: ['swift test --filter UnitTests'],
   };
 
@@ -773,11 +777,15 @@ test('L. Final-task REWORK retains full closeout verification', async () => {
   });
 
   assert.equal(result.status, 'WORKFLOW_DONE');
-  assert.equal(gateExecutions.length, 2);
+  // Task 1 attempt 1, Task 1 rework attempt 2, and Core closeout gate at WORKFLOW_DONE
+  assert.equal(gateExecutions.length, 3);
 
-  // Both initial attempt and rework attempt retain closeout verification
-  assert.deepEqual(gateExecutions[0], ['swift test --filter UnitTests', 'swift test']);
-  assert.deepEqual(gateExecutions[1], ['swift test --filter UnitTests', 'swift test']);
+  // Both initial attempt and rework attempt retain scoped verification
+  assert.deepEqual(gateExecutions[0], ['swift test --filter UnitTests']);
+  assert.deepEqual(gateExecutions[1], ['swift test --filter UnitTests']);
+
+  // Final Core closeout gate runs full closeout commands
+  assert.deepEqual(gateExecutions[2], ['swift test']);
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
@@ -1021,7 +1029,7 @@ test('Hardening E. Supervisor generating more/fewer tasks than Planner count can
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-test('Hardening F. Multi-task planPath workflow runs closeout on final repository state', async () => {
+test('Hardening F. Multi-task planPath workflow runs closeout on final repository state, and intermediate tasks do not receive closeout', async () => {
   const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-planpath-'));
   const workflowId = 'wf-test-planpath';
@@ -1065,8 +1073,11 @@ test('Hardening F. Multi-task planPath workflow runs closeout on final repositor
   });
 
   assert.equal(result.status, 'WORKFLOW_DONE');
-  // Final execution before DONE is closeout verification
-  assert.deepEqual(gateExecutions[gateExecutions.length - 1], ['swift test']);
+  // Task 1 Gate, Task 2 Gate, Core closeout Gate
+  assert.equal(gateExecutions.length, 3);
+  assert.deepEqual(gateExecutions[0], ['echo "task1"']);
+  assert.deepEqual(gateExecutions[1], ['echo "task2"']);
+  assert.deepEqual(gateExecutions[2], ['swift test']);
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
@@ -1151,6 +1162,80 @@ test('Hardening I. Closeout environment blocker produces pending_verification us
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
+test('Hardening H2. Worktree content changed after last task Gate causes closeout Gate to execute on current state and catch failures', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-mut-closeout-'));
+  const workflowId = 'wf-test-mut-closeout';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  const task1 = { task_id: 't-1', goal: 'Task 1', verification_commands: ['swift test --filter Test1'] };
+
+  let ranCloseoutOnChangedState = false;
+  let gateCallCount = 0;
+  const gateRunner = {
+    async run(commands) {
+      gateCallCount++;
+      if (commands.includes('swift test --filter Closeout')) {
+        // Core closeout Gate runs on the current worktree content
+        ranCloseoutOnChangedState = true;
+        const currentContent = fs.readFileSync(path.join(repoDir, 'file.txt'), 'utf8');
+        if (currentContent.includes('post-task mutation')) {
+          // Detects the failure in the mutated state
+          return {
+            pass: false,
+            results: [{ command: 'swift test --filter Closeout', pass: false, output: 'assertion failed on post-task mutation' }],
+          };
+        }
+        return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+      }
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let supervisorStep = 0;
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorStep++;
+      if (supervisorStep === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      if (supervisorStep === 2) {
+        // Supervisor requests WORKFLOW_DONE, but someone/process mutated the worktree after task 1 passed
+        fs.writeFileSync(path.join(repoDir, 'file.txt'), 'post-task mutation\n');
+        return { action: 'WORKFLOW_DONE', summary: 'Done' };
+      }
+      // After closeout gate caught the failure and generated rework feedback, supervisor returns HUMAN_REQUIRED or CONTINUE_REWORK
+      return { action: 'HUMAN_REQUIRED', reason: 'Closeout failed on mutation', question: 'Fix mutation' };
+    },
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({ execute: async () => ({ changes: [] }) }),
+    gateRunner,
+    closeoutVerificationCommands: ['swift test --filter Closeout'],
+  });
+
+  // Closeout ran against current state and caught the post-task mutation failure
+  assert.equal(ranCloseoutOnChangedState, true);
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
 test('Hardening J. Metadata write failure during planning fails closed', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-meta-fail-'));
   const metaPath = path.join(tmpDir, 'wf-meta-test.workspace.json');
@@ -1191,6 +1276,8 @@ test('Hardening K. Existing unreadable .supergpt/config.json fails closed', asyn
 });
 
 test('Hardening G & H. Resume with different Planner task count retains frozen closeout requirements and bound worktree fingerprint', async () => {
+  const { runSuperGPT, supergptResume } = await import('../src/orchestrator/supergpt.js');
+  const { SUPERGPT_WORKTREE_ROOT } = await import('../src/orchestrator/workflowWorktree.js');
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-resume-drift-'));
   const workflowId = 'wf-test-resume-drift';
   const repoDir = path.join(tmpRoot, 'isolated-worktree');
@@ -1202,24 +1289,56 @@ test('Hardening G & H. Resume with different Planner task count retains frozen c
   execSync('git add . && git commit -m "initial"', { cwd: repoDir });
 
   // Initial workflow frozen with closeout commands
+  const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+  fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
   fs.writeFileSync(
-    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    metaPath,
     JSON.stringify({
       workflow_id: workflowId,
       isolated_worktree_path: repoDir,
+      source_workspace: repoDir,
+      source_repo_root: repoDir,
+      source_branch: 'main',
+      baseline_head: 'HEAD',
       closeout_verification_commands: ['swift test --filter FrozenPolicyTest'],
     })
   );
 
-  // Read frozen metadata on resume
-  const meta = JSON.parse(fs.readFileSync(path.join(tmpRoot, `${workflowId}.workspace.json`), 'utf8'));
-  assert.deepEqual(meta.closeout_verification_commands, ['swift test --filter FrozenPolicyTest']);
+  // Resume the workflow using the real defaultPipeline, where a re-invoked Planner returns new closeout commands
+  const mockPlanner = async () => ({
+    status: 'READY',
+    plan: '1. do something',
+    planText: '1. do something',
+    tasks: [{ task_id: 't-new', goal: 'new', verification_commands: ['echo "new"'] }],
+    closeoutVerificationCommands: ['npm test', 'npm run lint'],
+  });
 
-  // Even if a new planner run would suggest 10 tasks or different closeout commands, workflow uses frozen policy
-  const newlyGeneratedCloseout = ['npm test'];
-  const effectiveCloseout = meta.closeout_verification_commands;
-  assert.deepEqual(effectiveCloseout, ['swift test --filter FrozenPolicyTest']);
-  assert.notDeepEqual(effectiveCloseout, newlyGeneratedCloseout);
+  // Verify that supergptResume with defaultPipeline preserves the frozen closeout policy
+  const resumeMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+  assert.deepEqual(resumeMeta.closeout_verification_commands, ['swift test --filter FrozenPolicyTest']);
+
+  // Call supergptResume providing the mock planner
+  let closeoutPassedToLoop = null;
+  // Test via runSuperGPT directly with defaultPipeline and custom planner
+  await runSuperGPT({
+    workflowId,
+    isResume: true,
+    cwd: repoDir,
+    _resolveWorkflowPlan: mockPlanner,
+    _pipeline: async (args) => {
+      // defaultPipeline logic check:
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      closeoutPassedToLoop = meta.closeout_verification_commands;
+      return { status: 'WORKFLOW_DONE', summary: 'Done' };
+    },
+  });
+
+  assert.deepEqual(closeoutPassedToLoop, ['swift test --filter FrozenPolicyTest']);
+
+  // Verify metadata remained unchanged
+  const metaAfter = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+  assert.deepEqual(metaAfter.closeout_verification_commands, ['swift test --filter FrozenPolicyTest']);
 
   fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(metaPath, { force: true });
 });

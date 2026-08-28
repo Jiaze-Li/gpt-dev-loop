@@ -270,6 +270,7 @@ export async function runSuperGPT({
   externalReadRoots = [],
   approvedExternalRoots = [],
   _pipeline = defaultPipeline,
+  _resolveWorkflowPlan,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   const result = { ...EMPTY_RESULT(), workflowId };
@@ -424,6 +425,7 @@ export async function runSuperGPT({
           answer,
           externalReadRoots: resolvedExternalRoots,
           approvedExternalRoots: resolvedExternalRoots,
+          _resolveWorkflowPlan,
         })
       );
     throwIfAborted(internalAbort.signal);
@@ -524,6 +526,7 @@ async function defaultPipeline({
   answer = null,
   externalReadRoots = [],
   approvedExternalRoots = [],
+  _resolveWorkflowPlan,
 }) {
   workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
@@ -679,8 +682,9 @@ async function defaultPipeline({
   if (answer && !planPath) {
     planArg = `${planArg}\n\n[User Clarification / Answer]:\n${answer}`;
   }
+  const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
   const resolved = (await selection.runtime.invoke('planner', {
-    resolve: (call) => resolveWorkflowPlan({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
+    resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
   }, { operationId: workflowId })).value;
   if (resolved.status === 'AMBIGUOUS') {
     emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason: 'plan_ambiguous', question: resolved.question });
@@ -699,8 +703,8 @@ async function defaultPipeline({
   }
   emit(SUPERGPT_EVENTS.PLANNING_COMPLETED, { tasksCount: resolved.tasks?.length ?? 1 });
 
-  // If the planner identified closeout commands, update workflow metadata to freeze them durably
-  if (Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0) {
+  // If this is a new workflow (not a resume) and the planner identified closeout commands, update workflow metadata to freeze them durably
+  if (!isResume && Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0) {
     try {
       if (existsSync(metadataPath)) {
         const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
@@ -764,6 +768,11 @@ async function defaultPipeline({
     }
   } catch {
     /* ignore best effort */
+  }
+
+  // If this is a new workflow, use the resolved closeout commands if metadata was empty
+  if (!isResume && (!frozenCloseoutCommands || frozenCloseoutCommands.length === 0) && Array.isArray(resolved.closeoutVerificationCommands)) {
+    frozenCloseoutCommands = resolved.closeoutVerificationCommands;
   }
 
   const loopResult = await runAutomatedWorkflow({
@@ -1128,6 +1137,7 @@ export async function supergptResume({
   signal,
   env = process.env,
   _pipeline = defaultPipeline,
+  _resolveWorkflowPlan,
 } = {}) {
   if (!workflowId) throw new Error('supergptResume requires a workflowId');
 
@@ -1166,6 +1176,7 @@ export async function supergptResume({
     signal,
     env,
     _pipeline,
+    _resolveWorkflowPlan,
   });
 }
 
