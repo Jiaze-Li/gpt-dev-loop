@@ -15,6 +15,7 @@ import { createAgyReviewerProvider } from './adapters/agyReviewerProvider.js';
 import {
   createAgySupervisorSession,
   createAgyReviewerSessionFactory,
+  createAgyProviderSessionStore,
   nullWindowSession,
 } from './agyProviderSessions.js';
 import { resolveAgySupervisorModel, resolveAgyReviewerModel } from '../agy/agyConfig.js';
@@ -28,7 +29,14 @@ function normalize(value) {
 // runAutomatedWorkflow. The Supervisor and Reviewer each get ONLY their own
 // resolved model — the Claude executor is never handed either. Throws (fail
 // closed) if either provider env var is not exactly "agy".
-export function selectProviders({ env = process.env, callAgy, timeoutMs, jsonSchema } = {}) {
+export function selectProviders({
+  env = process.env,
+  callAgy,
+  timeoutMs,
+  jsonSchema,
+  persistence,
+  workflowId,
+} = {}) {
   const supervisor = normalize(env.SUPERVISOR_PROVIDER);
   const reviewer = normalize(env.REVIEWER_PROVIDER);
 
@@ -55,11 +63,18 @@ export function selectProviders({ env = process.env, callAgy, timeoutMs, jsonSch
     jsonSchema,
   });
 
+  // One shared persistent-conversation store for this workflow: the
+  // Supervisor session and every per-task Reviewer session created below
+  // read/write the same map, persisted to workflow state when a
+  // `persistence` + `workflowId` pair is supplied.
+  const sessionStore = createAgyProviderSessionStore({ persistence, workflowId });
+
   return {
     supervisorModel,
     reviewerModel,
-    supervisorSession: createAgySupervisorSession(supervisorProvider),
-    createReviewerSession: createAgyReviewerSessionFactory(reviewerProvider),
+    supervisorSession: createAgySupervisorSession(supervisorProvider, { store: sessionStore }),
+    createReviewerSession: createAgyReviewerSessionFactory(reviewerProvider, { store: sessionStore }),
     windowSession: nullWindowSession,
+    sessionStore,
   };
 }

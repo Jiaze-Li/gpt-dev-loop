@@ -30,6 +30,7 @@ import {
   AgyExitError,
   AgyExecutableNotFoundError,
   AgyError,
+  AgyConversationResumeError,
 } from '../../agy/agyClient.js';
 import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../../agy/agyJson.js';
 import { AGY_REVIEWER_DEFAULT_MODEL } from '../../agy/agyConfig.js';
@@ -137,13 +138,20 @@ export function createAgyReviewerProvider({
 } = {}) {
   return {
     model,
-    async review(taskCard, executionReport, evidence, { attempt } = {}) {
+    // conversationId (optional): resume this task's persistent Reviewer
+    // conversation across REWORK rounds. Forwarded verbatim to callAgy,
+    // which fails closed (AgyConversationResumeError) if agy cannot resume
+    // exactly it. The returned Review Result carries `conversationId` — the
+    // id agy actually used — so the caller can capture it on the first
+    // review() and reuse it for every rework of the same task.
+    async review(taskCard, executionReport, evidence, { attempt, conversationId } = {}) {
       const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt });
 
       let result;
       try {
-        result = await callAgy({ prompt, model, timeoutMs, jsonSchema });
+        result = await callAgy({ prompt, model, timeoutMs, jsonSchema, conversationId });
       } catch (err) {
+        if (err instanceof AgyConversationResumeError) throw err;
         throw mapAgyError(err, model);
       }
 
@@ -154,7 +162,10 @@ export function createAgyReviewerProvider({
         if (err instanceof AgyStructuredOutputError) throw invalid(err.message);
         throw err;
       }
-      return parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null);
+      return {
+        ...parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null),
+        conversationId: result.conversationId ?? null,
+      };
     },
   };
 }

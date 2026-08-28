@@ -31,6 +31,35 @@ export class Persistence {
     return JSON.parse(raw);
   }
 
+  // Workflow-scoped state (one level above a task): persistent role
+  // conversation ownership for the whole workflow — the Supervisor's single
+  // conversation id and the Reviewer's per-task conversation ids. Written by
+  // src/orchestrator/agyProviderSessions.js as those ids are captured, read
+  // back on resume so the same agy conversations are continued rather than
+  // recreated. Snapshot, overwritten on every update.
+  workflowDir(workflowId) {
+    return path.join(this.baseDir, workflowId);
+  }
+
+  async writeWorkflowState(workflowId, state) {
+    if (typeof workflowId !== 'string' || workflowId === '') {
+      throw new Error('writeWorkflowState requires a non-empty workflowId');
+    }
+    const dir = this.workflowDir(workflowId);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'workflow.json'), JSON.stringify(state, null, 2), 'utf8');
+  }
+
+  async readWorkflowState(workflowId) {
+    try {
+      const raw = await readFile(path.join(this.workflowDir(workflowId), 'workflow.json'), 'utf8');
+      return JSON.parse(raw);
+    } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    }
+  }
+
   // PERSISTENCE.md §2 — append-only event log, one JSON object per line.
   async appendEvent(event) {
     const dir = await this.ensureTaskDir(event.workflow_id, event.task_id);

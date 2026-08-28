@@ -301,9 +301,11 @@ async function main() {
     return defaultCallAgy(opts);
   };
 
+  const persistence = new Persistence(path.join(repoRoot, '.gpt-dev-loop', 'workflows'));
+
   let selection;
   try {
-    selection = selectProviders({ env: process.env, callAgy: measuringCallAgy });
+    selection = selectProviders({ env: process.env, callAgy: measuringCallAgy, persistence, workflowId });
   } catch (err) {
     console.error(err.message);
     process.exitCode = 1;
@@ -325,8 +327,6 @@ async function main() {
   console.log('');
 
   const status = createCompactStatusLogger({ supervisorModel, reviewerModel });
-
-  const persistence = new Persistence(path.join(repoRoot, '.gpt-dev-loop', 'workflows'));
 
   const baseGate = createGateRunner({
     gitEvidenceCollector: createGitEvidenceCollector(),

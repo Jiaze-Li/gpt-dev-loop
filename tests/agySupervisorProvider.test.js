@@ -3,8 +3,33 @@ import assert from 'node:assert/strict';
 
 import { createAgySupervisorProvider, buildAgySupervisorPrompt } from '../src/orchestrator/adapters/agySupervisorProvider.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
-import { AgyTimeoutError, AgyExitError, AgyExecutableNotFoundError } from '../src/agy/agyClient.js';
+import {
+  AgyTimeoutError,
+  AgyExitError,
+  AgyExecutableNotFoundError,
+  AgyConversationResumeError,
+} from '../src/agy/agyClient.js';
 import { makeFakeCallAgy, validTaskCardObject } from './fixtures/fakeAgy.mjs';
+
+// A callAgy fake that models agy's real conversation behaviour: the first
+// call (no conversationId) is assigned a fresh id; a call that passes a
+// conversationId echoes exactly it back. Records the conversationId seen on
+// every call so tests can assert it was forwarded.
+function makeConversationalCallAgy(answers) {
+  const queue = [...answers];
+  const calls = [];
+  let counter = 0;
+  async function callAgy({ prompt, model, conversationId } = {}) {
+    calls.push({ prompt, model, conversationId: conversationId ?? null });
+    const answer = queue.length > 1 ? queue.shift() : queue[0];
+    if (answer instanceof Error) throw answer;
+    const cid = conversationId ?? `sup-conv-${++counter}`;
+    const text = typeof answer === 'string' ? answer : JSON.stringify(answer);
+    return { model, exitCode: 0, text, json: { result: text }, stdout: text, durationMs: 1, conversationId: cid };
+  }
+  callAgy.calls = calls;
+  return callAgy;
+}
 
 const CONTEXT = {
   workflowGoal: 'PLAN: create work/auto-a.txt then finish.',
@@ -36,16 +61,21 @@ test('NEXT_TASK: code-fenced JSON is tolerated', async () => {
 
 test('WORKFLOW_DONE / CONTINUE_REWORK / HUMAN_REQUIRED', async () => {
   const done = createAgySupervisorProvider({ callAgy: makeFakeCallAgy({ action: 'WORKFLOW_DONE', summary: 'all tasks passed' }) });
-  assert.deepEqual(await done.decide(CONTEXT), { action: 'WORKFLOW_DONE', summary: 'all tasks passed' });
+  assert.deepEqual(await done.decide(CONTEXT), { action: 'WORKFLOW_DONE', summary: 'all tasks passed', conversationId: null });
 
   const reworkCtx = { ...CONTEXT, latestReviewResult: { decision: 'REWORK', required_changes: ['x'] } };
   const rework = createAgySupervisorProvider({ callAgy: makeFakeCallAgy({ action: 'CONTINUE_REWORK' }) });
-  assert.deepEqual(await rework.decide(reworkCtx), { action: 'CONTINUE_REWORK' });
+  assert.deepEqual(await rework.decide(reworkCtx), { action: 'CONTINUE_REWORK', conversationId: null });
 
   const human = createAgySupervisorProvider({
     callAgy: makeFakeCallAgy({ action: 'HUMAN_REQUIRED', reason: 'ambiguous spec', question: 'which format?' }),
   });
-  assert.deepEqual(await human.decide(CONTEXT), { action: 'HUMAN_REQUIRED', reason: 'ambiguous spec', question: 'which format?' });
+  assert.deepEqual(await human.decide(CONTEXT), {
+    action: 'HUMAN_REQUIRED',
+    reason: 'ambiguous spec',
+    question: 'which format?',
+    conversationId: null,
+  });
 });
 
 test('fail closed: malformed JSON -> SUPERVISOR_INVALID_OUTPUT', async () => {
@@ -87,6 +117,33 @@ test('fail closed: agy nonzero exit / missing binary -> SUPERVISOR_UNAVAILABLE',
 
   const missing = createAgySupervisorProvider({ callAgy: makeFakeCallAgy(new AgyExecutableNotFoundError('agy')) });
   await assert.rejects(() => missing.decide(CONTEXT), (err) => err.code === ADAPTER_ERROR_CODES.SUPERVISOR_UNAVAILABLE);
+});
+
+test('decide() returns the agy conversation id, and forwards a supplied one verbatim', async () => {
+  const callAgy = makeConversationalCallAgy([
+    { action: 'NEXT_TASK', task_card: validTaskCardObject() },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const provider = createAgySupervisorProvider({ callAgy });
+
+  const first = await provider.decide(CONTEXT);
+  assert.equal(first.conversationId, 'sup-conv-1');
+  assert.equal(callAgy.calls[0].conversationId, null);
+
+  const second = await provider.decide(CONTEXT, { conversationId: 'sup-conv-1' });
+  assert.equal(second.conversationId, 'sup-conv-1');
+  assert.equal(callAgy.calls[1].conversationId, 'sup-conv-1');
+});
+
+test('fail closed: agy cannot resume the requested conversation -> AgyConversationResumeError propagates', async () => {
+  const callAgy = makeConversationalCallAgy([
+    new AgyConversationResumeError('agy could not resume conversation sup-conv-9'),
+  ]);
+  const provider = createAgySupervisorProvider({ callAgy });
+  await assert.rejects(
+    () => provider.decide(CONTEXT, { conversationId: 'sup-conv-9' }),
+    (err) => err instanceof AgyConversationResumeError && err.code === 'AGY_CONVERSATION_RESUME_FAILED',
+  );
 });
 
 test('prompt carries the plan text and constrains actions during rework', () => {

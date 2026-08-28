@@ -48,7 +48,10 @@ export function createGateRunner({ gitEvidenceCollector, cwd = process.cwd(), en
       for (const command of commands) {
         const { code, stdout, stderr } = await runShellCommand(command, { cwd, env, spawn });
         const pass = code === 0;
-        const output = (stdout + stderr).trim() || (pass ? 'ok' : `exit code ${code}`);
+        const raw = (stdout + stderr).trim() || (pass ? 'ok' : `exit code ${code}`);
+        const output = raw.length > 4000
+          ? `${raw.slice(0, 2000)}\n...[truncated ${raw.length - 4000} chars]...\n${raw.slice(-2000)}`
+          : raw;
         results.push({ command, pass, output });
       }
 

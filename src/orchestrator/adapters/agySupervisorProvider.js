@@ -31,6 +31,7 @@ import {
   AgyExitError,
   AgyExecutableNotFoundError,
   AgyError,
+  AgyConversationResumeError,
 } from '../../agy/agyClient.js';
 import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../../agy/agyJson.js';
 import { AGY_SUPERVISOR_DEFAULT_MODEL } from '../../agy/agyConfig.js';
@@ -228,13 +229,20 @@ export function createAgySupervisorProvider({
 } = {}) {
   return {
     model,
-    async decide(context = {}) {
+    // conversationId (optional): resume this persistent Supervisor
+    // conversation. Forwarded verbatim to callAgy, which fails closed
+    // (AgyConversationResumeError) if agy cannot resume exactly it. The
+    // returned decision carries `conversationId` — the id agy actually used
+    // (newly created on the first call, echoed back on every resume) — so
+    // the caller can capture it once and reuse it thereafter.
+    async decide(context = {}, { conversationId } = {}) {
       const prompt = buildAgySupervisorPrompt(context);
 
       let result;
       try {
-        result = await callAgy({ prompt, model, timeoutMs, jsonSchema });
+        result = await callAgy({ prompt, model, timeoutMs, jsonSchema, conversationId });
       } catch (err) {
+        if (err instanceof AgyConversationResumeError) throw err;
         throw mapAgyError(err, model);
       }
 
@@ -245,7 +253,7 @@ export function createAgySupervisorProvider({
         if (err instanceof AgyStructuredOutputError) throw invalid(err.message);
         throw err;
       }
-      return parseSupervisorJson(obj);
+      return { ...parseSupervisorJson(obj), conversationId: result.conversationId ?? null };
     },
   };
 }

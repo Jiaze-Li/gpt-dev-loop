@@ -3,8 +3,25 @@ import assert from 'node:assert/strict';
 
 import { createAgyReviewerProvider, buildAgyReviewPrompt } from '../src/orchestrator/adapters/agyReviewerProvider.js';
 import { ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
-import { AgyTimeoutError, AgyExitError } from '../src/agy/agyClient.js';
+import { AgyTimeoutError, AgyExitError, AgyConversationResumeError } from '../src/agy/agyClient.js';
 import { makeFakeCallAgy, validTaskCardObject } from './fixtures/fakeAgy.mjs';
+
+// Models agy conversation behaviour (see agySupervisorProvider.test.js).
+function makeConversationalCallAgy(answers) {
+  const queue = [...answers];
+  const calls = [];
+  let counter = 0;
+  async function callAgy({ prompt, model, conversationId } = {}) {
+    calls.push({ prompt, model, conversationId: conversationId ?? null });
+    const answer = queue.length > 1 ? queue.shift() : queue[0];
+    if (answer instanceof Error) throw answer;
+    const cid = conversationId ?? `rev-conv-${++counter}`;
+    const text = typeof answer === 'string' ? answer : JSON.stringify(answer);
+    return { model, exitCode: 0, text, json: { result: text }, stdout: text, durationMs: 1, conversationId: cid };
+  }
+  callAgy.calls = calls;
+  return callAgy;
+}
 
 function taskCard() {
   const o = validTaskCardObject();
@@ -173,6 +190,39 @@ test('safe diagnostics never contain prompt or reply text', async () => {
   assert.equal(blob.includes('You are the Reviewer'), false);
   assert.equal(blob.includes('acceptance_criteria'), false);
   assert.equal(blob.includes(taskCard().goal), false);
+});
+
+test('review() returns the agy conversation id and forwards a supplied one verbatim', async () => {
+  const callAgy = makeConversationalCallAgy([
+    { decision: 'REWORK', findings: [], required_changes: ['x'], rationale: 'r' },
+    { decision: 'PASS', findings: [], required_changes: [], rationale: 'ok' },
+  ]);
+  const provider = createAgyReviewerProvider({ callAgy });
+
+  const first = await provider.review(taskCard(), executionReport(), EVIDENCE, { attempt: 1 });
+  assert.equal(first.conversationId, 'rev-conv-1');
+  assert.equal(callAgy.calls[0].conversationId, null);
+
+  const second = await provider.review(taskCard(), executionReport(), EVIDENCE, {
+    attempt: 2,
+    conversationId: 'rev-conv-1',
+  });
+  assert.equal(second.conversationId, 'rev-conv-1');
+  assert.equal(callAgy.calls[1].conversationId, 'rev-conv-1');
+});
+
+test('fail closed: agy cannot resume the requested conversation -> AgyConversationResumeError propagates', async () => {
+  const callAgy = makeConversationalCallAgy([
+    new AgyConversationResumeError('agy could not resume conversation rev-conv-9'),
+  ]);
+  await assert.rejects(
+    () =>
+      createAgyReviewerProvider({ callAgy }).review(taskCard(), executionReport(), EVIDENCE, {
+        attempt: 2,
+        conversationId: 'rev-conv-9',
+      }),
+    (err) => err instanceof AgyConversationResumeError && err.code === 'AGY_CONVERSATION_RESUME_FAILED',
+  );
 });
 
 test('prompt carries attempt number and the rendered Task Card', () => {
