@@ -177,7 +177,8 @@ export function createWorkspaceSnapshot({
         ['diff', '--name-only', 'HEAD'],
         sourceCwd
       );
-      const tracked = splitLines(trackedRes.stdout);
+      const isAuxiliary = (p) => p.startsWith('.supergpt_auxiliary') || p.startsWith('.supergpt/') || p.startsWith('.supergpt\\') || p === '.supergpt';
+      const tracked = splitLines(trackedRes.stdout).filter((p) => !isAuxiliary(p));
 
       // Untracked files that are not gitignored.
       const untrackedRes = must(
@@ -185,7 +186,7 @@ export function createWorkspaceSnapshot({
         ['ls-files', '--others', '--exclude-standard'],
         sourceCwd
       );
-      const untracked = splitLines(untrackedRes.stdout);
+      const untracked = splitLines(untrackedRes.stdout).filter((p) => !isAuxiliary(p));
 
       if (tracked.length === 0 && untracked.length === 0) {
         return null;

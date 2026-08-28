@@ -151,7 +151,8 @@ async function collectUntrackedFiles({ git, cwd, repoRoot, readFile, stat, maxBy
       `"git ls-files --others --exclude-standard -z" failed: ${listResult.stderr.trim()}`
     );
   }
-  const relPaths = listResult.stdout.split('\0').map((p) => p.trim()).filter(Boolean).sort();
+  const isAuxiliary = (p) => p.startsWith('.supergpt_auxiliary') || p.startsWith('.supergpt/') || p.startsWith('.supergpt\\') || p === '.supergpt';
+  const relPaths = listResult.stdout.split('\0').map((p) => p.trim()).filter(Boolean).filter((p) => !isAuxiliary(p)).sort();
   const files = [];
   for (const relPath of relPaths) {
     const absPath = path.resolve(repoRoot ?? cwd, relPath);
@@ -302,7 +303,8 @@ export function createGitEvidenceCollector({
           `"${gitBin} ${[...diffArgs, '--name-only'].join(' ')}" failed: ${nameOnlyResult.stderr.trim()}`
         );
       }
-      const trackedChangedFiles = parseChangedFiles(nameOnlyResult.stdout);
+      const isAuxiliary = (p) => p.startsWith('.supergpt_auxiliary') || p.startsWith('.supergpt/') || p.startsWith('.supergpt\\') || p === '.supergpt';
+      const trackedChangedFiles = parseChangedFiles(nameOnlyResult.stdout).filter((p) => !isAuxiliary(p));
 
       // Untracked task-produced files are only collected in baseline mode —
       // that is the only mode where "untracked" reliably means "this

@@ -80,13 +80,15 @@ test("scanAndSnapshotExternalSymlinks snapshots safe external symlink into auxil
     const result = await scanAndSnapshotExternalSymlinks({
       worktreePath,
       sourceWorkspace,
+      candidatePaths: [path.join("docs", "TASK_BOARD.md")],
+      isTrackedFn: () => true,
     });
 
     assert.equal(result.blockers.length, 0);
     assert.equal(result.snapshots.length, 1);
     const snap = result.snapshots[0];
     assert.equal(snap.original_symlink_path, path.join("docs", "TASK_BOARD.md"));
-    assert.equal(snap.resolved_source_path, targetFile);
+    assert.equal(snap.resolved_source_path, fs.realpathSync(targetFile));
     assert.equal(snap.read_only, true);
     assert.ok(snap.content_hash);
     assert.ok(fs.existsSync(snap.absolute_snapshot_path));
@@ -111,6 +113,8 @@ test("scanAndSnapshotExternalSymlinks blocks when external symlink points to mis
     const result = await scanAndSnapshotExternalSymlinks({
       worktreePath,
       sourceWorkspace,
+      candidatePaths: [path.join("docs", "TASK_BOARD.md")],
+      isTrackedFn: () => true,
     });
 
     assert.equal(result.blockers.length, 1);

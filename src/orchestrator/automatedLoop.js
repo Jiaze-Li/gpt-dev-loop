@@ -334,6 +334,8 @@ export async function runAutomatedWorkflow({
   keepOpenOnFailure = false,
   keepOpenOnSuccess = false,
   sourceWorkspace = null,
+  externalReadRoots = [],
+  approvedExternalRoots = [],
   repoRoot = null,
   runPreflightFn = defaultRunPreflight,
   // Bounded rate-limit recovery knobs (see RateLimitStopError et al above).
@@ -507,6 +509,8 @@ export async function runAutomatedWorkflow({
       taskCard: currentTaskCard,
       cwd: effectiveRepoRoot,
       sourceWorkspace,
+      externalReadRoots,
+      approvedExternalRoots,
       env: process.env,
     });
 

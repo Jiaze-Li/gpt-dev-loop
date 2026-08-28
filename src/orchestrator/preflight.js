@@ -6,9 +6,12 @@
 
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawn as nodeSpawn } from 'node:child_process';
 import {
   existsSync,
   statSync,
+  lstatSync,
+  realpathSync,
   readFileSync,
   writeFileSync,
   mkdirSync,
@@ -65,6 +68,92 @@ const KNOWN_TOOLCHAINS = new Set([
 function isSubpath(parent, target) {
   const rel = path.relative(parent, target);
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Safely resolves the canonical realpath of a target, returning null if it does not exist.
+ */
+function safeRealpath(p) {
+  if (!p || typeof p !== 'string') return null;
+  try {
+    return realpathSync.native ? realpathSync.native(p) : realpathSync(p);
+  } catch {
+    try {
+      return realpathSync(p);
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * Checks if target is contained within parent directory based on canonical realpaths.
+ */
+function isContained(parent, target) {
+  if (!parent || !target) return false;
+  const parentReal = safeRealpath(parent) || path.resolve(parent);
+  const targetReal = safeRealpath(target) || path.resolve(target);
+  const rel = path.relative(parentReal, targetReal);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Extracts task-relevant candidate file paths from a task card or options.
+ */
+export function getTaskCandidatePaths(taskCard = null, candidatePaths = null) {
+  const result = new Set();
+  if (Array.isArray(candidatePaths)) {
+    for (const p of candidatePaths) {
+      if (typeof p === 'string' && p.trim()) result.add(p.trim());
+    }
+  }
+  if (taskCard && typeof taskCard === 'object') {
+    // Note: allowed_files is a write-scope permission, not proof that the file
+    // is required task input. Only inspect paths referenced by read_targets,
+    // required_files, context_files, external_dependencies, or verification requirements.
+    const fields = [
+      'read_targets',
+      'required_files',
+      'context_files',
+      'external_dependencies',
+      'verification_files',
+      'task_relevant_paths',
+    ];
+    for (const field of fields) {
+      const val = taskCard[field];
+      if (Array.isArray(val)) {
+        for (const item of val) {
+          if (typeof item === 'string' && item.trim()) result.add(item.trim());
+        }
+      } else if (typeof val === 'string' && val.trim()) {
+        result.add(val.trim());
+      }
+    }
+  }
+  return [...result];
+}
+
+/**
+ * Checks whether a given path is git-tracked in the working tree.
+ */
+export async function isGitTracked(relPath, { cwd = process.cwd(), gitBin = 'git', isTrackedFn = null } = {}) {
+  if (typeof isTrackedFn === 'function') {
+    return Boolean(await isTrackedFn(relPath, cwd));
+  }
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = nodeSpawn(gitBin, ['ls-files', '--error-unmatch', '--', relPath], {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    child.on('error', () => resolve(false));
+    child.on('close', (code) => resolve(code === 0));
+  });
 }
 
 /**
@@ -143,84 +232,86 @@ export function checkExecutable(nameOrPath, { cwd = process.cwd(), env = process
 }
 
 /**
- * Recursively find all symbolic links within a directory.
+ * Task-relevant tracked-symlink resolution and safe auxiliary snapshotting.
+ *
+ * A symlink may be snapshotted only if:
+ * 1. it is required by the current task;
+ * 2. it is git-tracked;
+ * 3. its final realpath is a regular readable file;
+ * 4. its final realpath is inside sourceWorkspace OR an explicitly approved externalReadRoot.
  */
-function findSymlinks(dir, { maxDepth = 6, currentDepth = 0, results = [], ignoreDirs = new Set(['.git', 'node_modules', '.supergpt_auxiliary']) } = {}) {
-  if (currentDepth > maxDepth || !existsSync(dir)) return results;
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return results;
-  }
-
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isSymbolicLink()) {
-      results.push(fullPath);
-    } else if (entry.isDirectory()) {
-      if (!ignoreDirs.has(entry.name)) {
-        findSymlinks(fullPath, { maxDepth, currentDepth: currentDepth + 1, results, ignoreDirs });
-      }
-    }
-  }
-  return results;
-}
-
-/**
- * Scan workspace for external symlinks and safely snapshot readable repository targets.
- */
-export function scanAndSnapshotExternalSymlinks({
+export async function scanAndSnapshotExternalSymlinks({
   worktreePath,
+  taskCard = null,
+  candidatePaths = null,
   sourceWorkspace = null,
+  externalReadRoots = [],
+  approvedExternalRoots = [],
   auxiliaryRoot = null,
+  gitBin = 'git',
+  isTrackedFn = null,
 } = {}) {
-  const symlinks = findSymlinks(worktreePath);
   const snapshots = [];
   const blockers = [];
-
   const effectiveAuxRoot = auxiliaryRoot || path.join(worktreePath, '.supergpt_auxiliary', 'snapshots');
 
-  for (const symlinkPath of symlinks) {
-    let linkTarget;
+  const taskPaths = getTaskCandidatePaths(taskCard, candidatePaths);
+  if (taskPaths.length === 0) {
+    return { snapshots, blockers };
+  }
+
+  const allApprovedRoots = [
+    ...(Array.isArray(externalReadRoots) ? externalReadRoots : externalReadRoots ? [externalReadRoots] : []),
+    ...(Array.isArray(approvedExternalRoots) ? approvedExternalRoots : approvedExternalRoots ? [approvedExternalRoots] : []),
+    ...(Array.isArray(taskCard?.external_read_roots) ? taskCard.external_read_roots : taskCard?.external_read_roots ? [taskCard.external_read_roots] : []),
+    ...(Array.isArray(taskCard?.approved_external_roots) ? taskCard.approved_external_roots : taskCard?.approved_external_roots ? [taskCard.approved_external_roots] : []),
+  ];
+
+  const worktreeReal = safeRealpath(worktreePath) || path.resolve(worktreePath);
+
+  for (const relPath of taskPaths) {
+    const fullPath = path.resolve(worktreePath, relPath);
+    let lstat = null;
     try {
-      linkTarget = readlinkSync(symlinkPath);
-    } catch (err) {
-      blockers.push({
-        type: PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE,
-        resource: path.relative(worktreePath, symlinkPath),
-        detail: `Cannot read symlink '${symlinkPath}': ${err.message}`,
-        remediation: 'Verify file permissions on the symlink.',
-        fingerprint: `${PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE}:${path.relative(worktreePath, symlinkPath)}`,
-      });
+      lstat = lstatSync(fullPath);
+    } catch {
+      // Path does not exist on disk
       continue;
     }
 
-    const symlinkDir = path.dirname(symlinkPath);
-    const resolvedTarget = path.resolve(symlinkDir, linkTarget);
+    const isDirectSymlink = lstat.isSymbolicLink();
+    const finalRealpath = safeRealpath(fullPath);
 
-    // If target is inside the worktree, it's local and safe
-    if (isSubpath(worktreePath, resolvedTarget)) {
-      if (!existsSync(resolvedTarget)) {
-        blockers.push({
-          type: PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE,
-          resource: path.relative(worktreePath, symlinkPath),
-          detail: `Local symlink '${path.relative(worktreePath, symlinkPath)}' points to non-existent target '${path.relative(worktreePath, resolvedTarget)}'.`,
-          remediation: 'Create or repair the symlink target file.',
-          fingerprint: `${PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE}:${path.relative(worktreePath, symlinkPath)}`,
-        });
-      }
+    // If it is neither a direct symlink nor resolving to an external destination, skip
+    const isExternal = finalRealpath ? !isContained(worktreeReal, finalRealpath) : isDirectSymlink;
+    if (!isDirectSymlink && !isExternal) {
       continue;
     }
 
-    // Target resolves OUTSIDE the isolated worktree
-    const relSymlink = path.relative(worktreePath, symlinkPath);
+    const relSymlink = path.relative(worktreePath, fullPath) || relPath;
 
-    if (!existsSync(resolvedTarget)) {
+    // Condition 1: Required by current task (satisfied via taskPaths)
+
+    // Condition 2: Git-tracked
+    const tracked = await isGitTracked(relSymlink, { cwd: worktreePath, gitBin, isTrackedFn });
+    if (!tracked) {
+      // Untracked symlinks are untrusted context: never snapshotted
+      continue;
+    }
+
+    // Condition 3: Final realpath is a regular readable file
+    if (!finalRealpath || !existsSync(finalRealpath)) {
+      let unresolvedTarget = finalRealpath || fullPath;
+      try {
+        if (isDirectSymlink) {
+          unresolvedTarget = path.resolve(path.dirname(fullPath), readlinkSync(fullPath));
+        }
+      } catch {}
       blockers.push({
         type: PREFLIGHT_BLOCKER_TYPES.SYMLINK_OUTSIDE_WORKSPACE,
         resource: relSymlink,
-        detail: `Symlink '${relSymlink}' points outside the worktree to non-existent target '${resolvedTarget}'.`,
+        target: unresolvedTarget,
+        detail: `Symlink '${relSymlink}' points outside the worktree to non-existent target '${unresolvedTarget}'.`,
         remediation: 'Ensure the external dependency exists and is accessible.',
         fingerprint: `${PREFLIGHT_BLOCKER_TYPES.SYMLINK_OUTSIDE_WORKSPACE}:${relSymlink}`,
       });
@@ -229,59 +320,81 @@ export function scanAndSnapshotExternalSymlinks({
 
     let st;
     try {
-      st = statSync(resolvedTarget);
+      st = statSync(finalRealpath);
     } catch (err) {
       blockers.push({
         type: PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE,
         resource: relSymlink,
-        detail: `External symlink target '${resolvedTarget}' is unreadable: ${err.message}`,
+        target: finalRealpath,
+        detail: `External symlink target '${finalRealpath}' is unreadable: ${err.message}`,
         remediation: 'Grant read access to the symlink target.',
         fingerprint: `${PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE}:${relSymlink}`,
       });
       continue;
     }
 
-    // Only regular files are safely snapshotted as read-only task context
     if (!st.isFile()) {
       blockers.push({
         type: PREFLIGHT_BLOCKER_TYPES.SYMLINK_OUTSIDE_WORKSPACE,
         resource: relSymlink,
-        detail: `External symlink target '${resolvedTarget}' is not a regular file and cannot be snapshotted safely.`,
+        target: finalRealpath,
+        detail: `External symlink target '${finalRealpath}' is not a regular file and cannot be snapshotted safely.`,
         remediation: 'Use a regular file or link within the worktree.',
         fingerprint: `${PREFLIGHT_BLOCKER_TYPES.SYMLINK_OUTSIDE_WORKSPACE}:${relSymlink}`,
       });
       continue;
     }
 
-    // Check if within source workspace / repo root policy
-    const isInsideSource = sourceWorkspace ? isSubpath(sourceWorkspace, resolvedTarget) : true;
-    if (!isInsideSource) {
+    // Condition 4: Inside sourceWorkspace OR an explicitly approved externalReadRoot
+    let approvedRoot = null;
+    if (sourceWorkspace && isContained(sourceWorkspace, finalRealpath)) {
+      approvedRoot = safeRealpath(sourceWorkspace) || path.resolve(sourceWorkspace);
+    } else {
+      for (const root of allApprovedRoots) {
+        if (root && isContained(root, finalRealpath)) {
+          approvedRoot = safeRealpath(root) || path.resolve(root);
+          break;
+        }
+      }
+    }
+
+    if (!approvedRoot) {
+      // Unapproved external target -> Immediately report HUMAN_REQUIRED blocker with suggested root
+      const suggestedRoot = path.dirname(finalRealpath);
       blockers.push({
         type: PREFLIGHT_BLOCKER_TYPES.SYMLINK_OUTSIDE_WORKSPACE,
         resource: relSymlink,
-        detail: `External symlink target '${resolvedTarget}' resolves outside allowed repository root '${sourceWorkspace}'.`,
-        remediation: 'Relocate external dependency into repository boundary.',
+        target: finalRealpath,
+        suggested_external_root: suggestedRoot,
+        detail: `External symlink '${relSymlink}' points to unapproved external target '${finalRealpath}'. Suggested external root: '${suggestedRoot}'.`,
+        remediation: `Add '${suggestedRoot}' to approved externalReadRoots or relocate the dependency into the repository.`,
         fingerprint: `${PREFLIGHT_BLOCKER_TYPES.SYMLINK_OUTSIDE_WORKSPACE}:${relSymlink}`,
       });
       continue;
     }
 
-    // Create safe read-only snapshot with provenance
+    // Approved external target: copy bytes into workflow-controlled auxiliary storage with full provenance
     try {
-      const content = readFileSync(resolvedTarget);
+      const content = readFileSync(finalRealpath);
       const hash = crypto.createHash('sha256').update(content).digest('hex');
       const snapshotDir = path.join(effectiveAuxRoot, hash.slice(0, 12));
       mkdirSync(snapshotDir, { recursive: true });
-      const snapshotFile = path.join(snapshotDir, path.basename(resolvedTarget));
+      const snapshotFile = path.join(snapshotDir, path.basename(finalRealpath));
       writeFileSync(snapshotFile, content, { mode: 0o444 });
 
       snapshots.push({
+        original_path: relSymlink,
         original_symlink_path: relSymlink,
-        resolved_source_path: resolvedTarget,
+        resolved_source_realpath: finalRealpath,
+        resolved_source_path: finalRealpath,
+        approved_root: approvedRoot,
+        sha256: hash,
         content_hash: hash,
         snapshot_path: path.relative(worktreePath, snapshotFile),
         absolute_snapshot_path: snapshotFile,
+        timestamp: new Date().toISOString(),
         captured_timestamp: new Date().toISOString(),
+        size: content.length,
         bytes: content.length,
         read_only: true,
       });
@@ -289,6 +402,7 @@ export function scanAndSnapshotExternalSymlinks({
       blockers.push({
         type: PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE,
         resource: relSymlink,
+        target: finalRealpath,
         detail: `Failed to snapshot external symlink '${relSymlink}': ${err.message}`,
         remediation: 'Ensure external target file is readable.',
         fingerprint: `${PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE}:${relSymlink}`,
@@ -306,8 +420,14 @@ export async function runPreflight({
   taskCard,
   cwd = process.cwd(),
   sourceWorkspace = null,
+  externalReadRoots = [],
+  approvedExternalRoots = [],
+  candidatePaths = null,
+  auxiliaryRoot = null,
   env = process.env,
   executableChecker = checkExecutable,
+  gitBin = 'git',
+  isTrackedFn = null,
 } = {}) {
   const blockers = [];
   const snapshots = [];
@@ -378,7 +498,19 @@ export async function runPreflight({
 
   for (const fileRel of requiredFiles) {
     const fullPath = path.resolve(cwd, fileRel);
-    if (!existsSync(fullPath)) {
+    let exists = existsSync(fullPath);
+    if (!exists) {
+      try {
+        const l = lstatSync(fullPath);
+        if (l.isSymbolicLink()) {
+          const rp = safeRealpath(fullPath);
+          if (rp && existsSync(rp)) {
+            exists = true;
+          }
+        }
+      } catch {}
+    }
+    if (!exists) {
       blockers.push({
         type: PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE,
         resource: fileRel,
@@ -388,7 +520,8 @@ export async function runPreflight({
       });
     } else {
       try {
-        accessSync(fullPath, constants.R_OK);
+        const targetToAccess = safeRealpath(fullPath) || fullPath;
+        accessSync(targetToAccess, constants.R_OK);
       } catch (err) {
         blockers.push({
           type: PREFLIGHT_BLOCKER_TYPES.FILE_UNREADABLE,
@@ -421,9 +554,16 @@ export async function runPreflight({
   }
 
   // 5. Tracked symlinks & external dependencies scan
-  const symlinkResult = scanAndSnapshotExternalSymlinks({
+  const symlinkResult = await scanAndSnapshotExternalSymlinks({
     worktreePath: cwd,
+    taskCard,
+    candidatePaths,
     sourceWorkspace,
+    externalReadRoots,
+    approvedExternalRoots,
+    auxiliaryRoot,
+    gitBin,
+    isTrackedFn,
   });
 
   if (symlinkResult.snapshots.length > 0) {

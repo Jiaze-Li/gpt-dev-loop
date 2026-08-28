@@ -264,6 +264,8 @@ export async function runSuperGPT({
   workflowId: explicitWorkflowId,
   isResume = false,
   answer = null,
+  externalReadRoots = [],
+  approvedExternalRoots = [],
   _pipeline = defaultPipeline,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
@@ -373,6 +375,8 @@ export async function runSuperGPT({
           usageTracker,
           isResume,
           answer,
+          externalReadRoots,
+          approvedExternalRoots,
         })
       );
     throwIfAborted(internalAbort.signal);
@@ -471,6 +475,8 @@ async function defaultPipeline({
   usageTracker,
   isResume = false,
   answer = null,
+  externalReadRoots = [],
+  approvedExternalRoots = [],
 }) {
   workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
@@ -668,6 +674,8 @@ async function defaultPipeline({
       commit_sha: worktree.baseline_head,
     },
     sourceWorkspace: worktree.source_workspace || cwd,
+    externalReadRoots,
+    approvedExternalRoots,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
     workflowStateManager,
     usageTracker,

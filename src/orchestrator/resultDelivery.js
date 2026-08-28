@@ -153,14 +153,17 @@ export function createResultDelivery({
     // Tracked changes the workflow produced (committed since the baseline
     // AND anything still uncommitted in the worktree), relative to the
     // snapshot baseline.
+    const isAuxiliary = (p) => p.startsWith('.supergpt_auxiliary') || p.startsWith('.supergpt/') || p.startsWith('.supergpt\\') || p === '.supergpt';
     const nameArgs = ['diff', '--name-status', '--no-renames', baselineHead, '--', '.'];
     const nameRes = must(await git(nameArgs, worktreePath), nameArgs, worktreePath);
-    const trackedChanges = splitLines(nameRes.stdout).map((line) => {
-      const tab = line.indexOf('\t');
-      return tab === -1
-        ? { status: '?', path: line }
-        : { status: line.slice(0, tab).trim(), path: line.slice(tab + 1).trim() };
-    });
+    const trackedChanges = splitLines(nameRes.stdout)
+      .map((line) => {
+        const tab = line.indexOf('\t');
+        return tab === -1
+          ? { status: '?', path: line }
+          : { status: line.slice(0, tab).trim(), path: line.slice(tab + 1).trim() };
+      })
+      .filter((c) => !isAuxiliary(c.path));
 
     const patchArgs = ['diff', '--full-index', '--binary', '--no-renames', baselineHead, '--', '.'];
     const patchRes = must(await git(patchArgs, worktreePath), patchArgs, worktreePath);
@@ -168,7 +171,7 @@ export function createResultDelivery({
 
     const untrackedArgs = ['ls-files', '--others', '--exclude-standard'];
     const untrackedRes = must(await git(untrackedArgs, worktreePath), untrackedArgs, worktreePath);
-    const untrackedFiles = splitLines(untrackedRes.stdout);
+    const untrackedFiles = splitLines(untrackedRes.stdout).filter((p) => !isAuxiliary(p));
 
     const changedPaths = [
       ...new Set([...trackedChanges.map((c) => c.path), ...untrackedFiles]),
