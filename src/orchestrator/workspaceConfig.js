@@ -77,7 +77,10 @@ export function loadWorkspaceConfig(workspaceCwd = process.cwd()) {
     if (err instanceof ExternalReadRootConfigError) {
       throw err;
     }
-    return { externalReadRoots: [], closeoutCommands: [] };
+    throw new ExternalReadRootConfigError(
+      `Failed to read workspace configuration at .supergpt/config.json: ${err.message}. Fix or remove the file.`,
+      { configPath, reason: "read_error", error: err.message }
+    );
   }
 }
 

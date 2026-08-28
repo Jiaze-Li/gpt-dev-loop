@@ -699,7 +699,7 @@ async function defaultPipeline({
   }
   emit(SUPERGPT_EVENTS.PLANNING_COMPLETED, { tasksCount: resolved.tasks?.length ?? 1 });
 
-  // If the planner identified closeout commands, update workflow metadata to freeze them
+  // If the planner identified closeout commands, update workflow metadata to freeze them durably
   if (Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0) {
     try {
       if (existsSync(metadataPath)) {
@@ -713,9 +713,19 @@ async function defaultPipeline({
           meta.closeout_policy_sources = resolved.closeoutPolicySources;
         }
         writeFileSync(metadataPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+
+        // Verify write back
+        const readBack = JSON.parse(readFileSync(metadataPath, 'utf8'));
+        if (!Array.isArray(readBack.closeout_verification_commands)) {
+          throw new Error('Metadata readback verification failed: missing closeout_verification_commands');
+        }
       }
-    } catch {
-      /* ignore best effort */
+    } catch (err) {
+      if (lifecycleManager) await lifecycleManager.onInitFailed();
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, {
+        reason: `Failed to persist closeout policy metadata: ${err.message}`,
+      });
+      throw err;
     }
   }
 

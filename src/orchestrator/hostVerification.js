@@ -51,27 +51,29 @@ export function computeWorktreeFingerprint(worktreePath, execSync = nodeExecSync
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
 
-    // Modified, staged, and untracked (non-ignored) file paths
-    const statusOutput = execSync('git status --porcelain', {
+    // Modified, staged, and untracked (non-ignored) file paths via NUL-separated records and -uall
+    const statusBuffer = execSync('git status --porcelain=v1 -z -uall', {
       cwd: worktreePath,
-      encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
 
-    const statusLines = statusOutput.split('\n').filter((l) => Boolean(l && l.trim()));
     const fileEntries = [];
+    let i = 0;
+    while (i < statusBuffer.length) {
+      if (i + 2 > statusBuffer.length) break;
+      const statusCode = statusBuffer.subarray(i, i + 2).toString('utf8');
+      i += 3; // skip status code (2 bytes) and following space (1 byte)
+      const end = statusBuffer.indexOf(0, i);
+      if (end === -1) break;
+      let filePath = statusBuffer.subarray(i, end).toString('utf8');
+      i = end + 1;
 
-    for (const rawLine of statusLines) {
-      const line = rawLine.padEnd(4, ' ');
-      const statusCode = line.slice(0, 2);
-      let filePath = line.slice(3).trim();
-      // Handle rename: "R  orig -> new"
-      if (filePath.includes(' -> ')) {
-        filePath = filePath.split(' -> ')[1].trim();
-      }
-      // Strip quotes if git quoted the path
-      if (filePath.startsWith('"') && filePath.endsWith('"')) {
-        filePath = filePath.slice(1, -1);
+      // In case of rename/copy (R or C), git porcelain -z emits original path as the next NUL-terminated record
+      if (statusCode.startsWith('R') || statusCode.startsWith('C')) {
+        const origEnd = statusBuffer.indexOf(0, i);
+        if (origEnd !== -1) {
+          i = origEnd + 1;
+        }
       }
 
       // Exclude runtime auxiliary / evidence directories
@@ -167,12 +169,9 @@ export async function supergptVerify({
     throw new Error(`Workflow runtime state not found for "${workflowId}"`);
   }
 
-  // Restrict supergpt_verify to valid workflow states
-  if (state.workflowStatus === 'DONE') {
-    throw new Error(`WORKFLOW_ALREADY_DONE: Cannot run host verification on completed workflow "${workflowId}"`);
-  }
-  if (state.workflowStatus === 'RUNNING') {
-    throw new Error(`WORKFLOW_ACTIVELY_RUNNING: Cannot run host verification while workflow "${workflowId}" is actively running`);
+  // Restrict supergpt_verify strictly to HUMAN_REQUIRED workflow state
+  if (state.workflowStatus !== 'HUMAN_REQUIRED') {
+    throw new Error(`INVALID_WORKFLOW_STATE: supergpt_verify may execute only when workflowStatus is HUMAN_REQUIRED, but current status is "${state.workflowStatus}"`);
   }
 
   // Load exact frozen pending verification context

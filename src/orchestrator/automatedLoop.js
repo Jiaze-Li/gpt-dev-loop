@@ -571,7 +571,11 @@ export async function runAutomatedWorkflow({
 
       if (workflowStateManager) {
         workflowStateManager.state.pending_verification = pendingVerification;
-        workflowStateManager.persist();
+        workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+          reason: `Gate command execution failed: ${envFailure.command} (${envFailure.output})`,
+          question: `Gate verification command failed due to an environment blocker: ${envFailure.output}. Fix the environment requirement, then resume.`,
+          pending_verification: pendingVerification,
+        });
       }
 
       return {
@@ -840,6 +844,149 @@ export async function runAutomatedWorkflow({
       }
 
       if (decision.action === 'WORKFLOW_DONE') {
+        // Deterministic Core Closeout Gate Guard:
+        // WORKFLOW_DONE from Supervisor is only a request to finish.
+        // If frozen closeout_verification_commands is non-empty, Core proves those exact commands
+        // have PASS evidence against the CURRENT worktree content before transitioning to DONE.
+        if (Array.isArray(closeoutVerificationCommands) && closeoutVerificationCommands.length > 0) {
+          const evidenceRoot = workflowStateManager?.root || SUPERGPT_WORKTREE_ROOT;
+          const hostEvidenceCheck = getValidHostEvidence({
+            workflowId,
+            verificationCommands: closeoutVerificationCommands,
+            root: evidenceRoot,
+          });
+
+          // Also check if the latest task Gate run already executed and passed all closeout commands
+          // on the current worktree content (e.g. final task injection)
+          let alreadySatisfiedByLatestGate = false;
+          if (latestGateEvidence?.pass && Array.isArray(currentTaskCard?.verification_commands)) {
+            const currentCommands = currentTaskCard.verification_commands;
+            const coversAllCloseout = closeoutVerificationCommands.every((c) => currentCommands.includes(c));
+            if (coversAllCloseout) {
+              alreadySatisfiedByLatestGate = true;
+            }
+          }
+
+          let closeoutEvidence;
+          if (alreadySatisfiedByLatestGate) {
+            log(`closeout gate: already satisfied by latest task gate pass on current worktree`);
+            closeoutEvidence = latestGateEvidence;
+          } else if (hostEvidenceCheck?.valid && hostEvidenceCheck.hostEvidence?.pass) {
+            log(`closeout gate: consuming valid trusted host verification evidence (id=${hostEvidenceCheck.hostEvidence.evidenceId})`);
+            markHostEvidenceConsumed({
+              workflowId,
+              evidenceId: hostEvidenceCheck.hostEvidence.evidenceId,
+              root: evidenceRoot,
+            });
+            closeoutEvidence = hostEvidenceCheck.hostEvidence.evidence || {
+              pass: true,
+              results: hostEvidenceCheck.hostEvidence.results,
+              changed_files: [],
+              git_diff: '',
+            };
+          } else {
+            log(`closeout gate: running core closeout verification commands: ${JSON.stringify(closeoutVerificationCommands)}`);
+            workflowStateManager?.startStage(WORKFLOW_STAGES.GATE);
+            closeoutEvidence = await gateRunner.run(closeoutVerificationCommands);
+            throwIfAborted();
+          }
+
+          if (!closeoutEvidence.pass) {
+            // Check if blocked by environment/toolchain
+            const envFailure = (closeoutEvidence.results || []).find(
+              (r) => !r.pass && (
+                r.output?.includes('command not found') ||
+                r.output?.includes('exit code 127') ||
+                /ENOENT|EACCES|No such file or directory/i.test(r.output || '')
+              )
+            );
+
+            if (envFailure) {
+              const cmdName = envFailure.command.trim().split(/\s+/)[0];
+              const fingerprint = `GATE_ENV:${cmdName}`;
+              seenBlockers.set(fingerprint, (seenBlockers.get(fingerprint) || 0) + 1);
+
+              const closeoutTaskId = currentTaskCard?.task_id || 'closeout-verification';
+              const gateEnvEvidence = buildHumanRequiredEvidence({
+                workflowId,
+                taskCard: currentTaskCard || { task_id: closeoutTaskId, goal: 'Closeout Verification' },
+                attempt: attemptCount,
+                stage: WORKFLOW_STAGES.GATE,
+                blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+                rootCause: `Closeout Gate verification command failed to execute: ${envFailure.command} (${envFailure.output})`,
+                failingGateCommand: envFailure.command,
+                exitCode: 127,
+                stderrTail: envFailure.output,
+                latestGateResult: closeoutEvidence,
+                blockerFingerprint: fingerprint,
+                blockerCount: seenBlockers.get(fingerprint),
+                recommendedAction: `Ensure command '${cmdName}' is installed and executable in the environment.`,
+                history,
+              });
+
+              const pendingVerification = {
+                task_id: closeoutTaskId,
+                commands: [...closeoutVerificationCommands],
+                commands_hash: hashCommandSet(closeoutVerificationCommands),
+                reason: envFailure.output || envFailure.command,
+                generation: attemptCount,
+              };
+
+              if (workflowStateManager) {
+                workflowStateManager.state.pending_verification = pendingVerification;
+                workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+                  reason: `Closeout Gate command execution failed: ${envFailure.command} (${envFailure.output})`,
+                  question: `Closeout verification failed due to an environment blocker: ${envFailure.output}. Fix the environment requirement, then resume.`,
+                  pending_verification: pendingVerification,
+                });
+              }
+
+              return {
+                status: 'HUMAN_REQUIRED',
+                reason: `Closeout Gate command execution failed: ${envFailure.command} (${envFailure.output})`,
+                question: `Closeout verification failed due to an environment blocker: ${envFailure.output}. Fix the environment requirement, then resume.`,
+                taskId: closeoutTaskId,
+                evidence: gateEnvEvidence,
+                blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+                pending_verification: pendingVerification,
+                history,
+                tokenUsage: usageTracker?.summary() ?? null,
+              };
+            }
+
+            // Closeout failed on code/test assertions: route back through review/rework or fail closed
+            log(`closeout gate failed: ${JSON.stringify(closeoutEvidence.results)}`);
+            if (currentTaskCard) {
+              const failingResults = (closeoutEvidence.results || []).filter((r) => !r.pass);
+              const failureSummary = failingResults.map((r) => `${r.command}: ${r.output || 'failed'}`).join('; ');
+              latestReviewResult = {
+                decision: 'REWORK',
+                rationale: `Closeout Gate verification failed on final repository state: ${failureSummary}`,
+                required_changes: failingResults.map((r) => `Fix failure in closeout command: ${r.command}`),
+              };
+              if (workflowStateManager) {
+                workflowStateManager.state.stageStatuses.gate = 'FAIL';
+                workflowStateManager.state.stageStatuses.reviewer = 'REWORK';
+                workflowStateManager.recordProgress();
+              }
+              // Loop back to Supervisor for rework decision
+              continue;
+            } else {
+              workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, {
+                reason: 'Closeout Gate verification failed',
+                evidence: closeoutEvidence,
+              });
+              return {
+                status: 'FAILED',
+                reason: 'Closeout Gate verification failed on final repository state',
+                evidence: closeoutEvidence,
+                history,
+                tokenUsage: usageTracker?.summary() ?? null,
+              };
+            }
+          }
+        }
+
         workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {
           summary: decision.summary,
         });
