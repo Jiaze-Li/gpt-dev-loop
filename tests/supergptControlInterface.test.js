@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { buildWorkspaceMetadata } from '../scripts/run-agy-workflow.js';
 
 import {
   runSuperGPT,
@@ -78,16 +79,16 @@ test('restoreResumableWorkspace accepts the current persisted workspace metadata
 });
 
 test('dirty-workspace HUMAN_REQUIRED resume restores the snapshot baseline, never the pre-snapshot source head', () => {
-  const restored = restoreResumableWorkspace({
+  // dirty source -> snapshot -> persisted HUMAN_REQUIRED metadata -> resume
+  const metadata = buildWorkspaceMetadata({ worktree: {
     workflow_id: 'wf-dirty-resume',
     source_workspace: '/tmp/dirty-invocation',
     source_branch: 'main',
-    // User edits were captured in this snapshot before the isolated tree was
-    // created. Delivery must compute only workflow changes relative to it.
     source_head: 'pre_snapshot_head',
     baseline_head: 'snapshot_head_with_user_edits',
-    isolated_worktree_path: '/tmp/managed/wf-dirty-resume',
-  });
+    worktree_path: '/tmp/managed/wf-dirty-resume',
+  } });
+  const restored = restoreResumableWorkspace(metadata);
 
   assert.equal(restored.worktree.baseline_head, 'snapshot_head_with_user_edits');
   assert.equal(restored.baseline.head, 'snapshot_head_with_user_edits');

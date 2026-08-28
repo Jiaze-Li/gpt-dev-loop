@@ -18,8 +18,8 @@
 //
 //   checkDeliveryConflicts({ delta, sourceWorkspace })
 //     Fail-closed gate. A conflict is any of:
-//       - a delta path that also has uncommitted / untracked changes in the
-//         invocation workspace (overlapping edit)
+//       - a delta path whose invocation-workspace contents have diverged from
+//         the captured invocation snapshot (overlapping post-start edit)
 //       - a new file the delta creates that already exists on disk there
 //         (creation collision)
 //       - a patch that will not `git apply --check` cleanly in the
@@ -193,11 +193,31 @@ export function createResultDelivery({
       );
     }
 
-    const dirtyArgs = ['diff', '--name-only', 'HEAD'];
-    const dirtyRes = must(await git(dirtyArgs, sourceWorkspace), dirtyArgs, sourceWorkspace);
-    const untrackedArgs = ['ls-files', '--others', '--exclude-standard'];
-    const untrackedRes = must(await git(untrackedArgs, sourceWorkspace), untrackedArgs, sourceWorkspace);
-    const sourceDirty = new Set([...splitLines(dirtyRes.stdout), ...splitLines(untrackedRes.stdout)]);
+    // The source may already be dirty relative to HEAD: those bytes are in
+    // baselineHead's invocation snapshot and are safe to patch over. Only a
+    // difference from that immutable snapshot represents a user edit made
+    // after workflow start.
+    const sourceDiverged = new Set();
+    for (const changedPath of delta.changedPaths) {
+      // `git diff <tree>` does not compare an untracked source file to the
+      // corresponding snapshot blob. Hash both raw file contents instead so
+      // snapshot-untracked files get the same exact comparison as tracked
+      // files.
+      const snapshotArgs = ['ls-tree', delta.baselineHead, '--', changedPath];
+      const snapshotRes = must(await git(snapshotArgs, sourceWorkspace), snapshotArgs, sourceWorkspace);
+      const snapshotLine = splitLines(snapshotRes.stdout)[0];
+      const snapshotHash = snapshotLine ? snapshotLine.split(/\s+/)[2] : null;
+      const sourcePath = path.join(sourceWorkspace, changedPath);
+      let sourceHash = null;
+      if (fs.existsSync(sourcePath)) {
+        // Hash through the path's Git filters so this is comparable to the
+        // blob written by the snapshot commit (e.g. CRLF attributes).
+        const sourceArgs = ['hash-object', `--path=${changedPath}`, '--', changedPath];
+        const sourceRes = must(await git(sourceArgs, sourceWorkspace), sourceArgs, sourceWorkspace);
+        sourceHash = sourceRes.stdout.trim() || null;
+      }
+      if (sourceHash !== snapshotHash) sourceDiverged.add(changedPath);
+    }
 
     const conflicts = [];
     const seen = new Set();
@@ -209,7 +229,7 @@ export function createResultDelivery({
     };
 
     for (const changedPath of delta.changedPaths) {
-      if (sourceDirty.has(changedPath)) add(changedPath, 'overlapping-edit');
+      if (sourceDiverged.has(changedPath)) add(changedPath, 'overlapping-edit');
     }
 
     for (const rel of delta.untrackedFiles) {
@@ -236,32 +256,73 @@ export function createResultDelivery({
       );
     }
 
-    if (delta.patch && delta.patch.trim() !== '') {
-      const applyRes = await withPatchFile(delta.patch, (patchFile) =>
-        git(['apply', '--whitespace=nowarn', patchFile], sourceWorkspace)
-      );
-      if (applyRes.code !== 0) {
-        throw new ResultDeliveryError(
-          RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
-          `could not apply the approved delta into "${sourceWorkspace}": ${applyRes.stderr.trim() || applyRes.stdout.trim()}`,
-          { source_workspace: sourceWorkspace }
-        );
-      }
-    }
-
+    // Preflight every new-file operation before mutating the source. Delivery
+    // only creates these paths, so a collision means rollback could overwrite
+    // user data and must fail closed.
     for (const rel of delta.untrackedFiles) {
       const src = path.join(delta.worktreePath, rel);
       const dst = path.join(sourceWorkspace, rel);
-      try {
-        fs.mkdirSync(path.dirname(dst), { recursive: true });
-        fs.copyFileSync(src, dst);
-      } catch (err) {
-        throw new ResultDeliveryError(
-          RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
-          `could not copy delivered file "${rel}" into "${sourceWorkspace}": ${err.message}`,
-          { path: rel }
-        );
+      if (!fs.existsSync(src)) {
+        throw new ResultDeliveryError(RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
+          `could not copy delivered file "${rel}": source file is missing`, { path: rel });
       }
+      if (fs.existsSync(dst)) {
+        throw new ResultDeliveryError(RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
+          `could not copy delivered file "${rel}": destination already exists`, { path: rel });
+      }
+    }
+
+    let patchApplied = false;
+    const copiedDestinations = [];
+    try {
+      if (delta.patch && delta.patch.trim() !== '') {
+        const applyRes = await withPatchFile(delta.patch, (patchFile) =>
+          git(['apply', '--whitespace=nowarn', patchFile], sourceWorkspace)
+        );
+        if (applyRes.code !== 0) {
+          throw new ResultDeliveryError(
+            RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
+            `could not apply the approved delta into "${sourceWorkspace}": ${applyRes.stderr.trim() || applyRes.stdout.trim()}`,
+            { source_workspace: sourceWorkspace }
+          );
+        }
+        patchApplied = true;
+      }
+
+      for (const rel of delta.untrackedFiles) {
+        const src = path.join(delta.worktreePath, rel);
+        const dst = path.join(sourceWorkspace, rel);
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        // Register before copying: a failing copy implementation may have
+        // created a partial destination, which is also this attempt's data.
+        copiedDestinations.push(dst);
+        fs.copyFileSync(src, dst);
+      }
+    } catch (err) {
+      // Every destination was absent in preflight, so deleting only the paths
+      // this attempt created cannot touch unrelated user work.
+      for (const dst of copiedDestinations.reverse()) {
+        try { fs.rmSync(dst, { force: true }); } catch { /* best effort */ }
+      }
+      if (patchApplied) {
+        try {
+          const rollbackRes = await withPatchFile(delta.patch, (patchFile) =>
+            git(['apply', '--reverse', '--whitespace=nowarn', patchFile], sourceWorkspace)
+          );
+          if (rollbackRes.code !== 0) throw new Error(rollbackRes.stderr.trim() || rollbackRes.stdout.trim());
+        } catch (rollbackErr) {
+          throw new ResultDeliveryError(
+            RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
+            `delivery failed and rollback of the tracked patch also failed: ${rollbackErr.message}`,
+            { source_workspace: sourceWorkspace, rollback_failed: true }
+          );
+        }
+      }
+      if (err instanceof ResultDeliveryError) throw err;
+      throw new ResultDeliveryError(
+        RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
+        `could not copy delivered file into "${sourceWorkspace}": ${err.message}`
+      );
     }
 
     return { delivered: delta.changedPaths, source_workspace: sourceWorkspace };

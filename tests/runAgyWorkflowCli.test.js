@@ -156,8 +156,19 @@ test('workspace metadata records source workspace + repository identity as separ
     repository_identity: '/src/primary/.git',
     source_branch: 'phase1-handshake',
     source_head: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef0',
+    baseline_head: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef0',
     isolated_worktree_path: '/managed/repo-wf-agy-abc',
   });
+});
+
+test('dirty invocation metadata persists both the original HEAD and effective snapshot baseline', () => {
+  const metadata = buildWorkspaceMetadata({ worktree: {
+    ...WT,
+    source_head: 'original-head',
+    baseline_head: 'snapshot-head',
+  } });
+  assert.equal(metadata.source_head, 'original-head');
+  assert.equal(metadata.baseline_head, 'snapshot-head');
 });
 
 test('invariants pass when every cwd is the isolated worktree and HEAD matches the baseline', () => {

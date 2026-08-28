@@ -48,7 +48,7 @@ function makeFakeFs({ existing = [] } = {}) {
   return {
     fs: {
       existsSync(p) {
-        return existingSet.has(p);
+        return existingSet.has(p) || p.startsWith(`${WT}/`) || p === `${SRC}/src/a.js`;
       },
       writeFileSync(p, data) {
         writes.push({ p, data });
@@ -145,8 +145,10 @@ test('checkDeliveryConflicts: safe when the workspace is dirty only in unrelated
     handler: (args, cwd) => {
       assert.equal(cwd, SRC);
       const a = args.join(' ');
-      if (a === 'diff --name-only HEAD') return { stdout: 'README.md\n' };
-      if (a === 'ls-files --others --exclude-standard') return { stdout: 'scratch.txt\n' };
+      if (a === `ls-tree ${BASE} -- src/a.js`) return { stdout: '100644 blob snapshot-a\tsrc/a.js\n' };
+      if (a === 'hash-object --path=src/a.js -- src/a.js') return { stdout: 'snapshot-a\n' };
+      if (a === `ls-tree ${BASE} -- notes/new.md`) return { stdout: '' };
+      if (a === 'hash-object --path=notes/new.md -- notes/new.md') return { stdout: 'user-file\n' };
       if (args[0] === 'apply') return { code: 0 };
       throw new Error(`unexpected git ${a}`);
     },
@@ -156,12 +158,28 @@ test('checkDeliveryConflicts: safe when the workspace is dirty only in unrelated
   assert.ok(calls.some((c) => c.args[0] === 'apply' && c.args.includes('--check')));
 });
 
-test('checkDeliveryConflicts: overlapping edit on a delta path is a conflict', async () => {
+test('checkDeliveryConflicts: a dirty delta path unchanged from the invocation snapshot is safe', async () => {
   const { delivery } = subject({
     handler: (args) => {
       const a = args.join(' ');
-      if (a === 'diff --name-only HEAD') return { stdout: 'src/a.js\n' };
-      if (a === 'ls-files --others --exclude-standard') return { stdout: '' };
+      if (a === `ls-tree ${BASE} -- src/a.js`) return { stdout: '100644 blob snapshot-a\tsrc/a.js\n' };
+      if (a === 'hash-object --path=src/a.js -- src/a.js') return { stdout: 'snapshot-a\n' };
+      if (a === `ls-tree ${BASE} -- notes/new.md`) return { stdout: '' };
+      if (args[0] === 'apply') return { code: 0 };
+      throw new Error(`unexpected git ${a}`);
+    },
+  });
+  const report = await delivery.checkDeliveryConflicts({ delta: DELTA, sourceWorkspace: SRC });
+  assert.deepEqual(report, { safe: true, conflicts: [] });
+});
+
+test('checkDeliveryConflicts: post-start edit on a delta path is a conflict', async () => {
+  const { delivery } = subject({
+    handler: (args) => {
+      const a = args.join(' ');
+      if (a === `ls-tree ${BASE} -- src/a.js`) return { stdout: '100644 blob snapshot-a\tsrc/a.js\n' };
+      if (a === 'hash-object --path=src/a.js -- src/a.js') return { stdout: 'post-start-a\n' };
+      if (a === `ls-tree ${BASE} -- notes/new.md`) return { stdout: '' };
       if (args[0] === 'apply') return { code: 0 };
       throw new Error(`unexpected git ${a}`);
     },
@@ -176,8 +194,10 @@ test('checkDeliveryConflicts: a new file that already exists on disk is a creati
     fsStub: makeFakeFs({ existing: [`${SRC}/notes/new.md`] }).fs,
     handler: (args) => {
       const a = args.join(' ');
-      if (a === 'diff --name-only HEAD') return { stdout: '' };
-      if (a === 'ls-files --others --exclude-standard') return { stdout: '' };
+      if (a === `ls-tree ${BASE} -- src/a.js`) return { stdout: '100644 blob snapshot-a\tsrc/a.js\n' };
+      if (a === 'hash-object --path=src/a.js -- src/a.js') return { stdout: 'snapshot-a\n' };
+      if (a === `ls-tree ${BASE} -- notes/new.md`) return { stdout: '' };
+      if (a === 'hash-object --path=notes/new.md -- notes/new.md') return { stdout: 'user-file\n' };
       if (args[0] === 'apply') return { code: 0 };
       throw new Error(`unexpected git ${a}`);
     },
@@ -191,8 +211,9 @@ test('checkDeliveryConflicts: a patch that will not apply cleanly is a conflict'
   const { delivery } = subject({
     handler: (args) => {
       const a = args.join(' ');
-      if (a === 'diff --name-only HEAD') return { stdout: '' };
-      if (a === 'ls-files --others --exclude-standard') return { stdout: '' };
+      if (a === `ls-tree ${BASE} -- src/a.js`) return { stdout: '100644 blob snapshot-a\tsrc/a.js\n' };
+      if (a === 'hash-object --path=src/a.js -- src/a.js') return { stdout: 'snapshot-a\n' };
+      if (a === `ls-tree ${BASE} -- notes/new.md`) return { stdout: '' };
       if (args[0] === 'apply') return { code: 1, stderr: 'error: patch failed' };
       throw new Error(`unexpected git ${a}`);
     },
@@ -232,6 +253,68 @@ test('deliverApprovedDelta: a failed apply fails closed', async () => {
     () => delivery.deliverApprovedDelta({ delta: DELTA, sourceWorkspace: SRC }),
     (err) => err.code === RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED
   );
+});
+
+function atomicFs({ failCopyAt } = {}) {
+  const files = new Map();
+  const copies = [];
+  const removals = [];
+  let copyAttempt = 0;
+  return {
+    files,
+    copies,
+    removals,
+    fs: {
+      existsSync(p) { return p.startsWith(`${WT}/`) || files.has(p); },
+      writeFileSync() {},
+      mkdirSync() {},
+      copyFileSync(src, dst) {
+        copyAttempt += 1;
+        if (copyAttempt === failCopyAt) throw new Error(`injected copy failure ${copyAttempt}`);
+        files.set(dst, `copied:${src}`);
+        copies.push(dst);
+      },
+      rmSync(p) { files.delete(p); removals.push(p); },
+    },
+  };
+}
+
+const MULTI_UNTRACKED_DELTA = {
+  ...DELTA,
+  untrackedFiles: ['notes/one.md', 'notes/two.md'],
+  changedPaths: ['src/a.js', 'notes/one.md', 'notes/two.md'],
+};
+
+test('deliverApprovedDelta: first untracked-copy failure rolls back the already-applied tracked patch', async () => {
+  const atomic = atomicFs({ failCopyAt: 1 });
+  const gitOps = [];
+  const { delivery } = subject({
+    fsStub: atomic.fs,
+    handler: (args) => {
+      if (args[0] === 'apply') { gitOps.push(args.includes('--reverse') ? 'reverse' : 'apply'); return { code: 0 }; }
+      throw new Error(`unexpected git ${args.join(' ')}`);
+    },
+  });
+  await assert.rejects(() => delivery.deliverApprovedDelta({ delta: DELTA, sourceWorkspace: SRC }));
+  assert.deepEqual(gitOps, ['apply', 'reverse']);
+  assert.deepEqual([...atomic.files.entries()], [], 'pre-delivery file bytes/status are restored');
+  assert.deepEqual(atomic.removals.filter((p) => p.startsWith(SRC)), [`${SRC}/notes/new.md`]);
+});
+
+test('deliverApprovedDelta: later untracked-copy failure removes prior copies and rolls back the tracked patch', async () => {
+  const atomic = atomicFs({ failCopyAt: 2 });
+  const gitOps = [];
+  const { delivery } = subject({
+    fsStub: atomic.fs,
+    handler: (args) => {
+      if (args[0] === 'apply') { gitOps.push(args.includes('--reverse') ? 'reverse' : 'apply'); return { code: 0 }; }
+      throw new Error(`unexpected git ${args.join(' ')}`);
+    },
+  });
+  await assert.rejects(() => delivery.deliverApprovedDelta({ delta: MULTI_UNTRACKED_DELTA, sourceWorkspace: SRC }));
+  assert.deepEqual(gitOps, ['apply', 'reverse']);
+  assert.deepEqual([...atomic.files.entries()], [], 'both copied and partially-copied files are removed');
+  assert.deepEqual(atomic.removals.filter((p) => p.startsWith(SRC)), [`${SRC}/notes/two.md`, `${SRC}/notes/one.md`]);
 });
 
 // --- cleanupDeliveredWorktree ------------------------------------------

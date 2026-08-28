@@ -154,6 +154,9 @@ export function buildWorkspaceMetadata({ worktree }) {
     repository_identity: worktree.repository_identity ?? null,
     source_branch: worktree.source_branch,
     source_head: worktree.source_head ?? worktree.baseline_head,
+    // This is the effective commit the isolated tree was created from. It is
+    // a snapshot commit (not source_head) when invocation started dirty.
+    baseline_head: worktree.baseline_head,
     isolated_worktree_path: worktree.worktree_path,
   };
 }
