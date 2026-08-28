@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
 import { buildPrompt, parseExecutionReport } from './claudeExecutorAdapter.js';
 
-function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActivity, onProcessStarted, onProcessExited }) {
+function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActivity, onProcessStarted, onProcessExited, signal }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -31,10 +31,17 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
       try { child.kill('SIGKILL'); } catch {}
     }, timeoutMs);
 
+    const onAbort = () => {
+      try { child.kill('SIGKILL'); } catch {}
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+
     const finish = (fn) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       fn();
     };
 
@@ -110,7 +117,7 @@ export function createCodexExecutorAdapter({
 
   return {
     model,
-    async execute(taskCard) {
+    async execute(taskCard, { signal } = {}) {
       const prompt = buildPrompt(taskCard);
       const result = await runProcess({
         command,
@@ -123,6 +130,7 @@ export function createCodexExecutorAdapter({
         onActivity,
         onProcessStarted,
         onProcessExited,
+        signal,
       });
 
       if (result.code !== 0) {
@@ -234,7 +242,8 @@ export function createCodexSessionManager({
   let sessionCount = 0;
 
   return {
-    async execute(taskCard) {
+    async execute(taskCard, { signal } = {}) {
+      if (signal?.aborted) throw new Error('executor cancelled');
       sessionCount += 1;
       const sessionNumber = sessionCount;
 
@@ -285,7 +294,8 @@ export function createCodexSessionManager({
         onProcessStarted: (pid) => onProcessStarted?.({ ...processContext, pid }),
         onProcessExited: (details) => onProcessExited?.({ ...processContext, ...details }),
       });
-      const report = await executor.execute(taskCardForSession);
+      const report = await executor.execute(taskCardForSession, { signal });
+      if (signal?.aborted) throw new Error('executor cancelled');
 
       try {
         Object.defineProperties(report, {

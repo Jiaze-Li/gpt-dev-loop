@@ -195,7 +195,7 @@ export function parseExecutionReport(taskId, text) {
   };
 }
 
-function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActivity, onProcessStarted, onProcessExited }) {
+function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActivity, onProcessStarted, onProcessExited, signal }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
@@ -224,10 +224,17 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
       child.kill('SIGKILL');
     }, timeoutMs);
 
+    const onAbort = () => {
+      try { child.kill('SIGKILL'); } catch {}
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+
     const finish = (fn) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       fn();
     };
 
@@ -313,7 +320,7 @@ export function createClaudeExecutorAdapter({
 
   return {
     model,
-    async execute(taskCard) {
+    async execute(taskCard, { signal } = {}) {
       const prompt = buildPrompt(taskCard);
       const result = await runProcess({
         command,
@@ -326,6 +333,7 @@ export function createClaudeExecutorAdapter({
         onActivity,
         onProcessStarted,
         onProcessExited,
+        signal,
       });
 
       if (result.code !== 0) {

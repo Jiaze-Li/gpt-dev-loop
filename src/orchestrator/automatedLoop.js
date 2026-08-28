@@ -337,7 +337,11 @@ export async function runAutomatedWorkflow({
   workflowStateManager = null,
   usageTracker = null,
   onTaskCompleted = null,
+  signal = null,
 }) {
+  const throwIfAborted = () => {
+    if (signal?.aborted) throw new Error('automated workflow cancelled');
+  };
   const {
     maxRetries: rlMaxRetries = 2,
     cooldownMs: rlCooldownMs = 90000,
@@ -354,6 +358,7 @@ export async function runAutomatedWorkflow({
   let attemptCount = 0;
   let supervisorTabId = null;
 
+  throwIfAborted();
   const { windowId, initialTabId } = await windowSession.create();
   log(`automation window created: windowId=${windowId} initialTabId=${initialTabId}`);
   await logWindowTabs('after-window-create');
@@ -389,6 +394,7 @@ export async function runAutomatedWorkflow({
   // into a resumable HUMAN_REQUIRED.
   async function runWithRateLimitRecovery({ label, subject, run, reactivate }) {
     for (let retry = 0; ; retry += 1) {
+      throwIfAborted();
       try {
         return await run(retry);
       } catch (err) {
@@ -413,6 +419,7 @@ export async function runAutomatedWorkflow({
         log(`${label} rate limited: ${subject} retry=${retry + 1}`);
         log('rate-limit cooldown started');
         await rlSleep(rateLimitCooldownMs(err, retry, rlCooldownMs, rlCooldownJitterMs));
+        throwIfAborted();
         log('rate-limit cooldown completed');
         if (reactivate) await reactivate();
         log(`${label} retry started`);
@@ -435,6 +442,7 @@ export async function runAutomatedWorkflow({
   // the fresh Review Result, or { done: true, result } if the
   // maxAttemptsPerTask guard tripped.
   async function runAttempt() {
+    throwIfAborted();
     attemptCount += 1;
     if (attemptCount > maxAttemptsPerTask) {
       return {
@@ -469,7 +477,8 @@ export async function runAutomatedWorkflow({
           },
         }
       : currentTaskCard;
-    const executionReport = await claudeManager.execute(executorTaskCard);
+    const executionReport = await claudeManager.execute(executorTaskCard, { signal });
+    throwIfAborted();
     log(`claude attempt completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
 
     if (executionReport?.usage && usageTracker) {
@@ -497,6 +506,7 @@ export async function runAutomatedWorkflow({
     log(`gate started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
     workflowStateManager?.startStage(WORKFLOW_STAGES.GATE);
     const evidence = await gateRunner.run(currentTaskCard.verification_commands);
+    throwIfAborted();
     log(`gate completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
     if (workflowStateManager) {
       workflowStateManager.state.stageStatuses.gate = evidence.pass ? 'PASS' : 'FAIL';

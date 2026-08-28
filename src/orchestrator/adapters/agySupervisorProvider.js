@@ -274,6 +274,7 @@ export function createAgySupervisorProvider({
   model = AGY_SUPERVISOR_DEFAULT_MODEL,
   timeoutMs = 180_000,
   jsonSchema,
+  signal,
 } = {}) {
   return {
     model,
@@ -288,7 +289,7 @@ export function createAgySupervisorProvider({
 
       let result;
       try {
-        result = await callAgy({ prompt, model, timeoutMs, jsonSchema, conversationId });
+        result = await callAgy({ prompt, model, timeoutMs, jsonSchema, conversationId, signal });
       } catch (err) {
         if (err instanceof AgyConversationResumeError) throw err;
         throw mapAgyError(err, model);

@@ -160,7 +160,8 @@ export function createClaudeSessionManager({
   let sessionCount = 0;
 
   return {
-    async execute(taskCard) {
+    async execute(taskCard, { signal } = {}) {
+      if (signal?.aborted) throw new Error('executor cancelled');
       sessionCount += 1;
       const sessionNumber = sessionCount;
 
@@ -211,7 +212,8 @@ export function createClaudeSessionManager({
         onProcessStarted: (pid) => onProcessStarted?.({ ...processContext, pid }),
         onProcessExited: (details) => onProcessExited?.({ ...processContext, ...details }),
       });
-      const report = await executor.execute(taskCardForSession);
+      const report = await executor.execute(taskCardForSession, { signal });
+      if (signal?.aborted) throw new Error('executor cancelled');
 
       // Ensure report has routing metadata attached
       try {

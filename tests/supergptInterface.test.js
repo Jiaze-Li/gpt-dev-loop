@@ -139,6 +139,38 @@ test('runSuperGPT cancels cleanly when the AbortSignal fires mid-run', async () 
   assert.equal(events.at(-1).status, 'CANCELLED');
 });
 
+test('cancellation waits for owned pipeline shutdown and never emits delivery afterwards', async () => {
+  const controller = new AbortController();
+  const { events, onEvent } = collector();
+  let shutdownComplete = false;
+
+  const running = runSuperGPT({
+    goal: 'cancel an owned executor',
+    signal: controller.signal,
+    onEvent,
+    _pipeline: ({ signal, emit }) => new Promise((resolve) => {
+      signal.addEventListener('abort', () => {
+        setTimeout(() => {
+          shutdownComplete = true;
+          // A late completion must not be able to turn cancellation into a
+          // delivered result after the child has been asked to stop.
+          emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles: ['late.js'] });
+          resolve({ status: 'WORKFLOW_DONE', deliveredFiles: ['late.js'] });
+        }, 20);
+      }, { once: true });
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  const result = await running;
+
+  assert.equal(shutdownComplete, true);
+  assert.equal(result.status, 'CANCELLED');
+  assert.equal(events.at(-1).type, 'workflow_finished');
+  assert.equal(events.at(-1).status, 'CANCELLED');
+  assert.equal(events.some((event) => event.type === SUPERGPT_EVENTS.DELIVERY_SUCCEEDED), false);
+});
+
 test('runSuperGPT returns CANCELLED immediately for an already-aborted signal', async () => {
   const controller = new AbortController();
   controller.abort();

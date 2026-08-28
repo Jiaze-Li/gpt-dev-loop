@@ -78,6 +78,7 @@ export function selectProviders({
   quotaRegistry,
   providerHealth,
   onEvent,
+  signal,
 } = {}) {
   // One shared persistent-conversation store for this workflow: the
   // Supervisor session and every per-task Reviewer session created below
@@ -97,7 +98,7 @@ export function selectProviders({
       } else if (family === 'claude:opus') {
         provider = createClaudeSupervisorProvider({ call: claudeCall, model: 'opus', timeoutMs });
       } else {
-        provider = createAgySupervisorProvider({ callAgy, model: family === 'agy:gpt-oss' ? gptOssModel : geminiModel, timeoutMs, jsonSchema });
+        provider = createAgySupervisorProvider({ callAgy, model: family === 'agy:gpt-oss' ? gptOssModel : geminiModel, timeoutMs, jsonSchema, signal });
       }
       sessions.set(family, createAgySupervisorSession(provider, {
         store: sessionStore, usageTracker, onEvent, requestedFamily: family,
@@ -126,7 +127,7 @@ export function selectProviders({
           return { text: trimmed, json: JSON.parse(trimmed), usage: result.usage, durationMs: result.durationMs };
         }),
         'agy:gemini': ({ resolve }, selection) => resolve(async (opts) => {
-          const result = await callAgy({ ...opts, model: geminiModel });
+          const result = await callAgy({ ...opts, model: geminiModel, signal });
           recordPlannerUsage({ result, selection, model: geminiModel, usageTracker, provider: 'agy' });
           return result;
         }),
@@ -137,7 +138,7 @@ export function selectProviders({
           return { text: trimmed, json: JSON.parse(trimmed), usage: result.usage, durationMs: result.durationMs };
         }),
         'agy:gpt-oss': ({ resolve }, selection) => resolve(async (opts) => {
-          const result = await callAgy({ ...opts, model: gptOssModel });
+          const result = await callAgy({ ...opts, model: gptOssModel, signal });
           recordPlannerUsage({ result, selection, model: gptOssModel, usageTracker, provider: 'agy' });
           return result;
         }),
@@ -150,7 +151,7 @@ export function selectProviders({
       },
       reviewer: {
         'agy:gpt-oss': async ({ taskId, taskCard, executionReport, evidence, opts }) => {
-          const key = `${taskId}:agy:gpt-oss`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createAgyReviewerProvider({ callAgy, model: gptOssModel, timeoutMs, jsonSchema }), { store: sessionStore, usageTracker })());
+          const key = `${taskId}:agy:gpt-oss`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createAgyReviewerProvider({ callAgy, model: gptOssModel, timeoutMs, jsonSchema, signal }), { store: sessionStore, usageTracker })());
           return reviewerSessions.get(key).review(taskId, taskCard, executionReport, evidence, opts);
         },
         'codex:default': async ({ taskId, taskCard, executionReport, evidence, opts }) => {
@@ -158,7 +159,7 @@ export function selectProviders({
           return reviewerSessions.get(key).review(taskId, taskCard, executionReport, evidence, opts);
         },
         'agy:gemini': async ({ taskId, taskCard, executionReport, evidence, opts }) => {
-          const key = `${taskId}:agy:gemini`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createAgyReviewerProvider({ callAgy, model: geminiModel, timeoutMs, jsonSchema }), { store: sessionStore, usageTracker })());
+          const key = `${taskId}:agy:gemini`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createAgyReviewerProvider({ callAgy, model: geminiModel, timeoutMs, jsonSchema, signal }), { store: sessionStore, usageTracker })());
           return reviewerSessions.get(key).review(taskId, taskCard, executionReport, evidence, opts);
         },
         'claude:opus': async ({ taskId, taskCard, executionReport, evidence, opts }) => {
@@ -167,9 +168,9 @@ export function selectProviders({
         },
       },
       executor: {
-        'claude:sonnet': async ({ taskId, taskCard, ...args }) => createClaudeSessionManager({ ...args, taskId, env: { ...env, FORCE_CLAUDE_MODEL: 'sonnet' } }).execute(taskCard),
-        'codex:default': async ({ taskId, taskCard, ...args }) => createCodexSessionManager({ ...args, taskId, model: codexModel, env }).execute(taskCard),
-        'claude:opus': async ({ taskId, taskCard, ...args }) => createClaudeSessionManager({ ...args, taskId, env: { ...env, FORCE_CLAUDE_MODEL: 'opus' } }).execute(taskCard),
+        'claude:sonnet': async ({ taskId, taskCard, ...args }) => createClaudeSessionManager({ ...args, taskId, env: { ...env, FORCE_CLAUDE_MODEL: 'sonnet' } }).execute(taskCard, { signal }),
+        'codex:default': async ({ taskId, taskCard, ...args }) => createCodexSessionManager({ ...args, taskId, model: codexModel, env }).execute(taskCard, { signal }),
+        'claude:opus': async ({ taskId, taskCard, ...args }) => createClaudeSessionManager({ ...args, taskId, env: { ...env, FORCE_CLAUDE_MODEL: 'opus' } }).execute(taskCard, { signal }),
       },
     },
   });
@@ -192,8 +193,10 @@ export function selectProviders({
     sessionStore,
     runtime,
     createExecutorSessionManager: ({ taskId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited }) => ({
-      async execute(taskCard) {
+      async execute(taskCard, { signal: executionSignal } = {}) {
+        if (executionSignal?.aborted) throw new Error('executor cancelled');
         const result = await runtime.invoke('executor', { taskId, workflowId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited, taskCard }, { signals: { reasoningFailures: 0 }, operationId: `${workflowId}:${taskId}` });
+        if (executionSignal?.aborted) throw new Error('executor cancelled');
         return result.value;
       },
     }),

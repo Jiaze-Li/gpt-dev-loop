@@ -77,6 +77,23 @@ test('restoreResumableWorkspace accepts the current persisted workspace metadata
   });
 });
 
+test('dirty-workspace HUMAN_REQUIRED resume restores the snapshot baseline, never the pre-snapshot source head', () => {
+  const restored = restoreResumableWorkspace({
+    workflow_id: 'wf-dirty-resume',
+    source_workspace: '/tmp/dirty-invocation',
+    source_branch: 'main',
+    // User edits were captured in this snapshot before the isolated tree was
+    // created. Delivery must compute only workflow changes relative to it.
+    source_head: 'pre_snapshot_head',
+    baseline_head: 'snapshot_head_with_user_edits',
+    isolated_worktree_path: '/tmp/managed/wf-dirty-resume',
+  });
+
+  assert.equal(restored.worktree.baseline_head, 'snapshot_head_with_user_edits');
+  assert.equal(restored.baseline.head, 'snapshot_head_with_user_edits');
+  assert.notEqual(restored.baseline.head, 'pre_snapshot_head');
+});
+
 test('workflow runtime persistence is outside an invocation worktree', () => {
   const runtimeDir = workflowRuntimeDirectory('wf-runtime-location');
   assert.match(runtimeDir, /\.supergpt[\\/]worktrees[\\/]wf-runtime-location[\\/]persistence$/);

@@ -143,6 +143,7 @@ function extractText(json) {
  * @param {string} [opts.agent]             optional dedicated agy agent name
  * @param {string} [opts.cwd]               working dir for the child
  * @param {Function} [opts.spawn]           injectable spawn (for tests)
+ * @param {AbortSignal} [opts.signal]       stops the owned agy child and waits for it to exit
  * @returns {Promise<{model:string, exitCode:number, text:string|null,
  *                     json:any, stdout:string, durationMs:number,
  *                     conversationId:string|null}>}
@@ -158,12 +159,16 @@ export async function callAgy({
   agent,
   cwd,
   spawn = nodeSpawn,
+  signal,
 } = {}) {
   if (typeof prompt !== 'string' || prompt.trim() === '') {
     throw new AgyError('callAgy requires a non-empty prompt string', { code: 'AGY_BAD_INPUT' });
   }
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new AgyError('callAgy requires a positive timeoutMs', { code: 'AGY_BAD_INPUT' });
+  }
+  if (signal?.aborted) {
+    throw new AgyError('agy call cancelled', { code: 'AGY_ABORTED' });
   }
   const resumeConversationId =
     typeof conversationId === 'string' && conversationId.trim() !== '' ? conversationId.trim() : null;
@@ -196,7 +201,7 @@ export async function callAgy({
 
   const startedAt = Date.now();
 
-  const { code, stdout, stderr, timedOut, spawnError } = await new Promise((resolve) => {
+  const { code, stdout, stderr, timedOut, spawnError, aborted } = await new Promise((resolve) => {
     let child;
     try {
       child = spawn(executable, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -211,11 +216,13 @@ export async function callAgy({
     let errBytes = 0;
     let settled = false;
     let timer;
+    let aborted = false;
 
     const finish = (result) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       resolve(result);
     };
 
@@ -224,6 +231,12 @@ export async function callAgy({
       finish({ timedOut: true });
     }, timeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
+
+    const onAbort = () => {
+      aborted = true;
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     child.on('error', (err) => finish({ spawnError: err }));
     child.stdout?.on('data', (chunk) => {
@@ -235,6 +248,7 @@ export async function callAgy({
     child.on('close', (closeCode) => {
       finish({
         code: closeCode,
+        aborted,
         stdout: Buffer.concat(outChunks).toString('utf8'),
         stderr: Buffer.concat(errChunks).toString('utf8'),
       });
@@ -249,6 +263,9 @@ export async function callAgy({
   }
   if (timedOut) {
     throw new AgyTimeoutError(timeoutMs);
+  }
+  if (aborted || signal?.aborted) {
+    throw new AgyError('agy call cancelled', { code: 'AGY_ABORTED' });
   }
   if (code !== 0) {
     // A resume that failed because the id is unknown must surface as a

@@ -36,9 +36,37 @@ import {
 import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../../agy/agyJson.js';
 import { AGY_REVIEWER_DEFAULT_MODEL } from '../../agy/agyConfig.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
-import { renderReviewInputs } from './gptReviewerAdapter.js';
 
 const DECISIONS = new Set(['PASS', 'REWORK', 'HUMAN_REQUIRED']);
+
+// This production provider must not import the legacy browser adapter just
+// to render review input. Keep the rendering local and dependency-free so a
+// clean SuperGPT install never loads Playwright or the WebSocket bridge.
+function renderList(items) { return items?.length ? items.map((item) => `- ${item}`).join('\n') : 'none'; }
+function renderContext(ctx = {}) {
+  return `repository_name: ${ctx.repository_name}\nrepository_url: ${ctx.repository_url ?? 'none'}\nbranch: ${ctx.branch}\ncommit_sha: ${ctx.commit_sha}`;
+}
+function renderTaskCard(card) {
+  return `## task_id\n${card.task_id}\n\n## repository_context\n${renderContext(card.repository_context)}\n\n## goal\n${card.goal}\n\n## context\n${card.context}\n\n## scope\n${card.scope}\n\n## allowed_files\n${renderList(card.allowed_files)}\n\n## forbidden_files\n${renderList(card.forbidden_files)}\n\n## acceptance_criteria\n${renderList(card.acceptance_criteria)}\n\n## verification_commands\n${renderList((card.verification_commands ?? []).map((command) => `\`${command}\``))}\n\n## completion_signal\n${card.completion_signal}`;
+}
+function renderExecutionReport(report) {
+  const issues = Array.isArray(report.issues) ? renderList(report.issues) : report.issues ?? 'none';
+  return `## task_id\n${report.task_id}\n\n## repository_context\n${renderContext(report.repository_context)}\n\n## status\n${report.status}\n\n## changed_files\n${renderList(report.changed_files)}\n\n## tests_run\n${renderList(report.tests_run)}\n\n## test_results\n${renderList(report.test_results)}\n\n## issues\n${issues}\n\n## next_recommendation\n${report.next_recommendation}`;
+}
+function renderEvidence(evidence) {
+  const sections = [];
+  if (evidence?.status) sections.push(`### diff status\n${evidence.status}`);
+  if (evidence?.base || evidence?.head) sections.push(`### base/head\nbase: ${evidence.base ?? 'none'}\nhead: ${evidence.head ?? 'none'}`);
+  if (evidence?.baseline) { const b = evidence.baseline; sections.push(`### workflow baseline\nbranch: ${b.branch ?? 'unknown'}\nhead: ${b.head ?? 'unknown'}\nclean: ${b.clean === undefined ? 'unknown' : b.clean}\nisolated_worktree: ${b.isolated_worktree ?? false}`); }
+  if (Array.isArray(evidence?.untracked_files) && evidence.untracked_files.length) sections.push(`### task-produced untracked files\n${evidence.untracked_files.map((f) => f.included ? `- ${f.path} (new file, ${f.bytes} bytes — full contents in the diff below)` : `- ${f.path} (new file, ${f.bytes ?? 'unknown'} bytes — ${f.reason ?? 'omitted'}, contents not shown)`).join('\n')}`);
+  if (evidence?.diff !== undefined) sections.push(`### git diff\n\`\`\`diff\n${evidence.diff || '(no changes)'}\n\`\`\``);
+  const results = evidence?.results ?? [];
+  sections.push(`### gate results\noverall pass: ${evidence?.pass ?? 'unknown'}\n${results.length ? results.map((result) => `- \`${result.command}\`: ${result.pass ? 'pass' : 'fail'} — ${result.output ?? ''}`).join('\n') : 'none'}`);
+  return sections.join('\n\n');
+}
+function renderReviewInputs(taskCard, executionReport, evidence) {
+  return `# Task Card (TASK_PROTOCOL.md)\n\n${renderTaskCard(taskCard)}\n\n# Execution Report (EXECUTION_REPORT.md)\n\n${renderExecutionReport(executionReport)}\n\n# Evidence\n\n${renderEvidence(evidence)}`;
+}
 
 function invalid(message) {
   return new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT, message);
@@ -142,6 +170,7 @@ export function createAgyReviewerProvider({
   model = AGY_REVIEWER_DEFAULT_MODEL,
   timeoutMs = 180_000,
   jsonSchema,
+  signal,
 } = {}) {
   return {
     model,
@@ -156,7 +185,7 @@ export function createAgyReviewerProvider({
 
       let result;
       try {
-        result = await callAgy({ prompt, model, timeoutMs, jsonSchema, conversationId });
+        result = await callAgy({ prompt, model, timeoutMs, jsonSchema, conversationId, signal });
       } catch (err) {
         if (err instanceof AgyConversationResumeError) throw err;
         throw mapAgyError(err, model);

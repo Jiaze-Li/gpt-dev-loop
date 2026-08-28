@@ -145,7 +145,10 @@ const EMPTY_RESULT = () => ({
 export function restoreResumableWorkspace(meta) {
   const worktreePath = meta?.isolated_worktree_path ?? meta?.worktree_path;
   const sourceWorkspace = meta?.source_workspace ?? meta?.source_repo_root;
-  const baselineHead = meta?.source_head ?? meta?.baseline_head;
+  // The worktree was created from the effective snapshot when the source
+  // workspace was dirty.  source_head predates that snapshot and must never
+  // become the delivery comparison baseline on resume.
+  const baselineHead = meta?.baseline_head ?? meta?.source_head;
 
   if (typeof worktreePath !== 'string' || worktreePath.trim() === '') {
     throw new Error('resume metadata has no isolated worktree path');
@@ -233,7 +236,11 @@ export async function runSuperGPT({
   gcSuperGptResources({ root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd }).catch(() => {});
 
   const write = outputFormat ? (s) => process.stdout.write(`${s}\n`) : null;
+  let internalAbort = null;
   const emit = (type, data = {}) => {
+    // A late completion from a provider that was being torn down must never
+    // be observable as a successful delivery after cancellation.
+    if (internalAbort?.signal?.aborted && type !== SUPERGPT_EVENTS.WORKFLOW_FINISHED) return;
     const { type: _ignored, ...rest } = data;
     void _ignored;
     const event = { type, timestamp: new Date().toISOString(), ...rest };
@@ -270,14 +277,9 @@ export async function runSuperGPT({
     isResume,
   });
 
-  const internalAbort = new AbortController();
+  internalAbort = new AbortController();
   let onAbort;
-  const abortPromise = new Promise((_resolve, reject) => {
-    onAbort = () => {
-      internalAbort.abort();
-      reject(new CancellationError());
-    };
-  });
+  onAbort = () => internalAbort.abort();
   if (signal) {
     if (signal.aborted) {
       internalAbort.abort();
@@ -293,8 +295,11 @@ export async function runSuperGPT({
   });
 
   try {
-    const pipelineResult = await Promise.race([
-      Promise.resolve().then(() =>
+    // Do not race cancellation against the pipeline: doing so reports a
+    // stopped workflow while its provider child can still edit/deliver.
+    // The signal is propagated to every owned operation and we await its
+    // shutdown before publishing the terminal cancellation state.
+    const pipelineResult = await Promise.resolve().then(() =>
         _pipeline({
           goal,
           planPath,
@@ -309,9 +314,8 @@ export async function runSuperGPT({
           isResume,
           answer,
         })
-      ),
-      abortPromise,
-    ]);
+      );
+    throwIfAborted(internalAbort.signal);
     Object.assign(result, pipelineResult, { workflowId });
 
     // Zero-model-token token anomaly / regression check
@@ -445,7 +449,7 @@ async function defaultPipeline({
   // Keeping it outside the isolated worktree prevents it being interpreted as
   // an untracked change and delivered into the invocation workspace.
   const persistence = new Persistence(workflowRuntimeDirectory(workflowId));
-  const selection = selectProviders({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, onEvent: (event) => emit(event.type, event) });
+  const selection = selectProviders({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal, onEvent: (event) => emit(event.type, event) });
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'planning' });
   workflowStateManager?.startStage(WORKFLOW_STAGES.PLANNING);
@@ -518,6 +522,7 @@ async function defaultPipeline({
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
     workflowStateManager,
     usageTracker,
+    signal,
     log: (line) => {
       const event = translateLogLine(line);
       if (!event) return;
@@ -543,6 +548,8 @@ async function defaultPipeline({
       }
     },
   });
+
+  throwIfAborted(signal);
 
   const conversations = selection.sessionStore?.snapshot?.() ?? null;
 
@@ -570,6 +577,7 @@ async function defaultPipeline({
   workflowStateManager?.startStage(WORKFLOW_STAGES.APPLYING);
   let delivery;
   try {
+    throwIfAborted(signal);
     delivery = await deliverWorkflowResult({ worktree });
   } catch (err) {
     emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: err.message });
