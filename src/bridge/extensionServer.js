@@ -222,8 +222,22 @@ export class ExtensionServer {
   // FIFO as ask()/deleteConversation() (still one in-flight request at a
   // time), but supervisorAsk/supervisorClose address an existing `tabId`
   // rather than getting a fresh tab created for them.
-  supervisorCreate({ requestId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
-    return this._enqueue({ requestId, action: 'supervisorCreate', chatgptUrl, responseTimeoutMs, connectTimeoutMs });
+  // `active` is an optional diagnostic override (see extensionProtocol.js's
+  // buildRequestMessage doc comment) — omitted by every production caller,
+  // in which case background.js's own default (active: false) governs.
+  // `windowId` is an optional diagnostic override (see extensionProtocol.js's
+  // buildRequestMessage doc comment) — omitted by every production caller.
+  supervisorCreate({ requestId, chatgptUrl, responseTimeoutMs, connectTimeoutMs, active, windowId }) {
+    return this._enqueue({ requestId, action: 'supervisorCreate', chatgptUrl, responseTimeoutMs, connectTimeoutMs, active, windowId });
+  }
+
+  // Opens a tab navigated directly to the given EXISTING conversation
+  // (never a fresh one) and resolves once the extension has verified (real
+  // DOM/URL evidence) that the tab actually ended up showing that exact
+  // conversation. Rejects (never falls back to supervisorCreate) if it
+  // doesn't — see extension/domActions.js's verifyAttachedConversationId.
+  supervisorAttach(conversationId, { requestId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'supervisorAttach', conversationId, chatgptUrl, responseTimeoutMs, connectTimeoutMs });
   }
 
   supervisorAsk(prompt, { requestId, tabId, expectedConversationId, responseTimeoutMs, connectTimeoutMs }) {
@@ -234,7 +248,56 @@ export class ExtensionServer {
     return this._enqueue({ requestId, action: 'supervisorClose', tabId, responseTimeoutMs, connectTimeoutMs });
   }
 
-  _enqueue({ requestId, action, prompt, conversationId, tabId, expectedConversationId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
+  // Zero-GPT-request local read of an EXISTING tab's current chrome-tab/
+  // content-script/composer state (see extensionProtocol.js's
+  // buildRequestMessage doc comment). Always resolves with a `preflight`
+  // diagnostics object when the extension is reachable at all — deciding
+  // pass/fail from it is the caller's (reviewerSession.js's) job.
+  reviewerPreflight({ requestId, tabId, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'reviewerPreflight', tabId, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  // Zero-chrome-API local read of background.js's stage-diagnostics store
+  // for `originalRequestId` (a PREVIOUSLY issued requestId, typically one
+  // whose own request already timed out/was cancelled) — see
+  // extensionProtocol.js's buildRequestMessage doc comment. `requestId`
+  // here is this lookup's OWN, brand-new id.
+  diagnosticStage({ requestId, originalRequestId, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'diagnosticStage', originalRequestId, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  // Window-lifecycle trio — diagnostics-only (see extensionProtocol.js's
+  // buildRequestMessage doc comment); no production caller uses these.
+  windowCreate({ requestId, chatgptUrl, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'windowCreate', chatgptUrl, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  windowActivateTab({ requestId, tabId, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'windowActivateTab', tabId, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  windowClose({ requestId, windowId, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'windowClose', windowId, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  windowListTabs({ requestId, windowId, responseTimeoutMs, connectTimeoutMs }) {
+    return this._enqueue({ requestId, action: 'windowListTabs', windowId, responseTimeoutMs, connectTimeoutMs });
+  }
+
+  _enqueue({
+    requestId,
+    action,
+    prompt,
+    conversationId,
+    tabId,
+    expectedConversationId,
+    chatgptUrl,
+    responseTimeoutMs,
+    connectTimeoutMs,
+    active,
+    windowId,
+    originalRequestId,
+  }) {
     this.start();
     return new Promise((resolve, reject) => {
       const entry = {
@@ -246,6 +309,9 @@ export class ExtensionServer {
         expectedConversationId,
         chatgptUrl,
         responseTimeoutMs,
+        active,
+        windowId,
+        originalRequestId,
         resolve,
         reject,
         connectTimer: null,
@@ -305,6 +371,7 @@ export class ExtensionServer {
 
     this.inFlight = {
       requestId: entry.requestId,
+      action: entry.action,
       resolve: (payload) => {
         clearTimeout(responseTimer);
         this.inFlight = null;
@@ -329,21 +396,36 @@ export class ExtensionServer {
           expectedConversationId: entry.expectedConversationId,
           chatgptUrl: entry.chatgptUrl,
           responseTimeoutMs: entry.responseTimeoutMs,
+          active: entry.active,
+          windowId: entry.windowId,
+          originalRequestId: entry.originalRequestId,
         })
       )
     );
   }
 
+  // Stage-only diagnostics (requestId/action, never prompt/reply content) for
+  // the moment a reply or error crosses back from the extension into Node —
+  // pairs with reviewerSession.js's "reviewer review request entered" log at
+  // the other end of the same round trip.
   _settle(msg) {
     if (!this.inFlight || msg.requestId !== this.inFlight.requestId) return;
     if (msg.type === 'response') {
+      log(`[${msg.requestId}] response returned to Node bridge (action=${this.inFlight.action})`);
       this.inFlight.resolve({
         text: msg.payload.text,
         conversationId: msg.payload.conversationId,
         ...(msg.payload.tabId !== undefined ? { tabId: msg.payload.tabId } : {}),
         ...(msg.payload.identityDiagnostics !== undefined ? { identityDiagnostics: msg.payload.identityDiagnostics } : {}),
+        ...(msg.payload.preflight !== undefined ? { preflight: msg.payload.preflight } : {}),
+        ...(msg.payload.windowId !== undefined ? { windowId: msg.payload.windowId } : {}),
+        ...(msg.payload.initialTabId !== undefined ? { initialTabId: msg.payload.initialTabId } : {}),
+        ...(msg.payload.tabs !== undefined ? { tabs: msg.payload.tabs } : {}),
+        ...(msg.payload.windowActivation !== undefined ? { windowActivation: msg.payload.windowActivation } : {}),
+        ...(msg.payload.stageRecord !== undefined ? { stageRecord: msg.payload.stageRecord } : {}),
       });
     } else {
+      log(`[${msg.requestId}] failure returned to Node bridge (action=${this.inFlight.action}): ${msg.error.code}`);
       this.inFlight.reject(new ExtensionProtocolError(msg.error.code, msg.error.message ?? msg.error.code));
     }
   }

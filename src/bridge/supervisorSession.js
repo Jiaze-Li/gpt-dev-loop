@@ -37,9 +37,25 @@ const NOT_CREATED_MESSAGE = 'SupervisorSession.create() has not been called (or 
 const ALREADY_CREATED_MESSAGE =
   'SupervisorSession.create() was already called for this session. Call close() before creating a new one.';
 
-async function runSupervisorCreate(server, config, requestId) {
+async function runSupervisorCreate(server, config, requestId, windowId) {
   try {
     return await server.supervisorCreate({
+      requestId,
+      chatgptUrl: config.chatgptUrl,
+      responseTimeoutMs: config.responseTimeoutMs,
+      connectTimeoutMs: config.extensionConnectTimeoutMs,
+      windowId,
+    });
+  } catch (err) {
+    if (err instanceof ExtensionProtocolError) throw mapProtocolError(err);
+    if (err instanceof TransportError) throw err;
+    throw new ChromeUnavailableError(`Unexpected extension transport failure: ${err.message}`);
+  }
+}
+
+async function runSupervisorAttach(server, config, requestId, conversationId) {
+  try {
+    return await server.supervisorAttach(conversationId, {
       requestId,
       chatgptUrl: config.chatgptUrl,
       responseTimeoutMs: config.responseTimeoutMs,
@@ -101,17 +117,51 @@ export class SupervisorSession {
 
   // Opens exactly one fresh ChatGPT tab and leaves it open. Does not send
   // any prompt and does not (cannot yet) capture a conversation id.
-  async create() {
+  // `windowId` is an optional diagnostic override (undefined by default, so
+  // chrome.tabs.create's own "current window" default governs) — added only
+  // for scripts/test-background-automation-window-live.js, which creates
+  // the tab inside a dedicated, deliberately unfocused window. No production
+  // caller passes `windowId` today.
+  async create({ windowId } = {}) {
     if (this._tabId !== null) throw new Error(ALREADY_CREATED_MESSAGE);
     const requestId = randomUUID();
     const server = getExtensionServer(this.config);
     const result = await withTimeout(
-      runSupervisorCreate(server, this.config, requestId),
+      runSupervisorCreate(server, this.config, requestId, windowId),
       this.config.requestTimeoutMs,
       `Supervisor create request did not complete within ${this.config.requestTimeoutMs}ms.`,
       () => server.cancel(requestId)
     );
     this._tabId = result.tabId;
+    return this.getIdentity();
+  }
+
+  // Re-attaches this session to an EXISTING conversation by its exact
+  // ChatGPT conversationId — never creates a new conversation (that's what
+  // create() is for). Opens a fresh worker tab navigated directly to
+  // /c/<conversationId>, and only resolves once the extension has verified
+  // — from real DOM/URL evidence, not a guess — that the tab actually ended
+  // up showing that exact conversation
+  // (extension/domActions.js's verifyAttachedConversationId). Any
+  // divergence (a redirect, the conversation not existing/being
+  // inaccessible, a login wall, or the tab never settling at all) rejects
+  // with SupervisorAttachMismatchError and leaves this session exactly as
+  // if attach() had never been called (this._tabId stays null) — it never
+  // silently falls back to creating a fresh conversation. Once attach()
+  // succeeds, ask()/decide() work exactly as they do after create().
+  async attach(conversationId) {
+    if (!conversationId) throw new Error('SupervisorSession.attach(conversationId) requires a non-empty conversationId.');
+    if (this._tabId !== null) throw new Error(ALREADY_CREATED_MESSAGE);
+    const requestId = randomUUID();
+    const server = getExtensionServer(this.config);
+    const result = await withTimeout(
+      runSupervisorAttach(server, this.config, requestId, conversationId),
+      this.config.requestTimeoutMs,
+      `Supervisor attach request did not complete within ${this.config.requestTimeoutMs}ms.`,
+      () => server.cancel(requestId)
+    );
+    this._tabId = result.tabId;
+    this._conversationId = result.conversationId;
     return this.getIdentity();
   }
 

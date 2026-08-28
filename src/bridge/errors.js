@@ -132,6 +132,46 @@ export class ReviewerIdentityMismatchError extends TransportError {
   }
 }
 
+// Thrown by SupervisorSession.attach() when the tab navigated to the
+// requested EXISTING conversation does not end up showing that exact
+// conversation id — a client-side redirect (conversation deleted/not
+// accessible), a login wall, or any other divergence from real DOM/URL
+// evidence (see extension/domActions.js's verifyAttachedConversationId).
+// Fails closed: this session is left un-created, and attach() never falls
+// back to creating a fresh conversation.
+export class SupervisorAttachMismatchError extends TransportError {
+  constructor(message) {
+    super(message, 17);
+    this.name = 'SupervisorAttachMismatchError';
+  }
+}
+
+// Thrown by ReviewerSession.attach() — mirrors SupervisorAttachMismatchError
+// for the Reviewer's own attach() call.
+export class ReviewerAttachMismatchError extends TransportError {
+  constructor(message) {
+    super(message, 18);
+    this.name = 'ReviewerAttachMismatchError';
+  }
+}
+
+// Thrown by ReviewerSession.review()'s local preflight gate (see
+// reviewerSession.js's header comment above runReviewerPreflight) when a
+// zero-GPT-request read of the EXISTING Reviewer tab proves it unusable —
+// before the real review prompt is ever sent, and without waiting out the
+// full response timeout. `code` is one of 'REVIEWER_TAB_LOST' (folded into
+// ReviewerTabLostError instead — see remapSupervisorError),
+// 'CONTENT_SCRIPT_UNREACHABLE' (the tab exists but its content script did
+// not respond), or 'CHATGPT_PAGE_NOT_READY' (the content script responded
+// but the composer is not currently usable).
+export class ReviewerPreflightError extends TransportError {
+  constructor(message, code) {
+    super(message, 19);
+    this.name = 'ReviewerPreflightError';
+    this.code = code;
+  }
+}
+
 export class UsageError extends Error {
   constructor(message) {
     super(message);

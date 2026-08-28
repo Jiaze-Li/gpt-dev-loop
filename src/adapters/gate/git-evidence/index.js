@@ -16,7 +16,13 @@
 
 import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
+import { readFile as nodeReadFile, stat as nodeStat } from 'node:fs/promises';
 import { GitEvidenceError, GIT_EVIDENCE_ERROR_CODES } from './errors.js';
+
+// Untracked task-produced files under this many bytes have their full text
+// folded into the evidence diff; larger ones (and binary ones) are reported
+// as safe metadata only (path + byte size + reason), never contents.
+export const DEFAULT_MAX_UNTRACKED_TEXT_BYTES = 131_072;
 
 // Phase 6.3.1: the collector only reports fact — whether an empty diff
 // (DIFF_STATUS.NO_CHANGES) is acceptable for a given task is the Reviewer
@@ -79,7 +85,9 @@ function deriveRepositoryName(remoteUrl, cwd) {
 // src/orchestrator/adapters/gptReviewerAdapter.js's renderEvidence already
 // reads (head, base, diff, results, pass, status) — the Reviewer Adapter is
 // not modified to learn a new evidence shape.
-function shapeEvidence({ currentCommit, baseCommit, changedFiles, diff, status, gitStatus, repositoryContext, testResults }) {
+function shapeEvidence({ currentCommit, baseCommit, changedFiles, diff, status, gitStatus, repositoryContext, testResults, untrackedFiles, baseline, trackedChangedFiles }) {
+  const untracked = untrackedFiles ?? [];
+  const diffBytes = Buffer.byteLength(diff, 'utf8');
   return {
     current_commit: currentCommit,
     base_commit: baseCommit ?? null,
@@ -89,16 +97,99 @@ function shapeEvidence({ currentCommit, baseCommit, changedFiles, diff, status, 
     status,
     repository_context: repositoryContext,
     test_results: testResults ?? null,
+    untracked_files: untracked,
+    baseline: baseline ?? null,
 
     head: currentCommit,
     base: baseCommit ?? null,
     diff,
     results: testResults?.results ?? [],
     pass: testResults?.pass,
+
+    // Metadata-only diagnostics (never contents). Safe to log.
+    diagnostics: {
+      tracked_changed_files: (trackedChangedFiles ?? changedFiles).length,
+      untracked_task_files: untracked.length,
+      untracked_task_files_included: untracked.filter((f) => f.included).length,
+      diff_chars: diff.length,
+      diff_bytes: diffBytes,
+    },
   };
 }
 
-export function createGitEvidenceCollector({ gitBin = 'git', spawn = nodeSpawn } = {}) {
+// "one\ntwo" -> a unified-diff add hunk for a brand-new file.
+function renderNewFileHunk(relPath, text) {
+  const lines = text.split('\n');
+  // A trailing newline yields a final empty element; git shows it as the
+  // usual "\ No newline" only when absent — for evidence purposes a plain
+  // per-line "+" rendering is enough and stays deterministic.
+  const bodyLines = lines.length > 1 && lines[lines.length - 1] === '' ? lines.slice(0, -1) : lines;
+  const count = bodyLines.length;
+  return [
+    `diff --git a/${relPath} b/${relPath}`,
+    'new file mode 100644',
+    '--- /dev/null',
+    `+++ b/${relPath}`,
+    `@@ -0,0 +1,${count} @@`,
+    ...bodyLines.map((line) => `+${line}`),
+  ].join('\n');
+}
+
+function renderOmittedFileNote(relPath, bytes, reason) {
+  return [
+    `diff --git a/${relPath} b/${relPath}`,
+    `new file (${reason}, ${bytes} bytes) — contents omitted from evidence`,
+  ].join('\n');
+}
+
+// git ls-files --others --exclude-standard -z, then classify each path.
+async function collectUntrackedFiles({ git, cwd, repoRoot, readFile, stat, maxBytes }) {
+  const listResult = await git(['ls-files', '--others', '--exclude-standard', '-z'], cwd);
+  if (listResult.code !== 0) {
+    throw new GitEvidenceError(
+      GIT_EVIDENCE_ERROR_CODES.DIFF_COMMAND_FAILED,
+      `"git ls-files --others --exclude-standard -z" failed: ${listResult.stderr.trim()}`
+    );
+  }
+  const relPaths = listResult.stdout.split('\0').map((p) => p.trim()).filter(Boolean).sort();
+  const files = [];
+  for (const relPath of relPaths) {
+    const absPath = path.resolve(repoRoot ?? cwd, relPath);
+    let size;
+    try {
+      const info = await stat(absPath);
+      size = info.size;
+    } catch {
+      files.push({ path: relPath, bytes: null, binary: null, included: false, reason: 'unreadable' });
+      continue;
+    }
+    if (size > maxBytes) {
+      files.push({ path: relPath, bytes: size, binary: null, included: false, reason: 'oversized' });
+      continue;
+    }
+    let buffer;
+    try {
+      buffer = await readFile(absPath);
+    } catch {
+      files.push({ path: relPath, bytes: size, binary: null, included: false, reason: 'unreadable' });
+      continue;
+    }
+    if (buffer.includes(0)) {
+      files.push({ path: relPath, bytes: buffer.length, binary: true, included: false, reason: 'binary' });
+      continue;
+    }
+    files.push({ path: relPath, bytes: buffer.length, binary: false, included: true, text: buffer.toString('utf8') });
+  }
+  return files;
+}
+
+export function createGitEvidenceCollector({
+  gitBin = 'git',
+  spawn = nodeSpawn,
+  readFile = nodeReadFile,
+  stat = nodeStat,
+  maxUntrackedTextBytes = DEFAULT_MAX_UNTRACKED_TEXT_BYTES,
+} = {}) {
   async function git(args, cwd) {
     let result;
     try {
@@ -150,7 +241,13 @@ export function createGitEvidenceCollector({ gitBin = 'git', spawn = nodeSpawn }
   return {
     async collect_evidence(context = {}) {
       const cwd = context.cwd ?? process.cwd();
-      const baseCommit = context.baseCommit ?? null;
+      // A Workflow Baseline (src/orchestrator/workflowBaseline.js) pins the
+      // pre-execution snapshot the Reviewer Evidence must be scoped to: the
+      // diff is taken against baseline.head (never a bare "git diff HEAD"
+      // over an unknown-cleanliness tree), and untracked task-produced files
+      // are folded in. `baseCommit` remains the legacy explicit-range knob.
+      const baseline = context.baseline ?? null;
+      const baseCommit = context.baseCommit ?? (baseline ? baseline.head : null);
       const testResults = context.testResults ?? null;
 
       const repoCheck = await git(['rev-parse', '--is-inside-work-tree'], cwd);
@@ -176,7 +273,18 @@ export function createGitEvidenceCollector({ gitBin = 'git', spawn = nodeSpawn }
       // makes no judgment call, it just picks the deterministic diff range —
       // an explicit base_commit..current_commit range when one is given,
       // otherwise the working tree against HEAD.
-      const diffArgs = baseCommit ? ['diff', `${baseCommit}..${currentCommit}`] : ['diff', 'HEAD'];
+      // baseline mode: working tree vs baseline.head (captures every tracked
+      //   change since the baseline, staged or not).
+      // legacy explicit-range mode: base_commit..current_commit.
+      // default mode: working tree vs HEAD (unchanged historical behavior).
+      let diffArgs;
+      if (baseline) {
+        diffArgs = ['diff', baseline.head];
+      } else if (context.baseCommit) {
+        diffArgs = ['diff', `${context.baseCommit}..${currentCommit}`];
+      } else {
+        diffArgs = ['diff', 'HEAD'];
+      }
 
       const diffResult = await git(diffArgs, cwd);
       if (diffResult.code !== 0) {
@@ -185,10 +293,7 @@ export function createGitEvidenceCollector({ gitBin = 'git', spawn = nodeSpawn }
           `"${gitBin} ${diffArgs.join(' ')}" failed: ${diffResult.stderr.trim() || diffResult.stdout.trim()}`
         );
       }
-      const diff = diffResult.stdout;
-      // Phase 6.3.1: an empty diff is a valid evidence state (nothing
-      // changed), not an error — reported via `status`, not thrown.
-      const diffStatus = diff.trim().length === 0 ? DIFF_STATUS.NO_CHANGES : DIFF_STATUS.CHANGED;
+      const trackedDiff = diffResult.stdout;
 
       const nameOnlyResult = await git([...diffArgs, '--name-only'], cwd);
       if (nameOnlyResult.code !== 0) {
@@ -197,7 +302,42 @@ export function createGitEvidenceCollector({ gitBin = 'git', spawn = nodeSpawn }
           `"${gitBin} ${[...diffArgs, '--name-only'].join(' ')}" failed: ${nameOnlyResult.stderr.trim()}`
         );
       }
-      const changedFiles = parseChangedFiles(nameOnlyResult.stdout);
+      const trackedChangedFiles = parseChangedFiles(nameOnlyResult.stdout);
+
+      // Untracked task-produced files are only collected in baseline mode —
+      // that is the only mode where "untracked" reliably means "this
+      // workflow made it" (a clean/isolated baseline was proven upstream).
+      let untrackedFiles = [];
+      let untrackedDiff = '';
+      if (baseline) {
+        untrackedFiles = await collectUntrackedFiles({
+          git,
+          cwd,
+          repoRoot: baseline.repo_root ?? cwd,
+          readFile,
+          stat,
+          maxBytes: maxUntrackedTextBytes,
+        });
+        untrackedDiff = untrackedFiles
+          .map((file) =>
+            file.included
+              ? renderNewFileHunk(file.path, file.text)
+              : renderOmittedFileNote(file.path, file.bytes ?? 0, file.reason ?? 'omitted')
+          )
+          .join('\n');
+      }
+
+      const diff = [trackedDiff.trimEnd(), untrackedDiff.trimEnd()].filter(Boolean).join('\n\n') +
+        (trackedDiff || untrackedDiff ? '\n' : '');
+
+      // Phase 6.3.1: an empty diff is a valid evidence state (nothing
+      // changed), not an error — reported via `status`, not thrown.
+      const diffStatus =
+        trackedDiff.trim().length === 0 && untrackedFiles.length === 0
+          ? DIFF_STATUS.NO_CHANGES
+          : DIFF_STATUS.CHANGED;
+
+      const changedFiles = [...trackedChangedFiles, ...untrackedFiles.map((f) => f.path)];
 
       const statusResult = await git(['status', '--porcelain=v1'], cwd);
       if (statusResult.code !== 0) {
@@ -211,11 +351,16 @@ export function createGitEvidenceCollector({ gitBin = 'git', spawn = nodeSpawn }
         currentCommit,
         baseCommit,
         changedFiles,
+        trackedChangedFiles,
         diff,
         status: diffStatus,
         gitStatus: statusResult.stdout,
         repositoryContext,
         testResults,
+        untrackedFiles,
+        baseline: baseline
+          ? { branch: baseline.branch, head: baseline.head, clean: baseline.clean, isolated_worktree: baseline.isolated_worktree ?? false }
+          : null,
       });
     },
   };

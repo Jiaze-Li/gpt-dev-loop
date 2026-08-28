@@ -21,28 +21,39 @@
 // ChatGPT, does not touch SupervisorSession, does not touch Claude/Reviewer,
 // and does not implement any loop.
 //
-// Wire format (deliberately NOT JSON — every other document in this system
-// is a Markdown document split on "## field_name" headings: Task Cards
-// (taskCard.js), Execution Reports (claudeExecutorAdapter.js), Review
-// Results (gptReviewerAdapter.js). This protocol matches that convention
-// instead of being the one JSON-shaped exception):
+// Wire format — render-stable plaintext, NOT Markdown headings. The
+// Supervisor's reply is not read as raw text: it is read from ChatGPT's
+// rendered assistant DOM node (extension/domActions.js's `.markdown`
+// innerText). ChatGPT renders a literal "## field_name" line as an actual
+// <h2> DOM element, and that element's innerText is just "field_name" — the
+// "##" characters never reach this parser. Every OTHER document in this
+// system (Task Cards via taskCard.js, Execution Reports via
+// claudeExecutorAdapter.js, Review Results via gptReviewerAdapter.js) is
+// exchanged as a file or as Claude/Reviewer plain-text output, never
+// through ChatGPT's rendered Markdown DOM, so "##" headings survive there.
+// Only the Supervisor's replies cross that specific rendering boundary, so
+// only this protocol uses a delimiter Markdown does not treat specially:
+// "@@ field_name", which ChatGPT renders as a literal, unmodified text
+// line.
 //
 //   <ACTION KEYWORD, alone on the first line>
 //
 //   <body — shape depends on the action, see below>
 //
-// - NEXT_TASK's body is a complete Task Card, in the EXACT format
-//   TASK_PROTOCOL.md §3 defines and taskCard.js's parseTaskCard already
-//   parses — reused here verbatim (see parseNextTask below), not
-//   reimplemented. There is only ever one Task Card parser in this
-//   codebase.
+// - NEXT_TASK's body is a complete Task Card, using "@@ field_name"
+//   section markers (instead of "## field_name") for exactly the fields
+//   TASK_PROTOCOL.md §3 defines. Before validation, the "@@ field_name"
+//   markers are mechanically rewritten to "## field_name" and handed to
+//   taskCard.js's existing parseTaskCard — reused verbatim, not
+//   reimplemented. There is only ever one Task Card schema/validator in
+//   this codebase; this module only translates the wire delimiter.
 // - CONTINUE_REWORK has no body at all — anything after the action line is
 //   rejected, exactly as an extra JSON field used to be rejected. The
 //   Supervisor does not get to smuggle rework instructions in here; see the
 //   module doc above.
-// - WORKFLOW_DONE's body is one "## summary" section.
-// - HUMAN_REQUIRED's body is a "## reason" section followed by a
-//   "## question" section.
+// - WORKFLOW_DONE's body is one "@@ summary" section.
+// - HUMAN_REQUIRED's body is a "@@ reason" section followed by a
+//   "@@ question" section.
 //
 // No malformed-output repair is attempted anywhere in this file: a reply
 // that doesn't match its action's exact shape throws
@@ -50,9 +61,11 @@
 // diagnosis, the same as an invalid Task Card/Execution Report/Review
 // Result does elsewhere in this codebase. Guessing at what a malformed
 // reply "probably meant" is exactly the failure mode this format (and this
-// module) exists to avoid.
+// module) exists to avoid — including a reply that still uses "##"
+// Markdown headings instead of "@@" markers, which fails loudly rather
+// than being reinterpreted.
 
-import { parseTaskCard } from './taskCard.js';
+import { parseTaskCard, REQUIRED_FIELDS } from './taskCard.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from './errors.js';
 
 export const SUPERVISOR_ACTIONS = Object.freeze({
@@ -101,47 +114,53 @@ function renderLatestReviewResult(latestReviewResult) {
 export function buildSupervisorPrompt(context = {}) {
   const { workflowGoal, repositoryContext, history, latestReviewResult } = context;
 
-  return `You are the Supervisor in an automated dev loop. Decide what happens next and reply with a plain-text document in EXACTLY this shape — nothing before it, nothing after it, no markdown code fence around it:
+  return `You are the Supervisor in an automated dev loop. Decide what happens next and reply with a plain-text document in EXACTLY this shape — nothing before it, nothing after it, no markdown code fence around it, and no Markdown formatting anywhere in the document (no "#" headings, no "**bold**", no bullet-list syntax beyond the literal "- " prefix shown below). Your reply is read back from the rendered page, not as raw text, so any characters Markdown would transform (like "#" headings) will NOT survive — use ONLY the literal "@@ field_name" markers shown below to separate fields.
 
 Line 1: ONLY one of these four words, alone on the line: NEXT_TASK, CONTINUE_REWORK, WORKFLOW_DONE, or HUMAN_REQUIRED.
 Then a blank line, then a body whose shape depends on that word:
 
-1. Start the next task — body is a complete Task Card, in EXACTLY this template (same convention as every other document in this system: one "## field_name" heading per field, in this order, content filled in for real, never a placeholder):
+1. Start the next task — body is a complete Task Card, in EXACTLY this template (one "@@ field_name" marker per field, in this order, content filled in for real, never a placeholder — do NOT write "## field_name", write "@@ field_name" exactly as shown):
 
 NEXT_TASK
 
-## task_id
+@@ task_id
 <short unique id>
 
-## repository_context
+@@ repository_context
 repository_name: <name>
 repository_url: <url, or "none">
 branch: <branch>
 commit_sha: <sha>
 
-## goal
+@@ goal
 <1-3 sentences>
 
-## context
+@@ context
 <background>
 
-## scope
+@@ scope
 <in scope / out of scope>
 
-## allowed_files
+@@ allowed_files
 - <path or glob>
 
-## forbidden_files
+@@ forbidden_files
 - <path or glob, or "none">
 
-## acceptance_criteria
+@@ acceptance_criteria
 - <checkable condition>
 
-## verification_commands
+@@ verification_commands
 - \`<command>\`
 
-## completion_signal
-DONE | BLOCKED | HUMAN_REQUIRED
+@@ completion_signal
+DONE
+
+For a normal executable NEXT_TASK, completion_signal must be exactly the
+single word DONE — never write the literal string
+"DONE | BLOCKED | HUMAN_REQUIRED" here. BLOCKED and HUMAN_REQUIRED remain
+possible runtime outcomes the Executor can report back in its Execution
+Report; they are not values you plan into the Task Card's completion_signal.
 
 2. Re-run the current task after rework, unchanged — body is empty. Reply with ONLY the word on its own, nothing else:
 
@@ -153,17 +172,17 @@ Do not include your own rework instructions here — the orchestrator will build
 
 WORKFLOW_DONE
 
-## summary
+@@ summary
 <what was accomplished>
 
 4. A human decision is required:
 
 HUMAN_REQUIRED
 
-## reason
+@@ reason
 <why only a human can decide this>
 
-## question
+@@ question
 <the specific question for the human>
 
 Use HUMAN_REQUIRED ONLY for something only a human can actually decide: a genuine ambiguity in the product spec/requirements, an architecture decision with no clearly-correct answer, a login/credentials/CAPTCHA block, or confirming an irreversible action. A failing test, a code bug, or the Reviewer returning REWORK are NOT reasons to use this action — those are CONTINUE_REWORK.
@@ -193,14 +212,15 @@ function splitFirstLine(text) {
   return { firstLine: trimmed.slice(0, newlineIndex).trim(), body: trimmed.slice(newlineIndex + 1).trim() };
 }
 
-// Same "## field_name" splitter taskCard.js/claudeExecutorAdapter.js/
-// gptReviewerAdapter.js each already use for their own reply formats —
-// kept as a small local copy (not imported) because WORKFLOW_DONE's/
-// HUMAN_REQUIRED's own one-or-two-field bodies are a different, much
-// smaller shape than any of those documents; NEXT_TASK's body, which IS
-// exactly a Task Card, uses taskCard.js's real parser instead of this.
+// Render-stable section splitter: splits on "@@ field_name" markers, the
+// literal delimiter this protocol uses instead of "## field_name" Markdown
+// headings (see the module doc above for why). Kept as a small local copy
+// (not imported) because WORKFLOW_DONE's/HUMAN_REQUIRED's own
+// one-or-two-field bodies are a different, much smaller shape than a Task
+// Card; NEXT_TASK's body is translated to "## field_name" form and handed
+// to taskCard.js's real parser instead of this (see parseNextTask below).
 function parseSections(text) {
-  const headingRe = /^##\s+(\w+)\s*$/gm;
+  const headingRe = /^@@\s+(\w+)\s*$/gm;
   const matches = [...text.matchAll(headingRe)];
   const sections = {};
   for (let i = 0; i < matches.length; i += 1) {
@@ -212,15 +232,102 @@ function parseSections(text) {
   return sections;
 }
 
+// Structural-only diagnostics for a raw Supervisor reply — used when a
+// NEXT_TASK reply fails to parse, so a live run can show the exact wire
+// shape GPT actually returned WITHOUT ever logging what any field
+// contained. Every value below is a marker NAME, a count, or a length —
+// never a section's body text, never the workflow goal/repository
+// URL/task content that's baked into the prompt or the reply, so this is
+// safe to put in a thrown error message or a console log line.
+function extractMarkerNames(text) {
+  const headingRe = /^@@\s+(\w+)\s*$/gm;
+  return [...text.matchAll(headingRe)].map((match) => match[1]);
+}
+
+function findDuplicateMarkerNames(markerNames) {
+  const seen = new Set();
+  const duplicates = new Set();
+  for (const name of markerNames) {
+    if (seen.has(name)) duplicates.add(name);
+    else seen.add(name);
+  }
+  return [...duplicates];
+}
+
+// Returns { action, markers, duplicates, missing, length } describing the
+// shape of `text` (a raw Supervisor reply, or a NEXT_TASK body — either
+// works since this only looks at the first line and "@@ field_name"
+// marker names). `missing` is only meaningful for a NEXT_TASK reply: the
+// subset of taskCard.js's REQUIRED_FIELDS not found among the observed
+// markers; it's empty for every other action.
+export function describeSupervisorReplyStructure(text) {
+  const safeText = typeof text === 'string' ? text : '';
+  const { firstLine } = splitFirstLine(safeText);
+  const markerNames = extractMarkerNames(safeText);
+  const missing =
+    firstLine === SUPERVISOR_ACTIONS.NEXT_TASK
+      ? REQUIRED_FIELDS.filter((field) => !markerNames.includes(field))
+      : [];
+  return {
+    action: isNonEmptyString(firstLine) ? firstLine : '(empty)',
+    markers: markerNames,
+    duplicates: findDuplicateMarkerNames(markerNames),
+    missing,
+    length: safeText.length,
+  };
+}
+
+// Renders describeSupervisorReplyStructure's result as the fixed-shape,
+// field-content-free log/error line documented in the diagnostics work
+// item — safe to print to stdout/stderr or embed in a thrown error's
+// message even for a reply carrying sensitive prompt/task data.
+export function formatSupervisorReplyDiagnostic(text) {
+  const d = describeSupervisorReplyStructure(text);
+  return `gpt-loop: supervisor response structure:
+action=${d.action}
+markers=[${d.markers.join(',')}]
+missing=[${d.missing.join(',')}]
+duplicates=[${d.duplicates.join(',')}]
+length=${d.length}`;
+}
+
+// Mechanically rewrites this protocol's "@@ field_name" wire markers to
+// the "## field_name" Markdown headings taskCard.js's parseTaskCard
+// expects. This is a pure delimiter translation, not a second Task Card
+// model: the resulting text is fed straight into the existing parser, so
+// all of its field/schema validation still applies unchanged. A body that
+// uses Markdown "##" headings instead of "@@" markers is left untouched
+// here and falls through to parseTaskCard's own "no ## field_name
+// headings" failure — no repair, no guessing.
+function toTaskCardHeadings(body) {
+  return body.replace(/^@@\s+(\w+)\s*$/gm, '## $1');
+}
+
+// On any NEXT_TASK parse failure, logs the structural (field-content-free)
+// diagnostic and folds it into the thrown error's message so a live run
+// shows the exact wire shape GPT returned without ever printing what a
+// field contained — see describeSupervisorReplyStructure's doc comment.
+function invalidNextTask(body, message) {
+  const diagnostic = formatSupervisorReplyDiagnostic(`${SUPERVISOR_ACTIONS.NEXT_TASK}\n${body}`);
+  console.error(diagnostic);
+  return invalid(`${message}\n${diagnostic}`);
+}
+
 function parseNextTask(body) {
   if (!isNonEmptyString(body)) {
-    throw invalid('NEXT_TASK output has no Task Card body');
+    throw invalidNextTask(body, 'NEXT_TASK output has no Task Card body');
+  }
+  if (!/^@@\s+\w+\s*$/m.test(body)) {
+    throw invalidNextTask(
+      body,
+      'NEXT_TASK task_card is invalid: no "@@ field_name" markers found. The Supervisor must use "@@ field_name" section markers, not "## field_name" Markdown headings — Markdown headings do not survive ChatGPT rendering and are rejected, never guessed at.'
+    );
   }
   let taskCard;
   try {
-    taskCard = parseTaskCard(body);
+    taskCard = parseTaskCard(toTaskCardHeadings(body));
   } catch (err) {
-    throw invalid(`NEXT_TASK task_card is invalid: ${err.message}`);
+    throw invalidNextTask(body, `NEXT_TASK task_card is invalid: ${err.message}`);
   }
   return { action: SUPERVISOR_ACTIONS.NEXT_TASK, task_card: taskCard };
 }
@@ -237,7 +344,7 @@ function parseContinueRework(body) {
 function parseWorkflowDone(body) {
   const sections = parseSections(body);
   if (!isNonEmptyString(sections.summary)) {
-    throw invalid('WORKFLOW_DONE output must have a non-empty "## summary" section');
+    throw invalid('WORKFLOW_DONE output must have a non-empty "@@ summary" section');
   }
   return { action: SUPERVISOR_ACTIONS.WORKFLOW_DONE, summary: sections.summary };
 }
@@ -245,10 +352,10 @@ function parseWorkflowDone(body) {
 function parseHumanRequired(body) {
   const sections = parseSections(body);
   if (!isNonEmptyString(sections.reason)) {
-    throw invalid('HUMAN_REQUIRED output must have a non-empty "## reason" section');
+    throw invalid('HUMAN_REQUIRED output must have a non-empty "@@ reason" section');
   }
   if (!isNonEmptyString(sections.question)) {
-    throw invalid('HUMAN_REQUIRED output must have a non-empty "## question" section');
+    throw invalid('HUMAN_REQUIRED output must have a non-empty "@@ question" section');
   }
   return { action: SUPERVISOR_ACTIONS.HUMAN_REQUIRED, reason: sections.reason, question: sections.question };
 }
@@ -261,8 +368,8 @@ function parseHumanRequired(body) {
 //     known action words
 //   - NEXT_TASK with a missing/invalid Task Card body
 //   - CONTINUE_REWORK carrying any body at all
-//   - WORKFLOW_DONE with a missing/empty "## summary" section
-//   - HUMAN_REQUIRED with a missing/empty "## reason" or "## question" section
+//   - WORKFLOW_DONE with a missing/empty "@@ summary" section
+//   - HUMAN_REQUIRED with a missing/empty "@@ reason" or "@@ question" section
 export function parseSupervisorDecision(text) {
   if (!isNonEmptyString(text)) {
     throw invalid('supervisor output is empty');

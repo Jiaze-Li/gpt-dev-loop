@@ -283,25 +283,25 @@ test('git evidence collector output is directly consumable by the GPT Reviewer A
   const reviewer = createGptReviewerAdapter({
     askGptFn: async (prompt) => {
       capturedPrompt = prompt;
-      return `## task_id
+      return `@@ task_id
 demo-task
 
-## repository_context
+@@ repository_context
 repository_name: gpt-dev-loop
 repository_url: https://github.com/example/gpt-dev-loop.git
 branch: main
 commit_sha: abc123def
 
-## decision
+@@ decision
 PASS
 
-## findings
+@@ findings
 - looks fine
 
-## required_changes
+@@ required_changes
 none
 
-## rationale
+@@ rationale
 matches acceptance_criteria`;
     },
     config: {},

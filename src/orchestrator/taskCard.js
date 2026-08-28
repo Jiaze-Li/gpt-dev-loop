@@ -10,7 +10,7 @@
 
 import { readFile } from 'node:fs/promises';
 
-const REQUIRED_FIELDS = [
+export const REQUIRED_FIELDS = [
   'task_id',
   'repository_context',
   'goal',

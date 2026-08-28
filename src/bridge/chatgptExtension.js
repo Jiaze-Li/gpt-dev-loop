@@ -21,6 +21,7 @@ import {
   ConversationIdentityError,
   SupervisorTabLostError,
   SupervisorIdentityMismatchError,
+  SupervisorAttachMismatchError,
 } from './errors.js';
 import { ExtensionProtocolError } from './extensionProtocol.js';
 
@@ -35,6 +36,8 @@ const ERROR_CODE_MAP = {
   RESPONSE_TIMEOUT: ResponseTimeoutError,
   RESPONSE_EMPTY: ResponseExtractionError,
   SEND_FAILED: SendFailedError,
+  PROMPT_INSERTION_TIMEOUT: SendFailedError,
+  PROMPT_INSERTION_FAILED: SendFailedError,
   RATE_LIMITED: RateLimitedError,
   CONVERSATION_IDENTITY_NOT_FOUND: ConversationIdentityError,
   CONVERSATION_NOT_FOUND: CleanupFailedError,
@@ -42,6 +45,7 @@ const ERROR_CODE_MAP = {
   DELETE_NOT_CONFIRMED: CleanupFailedError,
   SUPERVISOR_TAB_LOST: SupervisorTabLostError,
   SUPERVISOR_IDENTITY_MISMATCH: SupervisorIdentityMismatchError,
+  SUPERVISOR_ATTACH_MISMATCH: SupervisorAttachMismatchError,
   INTERNAL_ERROR: ChromeUnavailableError,
 };
 

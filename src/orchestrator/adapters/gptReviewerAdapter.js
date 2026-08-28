@@ -127,6 +127,23 @@ function renderEvidence(evidence) {
   if (evidence?.base || evidence?.head) {
     sections.push(`### base/head\nbase: ${evidence.base ?? 'none'}\nhead: ${evidence.head ?? 'none'}`);
   }
+  if (evidence?.baseline) {
+    const b = evidence.baseline;
+    sections.push(
+      `### workflow baseline\nbranch: ${b.branch ?? 'unknown'}\nhead: ${b.head ?? 'unknown'}\n` +
+        `clean: ${b.clean === undefined ? 'unknown' : b.clean}\nisolated_worktree: ${b.isolated_worktree ?? false}`
+    );
+  }
+  if (Array.isArray(evidence?.untracked_files) && evidence.untracked_files.length) {
+    const lines = evidence.untracked_files
+      .map((f) =>
+        f.included
+          ? `- ${f.path} (new file, ${f.bytes} bytes — full contents in the diff below)`
+          : `- ${f.path} (new file, ${f.bytes ?? 'unknown'} bytes — ${f.reason ?? 'omitted'}, contents not shown)`
+      )
+      .join('\n');
+    sections.push(`### task-produced untracked files\n${lines}`);
+  }
   if (evidence?.diff !== undefined) {
     sections.push(`### git diff\n\`\`\`diff\n${evidence.diff || '(no changes)'}\n\`\`\``);
   }
@@ -143,6 +160,22 @@ function renderEvidence(evidence) {
 // Instructs GPT to act as Reviewer and reply with nothing but a
 // REVIEW_RESULT.md §3-shaped document, so parseReviewResult can recover it
 // deterministically.
+//
+// Wire format — render-stable "@@ field_name" markers, NOT Markdown "##"
+// headings (2026-08-27, same lesson already learned for the Supervisor
+// protocol — see supervisorProtocol.js's own header comment). Live evidence:
+// a real ReviewerSession.review() round trip (extension transport) came back
+// with the "repository_context" section entirely missing even though GPT's
+// reply plainly discussed it — because ReviewerSession/extension/domActions.js
+// reads the reply from ChatGPT's *rendered* assistant DOM (`.markdown`
+// innerText), and ChatGPT renders a literal "## repository_context" line as
+// an actual <h2> element whose innerText is just "repository_context" with
+// the "##" characters gone. "@@ field_name" is not special to Markdown, so it
+// survives that rendering unchanged. The one-shot adapter below (askGpt, via
+// either the Playwright or extension transport) reuses this exact same
+// prompt/parser — Playwright's raw-text replies were never affected by this,
+// but there is only one Review Result wire format in this codebase, not one
+// per transport.
 // Repository Context header (Phase 6.3.1): a plain-language block up front
 // so GPT can state which repository/branch/commit it is reviewing without
 // having to dig for it inside the Task Card body. The Task Card is still
@@ -170,12 +203,31 @@ ${ctx.commit_sha ?? 'unknown'}`;
 // duplicating the Task Card/Execution Report/Evidence rendering logic — see
 // that file's own doc comment for why a multi-turn Reviewer conversation
 // needs additional framing text on top of this per-turn content.
+// The rendered Task Card + Execution Report + Evidence block, without any
+// transport-specific wire-format instructions. Exported so the agy Gemini
+// Reviewer (agyReviewerProvider.js) shows the model the exact same rendered
+// inputs this ChatGPT adapter does — there is only one rendering path for
+// review inputs in this codebase.
+export function renderReviewInputs(taskCard, executionReport, evidence) {
+  return `# Task Card (TASK_PROTOCOL.md)
+
+${renderTaskCard(taskCard)}
+
+# Execution Report (EXECUTION_REPORT.md)
+
+${renderExecutionReport(executionReport)}
+
+# Evidence
+
+${renderEvidence(evidence)}`;
+}
+
 export function buildReviewPrompt(taskCard, executionReport, evidence) {
   return `You are the Reviewer in an automated dev loop. Judge whether the Execution Report below satisfies the Task Card's acceptance_criteria, using the evidence provided. Per REVIEW_POLICY.md, judge intent-alignment — do not merely restate the gate pass/fail already shown in the evidence. If the evidence's diff status is NO_CHANGES, decide for yourself whether that's acceptable for this task's acceptance_criteria — the evidence only reports the fact, not the verdict.
 
 ${renderRepositoryHeader(taskCard, executionReport)}
 
-Reply with ONLY a Review Result: one Markdown document, one "## field_name" heading per field, in exactly this order: task_id, repository_context, decision, findings, required_changes, rationale. repository_context here is the commit this review was actually performed against. No text before or after it.
+Reply with ONLY a Review Result: a plain-text document using literal "@@ field_name" markers, one per field, in EXACTLY this order: task_id, repository_context, decision, findings, required_changes, rationale. Do NOT use Markdown headings ("## field_name") for these markers — your reply is read back from the rendered page, not as raw text, and Markdown heading characters do not survive that rendering. Write "@@ field_name" exactly as shown, never "## field_name". repository_context here is the commit this review was actually performed against. decision must be exactly ONE of the words PASS, REWORK, or HUMAN_REQUIRED — never write the literal string "PASS | REWORK | HUMAN_REQUIRED". No text before or after the document.
 
 # Task Card (TASK_PROTOCOL.md)
 
@@ -191,25 +243,25 @@ ${renderEvidence(evidence)}
 
 # Review Result template
 
-## task_id
+@@ task_id
 ${taskCard.task_id}
 
-## repository_context
+@@ repository_context
 repository_name: <name>
 repository_url: <url, or "none">
 branch: <branch>
 commit_sha: <the commit this review was performed against>
 
-## decision
-PASS | REWORK | HUMAN_REQUIRED
+@@ decision
+<exactly one of: PASS, REWORK, HUMAN_REQUIRED>
 
-## findings
+@@ findings
 - <specific observation, tied to a file/criterion/behavior>
 
-## required_changes
+@@ required_changes
 - <specific, actionable change; or "none" if PASS>
 
-## rationale
+@@ rationale
 <why this decision, tied to acceptance_criteria>`;
 }
 
@@ -222,60 +274,72 @@ function parseList(raw) {
     .map((line) => line.slice(2).trim());
 }
 
-// Splits GPT's reply on "## field_name" headings (TASK_PROTOCOL.md §1
-// convention) and validates it against REVIEW_RESULT.md §2.
+function invalidReviewResult(message) {
+  return new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT, message);
+}
+
+// Splits GPT's reply on literal "@@ field_name" markers (see buildReviewPrompt's
+// header comment above for why "## field_name" Markdown headings are not
+// render-stable across ChatGPT's rendered assistant DOM) and validates it
+// against REVIEW_RESULT.md §2. Deliberately no fuzzy/natural-language
+// repair anywhere below — a reply that doesn't match this exact shape fails
+// closed with the raw reply attached for diagnosis, mirroring
+// supervisorProtocol.js's own "no malformed-output repair" policy.
 //
-// The prompt asks for literal "## field_name" markdown, but the reply
-// crosses through ChatGPT's *rendered* web UI (extension/domActions.js
-// reads `.innerText` off the rendered DOM, not the raw markdown source) —
-// the browser renders "## task_id" as a heading element and its innerText
-// is just "task_id", with the "##" characters gone entirely (observed
-// live: 2026-08-26). The Playwright/CLI-backed executor doesn't have this
-// problem (its output is raw text, never DOM-rendered), so only this
-// parser needs to tolerate the "##" being stripped. Matches each known
-// field name alone on its own line, with an optional "##" prefix and/or
-// trailing colon, case-insensitively.
 // Exported for reviewerSession.js — same parser, same REVIEW_RESULT.md §2
 // contract, whether the reply came from a fresh one-shot conversation
 // (this adapter) or a task-scoped multi-turn one (ReviewerSession).
 export function parseReviewResult(taskId, text) {
-  const fieldPattern = RESULT_FIELDS.join('|');
-  const headingRe = new RegExp(`^#{0,2}\\s*(${fieldPattern})\\s*:?\\s*$`, 'gim');
+  const headingRe = /^@@\s+(\w+)\s*:?\s*$/gim;
   const matches = [...text.matchAll(headingRe)];
   if (matches.length === 0) {
-    throw new AdapterError(
-      ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT,
-      `reviewer output contained no Review Result headings. Raw reply (first 1000 chars): ${text.slice(0, 1000)}`
+    throw invalidReviewResult(
+      `reviewer output contained no "@@ field_name" Review Result markers (Markdown "##" headings are not a valid wire contract here — they do not survive ChatGPT's rendered DOM). Raw reply (first 1000 chars): ${text.slice(0, 1000)}`
     );
   }
 
+  // Only the six known Review Result fields are tracked for
+  // presence/duplicate/order purposes — an unrecognized "@@ something_else"
+  // marker is not itself an error (e.g. incidental text that happens to
+  // match the marker shape), it simply isn't one of the fields validated
+  // below.
   const sections = {};
+  const seenOrder = [];
   for (let i = 0; i < matches.length; i += 1) {
     const name = matches[i][1].toLowerCase();
+    if (!RESULT_FIELDS.includes(name)) continue;
     const start = matches[i].index + matches[i][0].length;
     const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
+    if (name in sections) {
+      throw invalidReviewResult(`reviewer output has a duplicate "@@ ${name}" marker — exactly one is required.`);
+    }
     sections[name] = text.slice(start, end).trim();
+    seenOrder.push(name);
   }
 
   for (const field of RESULT_FIELDS) {
     if (!(field in sections)) {
-      throw new AdapterError(
-        ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT,
-        `reviewer output is missing the "${field}" section`
-      );
+      throw invalidReviewResult(`reviewer output is missing the "@@ ${field}" section`);
     }
   }
 
-  if (!DECISIONS.has(sections.decision)) {
-    throw new AdapterError(
-      ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT,
-      `reviewer output has an invalid decision: "${sections.decision}"`
+  if (!RESULT_FIELDS.every((field, i) => seenOrder[i] === field)) {
+    throw invalidReviewResult(
+      `reviewer output's "@@ field_name" markers must appear in exactly this order: ${RESULT_FIELDS.join(', ')} — got: ${seenOrder.join(', ')}`
     );
   }
 
+  if (sections.decision === 'PASS | REWORK | HUMAN_REQUIRED') {
+    throw invalidReviewResult(
+      'reviewer output\'s "@@ decision" section is the literal template placeholder "PASS | REWORK | HUMAN_REQUIRED" — the Reviewer must pick exactly one.'
+    );
+  }
+  if (!DECISIONS.has(sections.decision)) {
+    throw invalidReviewResult(`reviewer output has an invalid decision: "${sections.decision}"`);
+  }
+
   if (sections.task_id !== taskId) {
-    throw new AdapterError(
-      ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT,
+    throw invalidReviewResult(
       `reviewer Review Result task_id "${sections.task_id}" does not match Task Card task_id "${taskId}"`
     );
   }

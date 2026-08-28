@@ -54,25 +54,25 @@ function demoEvidence(overrides = {}) {
 }
 
 function resultText({ taskId = 'demo-task', decision = 'PASS' } = {}) {
-  return `## task_id
+  return `@@ task_id
 ${taskId}
 
-## repository_context
+@@ repository_context
 repository_name: gpt-dev-loop
 repository_url: https://github.com/example/gpt-dev-loop
 branch: phase1-handshake
 commit_sha: def456
 
-## decision
+@@ decision
 ${decision}
 
-## findings
+@@ findings
 - looks correct
 
-## required_changes
+@@ required_changes
 ${decision === 'PASS' ? 'none' : '- fix the thing'}
 
-## rationale
+@@ rationale
 meets acceptance_criteria`;
 }
 
@@ -100,7 +100,7 @@ test('gpt reviewer adapter: parses a PASS result into review_result shape', asyn
     rationale: 'meets acceptance_criteria',
   });
 
-  assert.match(capturedPrompt, /## task_id\ndemo-task/);
+  assert.match(capturedPrompt, /@@ task_id\ndemo-task/);
   assert.match(capturedPrompt, /Task Card \(TASK_PROTOCOL\.md\)/);
   assert.match(capturedPrompt, /Execution Report \(EXECUTION_REPORT\.md\)/);
   assert.match(capturedPrompt, /gate results/);
@@ -198,10 +198,10 @@ test('gpt reviewer adapter: accepts HUMAN_REQUIRED decision', async () => {
 });
 
 test('gpt reviewer adapter: missing section throws REVIEWER_INVALID_OUTPUT', async () => {
-  const askGptFn = async () => `## task_id
+  const askGptFn = async () => `@@ task_id
 demo-task
 
-## decision
+@@ decision
 PASS`;
   const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
 
@@ -210,6 +210,236 @@ PASS`;
     (err) => {
       assert.ok(err instanceof AdapterError);
       assert.equal(err.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+      return true;
+    }
+  );
+});
+
+// Live evidence (2026-08-27): a real ReviewerSession.review() round trip
+// came back with "reviewer output is missing the repository_context
+// section" even though GPT's reply plainly discussed it — because the
+// reply crosses through ChatGPT's rendered DOM (extension/domActions.js
+// reads .innerText, not raw markdown source) and a literal "## field_name"
+// heading does not survive that rendering (see parseReviewResult's own doc
+// comment). This is the exact regression that motivated switching the wire
+// format to "@@ field_name" markers.
+test('gpt reviewer adapter: missing "@@ repository_context" specifically is rejected', async () => {
+  const askGptFn = async () => `@@ task_id
+demo-task
+
+@@ decision
+PASS
+
+@@ findings
+- looks correct
+
+@@ required_changes
+none
+
+@@ rationale
+meets acceptance_criteria`;
+  const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
+
+  await assert.rejects(
+    () => adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence()),
+    (err) => {
+      assert.equal(err.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+      assert.match(err.message, /repository_context/);
+      return true;
+    }
+  );
+});
+
+// Markdown "## field_name" headings must never be treated as an acceptable
+// primary wire contract, even when every field is otherwise present in the
+// right order — only "@@ field_name" markers are read.
+test('gpt reviewer adapter: Markdown-only "## field_name" headings are rejected, not silently accepted', async () => {
+  const askGptFn = async () => `## task_id
+demo-task
+
+## repository_context
+repository_name: gpt-dev-loop
+repository_url: https://github.com/example/gpt-dev-loop
+branch: phase1-handshake
+commit_sha: def456
+
+## decision
+PASS
+
+## findings
+- looks correct
+
+## required_changes
+none
+
+## rationale
+meets acceptance_criteria`;
+  const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
+
+  await assert.rejects(
+    () => adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence()),
+    (err) => {
+      assert.equal(err.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+      return true;
+    }
+  );
+});
+
+// Simulates exactly what crosses the ChatGPT rendered-DOM boundary: no
+// blank line before the marker's own content is guaranteed to be preserved
+// oddly by rendering in every case, but the "@@ field_name" marker text
+// itself must survive untouched (unlike "##", which the browser turns into
+// an <h2> element and strips entirely) — this is the render-stability
+// property the whole wire format switch depends on.
+test('gpt reviewer adapter: "@@ field_name" markers parse correctly as rendered-web plain text (no "##" anywhere)', async () => {
+  const renderedText = `@@ task_id
+demo-task
+
+@@ repository_context
+repository_name: gpt-dev-loop
+repository_url: https://github.com/example/gpt-dev-loop
+branch: phase1-handshake
+commit_sha: def456
+
+@@ decision
+PASS
+
+@@ findings
+- observation one
+- observation two
+
+@@ required_changes
+none
+
+@@ rationale
+meets acceptance_criteria`;
+  assert.ok(!renderedText.includes('##'), 'fixture must not contain any Markdown heading syntax');
+
+  const askGptFn = async () => renderedText;
+  const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
+
+  const result = await adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+
+  assert.equal(result.decision, 'PASS');
+  assert.deepEqual(result.findings, ['observation one', 'observation two']);
+});
+
+// The prompt template's own placeholder line must never be mistaken for a
+// real decision if GPT echoes it back verbatim instead of picking one.
+test('gpt reviewer adapter: literal "PASS | REWORK | HUMAN_REQUIRED" placeholder is rejected', async () => {
+  const askGptFn = async () => resultText({ decision: 'PASS | REWORK | HUMAN_REQUIRED' });
+  const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
+
+  await assert.rejects(
+    () => adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence()),
+    (err) => {
+      assert.equal(err.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+      assert.match(err.message, /placeholder/);
+      return true;
+    }
+  );
+});
+
+test('gpt reviewer adapter: findings and required_changes multiline lists survive parsing', async () => {
+  const askGptFn = async () => `@@ task_id
+demo-task
+
+@@ repository_context
+repository_name: gpt-dev-loop
+repository_url: https://github.com/example/gpt-dev-loop
+branch: phase1-handshake
+commit_sha: def456
+
+@@ decision
+REWORK
+
+@@ findings
+- first finding, tied to a specific file
+- second finding, tied to a specific behavior
+- third finding, tied to a specific criterion
+
+@@ required_changes
+- fix the first thing
+- fix the second thing
+
+@@ rationale
+meets some but not all acceptance_criteria`;
+  const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
+
+  const result = await adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence());
+
+  assert.deepEqual(result.findings, [
+    'first finding, tied to a specific file',
+    'second finding, tied to a specific behavior',
+    'third finding, tied to a specific criterion',
+  ]);
+  assert.deepEqual(result.required_changes, ['fix the first thing', 'fix the second thing']);
+});
+
+test('gpt reviewer adapter: a duplicate "@@ decision" marker is rejected', async () => {
+  const askGptFn = async () => `@@ task_id
+demo-task
+
+@@ repository_context
+repository_name: gpt-dev-loop
+repository_url: https://github.com/example/gpt-dev-loop
+branch: phase1-handshake
+commit_sha: def456
+
+@@ decision
+PASS
+
+@@ decision
+REWORK
+
+@@ findings
+- looks correct
+
+@@ required_changes
+none
+
+@@ rationale
+meets acceptance_criteria`;
+  const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
+
+  await assert.rejects(
+    () => adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence()),
+    (err) => {
+      assert.equal(err.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+      assert.match(err.message, /duplicate/);
+      return true;
+    }
+  );
+});
+
+test('gpt reviewer adapter: "@@ field_name" markers out of order are rejected', async () => {
+  const askGptFn = async () => `@@ task_id
+demo-task
+
+@@ decision
+PASS
+
+@@ repository_context
+repository_name: gpt-dev-loop
+repository_url: https://github.com/example/gpt-dev-loop
+branch: phase1-handshake
+commit_sha: def456
+
+@@ findings
+- looks correct
+
+@@ required_changes
+none
+
+@@ rationale
+meets acceptance_criteria`;
+  const adapter = createGptReviewerAdapter({ askGptFn, config: {} });
+
+  await assert.rejects(
+    () => adapter.review(demoTaskCard(), demoExecutionReport(), demoEvidence()),
+    (err) => {
+      assert.equal(err.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+      assert.match(err.message, /exactly this order/);
       return true;
     }
   );

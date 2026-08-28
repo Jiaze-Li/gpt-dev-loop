@@ -40,7 +40,7 @@ function runShellCommand(command, { cwd, env, spawn }) {
   });
 }
 
-export function createGateRunner({ gitEvidenceCollector, cwd = process.cwd(), env = process.env, spawn = nodeSpawn } = {}) {
+export function createGateRunner({ gitEvidenceCollector, cwd = process.cwd(), env = process.env, spawn = nodeSpawn, baseline = null } = {}) {
   return {
     async run(verificationCommands) {
       const commands = verificationCommands ?? [];
@@ -53,7 +53,7 @@ export function createGateRunner({ gitEvidenceCollector, cwd = process.cwd(), en
       }
 
       const testResults = { pass: results.every((result) => result.pass), results };
-      return gitEvidenceCollector.collect_evidence({ cwd, testResults });
+      return gitEvidenceCollector.collect_evidence({ cwd, testResults, baseline });
     },
   };
 }

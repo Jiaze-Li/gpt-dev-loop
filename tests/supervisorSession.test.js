@@ -4,7 +4,7 @@ import WebSocket from 'ws';
 
 import { SupervisorSession } from '../src/bridge/supervisorSession.js';
 import { getExtensionServer, closeExtensionServer } from '../src/bridge/extensionServer.js';
-import { SupervisorTabLostError, SupervisorIdentityMismatchError } from '../src/bridge/errors.js';
+import { SupervisorTabLostError, SupervisorIdentityMismatchError, SupervisorAttachMismatchError } from '../src/bridge/errors.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
 
 const EXTENSION_ID = 'test-extension-id';
@@ -160,6 +160,131 @@ test('ask() rejects with SupervisorIdentityMismatchError and does not update the
   client.close();
 });
 
+// --- attach() (conversation reattach/resume primitive) ------------------
+
+test('attach() to the exact conversationId succeeds and ask() works afterward', async () => {
+  const config = nextConfig();
+  const seenRequests = [];
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    seenRequests.push(msg.payload);
+    if (msg.payload.action === 'supervisorAttach') {
+      assert.equal(msg.payload.conversationId, 'conv-exact-1');
+      ws.send(
+        JSON.stringify({
+          protocol: PROTOCOL_ID,
+          type: 'response',
+          requestId: msg.requestId,
+          payload: { text: '', tabId: 900, conversationId: 'conv-exact-1' },
+        })
+      );
+      return;
+    }
+    ws.send(
+      JSON.stringify({
+        protocol: PROTOCOL_ID,
+        type: 'response',
+        requestId: msg.requestId,
+        payload: { text: 'SUPERVISOR-731', conversationId: 'conv-exact-1' },
+      })
+    );
+  });
+
+  const session = new SupervisorSession(config);
+  const identity = await session.attach('conv-exact-1');
+  assert.deepEqual(identity, { tabId: 900, conversationId: 'conv-exact-1' });
+
+  const reply = await session.ask('What code did I ask you to remember earlier?');
+  assert.equal(reply, 'SUPERVISOR-731');
+
+  assert.equal(seenRequests.filter((p) => p.action === 'supervisorCreate').length, 0, 'attach() must never create a new conversation');
+  const askRequests = seenRequests.filter((p) => p.action === 'supervisorAsk');
+  assert.equal(askRequests[0].tabId, 900);
+  assert.equal(askRequests[0].expectedConversationId, 'conv-exact-1');
+  client.close();
+});
+
+test('attach() preserves the exact conversation identity across the session', async () => {
+  const config = nextConfig();
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    if (msg.payload.action === 'supervisorAttach') {
+      ws.send(
+        JSON.stringify({
+          protocol: PROTOCOL_ID,
+          type: 'response',
+          requestId: msg.requestId,
+          payload: { text: '', tabId: 901, conversationId: 'conv-exact-2' },
+        })
+      );
+    }
+  });
+
+  const session = new SupervisorSession(config);
+  await session.attach('conv-exact-2');
+  assert.deepEqual(session.getIdentity(), { tabId: 901, conversationId: 'conv-exact-2' });
+  client.close();
+});
+
+test('attach() rejects with SupervisorAttachMismatchError when the loaded conversation does not match, and never creates a new one', async () => {
+  const config = nextConfig();
+  const seenRequests = [];
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    seenRequests.push(msg.payload);
+    ws.send(
+      JSON.stringify({
+        protocol: PROTOCOL_ID,
+        type: 'error',
+        requestId: msg.requestId,
+        error: { code: 'SUPERVISOR_ATTACH_MISMATCH', message: 'expected "conv-a", got "conv-b"' },
+      })
+    );
+  });
+
+  const session = new SupervisorSession(config);
+  await assert.rejects(() => session.attach('conv-a'), SupervisorAttachMismatchError);
+  assert.deepEqual(session.getIdentity(), { tabId: null, conversationId: null }, 'a failed attach must leave the session exactly as if attach() was never called');
+  assert.equal(seenRequests.filter((p) => p.action === 'supervisorCreate').length, 0, 'a failed attach must never fall back to creating a new conversation');
+  client.close();
+});
+
+test('attach() rejects with SupervisorTabLostError when the tab is lost before identity can be verified', async () => {
+  const config = nextConfig();
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    ws.send(
+      JSON.stringify({ protocol: PROTOCOL_ID, type: 'error', requestId: msg.requestId, error: { code: 'SUPERVISOR_TAB_LOST', message: 'gone' } })
+    );
+  });
+
+  const session = new SupervisorSession(config);
+  await assert.rejects(() => session.attach('conv-a'), SupervisorTabLostError);
+  assert.deepEqual(session.getIdentity(), { tabId: null, conversationId: null });
+  client.close();
+});
+
+test('attach() throws immediately for an empty conversationId, without contacting the extension', async () => {
+  const config = nextConfig();
+  const session = new SupervisorSession(config);
+  await assert.rejects(() => session.attach(''), /conversationId/);
+});
+
+test('attach() cannot be called twice without an intervening close()', async () => {
+  const config = nextConfig();
+  const client = await connectFakeExtension(config, (ws, msg) => {
+    ws.send(
+      JSON.stringify({
+        protocol: PROTOCOL_ID,
+        type: 'response',
+        requestId: msg.requestId,
+        payload: { text: '', tabId: 902, conversationId: 'conv-exact-3' },
+      })
+    );
+  });
+
+  const session = new SupervisorSession(config);
+  await session.attach('conv-exact-3');
+  await assert.rejects(() => session.attach('conv-exact-4'), /already called/);
+  client.close();
+});
+
 test('close() sends supervisorClose for the saved tabId and resets identity to null', async () => {
   const config = nextConfig();
   const seenRequests = [];
@@ -224,7 +349,7 @@ test('decide() sends the built Supervisor prompt and returns the parsed decision
         protocol: PROTOCOL_ID,
         type: 'response',
         requestId: msg.requestId,
-        payload: { text: 'WORKFLOW_DONE\n\n## summary\ndone', conversationId: 'conv-decide' },
+        payload: { text: 'WORKFLOW_DONE\n\n@@ summary\ndone', conversationId: 'conv-decide' },
       })
     );
   });
@@ -236,7 +361,7 @@ test('decide() sends the built Supervisor prompt and returns the parsed decision
   assert.deepEqual(decision, { action: 'WORKFLOW_DONE', summary: 'done' });
   assert.equal(seenPrompts.length, 1);
   assert.match(seenPrompts[0], /ship it/);
-  assert.match(seenPrompts[0], /## summary/);
+  assert.match(seenPrompts[0], /@@ summary/);
   client.close();
 });
 
