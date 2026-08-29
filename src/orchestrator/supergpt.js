@@ -248,6 +248,12 @@ export function workflowRuntimeDirectory(workflowId) {
 //
 const ACTIVE_WORKFLOWS = new Map();
 
+// Test-only hook: lets a regression drive the same-process stop/resume
+// ownership path deterministically without spinning a real pipeline.
+export function __ACTIVE_WORKFLOWS_FOR_TEST() {
+  return ACTIVE_WORKFLOWS;
+}
+
 function isProcessAlive(pid) {
   if (!pid || typeof pid !== 'number') return false;
   try {
@@ -495,6 +501,15 @@ export async function runSuperGPT({
     if (err instanceof CancellationError || signal?.aborted || internalAbort.signal.aborted) {
       result.status = 'CANCELLED';
       result.reason = stopReason ?? 'run cancelled by AbortSignal';
+      // Single-writer control.json: the OWNING process is the only party
+      // allowed to mark the workflow resumable, and it does so here, after it
+      // has actually observed the stop and unwound its own pipeline. A foreign
+      // `supergpt stop` never touches control.json.
+      try {
+        if (existsSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`))) {
+          markResumable({ root: SUPERGPT_WORKTREE_ROOT, workflowId, resumable: true });
+        }
+      } catch { /* best effort — resume also tolerates an absent flag */ }
       workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.STOPPED, {
         reason: result.reason,
         stopInitiator: 'user',
@@ -1234,6 +1249,7 @@ export async function supergptStop({
   //    if teardown hangs.
   const running = ACTIVE_WORKFLOWS.get(workflowId);
   let ownerAcknowledged = false;
+  let sameProcessOwnerTimedOut = false;
   if (running) {
     running.abortController?.abort();
     if (running.completionPromise && ownerPid === process.pid) {
@@ -1245,8 +1261,28 @@ export async function supergptStop({
       if (outcome === 'done') {
         const st = readLiveWorkflowState({ workflowId, root });
         if (st && OWNER_TERMINAL_STATUSES.has(st.workflowStatus)) ownerAcknowledged = true;
+      } else {
+        // The owning run's teardown did not settle in time. We must NOT release
+        // ownership: removing ACTIVE_WORKFLOWS, forcing a STOPPED state, or
+        // marking resumable now would let a resume overlap a pipeline that is
+        // still live. Keep every ownership/tombstone marker in place and return
+        // a structured fail-closed result. The run's own finalizer will remove
+        // ACTIVE_WORKFLOWS once it truly exits, after which resume is allowed.
+        sameProcessOwnerTimedOut = true;
       }
     }
+  }
+
+  if (sameProcessOwnerTimedOut) {
+    return {
+      workflowId,
+      status: 'STOP_TIMEOUT',
+      failClosed: true,
+      reason: `owner teardown did not complete within ${waitForOwnerMs}ms — stop request recorded and ownership retained; resume remains blocked until the original run exits`,
+      ownerPid,
+      ownerAlive: true,
+      ownerAcknowledged: false,
+    };
   }
 
   // 3. Foreign, live owner: wait (bounded) for it to acknowledge by
@@ -1320,9 +1356,18 @@ export async function supergptStop({
   // cleared and its status is terminal-finished).
   const metadataPath = path.join(root, `${workflowId}.workspace.json`);
   if (existsSync(metadataPath)) {
-    try {
-      markResumable({ root, workflowId, resumable: true });
-    } catch { /* best effort */ }
+    // Single-writer control.json: only touch it here when NO live foreign owner
+    // exists. A same-process owner marks itself resumable from its own cancel
+    // path; a live foreign owner does the same after observing the stop. A
+    // foreign `supergpt stop` writing control.json here could clobber that
+    // owner's concurrent checkpoint / baseline / delivery fields.
+    const controlNow = readControl({ root, workflowId });
+    const liveForeignOwner = isOwnerAlive(controlNow) && controlNow?.owner?.pid !== process.pid;
+    if (!liveForeignOwner) {
+      try {
+        markResumable({ root, workflowId, resumable: true });
+      } catch { /* best effort */ }
+    }
     const resourcesPath = path.join(root, `${workflowId}.resources.json`);
     if (existsSync(resourcesPath)) {
       try {
@@ -1365,9 +1410,27 @@ export async function supergptResume({
   if (!workflowId) throw new Error('supergptResume requires a workflowId');
 
   const root = SUPERGPT_WORKTREE_ROOT;
+
+  // Never let a resume overlap the original run. This covers both a
+  // same-process stop whose teardown has not settled (ACTIVE_WORKFLOWS still
+  // holds the entry — its finalizer removes it only once the pipeline truly
+  // exits) and a still-live owner in another process.
+  if (ACTIVE_WORKFLOWS.has(workflowId)) {
+    throw new Error(`Cannot resume workflow "${workflowId}": its original run in this process is still shutting down. Retry once it has exited.`);
+  }
+
   const metadataPath = path.join(root, `${workflowId}.workspace.json`);
   if (!existsSync(metadataPath)) {
     throw new Error(`Cannot resume workflow "${workflowId}": workspace metadata not found at ${metadataPath}`);
+  }
+
+  const resumeOwnerControl = readControl({ root, workflowId });
+  if (
+    resumeOwnerControl?.owner?.pid
+    && resumeOwnerControl.owner.pid !== process.pid
+    && isOwnerAlive(resumeOwnerControl)
+  ) {
+    throw new Error(`Cannot resume workflow "${workflowId}": its original run (pid ${resumeOwnerControl.owner.pid}) is still active. Stop it first, then resume.`);
   }
 
   let meta;

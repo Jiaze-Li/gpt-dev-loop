@@ -383,11 +383,11 @@ export async function deliverWorkflowResult({ worktree, delivery = createResultD
   // cleanup failure can never be misread as a failed / conflicting delivery
   // on resume (P2-2).
   if (typeof onDelivered === 'function') {
-    try {
-      await onDelivered({ changed_files: delta.changedPaths });
-    } catch {
-      /* the durable record is best-effort; delivery itself already succeeded */
-    }
+    // Fail closed: if the DELIVERED record cannot be persisted we must NOT
+    // proceed to resource cleanup. The applied bytes are already in the source
+    // workspace; tearing down the worktree now would leave a resume unable to
+    // tell an applied delivery from a conflicting one, risking redelivery.
+    await onDelivered({ changed_files: delta.changedPaths });
   }
 
   // Phase 3 — RESOURCE CLEANUP: a distinct, retryable phase. Its failure is a

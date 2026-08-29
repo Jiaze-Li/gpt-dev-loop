@@ -26,6 +26,17 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, rmSync 
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { isValidWorktreeFingerprint } from './hostVerification.js';
 
+// Thrown when a correctness-critical durable write cannot be proven to have
+// landed on disk. Callers of a verified writer MUST let this propagate — they
+// must never continue as though persistence succeeded.
+export class DurableWriteError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = 'DurableWriteError';
+    this.code = 'DURABLE_WRITE_FAILED';
+  }
+}
+
 export function controlPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
   if (!workflowId) throw new Error('controlPath requires a workflowId');
   return path.join(root, `${workflowId}.control.json`);
@@ -49,13 +60,42 @@ function readJson(file) {
 // one, never a partial write. Atomic replacement alone does NOT solve a
 // cross-process read-modify-write lost update — the file-per-concern split
 // above is what does.
-function atomicWrite(root, file, value) {
+// `verify` may be:
+//   - false/null  → best-effort: any failure is swallowed (legacy behaviour
+//                   for optimisation-only fields).
+//   - true        → fail-closed: on any write/rename/read-back error, or if the
+//                   file does not parse, throw DurableWriteError.
+//   - function    → fail-closed AND the parsed read-back must satisfy the
+//                   predicate, else throw DurableWriteError.
+function atomicWrite(root, file, value, { verify = null } = {}) {
+  const failClosed = verify === true || typeof verify === 'function';
   try {
     if (!existsSync(root)) mkdirSync(root, { recursive: true });
+    const serialized = `${JSON.stringify(value, null, 2)}\n`;
     const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
-    writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-    renameSync(tmp, file);
-  } catch {
+    writeFileSync(tmp, serialized, 'utf8');
+    try {
+      renameSync(tmp, file);
+    } catch (err) {
+      try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
+      throw err;
+    }
+    if (failClosed) {
+      let parsed;
+      try {
+        parsed = JSON.parse(readFileSync(file, 'utf8'));
+      } catch (err) {
+        throw new Error(`read-back of ${path.basename(file)} did not parse: ${err.message}`);
+      }
+      const ok = typeof verify === 'function' ? verify(parsed) : parsed !== null;
+      if (!ok) throw new Error(`read-back of ${path.basename(file)} failed verification`);
+    }
+  } catch (err) {
+    if (failClosed) {
+      throw err instanceof DurableWriteError
+        ? err
+        : new DurableWriteError(`durable write to ${path.basename(file)} failed: ${err.message}`, { cause: err });
+    }
     /* best effort — control is an optimisation layer, never the sole source of truth */
   }
 }
@@ -76,13 +116,15 @@ export function readControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) 
 }
 
 // Owner-only merge-write of control.json. NEVER touches the stop record.
-export function writeControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}, patch = {}) {
+export function writeControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}, patch = {}, { verify = false } = {}) {
   const file = controlPath({ root, workflowId });
   const current = readJson(file) ?? {};
   const { stop: _droppedStop, ...patchRest } = patch;
   void _droppedStop;
   const next = { ...current, ...patchRest, workflowId, updatedAt: new Date().toISOString() };
-  atomicWrite(root, file, next);
+  atomicWrite(root, file, next, {
+    verify: verify ? (parsed) => parsed !== null && parsed.updatedAt === next.updatedAt : null,
+  });
   return readControl({ root, workflowId });
 }
 
@@ -102,11 +144,13 @@ export function claimOwner({ root = SUPERGPT_WORKTREE_ROOT, workflowId, pid = pr
 }
 
 export function requestStop({ root = SUPERGPT_WORKTREE_ROOT, workflowId, reason = 'stopped by user' } = {}) {
+  // Fail closed: a cross-process stop that is silently lost would let the owner
+  // run to completion while the caller believes it was cancelled.
   atomicWrite(root, stopPath({ root, workflowId }), {
     requested: true,
     reason,
     requestedAt: new Date().toISOString(),
-  });
+  }, { verify: (parsed) => parsed !== null && parsed.requested === true });
   return readControl({ root, workflowId });
 }
 
@@ -126,7 +170,10 @@ export function markDeliveryReady({ root = SUPERGPT_WORKTREE_ROOT, workflowId, s
 // Git evidence to just that task, never re-including already-accepted tasks.
 export function recordAdvancedBaselineHead({ root = SUPERGPT_WORKTREE_ROOT, workflowId, head } = {}) {
   if (typeof head !== 'string' || head.trim() === '') return readControl({ root, workflowId });
-  return writeControl({ root, workflowId }, { baseline_head: head.trim() });
+  // Fail closed: if this advanced baseline is lost, a later resume scopes the
+  // next task's Git evidence against a stale baseline and re-includes an
+  // already-accepted task's delta.
+  return writeControl({ root, workflowId }, { baseline_head: head.trim() }, { verify: true });
 }
 
 // Durable closeout proof. It intentionally survives a delivery conflict: it
@@ -136,13 +183,19 @@ export function recordCloseoutVerificationEvidence({ root = SUPERGPT_WORKTREE_RO
   if (!evidence || evidence.pass !== true || !isValidWorktreeFingerprint(evidence.worktree_fingerprint)) {
     return readControl({ root, workflowId });
   }
-  return writeControl({ root, workflowId }, { closeout_verification_evidence: evidence });
+  // Fail closed: this is durable closeout proof; a silently-lost write would
+  // force an unnecessary re-verification at best and, combined with other
+  // failures, an unsound delivery at worst.
+  return writeControl({ root, workflowId }, { closeout_verification_evidence: evidence }, { verify: true });
 }
 
 // P2-2: delivery apply succeeded and was carried into the invocation
 // workspace. Persisted BEFORE worktree cleanup so a cleanup failure can never
 // turn an already-applied delivery back into a conflict on resume.
 export function recordDeliveryCompleted({ root = SUPERGPT_WORKTREE_ROOT, workflowId, changedFiles = [], cleanup = null } = {}) {
+  // Fail closed: this record is written BEFORE worktree cleanup precisely so a
+  // cleanup failure cannot turn an applied delivery back into a conflict on
+  // resume. If it is silently lost, the caller must NOT proceed to cleanup.
   return writeControl({ root, workflowId }, {
     delivery: {
       status: 'DELIVERED',
@@ -150,7 +203,7 @@ export function recordDeliveryCompleted({ root = SUPERGPT_WORKTREE_ROOT, workflo
       cleanup: cleanup ?? { status: 'PENDING' },
       completedAt: new Date().toISOString(),
     },
-  });
+  }, { verify: (parsed) => parsed !== null && parsed.delivery?.status === 'DELIVERED' });
 }
 
 export function recordDeliveryCleanup({ root = SUPERGPT_WORKTREE_ROOT, workflowId, status, error = null } = {}) {
@@ -170,7 +223,11 @@ export function markResumable({ root = SUPERGPT_WORKTREE_ROOT, workflowId, resum
 }
 
 export function saveCheckpoint({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}, checkpoint) {
-  return writeControl({ root, workflowId }, { checkpoint, phase: 'engineering' });
+  // Fail closed: the deterministic automated-loop resume point. A REVIEW_PENDING
+  // checkpoint in particular is the only record that lets a resume skip a
+  // completed Executor + Gate; a silently-lost write would replan/re-execute an
+  // already-accepted task.
+  return writeControl({ root, workflowId }, { checkpoint, phase: 'engineering' }, { verify: true });
 }
 
 export function clearControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {

@@ -247,6 +247,11 @@ export async function runAutomatedWorkflow({
 
   const persistCheckpoint = async (extra = {}) => {
     if (typeof onCheckpoint !== 'function') return;
+    // A REVIEW_PENDING checkpoint is the ONLY record that lets a resumed
+    // process skip an already-completed Executor + Gate and re-enter directly
+    // at the Reviewer. If it cannot be persisted we must NOT tell the user the
+    // run is safely resumable with no rework — surface the failure instead.
+    const failClosed = extra.phase === 'REVIEW_PENDING';
     try {
       await onCheckpoint({
         history: history.map((entry) => ({ ...entry })),
@@ -262,8 +267,9 @@ export async function runAutomatedWorkflow({
         worktreeFingerprint: null,
         ...extra,
       });
-    } catch {
-      /* checkpoint persistence is best-effort — never break the loop */
+    } catch (err) {
+      if (failClosed) throw err;
+      /* a plain engineering checkpoint is best-effort — never break the loop */
     }
   };
 
@@ -805,19 +811,30 @@ export async function runAutomatedWorkflow({
     if (resumeReviewPending) {
       const persisted = resumeReviewPending;
       resumeReviewPending = null;
+      const captured = persisted.worktreeFingerprint;
       const currentFp = typeof computeGateFingerprint === 'function' ? computeGateFingerprint() : null;
-      if (persisted.worktreeFingerprint && currentFp && currentFp !== persisted.worktreeFingerprint) {
-        // The worktree changed after the Gate evidence was captured — do not
-        // reuse stale evidence. Route back through a fresh full attempt.
-        log(`REVIEW_PENDING resume: worktree drift detected (was=${persisted.worktreeFingerprint} now=${currentFp}) — re-running attempt`);
-        attemptCount = Math.max(0, attemptCount - 1);
-        const outcome = await runAttempt();
-        if (outcome.done) return outcome.result;
-      } else {
+      const valid = (v) => typeof v === 'string' && v.trim().length > 0;
+      // Saved Executor + Gate evidence may be re-used for a Reviewer-only
+      // resume ONLY when the captured fingerprint is valid AND the current
+      // fingerprint is valid AND they are identical. A null/unavailable
+      // fingerprint on either side means we cannot prove the worktree still
+      // matches — fail closed and route back through a fresh full attempt
+      // (Executor state + Gate) rather than trusting stale evidence.
+      if (valid(captured) && valid(currentFp) && captured === currentFp) {
         const outcome = await runReviewStep({
           executionReport: persisted.executionReport,
           evidence: persisted.evidence,
         });
+        if (outcome.done) return outcome.result;
+      } else {
+        const why = !valid(captured)
+          ? 'captured worktree fingerprint unavailable'
+          : !valid(currentFp)
+            ? 'resume worktree fingerprint unavailable'
+            : `worktree drift detected (was=${captured} now=${currentFp})`;
+        log(`REVIEW_PENDING resume: ${why} — saved Gate evidence not reused, re-running attempt`);
+        attemptCount = Math.max(0, attemptCount - 1);
+        const outcome = await runAttempt();
         if (outcome.done) return outcome.result;
       }
     }
