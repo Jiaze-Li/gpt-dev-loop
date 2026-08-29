@@ -27,6 +27,7 @@ import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.
 import { Persistence } from './persistence.js';
 import { deliverWorkflowResult, createResultDelivery } from './resultDelivery.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
@@ -240,7 +241,12 @@ export function shouldResumeFromDelivery(control) {
 }
 
 export function workflowRuntimeDirectory(workflowId) {
-  return path.join(SUPERGPT_WORKTREE_ROOT, workflowId, 'persistence');
+  validateWorkflowId(workflowId);
+  return assertPathWithinRoot(
+    SUPERGPT_WORKTREE_ROOT,
+    path.join(SUPERGPT_WORKTREE_ROOT, workflowId, 'persistence'),
+    'workflow runtime directory'
+  );
 }
 
 // runSuperGPT — the single programmatic entrypoint.
@@ -299,6 +305,7 @@ export async function runSuperGPT({
   _afterOwnershipAcquired,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
+  validateWorkflowId(workflowId);
   const result = { ...EMPTY_RESULT(), workflowId };
 
   // ATOMIC OWNERSHIP LEASE — the authority. Acquired before ANY durable
@@ -614,7 +621,7 @@ export async function runSuperGPT({
       // has actually observed the stop and unwound its own pipeline. A foreign
       // `supergpt stop` never touches control.json.
       try {
-        if (existsSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`))) {
+        if (existsSync(assertPathWithinRoot(SUPERGPT_WORKTREE_ROOT, path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), 'workspace metadata'))) {
           markResumable({ root: SUPERGPT_WORKTREE_ROOT, workflowId, resumable: true });
         }
       } catch { /* best effort — resume also tolerates an absent flag */ }
@@ -655,6 +662,7 @@ export async function runSuperGPT({
 // lifecycle ownership while callers get a durable id without waiting for work.
 export function startSuperGPT(options = {}) {
   const workflowId = options.workflowId ?? `wf-agy-${randomUUID()}`;
+  validateWorkflowId(workflowId);
   const run = runSuperGPT({ ...options, workflowId });
   // runSuperGPT converts workflow failures into durable terminal state/result;
   // this final catch is only a last-resort guard against an unhandled rejection.
@@ -689,7 +697,8 @@ async function defaultPipeline({
   workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
 
-  const metadataPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+  validateWorkflowId(workflowId);
+  const metadataPath = assertPathWithinRoot(SUPERGPT_WORKTREE_ROOT, path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), 'workspace metadata');
   let worktree, baseline;
   let resolvedApprovedRoots = [];
 
@@ -1174,6 +1183,7 @@ async function defaultPipeline({
 export { supergptVerify };
 
 export function supergptStatus({ workflowId, root = SUPERGPT_WORKTREE_ROOT } = {}) {
+  validateWorkflowId(workflowId);
   const live = readLiveWorkflowState({ workflowId, root });
   if (!live) return null;
 
@@ -1201,6 +1211,7 @@ export function supergptStatus({ workflowId, root = SUPERGPT_WORKTREE_ROOT } = {
 }
 
 export function supergptWait({ workflowId, root = SUPERGPT_WORKTREE_ROOT, predicate, timeoutMs, intervalMs } = {}) {
+  validateWorkflowId(workflowId);
   return waitForWorkflowState({ workflowId, root, predicate, timeoutMs, intervalMs });
 }
 
@@ -1231,7 +1242,7 @@ export async function supergptWatch({
   _now = () => Date.now(),
   _sleep = abortableSleep,
 } = {}) {
-  if (!workflowId) throw new Error('supergptWatch requires a workflowId');
+  validateWorkflowId(workflowId);
 
   const effectiveTimeout = timeoutMs === null || timeoutMs === undefined ? Infinity : timeoutMs;
   const startTime = _now();
@@ -1338,7 +1349,7 @@ export async function supergptStop({
   _sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
   _now = () => Date.now(),
 } = {}) {
-  if (!workflowId) throw new Error('supergptStop requires a workflowId');
+  validateWorkflowId(workflowId);
 
   // 1. Durable, cross-process stop request. The owning orchestrator — even in
   //    a different CLI/MCP process — polls this file and aborts itself,
@@ -1517,7 +1528,7 @@ export async function supergptResume({
   _execSync,
   _computeWorktreeFingerprint,
 } = {}) {
-  if (!workflowId) throw new Error('supergptResume requires a workflowId');
+  validateWorkflowId(workflowId);
 
   const root = SUPERGPT_WORKTREE_ROOT;
 

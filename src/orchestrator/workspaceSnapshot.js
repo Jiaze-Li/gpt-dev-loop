@@ -52,6 +52,14 @@ export const WORKSPACE_SNAPSHOT_ERROR_CODES = Object.freeze({
   EXCESSIVE_FILE_SIZE: 'EXCESSIVE_FILE_SIZE',
   EXCESSIVE_SNAPSHOT_SIZE: 'EXCESSIVE_SNAPSHOT_SIZE',
   SNAPSHOT_APPLY_FAILED: 'SNAPSHOT_APPLY_FAILED',
+  // An untracked path in the invocation workspace is a symlink. Following it
+  // would let its (possibly external, never-approved) target bytes be copied
+  // into the isolated snapshot as an ordinary regular file — bypassing the
+  // externalReadRoots trust boundary entirely. Fail closed BEFORE any read.
+  UNTRACKED_SYMLINK_NOT_ALLOWED: 'UNTRACKED_SYMLINK_NOT_ALLOWED',
+  // An untracked path is neither a regular file nor a directory (FIFO, socket,
+  // block/char device, ...). Snapshot inputs must be plain files/dirs.
+  UNSUPPORTED_UNTRACKED_FILE_TYPE: 'UNSUPPORTED_UNTRACKED_FILE_TYPE',
 });
 
 function runGit(gitBin, args, cwd, spawn) {
@@ -133,6 +141,47 @@ export function createWorkspaceSnapshot({
     }
   }
 
+  // Classify every untracked source object with lstatSync (NEVER statSync —
+  // statSync follows the link and would report the target). A symlink is
+  // rejected fail-closed BEFORE its target is stat'd, size-read, or copied.
+  // We deliberately do NOT readlink()/realpath() the target: the diagnostic
+  // carries only the relative path and the fact that it is an untracked
+  // symlink, never anything derived from the target itself.
+  function classifyUntrackedSources(sourceCwd, relPaths) {
+    for (const rel of relPaths) {
+      const abs = path.join(sourceCwd, rel);
+      let st;
+      try {
+        st = fs.lstatSync(abs);
+      } catch (err) {
+        if (err && err.code === 'ENOENT') continue; // vanished between listing and now
+        throw new WorkspaceSnapshotError(
+          WORKSPACE_SNAPSHOT_ERROR_CODES.SNAPSHOT_APPLY_FAILED,
+          `could not classify untracked path "${rel}" in the invocation workspace: ${err.message}`,
+          { path: rel }
+        );
+      }
+      if (st.isSymbolicLink()) {
+        throw new WorkspaceSnapshotError(
+          WORKSPACE_SNAPSHOT_ERROR_CODES.UNTRACKED_SYMLINK_NOT_ALLOWED,
+          `refusing to snapshot the invocation workspace: "${rel}" is an untracked symlink. ` +
+            `Untracked symlinks are not copied into the isolated snapshot because doing so would ` +
+            `dereference the link and bypass the external-read trust boundary. Commit the symlink ` +
+            `(tracked symlinks follow the externalReadRoots policy) or remove it.`,
+          { path: rel, kind: 'untracked-symlink' }
+        );
+      }
+      if (!st.isFile() && !st.isDirectory()) {
+        throw new WorkspaceSnapshotError(
+          WORKSPACE_SNAPSHOT_ERROR_CODES.UNSUPPORTED_UNTRACKED_FILE_TYPE,
+          `refusing to snapshot the invocation workspace: "${rel}" is not a regular file or directory ` +
+            `(fifo/socket/device). Snapshot inputs must be plain files or directories.`,
+          { path: rel, kind: 'unsupported-special-file' }
+        );
+      }
+    }
+  }
+
   function guardSizes(sourceCwd, relPaths) {
     let total = 0;
     for (const rel of relPaths) {
@@ -191,6 +240,11 @@ export function createWorkspaceSnapshot({
       if (tracked.length === 0 && untracked.length === 0) {
         return null;
       }
+
+      // Fail closed on untracked symlinks / special files BEFORE any size read
+      // (which dereferences), before copyFileSync, before the snapshot commit,
+      // and before any Planner/Executor/Reviewer/model call.
+      classifyUntrackedSources(sourceCwd, untracked);
 
       const totalBytes = guardSizes(sourceCwd, [...tracked, ...untracked]);
 

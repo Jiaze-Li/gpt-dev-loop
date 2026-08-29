@@ -37,6 +37,7 @@ import {
   toCanonicalProgress,
 } from '../orchestrator/supergpt.js';
 import { SUPERGPT_WORKTREE_ROOT } from '../orchestrator/workflowWorktree.js';
+import { validateWorkflowId } from '../orchestrator/workflowId.js';
 import { resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
@@ -44,6 +45,24 @@ import { compileSuperGptRequest } from '../control/requestCompiler.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from '../orchestrator/runtimeIdentity.js';
 
 const WORKSPACE_METADATA_SUFFIX = '.workspace.json';
+
+// Shared zod schema for a workflow-id tool argument. Rejects a path-traversal
+// or otherwise malformed id at the schema boundary with a clean
+// INVALID_WORKFLOW_ID message, before any handler constructs a filesystem path.
+const workflowIdArg = (description) =>
+  z
+    .string()
+    .superRefine((val, ctx) => {
+      try {
+        validateWorkflowId(val);
+      } catch (err) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `INVALID_WORKFLOW_ID: ${err.message}`,
+        });
+      }
+    })
+    .describe(description);
 
 // Read the safe per-workflow workspace metadata SuperGPT records under
 // SUPERGPT_WORKTREE_ROOT. Returns an array (newest-mtime first). Missing
@@ -290,7 +309,7 @@ export function createSuperGptMcpServer({
       description:
         'Report on SuperGPT workflows with live state, progress block, heartbeat, and process health without calling an LLM. Pass "workflowId" to narrow to one.',
       inputSchema: {
-        workflowId: z.string().optional().describe('narrow to a single workflow id'),
+        workflowId: workflowIdArg('narrow to a single workflow id').optional(),
       },
       outputSchema: {
         workflows: z.array(z.record(z.string(), z.any())),
@@ -312,7 +331,7 @@ export function createSuperGptMcpServer({
       description:
         'Wait locally with zero model tokens. Without targetStatus, waits until terminal; with targetStatus, waits for that status.',
       inputSchema: {
-        workflowId: z.string().min(1).describe('workflow id to wait for'),
+        workflowId: workflowIdArg('workflow id to wait for'),
         timeoutMs: z.number().optional().describe('maximum milliseconds to wait (default: 60000)'),
         targetStatus: z.string().optional().describe('target status to wait for (e.g. DONE, HUMAN_REQUIRED, STOPPED)'),
       },
@@ -350,7 +369,7 @@ export function createSuperGptMcpServer({
       description:
         'Watch an active SuperGPT workflow locally with live streaming MCP progress notifications (heartbeat, elapsed time, stage transitions) until terminal. Consumes 0 model tokens.',
       inputSchema: {
-        workflowId: z.string().min(1, 'workflowId must not be empty').describe('workflow id to watch'),
+        workflowId: workflowIdArg('workflow id to watch'),
         intervalMs: z.number().optional().describe('refresh interval in milliseconds (default: 1000)'),
         timeoutMs: z.number().optional().describe('optional maximum milliseconds to watch before returning (default: runs until terminal or cancelled)'),
       },
@@ -410,7 +429,7 @@ export function createSuperGptMcpServer({
       description:
         'Resume a suspended SuperGPT workflow (e.g. after HUMAN_REQUIRED). Preserves exact workflow state, worktree, and conversations, and applies user answer/clarification.',
       inputSchema: {
-        workflowId: z.string().min(1).describe('id of the suspended workflow to resume'),
+        workflowId: workflowIdArg('id of the suspended workflow to resume'),
         answer: z.string().optional().describe('user decision / answer to the question if status was HUMAN_REQUIRED'),
         cwd: z.string().optional().describe('workspace directory'),
       },
@@ -457,7 +476,7 @@ export function createSuperGptMcpServer({
       description:
         'Safely stop an active SuperGPT workflow. Terminates active child processes, records STOPPED state, and preserves recoverable resources.',
       inputSchema: {
-        workflowId: z.string().min(1).describe('workflow id to stop'),
+        workflowId: workflowIdArg('workflow id to stop'),
         reason: z.string().optional().describe('reason for stopping (default: stopped by user)'),
       },
       outputSchema: {
@@ -482,7 +501,7 @@ export function createSuperGptMcpServer({
       description:
         'Run trusted host Gate verification against the preserved isolated worktree for a workflow. Executes frozen verification commands with zero model tokens, records durable immutable evidence, and invalidates on worktree mutation.',
       inputSchema: {
-        workflowId: z.string().min(1).describe('workflow id to run host verification for'),
+        workflowId: workflowIdArg('workflow id to run host verification for'),
       },
       outputSchema: {
         workflowId: z.string(),

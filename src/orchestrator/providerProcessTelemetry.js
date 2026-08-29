@@ -5,8 +5,16 @@
 import path from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
 
-export const PROVIDER_PROCESS_DIAGNOSTICS_FILE = (root, workflowId) =>
-  path.join(root, `${workflowId}.provider-processes.jsonl`);
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
+
+export const PROVIDER_PROCESS_DIAGNOSTICS_FILE = (root, workflowId) => {
+  validateWorkflowId(workflowId);
+  return assertPathWithinRoot(
+    root,
+    path.join(root, `${workflowId}.provider-processes.jsonl`),
+    'provider-process telemetry'
+  );
+};
 
 const TAIL_LIMIT = 4_000;
 

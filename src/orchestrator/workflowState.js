@@ -15,6 +15,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { appendProviderProcessDiagnostic } from './providerProcessTelemetry.js';
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 
 export const WORKFLOW_STAGES = Object.freeze({
   INIT: 'INIT',
@@ -71,10 +72,10 @@ export class WorkflowStateManager {
     root = SUPERGPT_WORKTREE_ROOT,
     onStateChange,
   } = {}) {
-    if (!workflowId) throw new Error('WorkflowStateManager requires a workflowId');
+    validateWorkflowId(workflowId);
     this.workflowId = workflowId;
     this.root = root;
-    this.stateFilePath = path.join(root, `${workflowId}.state.json`);
+    this.stateFilePath = assertPathWithinRoot(root, path.join(root, `${workflowId}.state.json`), 'state file');
     this.onStateChange = onStateChange;
     this.heartbeatTimer = null;
 
@@ -414,7 +415,8 @@ export function readLiveWorkflowState({
   root = SUPERGPT_WORKTREE_ROOT,
 } = {}) {
   if (!workflowId) return null;
-  const filePath = path.join(root, `${workflowId}.state.json`);
+  validateWorkflowId(workflowId);
+  const filePath = assertPathWithinRoot(root, path.join(root, `${workflowId}.state.json`), 'state file');
   if (!existsSync(filePath)) return null;
   try {
     const raw = readFileSync(filePath, 'utf8');

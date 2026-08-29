@@ -26,6 +26,7 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, rmSync 
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { isValidWorktreeFingerprint } from './hostVerification.js';
 import { foreignLiveLeaseHolder } from './workflowOwnership.js';
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 
 // §6 CONTROL.JSON SINGLE-WRITER INVARIANT. Only the process holding the
 // ownership lease may write owner-owned durable records (checkpoint, advanced
@@ -54,13 +55,13 @@ export class DurableWriteError extends Error {
 }
 
 export function controlPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
-  if (!workflowId) throw new Error('controlPath requires a workflowId');
-  return path.join(root, `${workflowId}.control.json`);
+  validateWorkflowId(workflowId);
+  return assertPathWithinRoot(root, path.join(root, `${workflowId}.control.json`), 'control record');
 }
 
 export function stopPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
-  if (!workflowId) throw new Error('stopPath requires a workflowId');
-  return path.join(root, `${workflowId}.stop.json`);
+  validateWorkflowId(workflowId);
+  return assertPathWithinRoot(root, path.join(root, `${workflowId}.stop.json`), 'stop record');
 }
 
 function readJson(file) {

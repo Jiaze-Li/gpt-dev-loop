@@ -15,6 +15,7 @@ import { createGateRunner } from './adapters/gateRunner.js';
 import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { readLiveWorkflowState } from './workflowState.js';
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 
 // Closeout is a workflow-level assertion, never an implementation task.  A
 // stable identity prevents a task's otherwise-identical host evidence from
@@ -22,7 +23,8 @@ import { readLiveWorkflowState } from './workflowState.js';
 export const CLOSEOUT_VERIFICATION_ID = '__supergpt_closeout__';
 
 export function getHostEvidenceDir(workflowId, root = SUPERGPT_WORKTREE_ROOT) {
-  return path.join(root, workflowId, 'host_evidence');
+  validateWorkflowId(workflowId);
+  return assertPathWithinRoot(root, path.join(root, workflowId, 'host_evidence'), 'host evidence directory');
 }
 
 /**
@@ -152,11 +154,9 @@ export async function supergptVerify({
   execSync = nodeExecSync,
   gateRunner: injectedGateRunner = null,
 } = {}) {
-  if (!workflowId || typeof workflowId !== 'string') {
-    throw new Error('supergptVerify requires a valid workflowId');
-  }
+  validateWorkflowId(workflowId);
 
-  const metaPath = path.join(root, `${workflowId}.workspace.json`);
+  const metaPath = assertPathWithinRoot(root, path.join(root, `${workflowId}.workspace.json`), 'workspace metadata');
   if (!existsSync(metaPath)) {
     throw new Error(`Workflow workspace metadata not found for "${workflowId}" at ${metaPath}`);
   }

@@ -35,6 +35,7 @@ import {
   WORKFLOW_WORKTREE_ERROR_CODES,
   SUPERGPT_WORKTREE_ROOT,
 } from '../src/orchestrator/workflowWorktree.js';
+import { validateWorkflowId, assertPathWithinRoot } from '../src/orchestrator/workflowId.js';
 import { callAgy as defaultCallAgy } from '../src/agy/agyClient.js';
 import { Persistence } from '../src/orchestrator/persistence.js';
 import { deliverWorkflowResult } from '../src/orchestrator/resultDelivery.js';
@@ -197,6 +198,7 @@ export async function establishIsolatedWorkspace({
   createBaseline = () => createWorkflowBaseline(),
   recordMetadata,
 }) {
+  validateWorkflowId(workflowId);
   const worktreeApi = createWorktree();
   const worktree = await worktreeApi.establish({ sourceCwd, workflowId });
   // Everything below is still PRE-EXECUTION setup (no Supervisor / Claude /
@@ -332,7 +334,7 @@ async function main() {
   let worktree;
   let baseline;
   try {
-    const metadataPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+    const metadataPath = assertPathWithinRoot(SUPERGPT_WORKTREE_ROOT, path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), 'workspace metadata');
     ({ worktree, baseline } = await establishIsolatedWorkspace({
       sourceCwd,
       workflowId,

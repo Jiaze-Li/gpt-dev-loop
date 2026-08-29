@@ -17,6 +17,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { readdir, stat, rm, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 
 export function isSuperGptOwnedWorktree(targetPath, root = SUPERGPT_WORKTREE_ROOT) {
   if (typeof targetPath !== 'string' || !targetPath) return false;
@@ -79,12 +80,12 @@ export class WorkflowLifecycleManager {
     sourceCwd = process.cwd(),
     spawn = nodeSpawn,
   } = {}) {
-    if (!workflowId) throw new Error('WorkflowLifecycleManager requires a workflowId');
+    validateWorkflowId(workflowId);
     this.workflowId = workflowId;
     this.root = root;
     this.sourceCwd = sourceCwd;
     this.spawn = spawn;
-    this.resourcesPath = path.join(root, `${workflowId}.resources.json`);
+    this.resourcesPath = assertPathWithinRoot(root, path.join(root, `${workflowId}.resources.json`), 'resources file');
 
     this.resources = {
       workflowId,
@@ -196,7 +197,7 @@ export class WorkflowLifecycleManager {
     // Clean up resource file and workspace metadata
     try {
       await rm(this.resourcesPath, { force: true });
-      const wsMeta = path.join(this.root, `${this.workflowId}.workspace.json`);
+      const wsMeta = assertPathWithinRoot(this.root, path.join(this.root, `${this.workflowId}.workspace.json`), 'workspace metadata');
       await rm(wsMeta, { force: true });
       const statePath = path.join(this.root, `${this.workflowId}.state.json`);
       await rm(statePath, { force: true });

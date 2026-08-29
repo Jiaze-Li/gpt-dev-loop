@@ -52,6 +52,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createWorkspaceSnapshot, WorkspaceSnapshotError } from './workspaceSnapshot.js';
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 
 export { WorkspaceSnapshotError };
 
@@ -172,6 +173,7 @@ export function createWorkflowWorktree({
           'establish() requires a non-empty workflowId'
         );
       }
+      validateWorkflowId(workflowId);
 
       const insideCheck = await git(['rev-parse', '--is-inside-work-tree'], sourceCwd);
       if (insideCheck.code !== 0 || insideCheck.stdout.trim() !== 'true') {
@@ -220,7 +222,11 @@ export function createWorkflowWorktree({
       const branchResult = await git(['rev-parse', '--abbrev-ref', 'HEAD'], sourceCwd);
       const sourceBranch = branchResult.code === 0 ? branchResult.stdout.trim() : 'HEAD';
 
-      const worktreePath = path.join(worktreeRoot, `${path.basename(sourceRepoRoot)}-${workflowId}`);
+      const worktreePath = assertPathWithinRoot(
+        worktreeRoot,
+        path.join(worktreeRoot, `${path.basename(sourceRepoRoot)}-${workflowId}`),
+        'isolated worktree path'
+      );
 
       // Detached checkout pinned exactly at the baseline commit — no branch
       // name to collide with the user's branches, nothing to accidentally

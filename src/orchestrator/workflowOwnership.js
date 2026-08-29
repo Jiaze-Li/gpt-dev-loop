@@ -55,6 +55,7 @@ import {
 import { randomBytes } from 'node:crypto';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { getSuperGptSourceRevision } from './runtimeIdentity.js';
+import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 
 export const OWNERSHIP_CODES = Object.freeze({
   ACQUIRED: 'ACQUIRED',
@@ -85,8 +86,8 @@ export class WorkflowOwnershipError extends Error {
 
 // The authoritative lock — a DIRECTORY. Its existence means OWNED.
 export function ownerLockPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
-  if (!workflowId) throw new Error('ownerLockPath requires a workflowId');
-  return path.join(root, `${workflowId}.owner.lock`);
+  validateWorkflowId(workflowId);
+  return assertPathWithinRoot(root, path.join(root, `${workflowId}.owner.lock`), 'owner lock');
 }
 
 function leaseJsonPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
@@ -94,7 +95,8 @@ function leaseJsonPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
 }
 
 function reclaimMutexPath({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) {
-  return path.join(root, `${workflowId}.owner.reclaim`);
+  validateWorkflowId(workflowId);
+  return assertPathWithinRoot(root, path.join(root, `${workflowId}.owner.reclaim`), 'reclaim mutex');
 }
 
 function newOwnerToken() {

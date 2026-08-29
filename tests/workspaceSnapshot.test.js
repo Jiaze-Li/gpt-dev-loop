@@ -40,19 +40,54 @@ function makeFakeGit(handler, { spawnError = null } = {}) {
 }
 
 // Minimal in-memory fs stub.
-function makeFakeFs(sizes = {}) {
+//   sizes:    { absPath: byteLength }  — regular files
+//   symlinks: [absPath, ...]          — untracked symlinks (lstat only)
+//   specials: [absPath, ...]          — fifo/socket/device (lstat only)
+function makeFakeFs(sizes = {}, { symlinks = [], specials = [] } = {}) {
   const writes = [];
   const copies = [];
   const removed = [];
+  const statPaths = [];
+  const lstatPaths = [];
+  const symSet = new Set(symlinks);
+  const specialSet = new Set(specials);
   return {
     fs: {
       statSync(p) {
+        statPaths.push(p);
         if (!(p in sizes)) {
           const err = new Error(`ENOENT: ${p}`);
           err.code = 'ENOENT';
           throw err;
         }
         return { size: sizes[p], isFile: () => true };
+      },
+      lstatSync(p) {
+        lstatPaths.push(p);
+        if (symSet.has(p)) {
+          return {
+            isSymbolicLink: () => true,
+            isFile: () => false,
+            isDirectory: () => false,
+          };
+        }
+        if (specialSet.has(p)) {
+          return {
+            isSymbolicLink: () => false,
+            isFile: () => false,
+            isDirectory: () => false,
+          };
+        }
+        if (p in sizes) {
+          return {
+            isSymbolicLink: () => false,
+            isFile: () => true,
+            isDirectory: () => false,
+          };
+        }
+        const err = new Error(`ENOENT: ${p}`);
+        err.code = 'ENOENT';
+        throw err;
       },
       writeFileSync(p, data) {
         writes.push({ p, data });
@@ -68,6 +103,8 @@ function makeFakeFs(sizes = {}) {
     writes,
     copies,
     removed,
+    statPaths,
+    lstatPaths,
   };
 }
 
@@ -215,6 +252,91 @@ test('deleted tracked file (gone from disk) does not count against the budget an
   const result = await snap.captureAndApply({ sourceCwd: SRC, worktreePath: WT, baselineHead: BASE });
   assert.equal(result.snapshot_commit, SNAP);
   assert.equal(result.total_bytes, 0);
+});
+
+test('untracked symlink -> unapproved external file: fails closed, target bytes never read or copied', async () => {
+  const { fs, copies, statPaths, lstatPaths } = makeFakeFs(
+    {},
+    { symlinks: [`${SRC}/secret-link`] }
+  );
+  const { snap, calls } = subject({
+    fsStub: fs,
+    handler: (args) => {
+      const a = args.join(' ');
+      if (a === 'diff --name-only HEAD') return { stdout: '' };
+      if (a === 'ls-files --others --exclude-standard') return { stdout: 'secret-link\n' };
+      throw new Error(`unexpected git ${a}`);
+    },
+  });
+  await assert.rejects(
+    () => snap.captureAndApply({ sourceCwd: SRC, worktreePath: WT, baselineHead: BASE }),
+    (err) =>
+      err instanceof WorkspaceSnapshotError &&
+      err.code === WORKSPACE_SNAPSHOT_ERROR_CODES.UNTRACKED_SYMLINK_NOT_ALLOWED &&
+      err.details.path === 'secret-link'
+  );
+  // Proof: after lstat identified the symlink, nothing stat'd/read/copied it.
+  assert.deepEqual(lstatPaths, [`${SRC}/secret-link`]);
+  assert.deepEqual(statPaths, []);
+  assert.deepEqual(copies, []);
+  assert.ok(!calls.some((c) => c.args.includes('commit')));
+  assert.ok(!calls.some((c) => c.args[0] === 'add'));
+});
+
+test('untracked symlink -> file inside the repo: still rejected (reject-all-untracked-symlinks rule)', async () => {
+  const { fs } = makeFakeFs({}, { symlinks: [`${SRC}/inside-link`] });
+  const { snap } = subject({
+    fsStub: fs,
+    handler: (args) => {
+      const a = args.join(' ');
+      if (a === 'diff --name-only HEAD') return { stdout: '' };
+      if (a === 'ls-files --others --exclude-standard') return { stdout: 'inside-link\n' };
+      throw new Error(`unexpected git ${a}`);
+    },
+  });
+  await assert.rejects(
+    () => snap.captureAndApply({ sourceCwd: SRC, worktreePath: WT, baselineHead: BASE }),
+    (err) => err.code === WORKSPACE_SNAPSHOT_ERROR_CODES.UNTRACKED_SYMLINK_NOT_ALLOWED
+  );
+});
+
+test('untracked fifo/socket/device fails closed with UNSUPPORTED_UNTRACKED_FILE_TYPE', async () => {
+  const { fs, copies } = makeFakeFs({}, { specials: [`${SRC}/pipe`] });
+  const { snap, calls } = subject({
+    fsStub: fs,
+    handler: (args) => {
+      const a = args.join(' ');
+      if (a === 'diff --name-only HEAD') return { stdout: '' };
+      if (a === 'ls-files --others --exclude-standard') return { stdout: 'pipe\n' };
+      throw new Error(`unexpected git ${a}`);
+    },
+  });
+  await assert.rejects(
+    () => snap.captureAndApply({ sourceCwd: SRC, worktreePath: WT, baselineHead: BASE }),
+    (err) => err.code === WORKSPACE_SNAPSHOT_ERROR_CODES.UNSUPPORTED_UNTRACKED_FILE_TYPE
+  );
+  assert.deepEqual(copies, []);
+  assert.ok(!calls.some((c) => c.args.includes('commit')));
+});
+
+test('normal untracked regular file still snapshots (regression C)', async () => {
+  const { fs, copies } = makeFakeFs({ [`${SRC}/new.txt`]: 40 });
+  const { snap } = subject({
+    fsStub: fs,
+    handler: (args) => {
+      const a = args.join(' ');
+      if (a === 'diff --name-only HEAD') return { stdout: '' };
+      if (a === 'ls-files --others --exclude-standard') return { stdout: 'new.txt\n' };
+      if (a === 'add -A') return { code: 0 };
+      if (a === 'status --porcelain=v1') return { stdout: 'A  new.txt\n' };
+      if (args.includes('commit')) return { code: 0 };
+      if (a === 'rev-parse HEAD') return { stdout: `${SNAP}\n` };
+      throw new Error(`unexpected git ${a}`);
+    },
+  });
+  const result = await snap.captureAndApply({ sourceCwd: SRC, worktreePath: WT, baselineHead: BASE });
+  assert.equal(result.snapshot_commit, SNAP);
+  assert.deepEqual(copies, [{ src: `${SRC}/new.txt`, dst: `${WT}/new.txt` }]);
 });
 
 test('changes identical to baseline (nothing staged) returns null instead of an empty commit', async () => {
