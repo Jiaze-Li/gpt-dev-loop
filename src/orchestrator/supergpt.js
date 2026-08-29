@@ -60,10 +60,11 @@ import {
   REWORK_VERIFICATION_STATUSES,
 } from './organicReworkRecorder.js';
 import {
-  tryAcquireWorkflowOwnership,
+  acquireWorkflowOwnership,
   releaseWorkflowOwnership,
   readOwnerLease,
   isLeaseOwnerAlive,
+  currentProcessHoldsLease,
   OWNERSHIP_CODES,
 } from './workflowOwnership.js';
 import {
@@ -295,6 +296,7 @@ export async function runSuperGPT({
   _createGateRunner,
   _execSync,
   _computeWorktreeFingerprint,
+  _afterOwnershipAcquired,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   const result = { ...EMPTY_RESULT(), workflowId };
@@ -305,7 +307,7 @@ export async function runSuperGPT({
   // concurrent process wins; every loser returns WORKFLOW_ALREADY_OWNED here
   // having made zero provider/Gate calls and zero checkpoint/worktree writes.
   // Held for this run's entire lifetime; released only in finalizeActiveWorkflow.
-  const ownership = tryAcquireWorkflowOwnership({
+  const ownership = acquireWorkflowOwnership({
     root: SUPERGPT_WORKTREE_ROOT,
     workflowId,
     isStopRequested: () => {
@@ -327,14 +329,6 @@ export async function runSuperGPT({
     }
     return result;
   }
-
-  const workflowStateManager = new WorkflowStateManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
-  workflowStateManager.startHeartbeat(1000);
-  const lifecycleManager = new WorkflowLifecycleManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd });
-  const usageTracker = new UsageTracker();
-
-  // Conservative GC in background: clean up any stale abandoned resources
-  gcSuperGptResources({ root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd }).catch(() => {});
 
   const write = outputFormat ? (s) => process.stdout.write(`${s}\n`) : null;
   let internalAbort = null;
@@ -361,14 +355,76 @@ export async function runSuperGPT({
     }
   };
 
+  // TOP-LEVEL OWNERSHIP-RELEASE GUARD. From here on, EVERY exit path — a
+  // synchronous throw during pre-pipeline init, an early typed return, a
+  // pipeline rejection, normal completion — flows through the `finally` at the
+  // very end of this function, which calls this exactly once. Release verifies
+  // ownerToken (so we can never drop a newer owner's lease) AND inspects the
+  // result: a release that did not actually succeed is surfaced, never
+  // silently forgotten (a live owner.lock whose PID is this still-running
+  // process would otherwise wedge every future resume).
+  let ownershipReleaseWarning = null;
+  const releaseOwnershipIfHeld = (context) => {
+    if (!ownershipToken) return;
+    let res;
+    try {
+      res = releaseWorkflowOwnership({ root: SUPERGPT_WORKTREE_ROOT, workflowId, ownerToken: ownershipToken });
+    } catch (err) {
+      res = { released: false, reason: err?.message ?? String(err) };
+    }
+    if (res?.released === true) {
+      ownershipToken = null;
+      return;
+    }
+    const stillOurs = currentProcessHoldsLease({ root: SUPERGPT_WORKTREE_ROOT, workflowId, ownerToken: ownershipToken });
+    ownershipReleaseWarning = {
+      workflowId,
+      ownerToken: ownershipToken, // preserved for deterministic remediation/retry
+      reason: res?.reason ?? 'unknown',
+      leaseStillPresent: res?.leaseStillPresent ?? stillOurs,
+      context: context ?? null,
+    };
+    try {
+      emit('ownership_release_failed', {
+        workflowId,
+        reason: ownershipReleaseWarning.reason,
+        leaseStillPresent: ownershipReleaseWarning.leaseStillPresent,
+      });
+    } catch { /* emit best-effort */ }
+    // Deliberately DO NOT null ownershipToken — it is the only remaining
+    // knowledge of which lease is stuck.
+  };
+
+  // Pre-pipeline init. Ownership is already held; any throw here (an injected
+  // test failure, a lifecycle-manager constructor error) must release the lease
+  // before it propagates, or a long-lived MCP process would leak the owner.lock.
+  let workflowStateManager;
+  let lifecycleManager;
+  let usageTracker;
+  try {
+    if (typeof _afterOwnershipAcquired === 'function') _afterOwnershipAcquired({ workflowId, ownerToken: ownershipToken });
+    workflowStateManager = new WorkflowStateManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
+    workflowStateManager.startHeartbeat(1000);
+    lifecycleManager = new WorkflowLifecycleManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd });
+    usageTracker = new UsageTracker();
+  } catch (initErr) {
+    releaseOwnershipIfHeld('pre-pipeline-init');
+    if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
+    try { workflowStateManager?.stopHeartbeat(); } catch { /* ignore */ }
+    throw initErr;
+  }
+
+  // Conservative GC in background: clean up any stale abandoned resources
+  gcSuperGptResources({ root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd }).catch(() => {});
+
   if (signal?.aborted) {
     result.status = 'CANCELLED';
     result.reason = 'AbortSignal was already aborted before the run started';
     workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason: result.reason });
     workflowStateManager.stopHeartbeat();
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status });
-    try { releaseWorkflowOwnership({ root: SUPERGPT_WORKTREE_ROOT, workflowId, ownerToken: ownershipToken }); } catch { /* best effort */ }
-    ownershipToken = null;
+    releaseOwnershipIfHeld('signal-aborted-early');
+    if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
     return result;
   }
 
@@ -404,10 +460,7 @@ export async function runSuperGPT({
   // process can never drop a newer owner's lease.
   const finalizeActiveWorkflow = () => {
     ACTIVE_WORKFLOWS.delete(workflowId);
-    if (ownershipToken) {
-      try { releaseWorkflowOwnership({ root: SUPERGPT_WORKTREE_ROOT, workflowId, ownerToken: ownershipToken }); } catch { /* best effort */ }
-      ownershipToken = null;
-    }
+    releaseOwnershipIfHeld('active-workflow-finalizer');
     try { resolveCompletion(); } catch { /* already settled */ }
   };
   ACTIVE_WORKFLOWS.set(workflowId, {
@@ -421,7 +474,15 @@ export async function runSuperGPT({
   // and poll the durable control file so a `supergpt stop` issued from a
   // different CLI/MCP process reaches this abort controller. The owner is the
   // only party that can actually tear the pipeline down and await shutdown.
-  claimOwner({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+  // A durable-write failure here must still release the ownership lease.
+  try {
+    claimOwner({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+  } catch (claimErr) {
+    workflowStateManager.stopHeartbeat();
+    finalizeActiveWorkflow();
+    if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
+    throw claimErr;
+  }
   let stopReason = null;
   const stopWatcher = setInterval(() => {
     try {
@@ -577,6 +638,7 @@ export async function runSuperGPT({
     // early from supergptStop — so a same-process stop that awaits
     // completionPromise sees teardown actually finished.
     finalizeActiveWorkflow();
+    if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
   }
 
   // A fully delivered workflow needs no durable control record any more.
@@ -585,6 +647,7 @@ export async function runSuperGPT({
   }
 
   emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, summary: result.summary ?? null });
+  if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
   return result;
 }
 

@@ -32,17 +32,30 @@ while (!existsSync(goFile)) {
 }
 
 try {
-  if (mode === 'acquire') {
+  if (mode === 'acquire' || mode === 'slowpublish') {
     const { tryAcquireWorkflowOwnership } = await import(new URL('../../src/orchestrator/workflowOwnership.js', import.meta.url));
-    const r = tryAcquireWorkflowOwnership({ root, workflowId });
+    const publishDelay = Number.parseInt(process.env.OWN_PUBLISH_DELAY || '0', 10);
+    const r = tryAcquireWorkflowOwnership({
+      root, workflowId,
+      _afterClaimHook: mode === 'slowpublish'
+        ? () => {
+          writeFileSync(path.join(barrierDir, `claimed-${id}`), '1');
+          const t = Date.now();
+          while (Date.now() - t < publishDelay) { /* hold BEFORE lease.json publication */ }
+        }
+        : undefined,
+    });
     out({ acquired: r.acquired, code: r.code, ownerToken: r.ownerToken, ownerPid: r.ownerPid });
-    if (r.acquired) { const t = Date.now(); while (Date.now() - t < 800) { /* hold live lease */ } }
+    if (r.acquired && mode === 'acquire') { const t = Date.now(); while (Date.now() - t < 800) { /* hold live lease */ } }
   } else {
     const { runSuperGPT } = await import(new URL('../../src/orchestrator/supergpt.js', import.meta.url));
     const res = await runSuperGPT({
       workflowId,
       isResume: true,
       externalReadRoots: [],
+      _afterOwnershipAcquired: process.env.OWN_INIT_THROW === '1'
+        ? () => { throw new Error('init boom'); }
+        : undefined,
       _pipeline: async () => {
         appendFileSync(path.join(barrierDir, 'pipeline.log'), `${process.pid}\n`);
         if (process.env.__CRASH === '1') throw new Error('simulated crash before delivery');
