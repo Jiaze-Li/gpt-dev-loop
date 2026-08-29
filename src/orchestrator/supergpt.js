@@ -16,6 +16,7 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { execSync as nodeExecSync } from 'node:child_process';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 
 import { runAutomatedWorkflow } from './automatedLoop.js';
@@ -24,7 +25,7 @@ import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
 import { createGateRunner } from './adapters/gateRunner.js';
 import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.js';
 import { Persistence } from './persistence.js';
-import { deliverWorkflowResult } from './resultDelivery.js';
+import { deliverWorkflowResult, createResultDelivery } from './resultDelivery.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
@@ -66,7 +67,12 @@ import {
   isOwnerAlive,
   saveCheckpoint,
   markDeliveryReady,
+  markResumable,
   recordCloseoutVerificationEvidence,
+  recordAdvancedBaselineHead,
+  recordDeliveryCompleted,
+  recordDeliveryCleanup,
+  isDeliveryCompleted,
   clearControl,
 } from './workflowControl.js';
 import { advanceTaskBaseline } from './taskBaseline.js';
@@ -341,10 +347,21 @@ export async function runSuperGPT({
     }
   }
 
+  // P1-3: an awaitable teardown handle. supergptStop() running in this same
+  // process aborts the run and then awaits this promise so no Reviewer /
+  // delivery / lifecycle unwind is still in flight when it returns STOPPED.
+  // Resolved by this function's own finalizer (below), never self-awaited.
+  let resolveCompletion;
+  const completionPromise = new Promise((resolve) => { resolveCompletion = resolve; });
+  const finalizeActiveWorkflow = () => {
+    ACTIVE_WORKFLOWS.delete(workflowId);
+    try { resolveCompletion(); } catch { /* already settled */ }
+  };
   ACTIVE_WORKFLOWS.set(workflowId, {
     abortController: internalAbort,
     workflowStateManager,
     lifecycleManager,
+    completionPromise,
   });
 
   // Cross-process ownership: record this process as the owning orchestrator
@@ -404,7 +421,7 @@ export async function runSuperGPT({
     workflowStateManager.stopHeartbeat();
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, reason: result.reason });
     clearInterval(stopWatcher);
-    ACTIVE_WORKFLOWS.delete(workflowId);
+    finalizeActiveWorkflow();
     if (signal) signal.removeEventListener('abort', onAbort);
     return result;
   }
@@ -492,9 +509,12 @@ export async function runSuperGPT({
     return result;
   } finally {
     clearInterval(stopWatcher);
-    ACTIVE_WORKFLOWS.delete(workflowId);
     workflowStateManager.stopHeartbeat();
     if (signal) signal.removeEventListener('abort', onAbort);
+    // Authoritative removal happens here, in the owning run's finalizer — never
+    // early from supergptStop — so a same-process stop that awaits
+    // completionPromise sees teardown actually finished.
+    finalizeActiveWorkflow();
   }
 
   // A fully delivered workflow needs no durable control record any more.
@@ -553,6 +573,36 @@ async function defaultPipeline({
       const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
       ({ worktree, baseline } = restoreResumableWorkspace(meta));
       lifecycleManager?.trackWorktree(worktree.worktree_path);
+
+      // P1-1: if an accepted task advanced the task-boundary baseline before
+      // this workflow suspended, that advanced commit — not the original
+      // invocation baseline — is the correct Gate/Reviewer evidence baseline
+      // for the resumed task. Restore it from the durable control record and
+      // validate it is a real commit usable in the preserved worktree. Fail
+      // closed if the record claims an advanced baseline that is unavailable.
+      const resumeControl = readControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+      const advancedHead = typeof resumeControl?.baseline_head === 'string'
+        ? resumeControl.baseline_head.trim() : '';
+      if (advancedHead) {
+        const execRunner = _execSync ?? nodeExecSync;
+        let valid = false;
+        try {
+          execRunner(`git cat-file -e ${advancedHead}^{commit}`, {
+            cwd: worktree.worktree_path, stdio: ['ignore', 'ignore', 'ignore'],
+          });
+          valid = true;
+        } catch { valid = false; }
+        if (!valid) {
+          throw new Error(
+            `resume: durable control records an advanced task baseline ${advancedHead} that is not a valid commit in the preserved worktree — refusing to fall back to the original invocation baseline`,
+          );
+        }
+        // Only the per-task Gate/Reviewer evidence baseline moves. The
+        // delivery baseline (worktree.baseline_head) stays at the original
+        // invocation snapshot so delivery still carries EVERY accepted task
+        // back to the invocation workspace.
+        baseline.head = advancedHead;
+      }
       const persistedRoots = Array.isArray(meta.external_read_roots)
         ? meta.external_read_roots
         : (Array.isArray(meta.approved_external_roots) ? meta.approved_external_roots : []);
@@ -675,7 +725,14 @@ async function defaultPipeline({
     let delivery;
     try {
       throwIfAborted(signal);
-      delivery = await deliverWorkflowResult({ worktree });
+      delivery = await deliverWorkflowResult({
+        worktree,
+        // Persisted BEFORE worktree cleanup: once the source workspace is
+        // mutated, a later cleanup failure must never re-run delivery (P2-2).
+        onDelivered: ({ changed_files }) => recordDeliveryCompleted({
+          root: SUPERGPT_WORKTREE_ROOT, workflowId, changedFiles: changed_files,
+        }),
+      });
     } catch (err) {
       emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: err.message });
       await lifecycleManager?.onWorkflowSuspended('delivery_failed');
@@ -701,15 +758,26 @@ async function defaultPipeline({
       };
     }
 
-    if (lifecycleManager) {
-      await lifecycleManager.onWorkflowDelivered();
+    const cleanupWarning = delivery.cleanup_status && delivery.cleanup_status !== 'OK';
+    if (cleanupWarning) {
+      // Delivery succeeded; only worktree teardown failed. Keep the durable
+      // delivery record (with the cleanup warning) so a resume retries ONLY
+      // cleanup and never re-delivers. Do not clearControl here.
+      recordDeliveryCleanup({ root: SUPERGPT_WORKTREE_ROOT, workflowId, status: 'WARNING', error: delivery.cleanup_error });
+    } else {
+      if (lifecycleManager) {
+        await lifecycleManager.onWorkflowDelivered();
+      }
+      clearControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
     }
-    clearControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
     workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {
       summary: summary ?? null,
       deliveredFiles: delivery.delivered ?? delivery.changed_files ?? [],
     });
-    emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles: delivery.delivered ?? delivery.changed_files ?? [] });
+    emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, {
+      changedFiles: delivery.delivered ?? delivery.changed_files ?? [],
+      ...(cleanupWarning ? { cleanupWarning: delivery.cleanup_error } : {}),
+    });
     emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'done' });
     return {
       ...EMPTY_RESULT(),
@@ -719,6 +787,37 @@ async function defaultPipeline({
       conversations,
       tokenUsage: usageTracker?.summary() ?? null,
     };
+  }
+
+  // P2-2: the approved delta was ALREADY carried into the invocation
+  // workspace on a previous run and only worktree cleanup failed afterwards.
+  // Never re-run delivery over an already-mutated source. Retry cleanup only,
+  // then finish DONE.
+  if (isDeliveryCompleted(control)) {
+    emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'delivery' });
+    const changedFiles = control.delivery.changed_files ?? [];
+    let cleanupStatus = control.delivery.cleanup?.status ?? 'PENDING';
+    if (cleanupStatus !== 'OK') {
+      try {
+        await createResultDelivery().cleanupDeliveredWorktree({
+          worktreePath: worktree.worktree_path,
+          sourceRepoRoot: worktree.source_repo_root ?? worktree.source_workspace,
+        });
+        cleanupStatus = 'OK';
+        recordDeliveryCleanup({ root: SUPERGPT_WORKTREE_ROOT, workflowId, status: 'OK' });
+      } catch (err) {
+        cleanupStatus = 'WARNING';
+        recordDeliveryCleanup({ root: SUPERGPT_WORKTREE_ROOT, workflowId, status: 'WARNING', error: err?.message ?? String(err) });
+        emit(SUPERGPT_EVENTS.DELIVERY_SUCCEEDED, { changedFiles, cleanupWarning: err?.message ?? String(err) });
+      }
+    }
+    if (cleanupStatus === 'OK') {
+      if (lifecycleManager) await lifecycleManager.onWorkflowDelivered();
+      clearControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, { summary: control.summary ?? null, deliveredFiles: changedFiles });
+    emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'done' });
+    return { ...EMPTY_RESULT(), status: 'WORKFLOW_DONE', summary: control.summary ?? null, deliveredFiles: changedFiles, conversations: null, tokenUsage: usageTracker?.summary() ?? null };
   }
 
   // Delivery-ready resume: every engineering/review task was already
@@ -876,6 +975,10 @@ async function defaultPipeline({
     signal,
     checkpoint: control?.checkpoint ?? null,
     onCheckpoint: (cp) => saveCheckpoint({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, cp),
+    computeGateFingerprint: () => {
+      const fp = getFingerprint(worktree.worktree_path);
+      return isValidWorktreeFingerprint(fp) ? fp : null;
+    },
     _execSync,
     log: (line) => {
       const event = translateLogLine(line);
@@ -895,7 +998,13 @@ async function defaultPipeline({
       });
       // Throws TaskBaselineError on a real git failure (hook / config / write
       // error) — a clean tree is the only silently-tolerated no-op.
-      await advanceTaskBaseline({ repoRoot, taskId, baseline, exec });
+      const advance = await advanceTaskBaseline({ repoRoot, taskId, baseline, exec });
+      // P1-1: persist the authoritative advanced baseline commit durably so a
+      // later HUMAN_REQUIRED + resume scopes the next task's Git evidence to
+      // just that task and never re-includes this accepted task's delta.
+      if (advance?.advanced && advance.head) {
+        recordAdvancedBaselineHead({ root: SUPERGPT_WORKTREE_ROOT, workflowId, head: advance.head });
+      }
     },
   });
 
@@ -1117,17 +1226,33 @@ export async function supergptStop({
   const ownerAlive = isOwnerAlive(control);
   const foreignLiveOwner = ownerAlive && ownerPid !== process.pid;
 
-  // 2. Same-process owner: abort directly and let its own teardown run.
+  // 2. Same-process owner: abort directly, then AWAIT the owning run's own
+  //    teardown (Executor terminate, Gate process-tree kill, provider session
+  //    close, lifecycle unwind) before returning. Its finalizer performs the
+  //    authoritative ACTIVE_WORKFLOWS removal and terminal-state publish — we
+  //    do not remove the entry here. A bounded timeout keeps stop fail-closed
+  //    if teardown hangs.
   const running = ACTIVE_WORKFLOWS.get(workflowId);
+  let ownerAcknowledged = false;
   if (running) {
     running.abortController?.abort();
+    if (running.completionPromise && ownerPid === process.pid) {
+      let timer;
+      const timeout = new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), waitForOwnerMs); });
+      if (typeof timer?.unref === 'function') timer.unref();
+      const outcome = await Promise.race([running.completionPromise.then(() => 'done'), timeout]);
+      clearTimeout(timer);
+      if (outcome === 'done') {
+        const st = readLiveWorkflowState({ workflowId, root });
+        if (st && OWNER_TERMINAL_STATUSES.has(st.workflowStatus)) ownerAcknowledged = true;
+      }
+    }
   }
 
   // 3. Foreign, live owner: wait (bounded) for it to acknowledge by
   //    publishing a terminal state. Its own pipeline shutdown completes
   //    before that write, so no Reviewer/delivery runs afterwards.
-  let ownerAcknowledged = false;
-  if (foreignLiveOwner) {
+  if (foreignLiveOwner && !ownerAcknowledged) {
     const deadline = _now() + waitForOwnerMs;
     while (_now() < deadline) {
       const st = readLiveWorkflowState({ workflowId, root });
@@ -1185,6 +1310,29 @@ export async function supergptStop({
       } catch {
         /* ignore */
       }
+    }
+  }
+
+  // P1-2: a user-stopped workflow still holds undelivered isolated edits and
+  // supergpt_resume is supported. Mark it durably resumable and its resources
+  // PRESERVED so age-based GC does not reap the worktree it needs to resume.
+  // A DONE/CLEANED workflow never reaches here (its control record is already
+  // cleared and its status is terminal-finished).
+  const metadataPath = path.join(root, `${workflowId}.workspace.json`);
+  if (existsSync(metadataPath)) {
+    try {
+      markResumable({ root, workflowId, resumable: true });
+    } catch { /* best effort */ }
+    const resourcesPath = path.join(root, `${workflowId}.resources.json`);
+    if (existsSync(resourcesPath)) {
+      try {
+        const res = JSON.parse(readFileSync(resourcesPath, 'utf8'));
+        if (res.status !== 'CLEANED') {
+          res.status = 'PRESERVED';
+          res.suspendedReason = 'stopped by user';
+          writeFileSync(resourcesPath, `${JSON.stringify(res, null, 2)}\n`, 'utf8');
+        }
+      } catch { /* best effort */ }
     }
   }
 

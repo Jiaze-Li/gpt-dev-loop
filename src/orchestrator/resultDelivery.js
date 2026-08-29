@@ -358,7 +358,7 @@ export function createResultDelivery({
 // report object; never throws for a conflict (that is a normal outcome).
 // A thrown ResultDeliveryError from git/fs propagates to the caller, which
 // treats it the same as a conflict — HUMAN_REQUIRED, worktree preserved.
-export async function deliverWorkflowResult({ worktree, delivery = createResultDelivery() } = {}) {
+export async function deliverWorkflowResult({ worktree, delivery = createResultDelivery(), onDelivered = null } = {}) {
   const delta = await delivery.calculateApprovedDelta({
     worktreePath: worktree.worktree_path,
     baselineHead: worktree.baseline_head,
@@ -375,15 +375,41 @@ export async function deliverWorkflowResult({ worktree, delivery = createResultD
     };
   }
 
+  // Phase 1 — DELIVERY APPLY: mutate the invocation workspace.
   await delivery.deliverApprovedDelta({ delta, sourceWorkspace });
-  await delivery.cleanupDeliveredWorktree({
-    worktreePath: worktree.worktree_path,
-    sourceRepoRoot: worktree.source_repo_root ?? sourceWorkspace,
-  });
+
+  // Phase 2 — DELIVERY COMMITTED: the source workspace now contains the
+  // approved bytes. Persist that fact BEFORE any resource cleanup so a
+  // cleanup failure can never be misread as a failed / conflicting delivery
+  // on resume (P2-2).
+  if (typeof onDelivered === 'function') {
+    try {
+      await onDelivered({ changed_files: delta.changedPaths });
+    } catch {
+      /* the durable record is best-effort; delivery itself already succeeded */
+    }
+  }
+
+  // Phase 3 — RESOURCE CLEANUP: a distinct, retryable phase. Its failure is a
+  // warning, never a delivery failure — the worktree is simply left for GC /
+  // doctor / an explicit cleanup to remove later.
+  let cleanupStatus = 'OK';
+  let cleanupError = null;
+  try {
+    await delivery.cleanupDeliveredWorktree({
+      worktreePath: worktree.worktree_path,
+      sourceRepoRoot: worktree.source_repo_root ?? sourceWorkspace,
+    });
+  } catch (err) {
+    cleanupStatus = 'WARNING';
+    cleanupError = err?.message ?? String(err);
+  }
 
   return {
     status: 'DELIVERED',
     changed_files: delta.changedPaths,
-    worktree_preserved: false,
+    worktree_preserved: cleanupStatus !== 'OK',
+    cleanup_status: cleanupStatus,
+    cleanup_error: cleanupError,
   };
 }

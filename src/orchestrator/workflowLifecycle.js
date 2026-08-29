@@ -298,13 +298,22 @@ export async function gcSuperGptResources({
               }
             }
           }
-          if (['DONE', 'CLEANED', 'STOPPED'].includes(state.workflowStatus)) {
+          // Only genuinely non-resumable states are disposable. A user-STOPPED
+          // workflow is NOT finished: it may still hold undelivered isolated
+          // edits and supergpt_resume is supported for it.
+          if (['DONE', 'CLEANED'].includes(state.workflowStatus)) {
             isFinishedWorkflow = true;
           }
           // A workflow suspended for a human is deliberately idle (no child
           // process) but holds un-delivered edits and is explicitly
-          // resumable — it must NOT be treated as age-expired garbage.
+          // resumable — it must NOT be treated as age-expired garbage. A
+          // STOPPED workflow whose workspace metadata still exists is likewise
+          // resumable (P1-2).
           if (state.workflowStatus === 'HUMAN_REQUIRED') {
+            isResumable = true;
+          }
+          if (state.workflowStatus === 'STOPPED'
+            && existsSync(path.join(root, `${wfId}.workspace.json`))) {
             isResumable = true;
           }
         } catch {

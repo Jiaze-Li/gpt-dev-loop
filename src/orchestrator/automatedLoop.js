@@ -216,6 +216,9 @@ export async function runAutomatedWorkflow({
   // called after every state-advancing transition with the current snapshot.
   checkpoint = null,
   onCheckpoint = null,
+  // P2-1: returns a deterministic fingerprint of the isolated worktree, used
+  // to persist/detect post-Gate drift for a REVIEW_PENDING resume.
+  computeGateFingerprint = null,
   _execSync,
 }) {
   const throwIfAborted = () => {
@@ -238,8 +241,11 @@ export async function runAutomatedWorkflow({
   let claudeManager = null;
   let attemptCount = 0;
   let supervisorTabId = null;
+  // P2-1: set when resuming from a REVIEW_PENDING checkpoint — carries the
+  // persisted Executor Report + Gate evidence to feed straight into review.
+  let resumeReviewPending = null;
 
-  const persistCheckpoint = async () => {
+  const persistCheckpoint = async (extra = {}) => {
     if (typeof onCheckpoint !== 'function') return;
     try {
       await onCheckpoint({
@@ -248,6 +254,13 @@ export async function runAutomatedWorkflow({
         currentTaskId: currentTaskCard?.task_id ?? null,
         attempt: attemptCount,
         latestReviewResult: latestReviewResult ?? null,
+        // Default: a plain engineering checkpoint. A REVIEW_PENDING checkpoint
+        // (P2-1) passes phase + the immutable Executor/Gate material via extra.
+        phase: null,
+        executionReport: null,
+        gateEvidence: null,
+        worktreeFingerprint: null,
+        ...extra,
       });
     } catch {
       /* checkpoint persistence is best-effort — never break the loop */
@@ -259,7 +272,24 @@ export async function runAutomatedWorkflow({
     // Only rehydrate a mid-flight task when the last Review Result was not a
     // PASS. An accepted task is already in `history`; re-seeding it as
     // current would make the loop re-run its Executor/Reviewer.
-    if (checkpoint.currentTaskCard && checkpoint.latestReviewResult?.decision !== 'PASS') {
+    if (checkpoint.phase === 'REVIEW_PENDING' && checkpoint.currentTaskCard
+      && checkpoint.executionReport && checkpoint.gateEvidence
+      && checkpoint.latestReviewResult?.decision !== 'PASS') {
+      // Executor + Gate already completed for this attempt; only the Reviewer
+      // call was blocked. Restore that exact point and re-enter at review.
+      currentTaskCard = checkpoint.currentTaskCard;
+      attemptCount = Number.isFinite(checkpoint.attempt) ? checkpoint.attempt : 1;
+      latestReviewResult = checkpoint.latestReviewResult ?? null;
+      claudeManager = createClaudeSessionManager({ taskId: currentTaskCard.task_id });
+      reviewerSession = createReviewerSession();
+      reviewerCreated = false;
+      resumeReviewPending = {
+        executionReport: checkpoint.executionReport,
+        evidence: checkpoint.gateEvidence,
+        worktreeFingerprint: checkpoint.worktreeFingerprint ?? null,
+      };
+      log(`loop checkpoint restored: REVIEW_PENDING task=${currentTaskCard.task_id} attempt=${attemptCount} completed=${history.length}`);
+    } else if (checkpoint.currentTaskCard && checkpoint.latestReviewResult?.decision !== 'PASS') {
       currentTaskCard = checkpoint.currentTaskCard;
       attemptCount = Number.isFinite(checkpoint.attempt) ? checkpoint.attempt : 0;
       latestReviewResult = checkpoint.latestReviewResult ?? null;
@@ -595,6 +625,15 @@ export async function runAutomatedWorkflow({
       };
     }
 
+    return runReviewStep({ executionReport, evidence });
+  }
+
+  // The Reviewer half of an attempt, split out so a resume can re-enter it
+  // directly from a persisted REVIEW_PENDING checkpoint — WITHOUT re-running
+  // the Executor or the Gate (P2-1).
+  async function runReviewStep({ executionReport, evidence }) {
+    latestGateEvidence = evidence;
+
     if (!reviewerCreated) {
       const reviewerIdentity = await reviewerSession.create(currentTaskCard.task_id, { windowId });
       reviewerTabId = reviewerIdentity?.tabId ?? null;
@@ -624,6 +663,18 @@ export async function runAutomatedWorkflow({
         // and conversation, and the Supervisor session are all left intact.
         // HUMAN_REQUIRED closes nothing (see its branch below), so the run
         // is fully resumable once ChatGPT's limit clears.
+        //
+        // P2-1: persist the completed Executor + Gate evidence and a
+        // REVIEW_PENDING resume phase BEFORE returning, so a resumed process
+        // restarts exactly at the Reviewer with this immutable material and
+        // never re-runs the Executor or the Gate. A worktree fingerprint is
+        // stored so a resume can detect post-Gate drift and re-verify.
+        await persistCheckpoint({
+          phase: 'REVIEW_PENDING',
+          executionReport,
+          gateEvidence: evidence,
+          worktreeFingerprint: (typeof computeGateFingerprint === 'function' ? computeGateFingerprint() : null) ?? null,
+        });
         return {
           done: true,
           result: {
@@ -748,6 +799,28 @@ export async function runAutomatedWorkflow({
       }
     }
     await logWindowTabs('after-supervisor-create');
+
+    // P2-1: a REVIEW_PENDING resume re-enters the Reviewer directly with the
+    // persisted Executor Report + Gate evidence — no Executor, no Gate rerun.
+    if (resumeReviewPending) {
+      const persisted = resumeReviewPending;
+      resumeReviewPending = null;
+      const currentFp = typeof computeGateFingerprint === 'function' ? computeGateFingerprint() : null;
+      if (persisted.worktreeFingerprint && currentFp && currentFp !== persisted.worktreeFingerprint) {
+        // The worktree changed after the Gate evidence was captured — do not
+        // reuse stale evidence. Route back through a fresh full attempt.
+        log(`REVIEW_PENDING resume: worktree drift detected (was=${persisted.worktreeFingerprint} now=${currentFp}) — re-running attempt`);
+        attemptCount = Math.max(0, attemptCount - 1);
+        const outcome = await runAttempt();
+        if (outcome.done) return outcome.result;
+      } else {
+        const outcome = await runReviewStep({
+          executionReport: persisted.executionReport,
+          evidence: persisted.evidence,
+        });
+        if (outcome.done) return outcome.result;
+      }
+    }
 
     for (;;) {
       await activateSupervisorTab();
