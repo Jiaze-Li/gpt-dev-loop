@@ -121,9 +121,20 @@ export function writeControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {},
   const current = readJson(file) ?? {};
   const { stop: _droppedStop, ...patchRest } = patch;
   void _droppedStop;
-  const next = { ...current, ...patchRest, workflowId, updatedAt: new Date().toISOString() };
+  // A per-write nonce makes the read-back check able to distinguish THIS
+  // write's payload from a competing writer's — a same-millisecond `updatedAt`
+  // collision alone would not. If the read-back nonce differs, another writer
+  // replaced our file between rename and read: fail closed rather than
+  // reporting a success that clobbered (or was clobbered by) their fields.
+  const writeNonce = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const next = { ...current, ...patchRest, workflowId, updatedAt: new Date().toISOString(), controlWriteNonce: writeNonce };
+  const patchedKeys = Object.keys(patchRest);
   atomicWrite(root, file, next, {
-    verify: verify ? (parsed) => parsed !== null && parsed.updatedAt === next.updatedAt : null,
+    verify: verify
+      ? (parsed) => parsed !== null
+        && parsed.controlWriteNonce === writeNonce
+        && patchedKeys.every((k) => JSON.stringify(parsed[k]) === JSON.stringify(next[k]))
+      : null,
   });
   return readControl({ root, workflowId });
 }

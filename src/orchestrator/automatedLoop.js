@@ -247,30 +247,26 @@ export async function runAutomatedWorkflow({
 
   const persistCheckpoint = async (extra = {}) => {
     if (typeof onCheckpoint !== 'function') return;
-    // A REVIEW_PENDING checkpoint is the ONLY record that lets a resumed
-    // process skip an already-completed Executor + Gate and re-enter directly
-    // at the Reviewer. If it cannot be persisted we must NOT tell the user the
-    // run is safely resumable with no rework — surface the failure instead.
-    const failClosed = extra.phase === 'REVIEW_PENDING';
-    try {
-      await onCheckpoint({
-        history: history.map((entry) => ({ ...entry })),
-        currentTaskCard: currentTaskCard ?? null,
-        currentTaskId: currentTaskCard?.task_id ?? null,
-        attempt: attemptCount,
-        latestReviewResult: latestReviewResult ?? null,
-        // Default: a plain engineering checkpoint. A REVIEW_PENDING checkpoint
-        // (P2-1) passes phase + the immutable Executor/Gate material via extra.
-        phase: null,
-        executionReport: null,
-        gateEvidence: null,
-        worktreeFingerprint: null,
-        ...extra,
-      });
-    } catch (err) {
-      if (failClosed) throw err;
-      /* a plain engineering checkpoint is best-effort — never break the loop */
-    }
+    // Every checkpoint is a durable-writer contract: the loop must never
+    // advance past a transition it could not persist, or a crash would resume
+    // from a stale point and repeat (or re-include) accepted-task work. A
+    // REVIEW_PENDING checkpoint additionally underpins the "no rework, no
+    // re-verification" resume promise. So any persistence failure is surfaced,
+    // not swallowed — onCheckpoint failures propagate out of the loop.
+    await onCheckpoint({
+      history: history.map((entry) => ({ ...entry })),
+      currentTaskCard: currentTaskCard ?? null,
+      currentTaskId: currentTaskCard?.task_id ?? null,
+      attempt: attemptCount,
+      latestReviewResult: latestReviewResult ?? null,
+      // Default: a plain engineering checkpoint. A REVIEW_PENDING checkpoint
+      // (P2-1) passes phase + the immutable Executor/Gate material via extra.
+      phase: null,
+      executionReport: null,
+      gateEvidence: null,
+      worktreeFingerprint: null,
+      ...extra,
+    });
   };
 
   if (checkpoint && typeof checkpoint === 'object') {

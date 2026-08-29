@@ -185,6 +185,41 @@ test('REVIEW_PENDING resume: fingerprint mismatch -> fresh attempt', async () =>
   assert.deepEqual(exec.managers.map((m) => m.taskId), ['b']);
 });
 
+test('any checkpoint persistence failure halts the loop (not just REVIEW_PENDING)', async () => {
+  const sup = fakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard('a') },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  await assert.rejects(() => runAutomatedWorkflow({
+    workflowId: 'wf-cp-fail',
+    supervisorSession: sup,
+    createReviewerSession: fakeReviewerFactory({ a: [pass('a')] }),
+    createClaudeSessionManager: fakeExecutorFactory(),
+    gateRunner: fakeGate(),
+    windowSession: fakeWindow(),
+    workflowGoal: 'g',
+    repositoryContext: taskCard('a').repository_context,
+    onCheckpoint: () => { throw new Error('disk full'); },
+  }), /disk full/);
+});
+
+test('onDelivered failure aborts before worktree cleanup (no redelivery path)', async () => {
+  const { deliverWorkflowResult } = await import('../src/orchestrator/resultDelivery.js');
+  let cleanupCalled = false;
+  const delivery = {
+    async calculateApprovedDelta() { return { changedPaths: ['src/x.js'], patch: 'p' }; },
+    async checkDeliveryConflicts() { return { safe: true, conflicts: [] }; },
+    async deliverApprovedDelta() { /* applied to source */ },
+    async cleanupDeliveredWorktree() { cleanupCalled = true; },
+  };
+  await assert.rejects(() => deliverWorkflowResult({
+    worktree: { worktree_path: '/wt', baseline_head: 'h', source_workspace: '/src', source_repo_root: '/src' },
+    delivery,
+    onDelivered: () => { throw new Error('control write lost'); },
+  }), /control write lost/);
+  assert.equal(cleanupCalled, false, 'worktree must NOT be cleaned up after a lost DELIVERED record');
+});
+
 // ---------------------------------------------------------------------------
 // 3 & 4. Stop ownership / single-writer control.json
 // ---------------------------------------------------------------------------
