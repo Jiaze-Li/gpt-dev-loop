@@ -1231,20 +1231,39 @@ function abortableSleep(ms, signal) {
   });
 }
 
+// A validly formatted workflow id is "known" if any durable/active record for
+// it exists: an in-process owner entry, or a persisted state / control /
+// workspace file. A just-started run claims its ownership lease (control
+// record) before any pipeline work, so this is true within the startup grace.
+function watchedWorkflowIsKnown({ workflowId, root }) {
+  try {
+    if (ACTIVE_WORKFLOWS.has(workflowId)) return true;
+  } catch { /* ignore */ }
+  for (const ext of ['state.json', 'control.json', 'workspace.json']) {
+    try {
+      if (existsSync(path.join(root, `${workflowId}.${ext}`))) return true;
+    } catch { /* ignore */ }
+  }
+  return false;
+}
+
 export async function supergptWatch({
   workflowId,
   root = SUPERGPT_WORKTREE_ROOT,
   intervalMs = 1000,
   timeoutMs = Infinity,
+  startupGraceMs = 15000,
   signal = null,
   onProgress = null,
   _readState = readLiveWorkflowState,
+  _isKnown = watchedWorkflowIsKnown,
   _now = () => Date.now(),
   _sleep = abortableSleep,
 } = {}) {
   validateWorkflowId(workflowId);
 
   const effectiveTimeout = timeoutMs === null || timeoutMs === undefined ? Infinity : timeoutMs;
+  const grace = Number.isFinite(startupGraceMs) && startupGraceMs >= 0 ? startupGraceMs : 15000;
   const startTime = _now();
   let progressSeq = 1;
 
@@ -1254,7 +1273,35 @@ export async function supergptWatch({
     return null;
   };
 
+  const notFoundResult = () => ({
+    workflowId,
+    status: 'WORKFLOW_NOT_FOUND',
+    stage: 'UNKNOWN',
+    formattedProgress: `SUPERGPT: workflow "${workflowId}" not found`,
+    summary: null,
+    reason: 'no durable or active record exists for this workflow id',
+    question: null,
+    evidence: null,
+    blockers: [],
+    blockerCategory: null,
+    deliveredFiles: [],
+    canonicalProgress: null,
+    cancelled: Boolean(signal?.aborted),
+  });
+
   let canonical = getCanonical();
+  if (!canonical) {
+    // No live state. Tolerate this ONLY for a workflow that genuinely exists,
+    // or for a bounded startup grace while a just-started run publishes its
+    // first state file. A validly formatted but nonexistent id must terminate
+    // with WORKFLOW_NOT_FOUND rather than polling a fabricated STARTING state
+    // until the client gives up.
+    while (!signal?.aborted && !getCanonical() && !_isKnown({ workflowId, root })) {
+      if (_now() - startTime >= grace) return notFoundResult();
+      await _sleep(intervalMs, signal);
+    }
+    canonical = getCanonical();
+  }
   if (!canonical) {
     canonical = toCanonicalProgress({
       workflowId,

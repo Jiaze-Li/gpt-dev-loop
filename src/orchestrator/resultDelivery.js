@@ -83,6 +83,48 @@ function runGit(gitBin, args, cwd, spawn) {
   });
 }
 
+// Inspect every path component of `rel` beneath `baseDir` with `lstat` (which
+// never follows a link). Returns:
+//   { symlinkComponent: <rel path of the first component that IS a symlink> | null,
+//     escapes:          true if `rel` contains a `..` / absolute segment,
+//     exists:           true iff the full path resolves to a real lstat entry
+//                       (false as soon as any component is missing) }
+// existsSync is unsafe for this: it follows links, so a dangling symlink (or a
+// symlinked parent whose target is absent) reads as "available" while the
+// later copy writes the approved bytes THROUGH the link, outside the source
+// workspace. This is the fail-closed replacement.
+function inspectPathComponents(fs, baseDir, rel) {
+  const parts = String(rel).split(/[\\/]+/).filter((p) => p !== '' && p !== '.');
+  if (parts.length === 0 || parts.some((p) => p === '..') || path.isAbsolute(rel)) {
+    return { symlinkComponent: null, escapes: true, exists: false };
+  }
+  if (typeof fs.lstatSync !== 'function') {
+    // No lstat available (an injected fs shim). Symlink safety cannot be
+    // proven here; fall back to a plain existence probe. node:fs — the only
+    // fs used in real deployments — always provides lstatSync.
+    const full = path.join(baseDir, ...parts);
+    const exists = typeof fs.existsSync === 'function' && fs.existsSync(full);
+    return { symlinkComponent: null, escapes: false, exists };
+  }
+  let current = baseDir;
+  for (let i = 0; i < parts.length; i += 1) {
+    current = path.join(current, parts[i]);
+    let st;
+    try {
+      st = fs.lstatSync(current);
+    } catch (err) {
+      if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
+        return { symlinkComponent: null, escapes: false, exists: false };
+      }
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      return { symlinkComponent: parts.slice(0, i + 1).join('/'), escapes: false, exists: true };
+    }
+  }
+  return { symlinkComponent: null, escapes: false, exists: true };
+}
+
 function splitLines(text) {
   return String(text ?? '')
     .split('\n')
@@ -200,8 +242,20 @@ export function createResultDelivery({
     // baselineHead's invocation snapshot and are safe to patch over. Only a
     // difference from that immutable snapshot represents a user edit made
     // after workflow start.
+    // Fail-closed symlink gate: a delivered destination may not traverse an
+    // existing symlink at ANY component (a dangling link, or a symlinked
+    // parent). Checked before the hash comparison because a symlinked path
+    // must never be probed with a link-following stat/hash.
+    const symlinkConflicts = new Map();
+    for (const changedPath of delta.changedPaths) {
+      const probe = inspectPathComponents(fs, sourceWorkspace, changedPath);
+      if (probe.escapes) symlinkConflicts.set(changedPath, 'destination-escapes-workspace');
+      else if (probe.symlinkComponent) symlinkConflicts.set(changedPath, probe.symlinkComponent);
+    }
+
     const sourceDiverged = new Set();
     for (const changedPath of delta.changedPaths) {
+      if (symlinkConflicts.has(changedPath)) continue;
       // `git diff <tree>` does not compare an untracked source file to the
       // corresponding snapshot blob. Hash both raw file contents instead so
       // snapshot-untracked files get the same exact comparison as tracked
@@ -210,9 +264,11 @@ export function createResultDelivery({
       const snapshotRes = must(await git(snapshotArgs, sourceWorkspace), snapshotArgs, sourceWorkspace);
       const snapshotLine = splitLines(snapshotRes.stdout)[0];
       const snapshotHash = snapshotLine ? snapshotLine.split(/\s+/)[2] : null;
-      const sourcePath = path.join(sourceWorkspace, changedPath);
+      // Non-link existence: inspectPathComponents already proved no component
+      // is a symlink for this path, and reports whether the final entry is a
+      // real lstat hit — so this never follows a link.
       let sourceHash = null;
-      if (fs.existsSync(sourcePath)) {
+      if (inspectPathComponents(fs, sourceWorkspace, changedPath).exists) {
         // Hash through the path's Git filters so this is comparable to the
         // blob written by the snapshot commit (e.g. CRLF attributes).
         const sourceArgs = ['hash-object', `--path=${changedPath}`, '--', changedPath];
@@ -231,12 +287,21 @@ export function createResultDelivery({
       conflicts.push(detail ? { path: conflictPath, reason, detail } : { path: conflictPath, reason });
     };
 
+    for (const [changedPath, detail] of symlinkConflicts) {
+      add(
+        changedPath,
+        detail === 'destination-escapes-workspace' ? 'destination-escapes-workspace' : 'symlinked-destination',
+        detail === 'destination-escapes-workspace' ? undefined : `symlink at "${detail}"`
+      );
+    }
+
     for (const changedPath of delta.changedPaths) {
       if (sourceDiverged.has(changedPath)) add(changedPath, 'overlapping-edit');
     }
 
     for (const rel of delta.untrackedFiles) {
-      if (fs.existsSync(path.join(sourceWorkspace, rel))) add(rel, 'creation-collision');
+      if (symlinkConflicts.has(rel)) continue;
+      if (inspectPathComponents(fs, sourceWorkspace, rel).exists) add(rel, 'creation-collision');
     }
 
     if (delta.patch && delta.patch.trim() !== '') {
@@ -259,17 +324,32 @@ export function createResultDelivery({
       );
     }
 
+    // Fail-closed symlink gate: no delivered path — tracked or untracked —
+    // may traverse an existing symlink at any destination component, and none
+    // may escape the source workspace. `git apply` and `copyFileSync` both
+    // follow links, so this must be proven with lstat BEFORE either runs.
+    for (const rel of delta.changedPaths) {
+      const probe = inspectPathComponents(fs, sourceWorkspace, rel);
+      if (probe.escapes) {
+        throw new ResultDeliveryError(RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
+          `refusing to deliver "${rel}": destination escapes the source workspace`, { path: rel });
+      }
+      if (probe.symlinkComponent) {
+        throw new ResultDeliveryError(RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
+          `refusing to deliver "${rel}": destination traverses a symlink at "${probe.symlinkComponent}"`,
+          { path: rel, symlink: probe.symlinkComponent });
+      }
+    }
+
     // Preflight every new-file operation before mutating the source. Delivery
     // only creates these paths, so a collision means rollback could overwrite
     // user data and must fail closed.
     for (const rel of delta.untrackedFiles) {
-      const src = path.join(delta.worktreePath, rel);
-      const dst = path.join(sourceWorkspace, rel);
-      if (!fs.existsSync(src)) {
+      if (!inspectPathComponents(fs, delta.worktreePath, rel).exists) {
         throw new ResultDeliveryError(RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
           `could not copy delivered file "${rel}": source file is missing`, { path: rel });
       }
-      if (fs.existsSync(dst)) {
+      if (inspectPathComponents(fs, sourceWorkspace, rel).exists) {
         throw new ResultDeliveryError(RESULT_DELIVERY_ERROR_CODES.DELIVERY_COMMAND_FAILED,
           `could not copy delivered file "${rel}": destination already exists`, { path: rel });
       }

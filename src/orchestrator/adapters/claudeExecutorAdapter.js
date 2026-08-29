@@ -9,7 +9,8 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
+import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
+import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
 
 const REPORT_FIELDS = [
   'task_id',
@@ -199,7 +200,7 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], ...PROCESS_GROUP_SPAWN_OPTS });
     } catch (err) {
       onProcessExited?.({ spawnError: err.message, timeoutDurationMs: timeoutMs });
       reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not start "${command}": ${err.message}`));
@@ -218,14 +219,25 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
     const stderrChunks = [];
     let settled = false;
     let timedOut = false;
+    let treeKillTimer = null;
+
+    // Abort / timeout must terminate the CLI's ENTIRE process tree (any
+    // verification or tool subprocess it spawned), not just its own pid, and
+    // teardown only completes once the direct child's `close` fires below.
+    const tearDownTree = () => {
+      if (treeKillTimer) clearTimeout(treeKillTimer);
+      treeKillTimer = terminateProcessTree(child);
+    };
 
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill('SIGKILL');
+      tearDownTree();
     }, timeoutMs);
 
+    let aborted = false;
     const onAbort = () => {
-      try { child.kill('SIGKILL'); } catch {}
+      aborted = true;
+      try { tearDownTree(); } catch {}
     };
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
@@ -234,6 +246,7 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (treeKillTimer) clearTimeout(treeKillTimer);
       signal?.removeEventListener('abort', onAbort);
       fn();
     };
@@ -278,6 +291,12 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
           reject(
             new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`)
           );
+          return;
+        }
+        if (aborted) {
+          // A cancellation is not a provider failure — surface it as one so it
+          // triggers ZERO failover / retry (see errors.js isCancellation).
+          reject(new ProviderCancelledError(`executor "${command}" terminated by cancellation`));
           return;
         }
         resolve({

@@ -3,14 +3,15 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
+import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
+import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
 import { buildPrompt, parseExecutionReport } from './claudeExecutorAdapter.js';
 
 function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActivity, onProcessStarted, onProcessExited, signal }) {
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], ...PROCESS_GROUP_SPAWN_OPTS });
     } catch (err) {
       onProcessExited?.({ spawnError: err.message, timeoutDurationMs: timeoutMs });
       reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not start "${command}": ${err.message}`));
@@ -25,14 +26,24 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
     const stderrChunks = [];
     let settled = false;
     let timedOut = false;
+    let aborted = false;
+    let treeKillTimer = null;
+
+    // Abort / timeout tears down the CLI's whole process tree, not just its
+    // own pid; teardown completes only when the direct child's `close` fires.
+    const tearDownTree = () => {
+      if (treeKillTimer) clearTimeout(treeKillTimer);
+      treeKillTimer = terminateProcessTree(child);
+    };
 
     const timer = setTimeout(() => {
       timedOut = true;
-      try { child.kill('SIGKILL'); } catch {}
+      try { tearDownTree(); } catch {}
     }, timeoutMs);
 
     const onAbort = () => {
-      try { child.kill('SIGKILL'); } catch {}
+      aborted = true;
+      try { tearDownTree(); } catch {}
     };
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
@@ -41,6 +52,7 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (treeKillTimer) clearTimeout(treeKillTimer);
       signal?.removeEventListener('abort', onAbort);
       fn();
     };
@@ -78,6 +90,10 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
         });
         if (timedOut) {
           reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`));
+          return;
+        }
+        if (aborted) {
+          reject(new ProviderCancelledError(`executor "${command}" terminated by cancellation`));
           return;
         }
         resolve({
@@ -243,7 +259,7 @@ export function createCodexSessionManager({
 
   return {
     async execute(taskCard, { signal } = {}) {
-      if (signal?.aborted) throw new Error('executor cancelled');
+      if (signal?.aborted) throw new ProviderCancelledError('executor cancelled');
       sessionCount += 1;
       const sessionNumber = sessionCount;
 
@@ -295,7 +311,7 @@ export function createCodexSessionManager({
         onProcessExited: (details) => onProcessExited?.({ ...processContext, ...details }),
       });
       const report = await executor.execute(taskCardForSession, { signal });
-      if (signal?.aborted) throw new Error('executor cancelled');
+      if (signal?.aborted) throw new ProviderCancelledError('executor cancelled');
 
       try {
         Object.defineProperties(report, {
