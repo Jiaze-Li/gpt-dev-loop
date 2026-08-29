@@ -60,6 +60,13 @@ import {
   REWORK_VERIFICATION_STATUSES,
 } from './organicReworkRecorder.js';
 import {
+  tryAcquireWorkflowOwnership,
+  releaseWorkflowOwnership,
+  readOwnerLease,
+  isLeaseOwnerAlive,
+  OWNERSHIP_CODES,
+} from './workflowOwnership.js';
+import {
   claimOwner,
   requestStop,
   readControl,
@@ -292,6 +299,35 @@ export async function runSuperGPT({
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   const result = { ...EMPTY_RESULT(), workflowId };
 
+  // ATOMIC OWNERSHIP LEASE — the authority. Acquired before ANY durable
+  // workflow-state or preserved-worktree mutation, and before the pipeline
+  // (Planner/Supervisor/Executor/Reviewer/Gate) can run. Exactly one
+  // concurrent process wins; every loser returns WORKFLOW_ALREADY_OWNED here
+  // having made zero provider/Gate calls and zero checkpoint/worktree writes.
+  // Held for this run's entire lifetime; released only in finalizeActiveWorkflow.
+  const ownership = tryAcquireWorkflowOwnership({
+    root: SUPERGPT_WORKTREE_ROOT,
+    workflowId,
+    isStopRequested: () => {
+      try { return isStopRequested({ root: SUPERGPT_WORKTREE_ROOT, workflowId }); } catch { return false; }
+    },
+  });
+  let ownershipToken = ownership.acquired ? ownership.ownerToken : null;
+  if (!ownership.acquired) {
+    result.status = 'WORKFLOW_ALREADY_OWNED';
+    result.code = ownership.code;
+    result.reason = ownership.code === OWNERSHIP_CODES.STALE_OWNER_LOCK
+      ? `workflow "${workflowId}" has a stale ownership lock that could not be safely reclaimed`
+      : `workflow "${workflowId}" is already owned by pid ${ownership.ownerPid ?? 'unknown'}${ownership.acquiredAt ? ` (since ${ownership.acquiredAt})` : ''}`;
+    result.ownerPid = ownership.ownerPid ?? null;
+    if (typeof onEvent === 'function') {
+      try {
+        onEvent({ type: SUPERGPT_EVENTS.WORKFLOW_FINISHED, timestamp: new Date().toISOString(), status: result.status, reason: result.reason });
+      } catch { /* consumer errors never break the run */ }
+    }
+    return result;
+  }
+
   const workflowStateManager = new WorkflowStateManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
   workflowStateManager.startHeartbeat(1000);
   const lifecycleManager = new WorkflowLifecycleManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd });
@@ -331,6 +367,8 @@ export async function runSuperGPT({
     workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.STOPPED, { reason: result.reason });
     workflowStateManager.stopHeartbeat();
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status });
+    try { releaseWorkflowOwnership({ root: SUPERGPT_WORKTREE_ROOT, workflowId, ownerToken: ownershipToken }); } catch { /* best effort */ }
+    ownershipToken = null;
     return result;
   }
 
@@ -359,8 +397,17 @@ export async function runSuperGPT({
   // Resolved by this function's own finalizer (below), never self-awaited.
   let resolveCompletion;
   const completionPromise = new Promise((resolve) => { resolveCompletion = resolve; });
+  // The AUTHORITATIVE owning-run finalizer. Ownership is released here and
+  // ONLY here — after ACTIVE_WORKFLOWS removal, i.e. after this function's
+  // own teardown (provider close, Gate kill, checkpoint writes, terminal-state
+  // publish, delivery/cleanup) has run. Release verifies ownerToken, so this
+  // process can never drop a newer owner's lease.
   const finalizeActiveWorkflow = () => {
     ACTIVE_WORKFLOWS.delete(workflowId);
+    if (ownershipToken) {
+      try { releaseWorkflowOwnership({ root: SUPERGPT_WORKTREE_ROOT, workflowId, ownerToken: ownershipToken }); } catch { /* best effort */ }
+      ownershipToken = null;
+    }
     try { resolveCompletion(); } catch { /* already settled */ }
   };
   ACTIVE_WORKFLOWS.set(workflowId, {
@@ -1424,6 +1471,9 @@ export async function supergptResume({
     throw new Error(`Cannot resume workflow "${workflowId}": workspace metadata not found at ${metadataPath}`);
   }
 
+  // Fast UX pre-checks (NOT authoritative — the atomic lease in runSuperGPT is
+  // the authority). Reject early on an obviously-live foreign owner so we do
+  // not spin up managers just to fail the ownership claim.
   const resumeOwnerControl = readControl({ root, workflowId });
   if (
     resumeOwnerControl?.owner?.pid
@@ -1431,6 +1481,12 @@ export async function supergptResume({
     && isOwnerAlive(resumeOwnerControl)
   ) {
     throw new Error(`Cannot resume workflow "${workflowId}": its original run (pid ${resumeOwnerControl.owner.pid}) is still active. Stop it first, then resume.`);
+  }
+  const resumeLease = readOwnerLease({ root, workflowId });
+  if (resumeLease && resumeLease.pid !== process.pid && isLeaseOwnerAlive(resumeLease)) {
+    const err = new Error(`Cannot resume workflow "${workflowId}": it is already owned by pid ${resumeLease.pid} (lease acquired ${resumeLease.acquiredAt}). Stop it first, then resume.`);
+    err.code = OWNERSHIP_CODES.WORKFLOW_ALREADY_OWNED;
+    throw err;
   }
 
   let meta;

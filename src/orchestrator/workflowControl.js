@@ -25,6 +25,22 @@ import path from 'node:path';
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, rmSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { isValidWorktreeFingerprint } from './hostVerification.js';
+import { foreignLiveLeaseHolder } from './workflowOwnership.js';
+
+// §6 CONTROL.JSON SINGLE-WRITER INVARIANT. Only the process holding the
+// ownership lease may write owner-owned durable records (checkpoint, advanced
+// baseline, closeout proof, delivery state). If a DIFFERENT live process holds
+// the lease, an owner-record write from here is a bug — fail closed rather than
+// silently clobbering the real owner's concurrent read-modify-write.
+// stop.json is an external-control record and is exempt (never routed here).
+function assertMayWriteOwnerRecord({ root, workflowId }) {
+  const foreign = foreignLiveLeaseHolder({ root, workflowId });
+  if (foreign) {
+    throw new DurableWriteError(
+      `refusing owner-record write to ${workflowId}.control.json: workflow is owned by a different live process (pid ${foreign.pid})`,
+    );
+  }
+}
 
 // Thrown when a correctness-critical durable write cannot be proven to have
 // landed on disk. Callers of a verified writer MUST let this propagate — they
@@ -116,7 +132,8 @@ export function readControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}) 
 }
 
 // Owner-only merge-write of control.json. NEVER touches the stop record.
-export function writeControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}, patch = {}, { verify = false } = {}) {
+export function writeControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {}, patch = {}, { verify = false, allowNonOwner = false } = {}) {
+  if (!allowNonOwner) assertMayWriteOwnerRecord({ root, workflowId });
   const file = controlPath({ root, workflowId });
   const current = readJson(file) ?? {};
   const { stop: _droppedStop, ...patchRest } = patch;
@@ -140,9 +157,13 @@ export function writeControl({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {},
 }
 
 export function claimOwner({ root = SUPERGPT_WORKTREE_ROOT, workflowId, pid = process.pid } = {}) {
+  // Ownership bookkeeping, not an owner-record mutation: the atomic lease in
+  // workflowOwnership.js is the real single-owner authority. Exempt from the
+  // single-writer guard so the lease holder can record owner identity even
+  // before its own lease read-back would be observable.
   const result = writeControl({ root, workflowId }, {
     owner: { pid, startedAt: new Date().toISOString() },
-  });
+  }, { allowNonOwner: true });
   // Lifecycle boundary: a fresh claim intentionally clears a stop request left
   // over from a prior, dead run so an old flag cannot instantly cancel a
   // legitimate resume. Routine checkpoint writes never do this.
