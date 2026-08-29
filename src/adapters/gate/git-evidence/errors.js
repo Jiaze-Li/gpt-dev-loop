@@ -21,4 +21,10 @@ export const GIT_EVIDENCE_ERROR_CODES = Object.freeze({
   GIT_UNAVAILABLE: 'GIT_UNAVAILABLE',
   NOT_A_REPOSITORY: 'NOT_A_REPOSITORY',
   DIFF_COMMAND_FAILED: 'DIFF_COMMAND_FAILED',
+  // A post-execution untracked path that is a symlink must never be
+  // stat()/readFile()'d — both follow the link and would fold the target's
+  // bytes (potentially outside the repo) into Reviewer evidence. Fail closed.
+  UNTRACKED_SYMLINK_NOT_ALLOWED: 'UNTRACKED_SYMLINK_NOT_ALLOWED',
+  // FIFO / socket / block or character device / other non-regular file.
+  UNTRACKED_SPECIAL_FILE_NOT_ALLOWED: 'UNTRACKED_SPECIAL_FILE_NOT_ALLOWED',
 });

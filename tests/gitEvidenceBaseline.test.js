@@ -26,11 +26,25 @@ function makeFakeGit(responses) {
 
 // In-memory fs for untracked-file reads. Keys are absolute paths.
 function makeFakeFs(files) {
+  const typeFlags = (type) => ({
+    isSymbolicLink: () => type === 'symlink',
+    isFile: () => type === undefined || type === 'file',
+    isFIFO: () => type === 'fifo',
+    isSocket: () => type === 'socket',
+    isBlockDevice: () => type === 'block',
+    isCharacterDevice: () => type === 'char',
+    isDirectory: () => type === 'dir',
+  });
   return {
+    async lstat(p) {
+      const entry = files[p];
+      if (!entry) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      return { size: entry.size ?? entry.buffer?.length ?? 0, ...typeFlags(entry.type) };
+    },
     async stat(p) {
       const entry = files[p];
       if (!entry) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
-      return { size: entry.size ?? entry.buffer.length };
+      return { size: entry.size ?? entry.buffer.length, ...typeFlags(entry.type === 'symlink' ? 'file' : entry.type) };
     },
     async readFile(p) {
       const entry = files[p];
@@ -50,7 +64,7 @@ const REPO_HEAD = {
 function collector(responses, files = {}) {
   const { spawn, calls } = makeFakeGit(responses);
   const fs = makeFakeFs(files);
-  return { collector: createGitEvidenceCollector({ spawn, readFile: fs.readFile, stat: fs.stat }), calls };
+  return { collector: createGitEvidenceCollector({ spawn, readFile: fs.readFile, stat: fs.stat, lstat: fs.lstat }), calls };
 }
 
 test('clean baseline + modified tracked file: diff is taken against baseline.head, no untracked files', async () => {

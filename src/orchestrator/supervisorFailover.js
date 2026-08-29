@@ -2,6 +2,8 @@
 // decide() is authoritative; a fallback starts from a compact checkpoint,
 // never a copied provider transcript.
 
+import { isCancellation } from './errors.js';
+
 const RECOVERABLE = new Set(['PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_AUTH_FAILED', 'PROVIDER_UNAVAILABLE', 'PROVIDER_TIMEOUT']);
 
 export function createSupervisorHandoffCheckpoint(context = {}) {
@@ -26,6 +28,9 @@ export function createFailoverSupervisorSession({ providers, onEvent } = {}) {
       try {
         return await providers[index].session.decide(context);
       } catch (error) {
+        // A cancellation is never a recoverable provider failure — propagate
+        // it and switch to no other provider.
+        if (isCancellation(error, context?.signal)) throw error;
         const reason = error?.details?.providerFailure ?? error?.providerFailure ?? null;
         if (!RECOVERABLE.has(reason) || index + 1 >= providers.length) throw error;
         const from = providers[index];

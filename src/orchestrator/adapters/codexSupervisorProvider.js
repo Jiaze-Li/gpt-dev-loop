@@ -6,7 +6,7 @@
 import { randomUUID } from 'node:crypto';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { buildAgySupervisorPrompt, parseSupervisorJson } from './agySupervisorProvider.js';
-import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
+import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
 
 function classify(stderr = '') {
   if (/quota|rate.?limit|usage limit/i.test(stderr)) return 'PROVIDER_QUOTA_EXHAUSTED';
@@ -14,7 +14,8 @@ function classify(stderr = '') {
   return 'PROVIDER_UNAVAILABLE';
 }
 
-async function callCodex({ prompt, model, timeoutMs = 180000, executable = 'codex', spawn = nodeSpawn, effort = null, conversationId = null } = {}) {
+async function callCodex({ prompt, model, timeoutMs = 180000, executable = 'codex', spawn = nodeSpawn, effort = null, conversationId = null, signal = null } = {}) {
+  if (signal?.aborted) throw new ProviderCancelledError('Codex Supervisor call cancelled before launch', { model: model ?? null });
   // Codex persists a thread locally so BOUNDED_STICKY can use its documented
   // `exec resume <session-id>` transport.  CHECKPOINT_FRESH callers simply
   // omit the id and get a new physical thread.
@@ -27,15 +28,27 @@ async function callCodex({ prompt, model, timeoutMs = 180000, executable = 'code
     let child;
     try { child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] }); } catch (error) { resolve({ error }); return; }
     const out = []; const err = []; let settled = false;
-    const finish = (value) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+    const finish = (value) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener?.('abort', onAbort);
+        resolve(value);
+      }
+    };
     const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} finish({ timedOut: true }); }, timeoutMs);
     timer.unref?.();
+    // A cancellation kills the already-launched child immediately so it can
+    // never keep running for its full timeout after the workflow stopped.
+    const onAbort = () => { try { child.kill('SIGKILL'); } catch {} finish({ aborted: true }); };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     child.on('error', (error) => finish({ error }));
     child.stdout?.on('data', (chunk) => out.push(chunk));
     child.stderr?.on('data', (chunk) => err.push(chunk));
     child.on('close', (exitCode) => finish({ exitCode, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
   });
   const durationMs = Date.now() - started;
+  if (result.aborted || signal?.aborted) throw new ProviderCancelledError('Codex Supervisor call cancelled', { durationMs, model: model ?? null });
   if (result.timedOut) throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_TIMEOUT, 'Codex Supervisor timed out', { providerFailure: 'PROVIDER_TIMEOUT', durationMs, model: model ?? null });
   if (result.error || result.exitCode !== 0) throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_UNAVAILABLE, 'Codex Supervisor transport unavailable', { providerFailure: classify(result.stderr), durationMs, model: model ?? null, exitCode: result.exitCode ?? null });
   let text = null; let usage = null; let returnedConversationId = null;
@@ -51,11 +64,11 @@ async function callCodex({ prompt, model, timeoutMs = 180000, executable = 'code
   return { text, usage, durationMs, conversationId: returnedConversationId ?? conversationId ?? null };
 }
 
-export function createCodexSupervisorProvider({ call = callCodex, model = null, timeoutMs, executable, spawn } = {}) {
+export function createCodexSupervisorProvider({ call = callCodex, model = null, timeoutMs, executable, spawn, signal = null } = {}) {
   return {
     provider: 'codex', model,
     async decide(context = {}, { effort = null, conversationId = null } = {}) {
-      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort, conversationId });
+      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort, conversationId, signal });
       let raw;
       try { raw = JSON.parse(result.text.trim()); } catch {
         throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT, 'Codex Supervisor did not return a JSON decision', { providerFailure: 'PROVIDER_PROTOCOL_ERROR', model });

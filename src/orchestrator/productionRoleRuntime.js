@@ -2,6 +2,7 @@
 // physical transports stay in their existing adapters; this module is the
 // only place that selects a provider and retries another family.
 import { RoleRouter, QuotaPoolRegistry, ProviderHealthRegistry } from './roleRouting.js';
+import { isCancellation, ProviderCancelledError } from './errors.js';
 
 const RETRYABLE = new Set([
   'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_RATE_LIMITED', 'PROVIDER_AUTH_FAILED',
@@ -29,6 +30,7 @@ export function createProductionRoleRuntime({
   resolveFamily,
   adapters = {},
   onEvent,
+  signal,
 } = {}) {
   const capabilityResolver = resolveFamily ?? ((family) => ({
     requestedFamily: family,
@@ -38,10 +40,16 @@ export function createProductionRoleRuntime({
   }));
   const roleRouter = router ?? new RoleRouter({ rolePolicy, quotaRegistry, providerHealth, resolveFamily: capabilityResolver, onEvent });
 
-  async function invoke(role, payload, { signals = {}, operationId = null } = {}) {
+  async function invoke(role, payload, { signals = {}, operationId = null, signal: callSignal = null } = {}) {
+    const abortSignal = callSignal ?? signal;
     const attempted = new Set();
     let lastError = null;
     while (true) {
+      // A cancellation between provider attempts terminates the whole
+      // invocation immediately — it never selects "the next provider".
+      if (abortSignal?.aborted) {
+        throw new ProviderCancelledError(`${role} invocation cancelled`, { operationId });
+      }
       const selection = roleRouter.route(role, signals);
       if (!selection || attempted.has(selection.requestedFamily)) {
         if (lastError) throw lastError;
@@ -60,6 +68,13 @@ export function createProductionRoleRuntime({
         onEvent?.({ type: 'ROLE_INVOCATION_SUCCEEDED', role, operationId, ...selection });
         return { value, selection };
       } catch (error) {
+        // Cancellation is not provider unavailability. Bail out BEFORE any
+        // failure classification, recordFailure, provider-health/quota
+        // mutation, or failover — and propagate the original error.
+        if (isCancellation(error, abortSignal)) {
+          onEvent?.({ type: 'ROLE_INVOCATION_CANCELLED', role, operationId, ...selection });
+          throw error;
+        }
         lastError = error;
         const failure = providerFailure(error);
         roleRouter.recordFailure(selection, failure);

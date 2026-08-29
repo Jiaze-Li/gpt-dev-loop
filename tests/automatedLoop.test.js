@@ -1844,3 +1844,85 @@ test('rate-limit: Supervisor decision throttle exhausts budget -> resumable HUMA
   assert.equal(supervisor.isClosed(), false);
   assert.equal(windowSession.closedWindowId(), null);
 });
+
+// P1-1: STATE_MACHINE.md §2 — VERIFYING FAIL -> REWORK (never REVIEWING).
+// A non-environment Gate failure must consume ZERO Reviewer calls and route
+// deterministically to a fresh Executor attempt. A Reviewer PASS must never
+// be able to override a Gate FAIL.
+test('P1-1. Gate FAIL routes to REWORK with zero Reviewer calls; PASS after fix completes', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'CONTINUE_REWORK' },
+    { action: 'WORKFLOW_DONE', summary: 'done after gate fix' },
+  ]);
+
+  // attempt 1 Gate FAIL (ordinary test failure), attempt 2 Gate PASS.
+  const gateOutcomes = [
+    { pass: false, results: [{ command: 'npm test', pass: false, output: '1 failing' }] },
+    { pass: true, results: [{ command: 'npm test', pass: true, output: 'ok' }] },
+  ];
+  let gateRuns = 0;
+  const gateRunner = {
+    runs: [],
+    async run(cmds) {
+      this.runs.push(cmds);
+      return gateOutcomes[gateRuns++] ?? gateOutcomes[gateOutcomes.length - 1];
+    },
+  };
+
+  // Reviewer would return PASS if ever called — it must NOT be called for
+  // the failed Gate attempt.
+  const passWithUsage = {
+    ...passResult(taskCard.task_id),
+    callId: 'rev-call-attempt-2',
+    usage: { input_tokens: 10, output_tokens: 5, callId: 'rev-call-attempt-2' },
+  };
+  const createReviewerSession = makeFakeReviewerFactory({
+    [taskCard.task_id]: [passWithUsage],
+  });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const persistence = makeFakePersistence();
+  const windowSession = makeFakeWindowSession();
+
+  const usageRecords = [];
+  const usageTracker = {
+    record: (r) => usageRecords.push(r),
+    summary: () => ({}),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-p1-1',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    persistence,
+    usageTracker,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+
+  // attempt 1: Gate FAIL — zero Reviewer calls, task not completed, fresh
+  // Executor attempt followed.
+  assert.equal(createReviewerSession.created.length, 1);
+  assert.equal(createReviewerSession.created[0].reviewCalls, 1, 'Reviewer called exactly once — only for the PASS attempt 2');
+  assert.equal(createClaudeSessionManager.managers[0].executions.length, 2, 'two Executor attempts');
+  assert.equal(gateRuns, 2);
+
+  // History records a single PASS after the rework, not a completion off the
+  // failed Gate attempt.
+  assert.deepEqual(result.history, [{ task_id: taskCard.task_id, decision: 'PASS', attempts: 2 }]);
+
+  // Usage accounting contains no Reviewer call for attempt 1.
+  const reviewerUsage = usageRecords.filter((r) => r.role === 'reviewer');
+  assert.equal(reviewerUsage.length, 1);
+  assert.equal(reviewerUsage[0].attempt, 2);
+  assert.ok(!reviewerUsage.some((r) => r.attempt === 1), 'no Reviewer usage recorded for the failed Gate attempt');
+
+  // The failing Gate output was persisted as actionable rework feedback.
+  assert.ok(persistence.writes.some((w) => /1 failing/.test(w.last_error || '')));
+});

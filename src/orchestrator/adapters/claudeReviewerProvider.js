@@ -6,13 +6,13 @@ import { buildAgyReviewPrompt, parseReviewJson } from "./agyReviewerProvider.js"
 import { callClaude } from "./claudeSupervisorProvider.js";
 import { AdapterError, ADAPTER_ERROR_CODES } from "../errors.js";
 
-export function createClaudeReviewerProvider({ call = callClaude, model = "opus", timeoutMs, executable, spawn } = {}) {
+export function createClaudeReviewerProvider({ call = callClaude, model = "opus", timeoutMs, executable, spawn, signal = null } = {}) {
   return {
     provider: "claude",
     model,
     async review(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
       const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
-      const result = await call({ prompt, model, timeoutMs, executable, spawn });
+      const result = await call({ prompt, model, timeoutMs, executable, spawn, signal });
       let obj;
       try {
         const trimmed = result.text.trim().replace(/^\`\`\`(?:json)?\s*/i, "").replace(/\s*\`\`\`$/, "");

@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn as nodeSpawn } from "node:child_process";
 import { buildAgySupervisorPrompt, parseSupervisorJson } from "./agySupervisorProvider.js";
-import { AdapterError, ADAPTER_ERROR_CODES } from "../errors.js";
+import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from "../errors.js";
 
 function classify(stderr = "", stdout = "") {
   const combined = `${stderr} ${stdout}`;
@@ -21,7 +21,9 @@ export async function callClaude({
   spawn = nodeSpawn,
   env = process.env,
   cwd = process.cwd(),
+  signal = null,
 } = {}) {
+  if (signal?.aborted) throw new ProviderCancelledError("Claude Supervisor call cancelled before launch", { model: model ?? null });
   const args = [
     "-p",
     "--output-format",
@@ -46,6 +48,7 @@ export async function callClaude({
       if (!settled) {
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener?.("abort", onAbort);
         resolve(value);
       }
     };
@@ -54,6 +57,8 @@ export async function callClaude({
       finish({ timedOut: true });
     }, timeoutMs);
     timer.unref?.();
+    const onAbort = () => { try { child.kill("SIGKILL"); } catch {} finish({ aborted: true }); };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
     child.on("error", (error) => finish({ error }));
     child.stdout?.on("data", (chunk) => out.push(chunk));
     child.stderr?.on("data", (chunk) => err.push(chunk));
@@ -66,6 +71,9 @@ export async function callClaude({
     child.stdin?.end();
   });
   const durationMs = Date.now() - started;
+  if (result.aborted || signal?.aborted) {
+    throw new ProviderCancelledError("Claude Supervisor call cancelled", { durationMs, model: model ?? null });
+  }
   if (result.timedOut) {
     throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_TIMEOUT, "Claude Supervisor timed out", {
       providerFailure: "PROVIDER_TIMEOUT",
@@ -117,12 +125,12 @@ export async function callClaude({
   return { text, usage, durationMs };
 }
 
-export function createClaudeSupervisorProvider({ call = callClaude, model = "opus", timeoutMs, executable, spawn } = {}) {
+export function createClaudeSupervisorProvider({ call = callClaude, model = "opus", timeoutMs, executable, spawn, signal = null } = {}) {
   return {
     provider: "claude",
     model,
     async decide(context = {}, { effort } = {}) {
-      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort });
+      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort, signal });
       let raw;
       try {
         const trimmed = result.text.trim().replace(/^\`\`\`(?:json)?\s*/i, "").replace(/\s*\`\`\`$/, "");

@@ -6,13 +6,13 @@ import { buildAgyReviewPrompt, parseReviewJson } from "./agyReviewerProvider.js"
 import { callCodex } from "./codexSupervisorProvider.js";
 import { AdapterError, ADAPTER_ERROR_CODES } from "../errors.js";
 
-export function createCodexReviewerProvider({ call = callCodex, model = null, timeoutMs, executable, spawn } = {}) {
+export function createCodexReviewerProvider({ call = callCodex, model = null, timeoutMs, executable, spawn, signal = null } = {}) {
   return {
     provider: "codex",
     model,
     async review(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
       const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
-      const result = await call({ prompt, model, timeoutMs, executable, spawn });
+      const result = await call({ prompt, model, timeoutMs, executable, spawn, signal });
       let obj;
       try {
         const trimmed = result.text.trim().replace(/^\`\`\`(?:json)?\s*/i, "").replace(/\s*\`\`\`$/, "");

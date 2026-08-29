@@ -94,9 +94,9 @@ export function selectProviders({
     if (!sessions.has(family)) {
       let provider;
       if (family === 'codex:default') {
-        provider = createCodexSupervisorProvider({ call: codexCall, model: codexModel, timeoutMs });
+        provider = createCodexSupervisorProvider({ call: codexCall, model: codexModel, timeoutMs, signal });
       } else if (family === 'claude:opus') {
-        provider = createClaudeSupervisorProvider({ call: claudeCall, model: 'opus', timeoutMs });
+        provider = createClaudeSupervisorProvider({ call: claudeCall, model: 'opus', timeoutMs, signal });
       } else {
         provider = createAgySupervisorProvider({ callAgy, model: family === 'agy:gpt-oss' ? gptOssModel : geminiModel, timeoutMs, jsonSchema, signal });
       }
@@ -109,7 +109,7 @@ export function selectProviders({
     return sessions.get(family);
   };
   const runtime = createProductionRoleRuntime({
-    router, rolePolicy, quotaRegistry, providerHealth, onEvent,
+    router, rolePolicy, quotaRegistry, providerHealth, onEvent, signal,
     resolveFamily: (family) => ({
       requestedFamily: family,
       resolvedModel: family === 'codex:default' ? codexModel : family === 'agy:gpt-oss' ? gptOssModel : family === 'agy:gemini' ? geminiModel : family.split(':')[1],
@@ -121,7 +121,7 @@ export function selectProviders({
     adapters: {
       planner: {
         'codex:default': ({ resolve }, selection) => resolve(async (opts) => {
-          const result = await (codexCall ?? callCodex)({ prompt: opts.prompt, model: codexModel, timeoutMs });
+          const result = await (codexCall ?? callCodex)({ prompt: opts.prompt, model: codexModel, timeoutMs, signal });
           recordPlannerUsage({ result, selection, model: codexModel, usageTracker, provider: 'codex' });
           const trimmed = (result.text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
           return { text: trimmed, json: JSON.parse(trimmed), usage: result.usage, durationMs: result.durationMs };
@@ -132,7 +132,7 @@ export function selectProviders({
           return result;
         }),
         'claude:opus': ({ resolve }, selection) => resolve(async (opts) => {
-          const result = await (claudeCall ?? callClaude)({ prompt: opts.prompt, model: 'opus', timeoutMs });
+          const result = await (claudeCall ?? callClaude)({ prompt: opts.prompt, model: 'opus', timeoutMs, signal });
           recordPlannerUsage({ result, selection, model: 'opus', usageTracker, provider: 'claude' });
           const trimmed = (result.text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
           return { text: trimmed, json: JSON.parse(trimmed), usage: result.usage, durationMs: result.durationMs };
@@ -155,7 +155,7 @@ export function selectProviders({
           return reviewerSessions.get(key).review(taskId, taskCard, executionReport, evidence, opts);
         },
         'codex:default': async ({ taskId, taskCard, executionReport, evidence, opts }) => {
-          const key = `${taskId}:codex:default`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createCodexReviewerProvider({ call: codexCall, model: codexModel, timeoutMs }), { store: sessionStore, usageTracker })());
+          const key = `${taskId}:codex:default`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createCodexReviewerProvider({ call: codexCall, model: codexModel, timeoutMs, signal }), { store: sessionStore, usageTracker })());
           return reviewerSessions.get(key).review(taskId, taskCard, executionReport, evidence, opts);
         },
         'agy:gemini': async ({ taskId, taskCard, executionReport, evidence, opts }) => {
@@ -163,7 +163,7 @@ export function selectProviders({
           return reviewerSessions.get(key).review(taskId, taskCard, executionReport, evidence, opts);
         },
         'claude:opus': async ({ taskId, taskCard, executionReport, evidence, opts }) => {
-          const key = `${taskId}:claude:opus`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createClaudeReviewerProvider({ call: claudeCall, model: 'opus', timeoutMs }), { store: sessionStore, usageTracker })());
+          const key = `${taskId}:claude:opus`; if (!reviewerSessions.has(key)) reviewerSessions.set(key, createAgyReviewerSessionFactory(createClaudeReviewerProvider({ call: claudeCall, model: 'opus', timeoutMs, signal }), { store: sessionStore, usageTracker })());
           return reviewerSessions.get(key).review(taskId, taskCard, executionReport, evidence, opts);
         },
       },

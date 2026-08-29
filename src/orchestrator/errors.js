@@ -13,6 +13,39 @@ export class AdapterError extends Error {
   }
 }
 
+// A cancellation is NOT a provider failure. When an in-flight provider call
+// is aborted (AbortSignal, agy AGY_ABORTED, a killed child process), the
+// runtime must propagate this immediately and perform ZERO failover — it
+// must never be classified as PROVIDER_UNAVAILABLE, and it must never poison
+// provider-health or quota state.
+export class ProviderCancelledError extends Error {
+  constructor(message = 'provider call cancelled', details) {
+    super(message);
+    this.name = 'ProviderCancelledError';
+    this.code = 'PROVIDER_CANCELLED';
+    this.cancelled = true;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+// Recognises every cancellation shape that can reach the role runtime:
+//   - an aborted AbortSignal handed to invoke()
+//   - AbortError / ABORT_ERR from a native aborted operation
+//   - AGY_ABORTED from src/agy/agyClient.js
+//   - CancellationError from src/orchestrator/supergpt.js
+//   - ProviderCancelledError (above), or any error tagged { cancelled: true }
+//   - an AdapterError whose providerFailure is PROVIDER_CANCELLED
+export function isCancellation(error, signal) {
+  if (signal?.aborted) return true;
+  if (!error || typeof error !== 'object') return false;
+  if (error.cancelled === true) return true;
+  const names = new Set(['AbortError', 'CancellationError', 'ProviderCancelledError']);
+  if (names.has(error.name)) return true;
+  const codes = new Set(['ABORT_ERR', 'AGY_ABORTED', 'CANCELLED', 'PROVIDER_CANCELLED']);
+  const code = error.code ?? error.details?.providerFailure ?? error.providerFailure ?? null;
+  return codes.has(code);
+}
+
 export const ADAPTER_ERROR_CODES = Object.freeze({
   EXECUTOR_UNAVAILABLE: 'EXECUTOR_UNAVAILABLE',
   EXECUTOR_TIMEOUT: 'EXECUTOR_TIMEOUT',

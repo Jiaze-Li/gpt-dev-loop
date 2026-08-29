@@ -10,7 +10,7 @@
 
 import path from 'node:path';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { readFile as nodeReadFile, stat as nodeStat } from 'node:fs/promises';
+import { readFile as nodeReadFile, stat as nodeStat, lstat as nodeLstat } from 'node:fs/promises';
 import { GitEvidenceError, GIT_EVIDENCE_ERROR_CODES } from './errors.js';
 
 // Untracked task-produced files under this many bytes have their full text
@@ -137,7 +137,16 @@ function renderOmittedFileNote(relPath, bytes, reason) {
 }
 
 // git ls-files --others --exclude-standard -z, then classify each path.
-async function collectUntrackedFiles({ git, cwd, repoRoot, readFile, stat, maxBytes }) {
+function describeSpecialFile(info) {
+  if (info.isFIFO()) return 'FIFO';
+  if (info.isSocket()) return 'socket';
+  if (info.isBlockDevice()) return 'block device';
+  if (info.isCharacterDevice()) return 'character device';
+  if (info.isDirectory()) return 'directory';
+  return 'non-regular file';
+}
+
+async function collectUntrackedFiles({ git, cwd, repoRoot, readFile, stat, lstat, maxBytes }) {
   const listResult = await git(['ls-files', '--others', '--exclude-standard', '-z'], cwd);
   if (listResult.code !== 0) {
     throw new GitEvidenceError(
@@ -150,14 +159,35 @@ async function collectUntrackedFiles({ git, cwd, repoRoot, readFile, stat, maxBy
   const files = [];
   for (const relPath of relPaths) {
     const absPath = path.resolve(repoRoot ?? cwd, relPath);
-    let size;
+
+    // SECURITY (P1-3): lstat BEFORE any size read / readFile of an untracked
+    // evidence path. A symlink (or FIFO/socket/device) must never be
+    // stat()'d or readFile()'d — both follow the link and would fold the
+    // target's bytes into Reviewer evidence. Fail closed with a typed error
+    // rather than silently turning a leak into ordinary evidence.
+    let linkInfo;
     try {
-      const info = await stat(absPath);
-      size = info.size;
+      linkInfo = await lstat(absPath);
     } catch {
       files.push({ path: relPath, bytes: null, binary: null, included: false, reason: 'unreadable' });
       continue;
     }
+    if (linkInfo.isSymbolicLink()) {
+      throw new GitEvidenceError(
+        GIT_EVIDENCE_ERROR_CODES.UNTRACKED_SYMLINK_NOT_ALLOWED,
+        `untracked evidence path "${relPath}" is a symlink — refusing to stat or read its target`
+      );
+    }
+    if (!linkInfo.isFile()) {
+      throw new GitEvidenceError(
+        GIT_EVIDENCE_ERROR_CODES.UNTRACKED_SPECIAL_FILE_NOT_ALLOWED,
+        `untracked evidence path "${relPath}" is a ${describeSpecialFile(linkInfo)} — refusing to read it`
+      );
+    }
+
+    // The lstat above already proved this is a regular file; use its size
+    // directly (no second, symlink-following stat() call).
+    const size = linkInfo.size;
     if (size > maxBytes) {
       files.push({ path: relPath, bytes: size, binary: null, included: false, reason: 'oversized' });
       continue;
@@ -183,6 +213,7 @@ export function createGitEvidenceCollector({
   spawn = nodeSpawn,
   readFile = nodeReadFile,
   stat = nodeStat,
+  lstat = nodeLstat,
   maxUntrackedTextBytes = DEFAULT_MAX_UNTRACKED_TEXT_BYTES,
 } = {}) {
   async function git(args, cwd) {
@@ -312,6 +343,7 @@ export function createGitEvidenceCollector({
           repoRoot: baseline.repo_root ?? cwd,
           readFile,
           stat,
+          lstat,
           maxBytes: maxUntrackedTextBytes,
         });
         untrackedDiff = untrackedFiles

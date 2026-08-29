@@ -627,6 +627,76 @@ export async function runAutomatedWorkflow({
       };
     }
 
+    // STATE_MACHINE.md §2: VERIFYING FAIL -> REWORK (never REVIEWING).
+    // A non-environment Gate failure routes deterministically back to a fresh
+    // Executor attempt and consumes ZERO Reviewer calls — a Reviewer PASS
+    // must never be able to override a Gate FAIL. The failing Gate results
+    // are carried forward as actionable Executor rework feedback.
+    if (evidence.pass !== true) {
+      const failingResults = (evidence.results || []).filter((r) => !r.pass);
+      const failureSummary =
+        failingResults.map((r) => `${r.command}: ${r.output || 'failed'}`).join('; ') ||
+        'Gate verification did not pass';
+      log(
+        `gate FAIL (non-environment): routing task=${currentTaskCard.task_id} attempt=${attemptCount} ` +
+          `to REWORK without invoking the Reviewer`
+      );
+
+      latestReviewResult = {
+        task_id: currentTaskCard.task_id,
+        decision: 'REWORK',
+        findings: failingResults.map((r) => `Gate command failed: ${r.command}`),
+        required_changes: failingResults.map((r) => `Fix failing verification command: ${r.command}`),
+        rationale: `Gate verification failed on this attempt: ${failureSummary}`,
+        source: 'GATE',
+      };
+
+      if (workflowStateManager) {
+        workflowStateManager.state.stageStatuses.reviewer = 'REWORK';
+        workflowStateManager.setDecision('REWORK');
+        workflowStateManager.recordTaskAttempt({
+          taskId: currentTaskCard.task_id,
+          attempt: attemptCount,
+          executorCallId: executionReport?.callId ?? executionReport?.usage?.callId ?? null,
+          gateResult: 'FAIL',
+          reviewerDecision: 'REWORK',
+          requiredChanges: latestReviewResult.required_changes,
+          reviewerCallId: null,
+        });
+        workflowStateManager.recordProgress();
+      }
+
+      try {
+        defaultOrganicReworkRecorder.observeAttempt({
+          workflowId,
+          taskId: currentTaskCard.task_id,
+          attempt: attemptCount,
+          executorCallId: executionReport?.callId ?? executionReport?.usage?.callId ?? null,
+          executorModel: executionReport?.model ?? null,
+          gateResult: 'FAIL',
+          reviewerDecision: 'REWORK',
+          reviewerCallId: null,
+          reviewerModel: null,
+          requiredChanges: latestReviewResult.required_changes,
+          evidence,
+          nonConvergence: false,
+        });
+      } catch {
+        /* non-blocking passive observation */
+      }
+
+      if (persistence) {
+        await persistence.writeState({
+          workflow_id: workflowId,
+          task_id: currentTaskCard.task_id,
+          last_error: `Gate verification failed: ${failureSummary}`,
+        });
+      }
+
+      await persistCheckpoint();
+      return { done: false };
+    }
+
     return runReviewStep({ executionReport, evidence });
   }
 
