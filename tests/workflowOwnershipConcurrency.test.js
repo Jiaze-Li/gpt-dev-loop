@@ -22,6 +22,7 @@ import {
   releaseWorkflowOwnership,
   readOwnerLease,
   ownerLockPath,
+  WorkflowOwnershipError,
   OWNERSHIP_CODES,
 } from '../src/orchestrator/workflowOwnership.js';
 
@@ -363,6 +364,65 @@ test('K: a failed lease removal is surfaced, not silently dropped', async () => 
     // A real retry with the same token succeeds.
     assert.equal(releaseWorkflowOwnership({ root, workflowId, ownerToken: owner.ownerToken }).released, true);
     assert.equal(readOwnerLease({ root, workflowId }), null);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// L. NO TIME-BASED STEAL — a lock directory with no valid lease.json is never
+//    automatically reclaimed, no matter how old it is.
+// ---------------------------------------------------------------------------
+test('L: an old lock dir with no lease.json is NOT auto-reclaimed regardless of age', async () => {
+  const home = await tmp('home-L');
+  const root = worktreeRoot(home);
+  const workflowId = 'wf-nosteal-L';
+  try {
+    // Lock dir only — no lease.json — aged well past every grace window.
+    writeLeaseFixture(root, workflowId, null, { dirAgeMs: 72 * 3600_000 });
+
+    const r = tryAcquireWorkflowOwnership({ root, workflowId });
+    assert.equal(r.acquired, false);
+    assert.equal(r.code, OWNERSHIP_CODES.STALE_OWNER_LOCK);
+
+    // The directory was neither deleted nor replaced, and no lease was written.
+    assert.equal(existsSync(ownerLockPath({ root, workflowId })), true);
+    assert.equal(readOwnerLease({ root, workflowId }), null);
+
+    // A second, even older attempt still refuses.
+    writeLeaseFixture(root, workflowId, null, { dirAgeMs: 365 * 24 * 3600_000 });
+    assert.equal(tryAcquireWorkflowOwnership({ root, workflowId }).code, OWNERSHIP_CODES.STALE_OWNER_LOCK);
+    assert.equal(readOwnerLease({ root, workflowId }), null);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// M. PUBLICATION FAILURE CLEANUP — mkdir succeeds but publishLease throws; the
+//    current process removes its own half-published directory, then a later
+//    acquisition succeeds normally.
+// ---------------------------------------------------------------------------
+test('M: mkdir succeeds but publishLease throws — the half-published lock is cleaned up; a later acquire succeeds', async () => {
+  const home = await tmp('home-M');
+  const root = worktreeRoot(home);
+  const workflowId = 'wf-pubfail-M';
+  try {
+    assert.throws(
+      () => tryAcquireWorkflowOwnership({
+        root, workflowId,
+        _publishLease: () => { throw new Error('simulated disk full during publish'); },
+      }),
+      (err) => err instanceof WorkflowOwnershipError && /disk full/.test(err.message),
+    );
+
+    // No orphan left behind.
+    assert.equal(existsSync(ownerLockPath({ root, workflowId })), false);
+
+    // Normal acquisition now works.
+    const ok = tryAcquireWorkflowOwnership({ root, workflowId });
+    assert.equal(ok.acquired, true);
+    assert.equal(readOwnerLease({ root, workflowId }).ownerToken, ok.ownerToken);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

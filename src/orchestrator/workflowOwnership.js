@@ -19,11 +19,16 @@
 // sees either no lease.json or the whole thing, never a torn file.
 //
 // A contender that sees the lock directory but a missing / partial / unreadable
-// lease.json must NOT treat it as a dead owner and reclaim it — that is the
-// window in which the legitimate winner is still publishing its metadata.
-// During a bounded grace period it is reported as OWNER_LEASE_INITIALIZING
-// (fail closed). Only after the grace period, and only through the serialized
-// stale-recovery mutex, may an orphaned lock be reclaimed.
+// lease.json must NEVER reclaim it. Age is not proof the owner died — a hard
+// crash in the tiny mkdir→publish window and a slow publication look identical
+// from outside. Such a lock ALWAYS fails closed: OWNER_LEASE_INITIALIZING while
+// young (the caller may briefly retry), STALE_OWNER_LOCK once past the grace
+// window. Neither steals. Recovery of a genuinely orphaned unreadable lock is
+// explicit/manual only.
+//
+// Automatic stale recovery is allowed in EXACTLY ONE case: a complete, valid
+// lease.json whose recorded local PID is demonstrably dead — then a serialized
+// reclaim (mkdir-mutex) hands the workflow to exactly one new owner.
 //
 // lease.json holds:
 //   { workflowId, ownerToken, pid, hostname, acquiredAt, runtimeRevision }
@@ -59,9 +64,10 @@ export const OWNERSHIP_CODES = Object.freeze({
   STALE_OWNER_LOCK: 'STALE_OWNER_LOCK',
 });
 
-// A lock directory with no readable lease.json younger than this is assumed to
-// belong to a winner still publishing its metadata — fail closed, never steal.
-// Publication is normally sub-millisecond; the window is deliberately generous.
+// A lock directory with no readable lease.json younger than this is reported as
+// OWNER_LEASE_INITIALIZING (transient, caller may retry); older than this it is
+// STALE_OWNER_LOCK. BOTH are fail-closed — neither ever reclaims. The threshold
+// only changes the typed code, never whether a steal happens.
 const LEASE_INIT_GRACE_MS = 10_000;
 
 // A reclaim mutex older than this whose holder PID is dead is itself considered
@@ -114,10 +120,10 @@ export function readOwnerLease({ root = SUPERGPT_WORKTREE_ROOT, workflowId } = {
 }
 
 // Classify the on-disk ownership state.
-//   { state: 'ABSENT' }
-//   { state: 'OWNED', lease }          lease.json is complete and valid
-//   { state: 'INITIALIZING', ageMs }   lock dir young, lease.json not yet readable
-//   { state: 'ORPHANED', ageMs }       lock dir old, lease.json still not readable
+//   { state: 'ABSENT' }               no lock directory
+//   { state: 'OWNED', lease }         lock dir + complete, valid lease.json
+//   { state: 'UNKNOWN', ageMs }       lock dir but NO readable lease.json —
+//                                     ALWAYS fail closed, never reclaimed
 function leaseState({ root, workflowId, now = Date.now() }) {
   const dir = ownerLockPath({ root, workflowId });
   if (!existsSync(dir)) return { state: 'ABSENT' };
@@ -125,11 +131,22 @@ function leaseState({ root, workflowId, now = Date.now() }) {
   if (lease) return { state: 'OWNED', lease };
   let ageMs = 0;
   try { ageMs = now - statSync(dir).mtimeMs; } catch { ageMs = LEASE_INIT_GRACE_MS + 1; }
-  // A reclaimer holding the serialized mutex is actively rewriting lease.json
-  // (its rm + rename bump the dir mtime, so age alone would misread this as a
-  // fresh publication). Route contenders to the mutex, not to INITIALIZING.
-  if (existsSync(reclaimMutexPath({ root, workflowId }))) return { state: 'ORPHANED', ageMs, reclaiming: true };
-  return { state: ageMs < LEASE_INIT_GRACE_MS ? 'INITIALIZING' : 'ORPHANED', ageMs };
+  return { state: 'UNKNOWN', ageMs };
+}
+
+// The typed fail-closed code for an UNKNOWN lock (lock dir, no valid lease).
+// Young → transient/retryable; old → stale. Never reclaims either way.
+function unknownLockResult(ageMs) {
+  return {
+    acquired: false,
+    code: ageMs < LEASE_INIT_GRACE_MS
+      ? OWNERSHIP_CODES.OWNER_LEASE_INITIALIZING
+      : OWNERSHIP_CODES.STALE_OWNER_LOCK,
+    ownerToken: null,
+    lease: null,
+    ownerPid: null,
+    acquiredAt: null,
+  };
 }
 
 // Is the process that holds `lease` demonstrably alive? A live owner must NEVER
@@ -176,6 +193,25 @@ function publishLease({ root, workflowId, lease }) {
   renameSync(tmp, finalPath);
 }
 
+// Fresh claim: atomic mkdir, then publish complete lease.json. If EITHER the
+// hook or the publication fails AFTER we created the directory, remove our own
+// half-published directory immediately (it is unambiguously ours — we just
+// mkdir()'d it) and rethrow, so an ordinary I/O failure never leaves an orphan.
+function claimAndPublish({ root, workflowId, runtimeRevision, _afterClaimHook, _publishLease }) {
+  const dir = ownerLockPath({ root, workflowId });
+  mkdirSync(dir); // throws EEXIST to the caller if we lost the race
+  try {
+    const token = newOwnerToken();
+    const lease = buildLease({ workflowId, ownerToken: token, runtimeRevision });
+    if (typeof _afterClaimHook === 'function') _afterClaimHook();
+    (typeof _publishLease === 'function' ? _publishLease : publishLease)({ root, workflowId, lease });
+    return acquiredResult({ ownerToken: token, lease });
+  } catch (err) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort cleanup */ }
+    throw err;
+  }
+}
+
 function ownedResult(lease, code) {
   return {
     acquired: false,
@@ -198,11 +234,12 @@ function acquiredResult({ ownerToken, lease }) {
   };
 }
 
-// Reclaim an ORPHANED or dead-owner lock. Serialized through an atomic mkdir
-// mutex so two simultaneous reclaimers cannot both wipe + republish. Returns an
-// acquire-result-shaped object; the loser gets STALE_OWNER_LOCK (fail closed),
-// never a wrong "acquired".
-function reclaimStaleLease({ root, workflowId, runtimeRevision, staleLease, isStopRequested, _afterClaimHook }) {
+// Reclaim a lock whose lease.json is COMPLETE, VALID, and names a demonstrably
+// dead local PID. This is the only automatic-recovery path. Serialized through
+// an atomic mkdir mutex so two simultaneous reclaimers still yield exactly one
+// winner (the loser gets STALE_OWNER_LOCK, fail closed — never a wrong
+// "acquired"). An UNKNOWN lock (no valid lease.json) is NEVER routed here.
+function reclaimStaleLease({ root, workflowId, runtimeRevision, staleLease, isStopRequested, _afterClaimHook, _publishLease }) {
   const mutex = reclaimMutexPath({ root, workflowId });
   let holdMutex = false;
   try {
@@ -232,40 +269,35 @@ function reclaimStaleLease({ root, workflowId, runtimeRevision, staleLease, isSt
 
     // Re-classify under the mutex: state may have changed while we waited.
     const st = leaseState({ root, workflowId });
-    if (st.state === 'OWNED') {
-      if (isLeaseOwnerAlive(st.lease)) {
-        return ownedResult(
-          st.lease,
-          safeBool(isStopRequested) ? OWNERSHIP_CODES.OWNER_SHUTTING_DOWN : OWNERSHIP_CODES.WORKFLOW_ALREADY_OWNED,
-        );
-      }
-      // valid lease, dead owner -> reclaim below
-    } else if (st.state === 'INITIALIZING') {
-      // A brand-new winner appeared and is publishing — do NOT touch it.
-      return ownedResult(null, OWNERSHIP_CODES.OWNER_LEASE_INITIALIZING);
-    } else if (st.state === 'ABSENT') {
-      // Lock vanished entirely — fresh claim.
+    if (st.state === 'OWNED' && isLeaseOwnerAlive(st.lease)) {
+      // Someone published a fresh live lease while we waited for the mutex.
+      return ownedResult(
+        st.lease,
+        safeBool(isStopRequested) ? OWNERSHIP_CODES.OWNER_SHUTTING_DOWN : OWNERSHIP_CODES.WORKFLOW_ALREADY_OWNED,
+      );
+    }
+    if (st.state === 'UNKNOWN') {
+      // Lock dir with no valid lease.json — never reclaim automatically.
+      return unknownLockResult(st.ageMs);
+    }
+    if (st.state === 'ABSENT') {
+      // Lock vanished entirely — a fresh claim (with orphan cleanup on failure).
       try {
-        mkdirSync(ownerLockPath({ root, workflowId }));
+        return claimAndPublish({ root, workflowId, runtimeRevision, _afterClaimHook, _publishLease });
       } catch (err) {
         if (err?.code === 'EEXIST') return ownedResult(readOwnerLease({ root, workflowId }), OWNERSHIP_CODES.WORKFLOW_ALREADY_OWNED);
-        throw err;
+        throw new WorkflowOwnershipError(`stale-recovery fresh claim failed for "${workflowId}": ${err.message}`, 'WORKFLOW_OWNERSHIP_ERROR');
       }
-      const t = newOwnerToken();
-      const lease = buildLease({ workflowId, ownerToken: t, runtimeRevision });
-      if (typeof _afterClaimHook === 'function') _afterClaimHook();
-      publishLease({ root, workflowId, lease });
-      return acquiredResult({ ownerToken: t, lease });
     }
 
-    // Reclaim: replace lease.json in place (we hold the reclaim mutex, so no
-    // other reclaimer races us; the lock dir already exists so no fresh
-    // fast-path contender can mkdir it).
+    // OWNED + dead PID: overwrite lease.json in place. publishLease writes a
+    // temp file and atomic-renames over the old one — if it throws, the old
+    // (dead) lease.json is left intact and a later attempt reclaims again; we
+    // never leave the lock in an UNKNOWN state here.
     const token = newOwnerToken();
     const lease = buildLease({ workflowId, ownerToken: token, runtimeRevision });
-    try { rmSync(leaseJsonPath({ root, workflowId }), { force: true }); } catch { /* ignore */ }
     if (typeof _afterClaimHook === 'function') _afterClaimHook();
-    publishLease({ root, workflowId, lease });
+    (typeof _publishLease === 'function' ? _publishLease : publishLease)({ root, workflowId, lease });
     return acquiredResult({ ownerToken: token, lease });
   } finally {
     if (holdMutex) {
@@ -297,9 +329,8 @@ function writeAdvisoryFile(file, contents) {
  * / OWNER_LEASE_INITIALIZING / STALE_OWNER_LOCK. The caller MUST NOT proceed to
  * drive the workflow unless `acquired === true`.
  *
- * `_afterClaimHook` (test-only): invoked AFTER the atomic mkdir claim wins but
- * BEFORE lease.json is published — used to widen the publication window in the
- * paused-publication race regression.
+ * `_afterClaimHook` / `_publishLease` (test-only): widen or fail the
+ * mkdir→publish window in the publication-race / publish-failure regressions.
  *
  * @returns {{acquired:boolean, code:string, ownerToken:(string|null), lease:object|null, ownerPid:(number|null), acquiredAt:(string|null)}}
  */
@@ -309,20 +340,19 @@ export function tryAcquireWorkflowOwnership({
   runtimeRevision,
   isStopRequested,
   _afterClaimHook,
+  _publishLease,
 } = {}) {
   if (!workflowId) throw new Error('tryAcquireWorkflowOwnership requires a workflowId');
   if (!existsSync(root)) mkdirSync(root, { recursive: true });
   const rev = runtimeRevision === undefined ? getSuperGptSourceRevision() : runtimeRevision;
-  const dir = ownerLockPath({ root, workflowId });
 
-  // Fast path: atomic exclusive directory creation IS the claim.
+  const claimOpts = { root, workflowId, runtimeRevision: rev, _afterClaimHook, _publishLease };
+
+  // Fast path: atomic exclusive directory creation IS the claim. A publish
+  // failure after the mkdir cleans up its own directory (claimAndPublish) and
+  // rethrows — no orphan.
   try {
-    mkdirSync(dir);
-    const token = newOwnerToken();
-    const lease = buildLease({ workflowId, ownerToken: token, runtimeRevision: rev });
-    if (typeof _afterClaimHook === 'function') _afterClaimHook();
-    publishLease({ root, workflowId, lease });
-    return acquiredResult({ ownerToken: token, lease });
+    return claimAndPublish(claimOpts);
   } catch (err) {
     if (err?.code !== 'EEXIST') {
       throw new WorkflowOwnershipError(
@@ -337,57 +367,39 @@ export function tryAcquireWorkflowOwnership({
 
   if (st.state === 'OWNED') {
     if (isLeaseOwnerAlive(st.lease)) {
-      // Live owner — includes the PID-reuse case (a recycled PID now belongs to
-      // an unrelated live process): fail closed, never steal.
+      // Live / foreign / unknown-liveness owner (incl. PID reuse): never steal.
       const code = safeBool(isStopRequested)
         ? OWNERSHIP_CODES.OWNER_SHUTTING_DOWN
         : OWNERSHIP_CODES.WORKFLOW_ALREADY_OWNED;
       return ownedResult(st.lease, code);
     }
-    // Valid lease, dead owner -> serialized stale reclamation.
-    return reclaimStaleLease({ root, workflowId, runtimeRevision: rev, staleLease: st.lease, isStopRequested, _afterClaimHook });
+    // The ONLY automatic-recovery case: complete valid lease, dead local PID.
+    return reclaimStaleLease({ ...claimOpts, staleLease: st.lease, isStopRequested });
   }
 
-  if (st.state === 'INITIALIZING') {
-    // A winner claimed the lock and is still publishing lease.json. NEVER
-    // delete it. Fail closed; the caller can retry shortly.
-    return {
-      acquired: false,
-      code: OWNERSHIP_CODES.OWNER_LEASE_INITIALIZING,
-      ownerToken: null,
-      lease: null,
-      ownerPid: null,
-      acquiredAt: null,
-    };
+  if (st.state === 'UNKNOWN') {
+    // Lock directory with a missing / malformed / unreadable lease.json. Age is
+    // NOT proof the owner died — fail closed, NEVER reclaim automatically.
+    return unknownLockResult(st.ageMs);
   }
 
-  if (st.state === 'ABSENT') {
-    // Lock dir vanished between our failed mkdir and the stat (a concurrent
-    // release). One bounded retry of the fast path.
-    try {
-      mkdirSync(dir);
-      const token = newOwnerToken();
-      const lease = buildLease({ workflowId, ownerToken: token, runtimeRevision: rev });
-      if (typeof _afterClaimHook === 'function') _afterClaimHook();
-      publishLease({ root, workflowId, lease });
-      return acquiredResult({ ownerToken: token, lease });
-    } catch (err) {
-      if (err?.code === 'EEXIST') {
-        const raced = leaseState({ root, workflowId });
-        if (raced.state === 'OWNED' && isLeaseOwnerAlive(raced.lease)) {
-          return ownedResult(raced.lease, OWNERSHIP_CODES.WORKFLOW_ALREADY_OWNED);
-        }
-        if (raced.state === 'INITIALIZING') {
-          return { acquired: false, code: OWNERSHIP_CODES.OWNER_LEASE_INITIALIZING, ownerToken: null, lease: null, ownerPid: null, acquiredAt: null };
-        }
-        return reclaimStaleLease({ root, workflowId, runtimeRevision: rev, staleLease: raced.lease ?? null, isStopRequested, _afterClaimHook });
+  // ABSENT — the lock dir vanished between our failed mkdir and the classify
+  // (a concurrent release). One bounded retry of the fast path.
+  try {
+    return claimAndPublish(claimOpts);
+  } catch (err) {
+    if (err?.code === 'EEXIST') {
+      const raced = leaseState({ root, workflowId });
+      if (raced.state === 'OWNED' && isLeaseOwnerAlive(raced.lease)) {
+        return ownedResult(raced.lease, OWNERSHIP_CODES.WORKFLOW_ALREADY_OWNED);
       }
-      throw new WorkflowOwnershipError(`ownership retry failed for "${workflowId}": ${err.message}`, 'WORKFLOW_OWNERSHIP_ERROR');
+      if (raced.state === 'OWNED') {
+        return reclaimStaleLease({ ...claimOpts, staleLease: raced.lease, isStopRequested });
+      }
+      return unknownLockResult(raced.ageMs ?? LEASE_INIT_GRACE_MS + 1);
     }
+    throw new WorkflowOwnershipError(`ownership retry failed for "${workflowId}": ${err.message}`, 'WORKFLOW_OWNERSHIP_ERROR');
   }
-
-  // ORPHANED — lock dir old, no readable lease.json -> serialized reclamation.
-  return reclaimStaleLease({ root, workflowId, runtimeRevision: rev, staleLease: null, isStopRequested, _afterClaimHook });
 }
 
 /**
