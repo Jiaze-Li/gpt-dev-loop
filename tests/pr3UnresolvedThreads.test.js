@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import { createResultDelivery, ResultDeliveryError } from '../src/orchestrator/resultDelivery.js';
 import { killProcessTree, terminateProcessTree } from '../src/orchestrator/processTree.js';
 import { createClaudeExecutorAdapter } from '../src/orchestrator/adapters/claudeExecutorAdapter.js';
+import { createGateRunner } from '../src/orchestrator/adapters/gateRunner.js';
 import { supergptWatch } from '../src/orchestrator/supergpt.js';
 
 const tick = () => new Promise((r) => setImmediate(r));
@@ -27,6 +28,12 @@ function demoTaskCard() {
     allowed_files: ['src/**'], forbidden_files: [],
     acceptance_criteria: ['ok'], verification_commands: ['npm test'], completion_signal: 'DONE',
   };
+}
+
+function esrch() {
+  const err = new Error('no such process group');
+  err.code = 'ESRCH';
+  return err;
 }
 
 // ===========================================================================
@@ -92,6 +99,8 @@ test('symlink delivery: a symlinked PARENT directory is a conflict for both chec
         child.stdout.emit('data', Buffer.from(''));
         child.emit('close', 0);
       });
+      void command;
+      void args;
       void opts;
       return child;
     };
@@ -120,10 +129,10 @@ test('symlink delivery: a symlinked PARENT directory is a conflict for both chec
 });
 
 // ===========================================================================
-// Finding 2 — abort/timeout must terminate the executor CLI's whole process
-// tree (its own process group), and adapter teardown must not complete until
-// the direct child has closed. A cancellation must not look like a provider
-// failure (zero failover).
+// Finding 2 — abort/timeout must terminate the whole owned process group. The
+// subtle regression locked here is: the direct CLI/shell leader can exit from
+// SIGTERM while a descendant ignores TERM. Leader close MUST NOT cancel the
+// later SIGKILL or let stop/resume/retry proceed before the group is gone.
 // ===========================================================================
 
 test('killProcessTree signals the negative pid (the whole process group)', () => {
@@ -138,55 +147,155 @@ test('killProcessTree signals the negative pid (the whole process group)', () =>
   assert.deepEqual(calls, [[-4242, 'SIGTERM']]);
 });
 
-test('terminateProcessTree escalates SIGTERM -> SIGKILL after a finite grace', async () => {
+test('terminateProcessTree still SIGKILLs descendants after the group leader has already exited', async () => {
   const orig = process.kill;
   const calls = [];
-  process.kill = (pid, sig) => { calls.push([pid, sig]); };
+  let groupAlive = true;
+  const child = { pid: 77, killed: false, exitCode: null, kill() {} };
+
+  process.kill = (pid, sig) => {
+    calls.push([pid, sig]);
+    if (sig === 0) {
+      if (groupAlive) return;
+      throw esrch();
+    }
+    if (sig === 'SIGKILL') groupAlive = false;
+  };
+
   try {
-    terminateProcessTree({ pid: 77, killed: false, exitCode: null }, { graceMs: 10 });
-    await new Promise((r) => setTimeout(r, 40));
+    const termination = terminateProcessTree(child, { graceMs: 15, pollMs: 2 });
+    // The leader exits promptly on TERM, but another group member survives.
+    child.exitCode = 0;
+
+    let done = false;
+    termination.done.then(() => { done = true; });
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(done, false, 'leader exit alone must not acknowledge teardown');
+
+    await termination.done;
+    assert.equal(groupAlive, false);
+    assert.ok(calls.some(([pid, sig]) => pid === -77 && sig === 'SIGTERM'));
+    assert.ok(calls.some(([pid, sig]) => pid === -77 && sig === 'SIGKILL'),
+      'SIGKILL still targets the snapshotted PGID after leader exit');
   } finally {
     process.kill = orig;
   }
-  assert.deepEqual(calls, [[-77, 'SIGTERM'], [-77, 'SIGKILL']]);
 });
 
-test('claude executor adapter: own process group + tree teardown on abort that awaits child close', async () => {
+test('claude executor: child close does not settle cancellation until its process group disappears', async () => {
   const controller = new AbortController();
-  const killSignals = [];
-  let capturedOpts = null;
+  const orig = process.kill;
   let child = null;
+  let capturedOpts = null;
+  let probes = 0;
 
-  const spawn = (command, args, opts) => {
-    capturedOpts = opts;
-    child = new EventEmitter();
-    child.stdout = new EventEmitter();
-    child.stderr = new EventEmitter();
-    child.stdin = { write() {}, end() {} };
-    // No pid on the fake -> killProcessTree falls back to child.kill, which
-    // here records the signal WITHOUT closing, so we can prove teardown waits.
-    child.kill = (sig) => { killSignals.push(sig); };
-    return child;
+  process.kill = (pid, sig) => {
+    if (pid !== -5151) return orig(pid, sig);
+    if (sig === 0) {
+      probes += 1;
+      // Keep a descendant alive through the immediate probe and one poll,
+      // then model its eventual clean TERM exit before escalation is needed.
+      if (probes < 3) return;
+      throw esrch();
+    }
+    // TERM is accepted but does not immediately remove the whole group.
   };
 
-  const adapter = createClaudeExecutorAdapter({ spawn, command: 'claude' });
-  const p = adapter.execute(demoTaskCard(), { signal: controller.signal });
-  let settled = false;
-  p.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    const spawn = (command, args, opts) => {
+      void command;
+      void args;
+      capturedOpts = opts;
+      child = new EventEmitter();
+      child.pid = 5151;
+      child.killed = false;
+      child.exitCode = null;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.stdin = { write() {}, end() {} };
+      child.kill = () => {};
+      return child;
+    };
 
-  await tick();
-  assert.equal(capturedOpts.detached, true, 'CLI spawned as its own process-group leader');
+    const adapter = createClaudeExecutorAdapter({ spawn, command: 'claude' });
+    const p = adapter.execute(demoTaskCard(), { signal: controller.signal });
+    let settled = false;
+    p.then(() => { settled = true; }, () => { settled = true; });
 
-  controller.abort();
-  await tick();
-  assert.ok(killSignals.includes('SIGTERM'), 'tree teardown started on abort');
-  assert.equal(settled, false, 'execute() has NOT resolved — teardown awaits the child close');
+    await tick();
+    assert.equal(capturedOpts.detached, true, 'CLI spawned as its own process-group leader');
 
-  child.emit('close', null, 'SIGTERM');
-  await assert.rejects(
-    p,
-    (err) => err.name === 'ProviderCancelledError' && err.cancelled === true
-  );
+    controller.abort();
+    child.exitCode = 0;
+    child.emit('close', null, 'SIGTERM');
+    await tick();
+    assert.equal(settled, false,
+      'direct child close is not enough while the owned process group still exists');
+
+    await assert.rejects(
+      p,
+      (err) => err.name === 'ProviderCancelledError' && err.cancelled === true
+    );
+    assert.ok(probes >= 3, 'adapter waited until group-existence probe reported ESRCH');
+  } finally {
+    process.kill = orig;
+  }
+});
+
+test('gate cancellation uses the same group-disappearance acknowledgement', async () => {
+  const controller = new AbortController();
+  const orig = process.kill;
+  let child = null;
+  let probes = 0;
+  let evidenceCalls = 0;
+
+  process.kill = (pid, sig) => {
+    if (pid !== -6161) return orig(pid, sig);
+    if (sig === 0) {
+      probes += 1;
+      if (probes < 3) return;
+      throw esrch();
+    }
+  };
+
+  try {
+    const spawn = () => {
+      child = new EventEmitter();
+      child.pid = 6161;
+      child.killed = false;
+      child.exitCode = null;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      return child;
+    };
+    const gate = createGateRunner({
+      spawn,
+      gitEvidenceCollector: {
+        collect_evidence() {
+          evidenceCalls += 1;
+          return { pass: true };
+        },
+      },
+    });
+
+    const p = gate.run(['long-running-check'], { signal: controller.signal });
+    let settled = false;
+    p.then(() => { settled = true; }, () => { settled = true; });
+    await tick();
+
+    controller.abort();
+    child.exitCode = 0;
+    child.emit('close', null, 'SIGTERM');
+    await tick();
+    assert.equal(settled, false, 'Gate also waits beyond direct shell close');
+
+    await assert.rejects(p, (err) => err.code === 'GATE_CANCELLED');
+    assert.ok(probes >= 3);
+    assert.equal(evidenceCalls, 0, 'cancelled Gate never produces review evidence');
+  } finally {
+    process.kill = orig;
+  }
 });
 
 // ===========================================================================
