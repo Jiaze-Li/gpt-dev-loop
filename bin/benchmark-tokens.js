@@ -42,9 +42,13 @@ export function runDeterministicBenchmark({
     ? VERSIONED_BASELINES['single-attempt']
     : VERSIONED_BASELINES['rework-attempt'];
 
+  // Deterministic benchmarks must be hermetic. Host probes belong only to
+  // benchmark:live; otherwise a CI runner without agy/Claude installed can
+  // turn an unchanged deterministic scenario into an environment anomaly.
+  const baselineEnv = baseline?.environment ?? {};
   const currentEnv = simulateAnomaly === 'env_mismatch'
-    ? { ...getEnvironmentMetadata(), supervisorModel: 'gemini-2.0-flash-experimental' }
-    : { ...baseline?.environment, ...getEnvironmentMetadata(), claudeCliVersion: baseline?.environment?.claudeCliVersion || getEnvironmentMetadata().claudeCliVersion };
+    ? { ...baselineEnv, supervisorModel: 'gemini-2.0-flash-experimental' }
+    : { ...baselineEnv };
 
   if (scenario === 'single') {
     // 1 task / 1 attempt
