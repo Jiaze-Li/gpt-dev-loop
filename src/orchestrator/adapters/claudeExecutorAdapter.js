@@ -219,22 +219,22 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
     const stderrChunks = [];
     let settled = false;
     let timedOut = false;
-    let treeKillTimer = null;
+    let aborted = false;
+    let treeTermination = null;
 
-    // Abort / timeout must terminate the CLI's ENTIRE process tree (any
-    // verification or tool subprocess it spawned), not just its own pid, and
-    // teardown only completes once the direct child's `close` fires below.
+    // Start teardown at most once. The returned promise remains authoritative
+    // even if the direct CLI exits first: descendants in its process group can
+    // still be alive and mutating the worktree.
     const tearDownTree = () => {
-      if (treeKillTimer) clearTimeout(treeKillTimer);
-      treeKillTimer = terminateProcessTree(child);
+      if (!treeTermination) treeTermination = terminateProcessTree(child);
+      return treeTermination;
     };
 
     const timer = setTimeout(() => {
       timedOut = true;
-      tearDownTree();
+      try { tearDownTree(); } catch {}
     }, timeoutMs);
 
-    let aborted = false;
     const onAbort = () => {
       aborted = true;
       try { tearDownTree(); } catch {}
@@ -242,20 +242,22 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
 
-    const finish = (fn) => {
+    const finish = async (fn, { awaitTree = false } = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (treeKillTimer) clearTimeout(treeKillTimer);
       signal?.removeEventListener('abort', onAbort);
+      if (awaitTree && treeTermination) await treeTermination.done;
       fn();
     };
 
     child.on('error', (err) => {
-      finish(() =>
-        (onProcessExited?.({ pid: child.pid ?? null, spawnError: err.message, timeoutDurationMs: timeoutMs }),
-        reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not run "${command}": ${err.message}`))
-        )
+      void finish(
+        () => {
+          onProcessExited?.({ pid: child.pid ?? null, spawnError: err.message, timeoutDurationMs: timeoutMs });
+          reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not run "${command}": ${err.message}`));
+        },
+        { awaitTree: aborted || timedOut }
       );
     });
 
@@ -280,31 +282,38 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
       }
     });
 
-    child.on('close', (code, signal) => {
-      finish(() => {
-        onProcessExited?.({
-          pid: child.pid ?? null, exitCode: code, signal: signal ?? null,
-          timeoutInitiator: timedOut ? 'internal' : null, timeoutDurationMs: timedOut ? timeoutMs : null,
-          stdoutTail: Buffer.concat(stdoutChunks).toString('utf8'), stderrTail: Buffer.concat(stderrChunks).toString('utf8'),
-        });
-        if (timedOut) {
-          reject(
-            new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`)
-          );
-          return;
-        }
-        if (aborted) {
-          // A cancellation is not a provider failure — surface it as one so it
-          // triggers ZERO failover / retry (see errors.js isCancellation).
-          reject(new ProviderCancelledError(`executor "${command}" terminated by cancellation`));
-          return;
-        }
-        resolve({
-          code,
-          stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-          stderr: Buffer.concat(stderrChunks).toString('utf8'),
-        });
-      });
+    child.on('close', (code, closeSignal) => {
+      void finish(
+        () => {
+          onProcessExited?.({
+            pid: child.pid ?? null,
+            exitCode: code,
+            signal: closeSignal ?? null,
+            timeoutInitiator: timedOut ? 'internal' : null,
+            timeoutDurationMs: timedOut ? timeoutMs : null,
+            stdoutTail: Buffer.concat(stdoutChunks).toString('utf8'),
+            stderrTail: Buffer.concat(stderrChunks).toString('utf8'),
+          });
+          if (timedOut) {
+            reject(
+              new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`)
+            );
+            return;
+          }
+          if (aborted) {
+            // A cancellation is not a provider failure — surface it as one so
+            // it triggers ZERO failover / retry (see errors.js isCancellation).
+            reject(new ProviderCancelledError(`executor "${command}" terminated by cancellation`));
+            return;
+          }
+          resolve({
+            code,
+            stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+            stderr: Buffer.concat(stderrChunks).toString('utf8'),
+          });
+        },
+        { awaitTree: aborted || timedOut }
+      );
     });
 
     child.stdin?.write(prompt);
