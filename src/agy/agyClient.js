@@ -230,7 +230,6 @@ export async function callAgy({
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
       finish({ timedOut: true });
     }, timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
 
     const onAbort = () => {
       aborted = true;
