@@ -250,12 +250,15 @@ test('a same-process stop whose owner teardown exceeds the timeout keeps ownersh
   const mod = await import('../src/orchestrator/supergpt.js');
   const { supergptStop, supergptResume, __ACTIVE_WORKFLOWS_FOR_TEST } = mod;
   const root = await tmpRoot('sameproc-timeout');
+  let ownerTimer;
   try {
     const workflowId = 'wf-sp-timeout';
     claimOwner({ root, workflowId, pid: process.pid });
     await writeFile(path.join(root, `${workflowId}.workspace.json`), JSON.stringify({ goal: 'g' }), 'utf8');
     let released = false;
-    const neverSettles = new Promise((resolve) => { setTimeout(() => { released = true; resolve(); }, 10_000).unref(); });
+    const neverSettles = new Promise((resolve) => {
+      ownerTimer = setTimeout(() => { released = true; resolve(); }, 10_000);
+    });
     __ACTIVE_WORKFLOWS_FOR_TEST().set(workflowId, {
       abortController: { abort() {} },
       completionPromise: neverSettles,
@@ -272,6 +275,7 @@ test('a same-process stop whose owner teardown exceeds the timeout keeps ownersh
       /still shutting down|still active/,
     );
   } finally {
+    if (ownerTimer) clearTimeout(ownerTimer);
     __ACTIVE_WORKFLOWS_FOR_TEST().delete('wf-sp-timeout');
     await rm(root, { recursive: true, force: true });
   }
