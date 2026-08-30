@@ -12,6 +12,7 @@ import {
   statSync,
   lstatSync,
   realpathSync,
+  readlinkSync,
   readFileSync,
   writeFileSync,
   mkdirSync,

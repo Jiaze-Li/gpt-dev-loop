@@ -314,7 +314,7 @@ export async function runSuperGPT({
   // concurrent process wins; every loser returns WORKFLOW_ALREADY_OWNED here
   // having made zero provider/Gate calls and zero checkpoint/worktree writes.
   // Held for this run's entire lifetime; released only in finalizeActiveWorkflow.
-  const ownership = acquireWorkflowOwnership({
+  const ownership = await acquireWorkflowOwnership({
     root: SUPERGPT_WORKTREE_ROOT,
     workflowId,
     isStopRequested: () => {

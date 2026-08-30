@@ -412,7 +412,7 @@ export function tryAcquireWorkflowOwnership({
  * immediately. Bounded so a genuinely wedged half-published lock still fails
  * closed (after which the ORPHANED grace/stale-recovery path applies).
  */
-export function acquireWorkflowOwnership({
+export async function acquireWorkflowOwnership({
   maxInitializingRetries = 20,
   initializingRetryMs = 25,
   ...opts
@@ -422,8 +422,7 @@ export function acquireWorkflowOwnership({
     if (r.acquired || r.code !== OWNERSHIP_CODES.OWNER_LEASE_INITIALIZING || attempt >= maxInitializingRetries) {
       return r;
     }
-    const until = Date.now() + initializingRetryMs;
-    while (Date.now() < until) { /* brief spin; publication window is microseconds */ }
+    await new Promise((resolve) => setTimeout(resolve, initializingRetryMs));
   }
 }
 
