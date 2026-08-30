@@ -1,0 +1,26 @@
+name: PR3 unified frontend validation
+
+on:
+  push:
+    branches:
+      - phase1-handshake
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run benchmark
+      - run: git diff --check origin/main...HEAD
