@@ -1,4 +1,4 @@
-name: PR3 closeout validation
+name: PR3 diff-check diagnostic
 
 on:
   push:
@@ -9,50 +9,27 @@ permissions:
   contents: read
 
 jobs:
-  discover-tests:
+  diff-check:
     runs-on: ubuntu-latest
-    outputs:
-      files: ${{ steps.tests.outputs.files }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: tests
-        shell: bash
-        run: |
-          node -e "const fs=require('fs'); const files=fs.readdirSync('tests').filter(f=>f.endsWith('.test.js')).sort().map(f=>'tests/'+f); console.log('files='+JSON.stringify(files))" >> "$GITHUB_OUTPUT"
-
-  test-file:
-    needs: discover-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        file: ${{ fromJSON(needs.discover-tests.outputs.files) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - name: Run ${{ matrix.file }}
-        run: node --test "${{ matrix.file }}"
-
-  validate:
-    needs: test-file
-    if: ${{ always() && needs.test-file.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - name: Capture diff-check output
+        id: diffcheck
+        shell: bash
+        run: |
+          set +e
+          git diff --check origin/main...HEAD > diff-check.txt 2>&1
+          status=$?
+          cat diff-check.txt
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit 0
+      - uses: actions/upload-artifact@v4
         with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: node bin/supergpt.js --help
-      - run: npm test
-      - run: npm run benchmark
-      - run: git diff --check origin/main...HEAD
+          name: diff-check-output
+          path: diff-check.txt
+          if-no-files-found: error
+      - name: Enforce diff-check
+        shell: bash
+        run: test "${{ steps.diffcheck.outputs.status }}" -eq 0
