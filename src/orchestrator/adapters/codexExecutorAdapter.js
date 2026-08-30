@@ -27,13 +27,13 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
     let settled = false;
     let timedOut = false;
     let aborted = false;
-    let treeKillTimer = null;
+    let treeTermination = null;
 
-    // Abort / timeout tears down the CLI's whole process tree, not just its
-    // own pid; teardown completes only when the direct child's `close` fires.
+    // Start teardown at most once. A direct-child close is not sufficient:
+    // descendants may remain alive in the owned process group.
     const tearDownTree = () => {
-      if (treeKillTimer) clearTimeout(treeKillTimer);
-      treeKillTimer = terminateProcessTree(child);
+      if (!treeTermination) treeTermination = terminateProcessTree(child);
+      return treeTermination;
     };
 
     const timer = setTimeout(() => {
@@ -48,20 +48,23 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
 
-    const finish = (fn) => {
+    const finish = async (fn, { awaitTree = false } = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (treeKillTimer) clearTimeout(treeKillTimer);
       signal?.removeEventListener('abort', onAbort);
+      if (awaitTree && treeTermination) await treeTermination.done;
       fn();
     };
 
     child.on('error', (err) => {
-      finish(() => {
-        onProcessExited?.({ pid: child.pid ?? null, spawnError: err.message, timeoutDurationMs: timeoutMs });
-        reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not run "${command}": ${err.message}`));
-      });
+      void finish(
+        () => {
+          onProcessExited?.({ pid: child.pid ?? null, spawnError: err.message, timeoutDurationMs: timeoutMs });
+          reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE, `could not run "${command}": ${err.message}`));
+        },
+        { awaitTree: aborted || timedOut }
+      );
     });
 
     child.stdout?.on('data', (chunk) => {
@@ -77,31 +80,34 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
       }
     });
 
-    child.on('close', (code, signal) => {
-      finish(() => {
-        onProcessExited?.({
-          pid: child.pid ?? null,
-          exitCode: code,
-          signal: signal ?? null,
-          timeoutInitiator: timedOut ? 'internal' : null,
-          timeoutDurationMs: timedOut ? timeoutMs : null,
-          stdoutTail: Buffer.concat(stdoutChunks).toString('utf8'),
-          stderrTail: Buffer.concat(stderrChunks).toString('utf8'),
-        });
-        if (timedOut) {
-          reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`));
-          return;
-        }
-        if (aborted) {
-          reject(new ProviderCancelledError(`executor "${command}" terminated by cancellation`));
-          return;
-        }
-        resolve({
-          code,
-          stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-          stderr: Buffer.concat(stderrChunks).toString('utf8'),
-        });
-      });
+    child.on('close', (code, closeSignal) => {
+      void finish(
+        () => {
+          onProcessExited?.({
+            pid: child.pid ?? null,
+            exitCode: code,
+            signal: closeSignal ?? null,
+            timeoutInitiator: timedOut ? 'internal' : null,
+            timeoutDurationMs: timedOut ? timeoutMs : null,
+            stdoutTail: Buffer.concat(stdoutChunks).toString('utf8'),
+            stderrTail: Buffer.concat(stderrChunks).toString('utf8'),
+          });
+          if (timedOut) {
+            reject(new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`));
+            return;
+          }
+          if (aborted) {
+            reject(new ProviderCancelledError(`executor "${command}" terminated by cancellation`));
+            return;
+          }
+          resolve({
+            code,
+            stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+            stderr: Buffer.concat(stderrChunks).toString('utf8'),
+          });
+        },
+        { awaitTree: aborted || timedOut }
+      );
     });
 
     child.stdin?.write(prompt);
