@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "supergpt": {
-      "command": "node",
-      "args": ["bin/supergpt-mcp.js"]
-    }
-  }
-}

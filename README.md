@@ -1,131 +1,99 @@
 # SuperGPT (gpt-dev-loop)
 
-Autonomous multi-role coding engine with role-routed Planner, Supervisor,
-Executor, and Reviewer providers; complete Git worktree isolation;
-deterministic verification gates; and safe automatic result delivery.
+SuperGPT is a local autonomous coding system. A front-facing agent launches one workflow; the deterministic Core owns planning, isolated execution, verification, independent review, rework, delivery, persistence, and recovery.
 
-> **"Normal coding UX, larger autonomous scope."**
-> Run in any repository or linked worktree: provide natural-language instructions, and SuperGPT plans, isolates, executes, tests, reviews, and delivers verified changes back to your workspace.
+## Product model
 
----
-
-## High-Level Architecture
+Claude, Codex, and AGY have the same role:
 
 ```text
-User Request / Front-Facing Agent
-           │
-           ▼
-    Natural Language Planner (RolePool)
-           │
-           ▼
-    Invocation Workspace Snapshot (HEAD, staged, unstaged, untracked)
-           │
-           ▼
-    Isolated Git Worktree Sandbox (~/.supergpt/worktrees)
-           │
-           ├──► Supervisor RolePool (logical continuity via checkpoints)
-           │          │ (Task Cards)
-           │          ▼
-           ├──► Executor RolePool (Fresh session per attempt)
-           │          │ (Code Edits)
-           │          ▼
-           ├──► Verification Gate [Shell / npm test] (Bounded diagnostics)
-           │          │ (Git Evidence)
-           │          ▼
-           └──► Reviewer RolePool (fresh provider context per attempt)
-                      │ (PASS / REWORK / HUMAN_REQUIRED)
-                      ▼
-    Safe Automatic Result Delivery (Pre-flight conflict check & verification)
-           │
-           ▼
-Invocation Workspace (Approved changes applied, worktree cleaned up)
+User
+  -> Claude / Codex / AGY
+  -> one shared frontend policy
+  -> one shared SuperGPT MCP
+  -> runSuperGPT()
+  -> Planner
+  -> Executor
+  -> deterministic Gate
+  -> independent Reviewer
+  -> next task / rework
+  -> Supervisor only for genuine exceptions
+  -> safe delivery
 ```
 
----
+The front agent is a human interface and launcher, not a second implementation engine. Once SuperGPT owns a task, the front agent does not duplicate planning, coding, testing, review, or rework.
 
-## Features
+## One frontend contract
 
-- **Autonomous Multi-Role Loop**:
-  - **RolePools and failover**: Planner, Supervisor, Executor, and Reviewer are routed independently through provider health, quota, and effort policies.
-  - **Supervisor**: Tracks tasks, handles rework requests, and surfaces real domain ambiguities as `HUMAN_REQUIRED`.
-  - **Executor and Reviewer**: Execute task cards in clean worktrees and independently audit Git diffs plus Gate evidence.
-- **Structured role continuity**: Supervisor continuity is logical, not one persistent physical conversation (`agy:gemini` uses `CHECKPOINT_FRESH`); Reviewer context is fresh per attempt with structured continuity. Executor is RoleRouter-selected (Sonnet, Codex, or Opus).
-- **Workspace Snapshotting**: Operates cleanly on dirty workspaces with untracked files without requiring `git stash` or manual commits. Pre-existing changes become the baseline and are never misclassified as model output.
-- **Safe Automatic Result Delivery**: Approved changes are delivered directly into the exact invocation workspace with atomic conflict detection. Unrelated dirty changes are preserved.
-- **Worktree Lifecycle**: Successfully delivered worktrees are pruned automatically; failed or `HUMAN_REQUIRED` runs are preserved for auditing and resumption.
-- **Human-visible progress**: Frontend observers show task, attempt, stage, active role/provider, Gate/Reviewer state, and terminal status without model calls.
-- **Multiple Front-End Surfaces**:
-  - **CLI**: `bin/supergpt.js "<goal>"` supporting text or streaming JSON (`--output-format=json`).
-  - **Antigravity Skill**: `.agents/skills/supergpt/SKILL.md` for AI pair programmers.
-  - **MCP Server**: `bin/supergpt-mcp.js` exposing non-blocking `supergpt_start`, blocking `supergpt_run`, and local status/wait monitoring.
+`agent-policy/COMMON.md` is the only active front-agent policy. There are no Claude-, Codex-, or AGY-specific routing/launch policies.
 
----
+Normal SuperGPT execution is MCP-only for front agents:
 
-## Quickstart
+1. `supergpt_start({ goal, cwd })`
+2. `supergpt_watch({ workflowId })`
+3. return the terminal result or surface a real `HUMAN_REQUIRED` question
 
-### 1. Check Prerequisites
-Run the built-in diagnostic doctor:
+The CLI remains available for humans and diagnostics, but it is not an alternate agent workflow.
+
+## Global install
+
+Prerequisites: Node 20+, Git, AGY, Claude Code, and Codex available on `PATH`.
+
 ```bash
-npm run doctor
-```
-Verifies local availability of:
-- `git` (system version)
-- `node` (>= 20)
-- `agy` CLI (Google Antigravity CLI, authenticated)
-- `claude` (Claude Code CLI)
-
-### 2. Run Tests
-Run the deterministic unit test suite (524 tests):
-```bash
-npm test
+npm run install-global
+node bin/install-plugin.js --status
 ```
 
-### 3. CLI Usage
+One installation gives all three frontends the same `supergpt` MCP server and the same `COMMON.md` behavior. Re-open/restart frontend sessions after installation so they reload global configuration.
 
-Run a coding task from natural language:
-```bash
-node bin/supergpt.js "Add a healthcheck endpoint with unit tests"
+See `docs/GLOBAL_INSTALL.md` for details.
+
+## V1 workflow
+
+For a reliable Planner task queue, normal transitions are deterministic:
+
+```text
+Planner once
+  -> Executor
+  -> Gate
+  -> Reviewer
+     PASS -> next task / WORKFLOW_DONE
+     first ordinary REWORK -> Executor
+     Gate failure -> Executor
+     ambiguity / repeated non-convergence / plan mismatch / HUMAN_REQUIRED -> Supervisor
 ```
 
-Stream machine-readable typed events (NDJSON):
-```bash
-node bin/supergpt.js "Add a healthcheck endpoint with unit tests" --output-format=json
-```
+Reviewer independence is preserved. Supervisor is not part of the normal happy path.
 
-Run from an explicit plan file:
-```bash
-node bin/supergpt.js --plan=plan.txt
-```
+## Public MCP operations
 
----
+- `supergpt_prepare`
+- `supergpt_plan`
+- `supergpt_start`
+- `supergpt_run`
+- `supergpt_watch`
+- `supergpt_status`
+- `supergpt_wait`
+- `supergpt_verify`
+- `supergpt_resume`
+- `supergpt_stop`
 
-## Machine-Readable Event Stream
+Status/watch/wait and deterministic control-plane operations read local persisted state and do not need model calls.
 
-When invoked with `--output-format=json`, SuperGPT streams typed events:
-- `workflow_started`
-- `stage_changed` (`workspace`, `planning`, `executing`, `supervisor`, `delivery`)
-- `task_started` / `task_attempt_started`
-- `verification_started` / `verification_finished`
-- `review_finished` (`PASS`, `REWORK`, `HUMAN_REQUIRED`)
-- `rework_requested`
-- `delivery_succeeded` / `delivery_failed`
-- `workflow_finished`
+## Safety and reliability
 
----
+- exact invocation workspace snapshot and isolated worktree execution;
+- deterministic Gate before independent Reviewer acceptance;
+- conflict-checked delivery back to the invocation workspace;
+- durable terminal states and phase-aware resume;
+- provider failover, quota/health policy, bounded retries, and process cleanup;
+- no browser/ChatGPT-Web dependency in the V1 production path.
 
-## Project Structure
+## Roadmap
 
-- `bin/`
-  - `supergpt.js`: Production CLI entrypoint.
-  - `supergpt-mcp.js`: Model Context Protocol (MCP) server.
-- `src/`
-  - `orchestrator/`: Core state machine, RolePools, provider routing, workspace snapshotting, result delivery, and persistent sessions.
-  - `agy/`: Headless Antigravity CLI client with fail-closed conversation resumption.
-  - `adapters/`: Gate runner, git evidence collector, and executor adapters.
-- `skills/` / `.agents/skills/supergpt/`: Antigravity Skill definition.
-- `tests/`: 524 deterministic unit tests across all subsystem boundaries.
+V1 is the current production baseline. `docs/V2_PLAN.md` is the sole active V2 plan. V2 adds centralized zero-token `supergpt_route`, Fast/Full paths, and the PR review/fix/re-review closeout loop without reintroducing parallel frontend policies.
 
----
+Historical browser-bridge material is retained only under `docs/handoff/archive/` and Git history.
 
 ## License
 

@@ -1,19 +1,15 @@
 #!/usr/bin/env node
-// SuperGPT global installer.
+// SuperGPT global frontend installer.
 //
-// One install gives every repository the same SuperGPT front-agent policy:
-//   - AGY/Gemini: global MCP registration + generated SuperGPT skill
-//   - Claude Code: managed block in ~/.claude/CLAUDE.md
-//   - Codex: managed block in ~/.codex/AGENTS.md
-//
-// COMMON.md is the single source of truth for cross-agent delegation policy.
-// Agent-specific policy fragments only describe how that frontend reaches
-// SuperGPT. Managed blocks preserve unrelated user instructions on reinstall
-// and uninstall.
+// Product contract: Claude, Codex, and AGY are identical front-agent launchers.
+// All three receive the same agent-policy/COMMON.md and the same `supergpt` MCP
+// server. Client-specific differences are limited to the mechanics required to
+// write each client's global configuration.
 
 import path from 'node:path';
 import os from 'node:os';
-import { fileURLToPath } from 'node:url';
+import { execFileSync as nodeExecFileSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
@@ -21,20 +17,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 const MCP_BIN = path.join(REPO_ROOT, 'bin', 'supergpt-mcp.js');
-const SOURCE_SKILL = path.join(REPO_ROOT, '.agents', 'skills', 'supergpt', 'SKILL.md');
-const POLICY_DIR = path.join(REPO_ROOT, 'agent-policy');
+const POLICY_FILE = path.join(REPO_ROOT, 'agent-policy', 'COMMON.md');
 
+const MCP_NAME = 'supergpt';
 const MANAGED_BEGIN = '<!-- SUPERGPT-GLOBAL-POLICY:BEGIN -->';
 const MANAGED_END = '<!-- SUPERGPT-GLOBAL-POLICY:END -->';
 
-export function resolveGlobalConfigDir(env = process.env) {
+export function resolveGlobalConfigDir(env = process.env, homeDir = os.homedir()) {
   if (env.ANTIGRAVITY_CONFIG_DIR) return env.ANTIGRAVITY_CONFIG_DIR;
   if (env.GEMINI_CONFIG_DIR) return env.GEMINI_CONFIG_DIR;
-  return path.join(os.homedir(), '.gemini', 'config');
-}
-
-function renderFragment(text, { supergptCli }) {
-  return String(text).replaceAll('{{SUPERGPT_CLI}}', supergptCli);
+  return path.join(homeDir, '.gemini', 'config');
 }
 
 function managedBlock(content) {
@@ -75,151 +67,201 @@ async function removeManagedPolicy(filePath) {
   return true;
 }
 
-async function loadPolicySet({ policyDir, supergptCli }) {
-  const [common, claude, codex, agy] = await Promise.all([
-    readFile(path.join(policyDir, 'COMMON.md'), 'utf8'),
-    readFile(path.join(policyDir, 'CLAUDE.md'), 'utf8'),
-    readFile(path.join(policyDir, 'CODEX.md'), 'utf8'),
-    readFile(path.join(policyDir, 'AGY.md'), 'utf8'),
-  ]);
-  return {
-    common: common.trim(),
-    claude: renderFragment(claude, { supergptCli }).trim(),
-    codex: renderFragment(codex, { supergptCli }).trim(),
-    agy: renderFragment(agy, { supergptCli }).trim(),
-  };
+function runCli(execFileSync, command, args, { allowFailure = false } = {}) {
+  try {
+    return String(execFileSync(command, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }) ?? '').trim();
+  } catch (err) {
+    if (allowFailure) return null;
+    const detail = err?.stderr ? String(err.stderr).trim() : err?.message;
+    throw new Error(`${command} ${args.join(' ')} failed${detail ? `: ${detail}` : ''}`);
+  }
 }
 
-export async function installGlobal({
-  configDir = resolveGlobalConfigDir(),
-  homeDir = os.homedir(),
-  repoRoot = REPO_ROOT,
-  mcpBin = MCP_BIN,
-  sourceSkill = SOURCE_SKILL,
-  policyDir = POLICY_DIR,
-} = {}) {
-  const mcpConfigFile = path.join(configDir, 'mcp_config.json');
-  const skillTargetDir = path.join(configDir, 'skills', 'supergpt');
-  const skillTargetFile = path.join(skillTargetDir, 'SKILL.md');
-  const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
-  const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
-  const supergptCli = path.join(repoRoot, 'bin', 'supergpt.js');
+function assertFrontendCli(execFileSync, command) {
+  const version = runCli(execFileSync, command, ['--version']);
+  if (!version) throw new Error(`${command} --version returned no output`);
+  return version;
+}
 
-  await mkdir(configDir, { recursive: true });
-  await mkdir(skillTargetDir, { recursive: true });
+function registerClaudeMcp(execFileSync, nodeBin, mcpBin) {
+  runCli(execFileSync, 'claude', ['mcp', 'remove', MCP_NAME, '--scope', 'user'], { allowFailure: true });
+  runCli(execFileSync, 'claude', ['mcp', 'add', MCP_NAME, '--scope', 'user', '--', nodeBin, mcpBin]);
+}
 
-  // Fail closed before writing any policy if the existing AGY MCP config is invalid.
+function registerCodexMcp(execFileSync, nodeBin, mcpBin) {
+  runCli(execFileSync, 'codex', ['mcp', 'remove', MCP_NAME], { allowFailure: true });
+  runCli(execFileSync, 'codex', ['mcp', 'add', MCP_NAME, '--', nodeBin, mcpBin]);
+}
+
+function removeClaudeMcp(execFileSync) {
+  return runCli(execFileSync, 'claude', ['mcp', 'remove', MCP_NAME, '--scope', 'user'], { allowFailure: true }) !== null;
+}
+
+function removeCodexMcp(execFileSync) {
+  return runCli(execFileSync, 'codex', ['mcp', 'remove', MCP_NAME], { allowFailure: true }) !== null;
+}
+
+function hasClaudeMcp(execFileSync) {
+  return runCli(execFileSync, 'claude', ['mcp', 'get', MCP_NAME], { allowFailure: true }) !== null;
+}
+
+function hasCodexMcp(execFileSync) {
+  return runCli(execFileSync, 'codex', ['mcp', 'get', MCP_NAME], { allowFailure: true }) !== null;
+}
+
+function renderAgySkill(commonPolicy) {
+  return `---\nname: supergpt\ndescription: Shared SuperGPT frontend launcher contract.\n---\n\n${String(commonPolicy).trim()}\n`;
+}
+
+async function readAgyConfig(mcpConfigFile) {
   let config = { mcpServers: {} };
   if (existsSync(mcpConfigFile)) {
     try {
       const raw = await readFile(mcpConfigFile, 'utf8');
       config = JSON.parse(raw);
-      if (!config || typeof config !== 'object') throw new Error('config must be a JSON object');
+      if (!config || typeof config !== 'object' || Array.isArray(config)) {
+        throw new Error('config must be a JSON object');
+      }
     } catch (err) {
       throw new Error(`Refusing to overwrite existing invalid MCP config ${mcpConfigFile}: ${err.message}`);
     }
   }
-  if (!config.mcpServers || typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers)) config.mcpServers = {};
+  if (!config.mcpServers || typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers)) {
+    config.mcpServers = {};
+  }
+  return config;
+}
 
-  const policy = await loadPolicySet({ policyDir, supergptCli });
+export async function installGlobal({
+  configDir,
+  homeDir = os.homedir(),
+  mcpBin = MCP_BIN,
+  policyFile = POLICY_FILE,
+  nodeBin = process.execPath || 'node',
+  execFileSync = nodeExecFileSync,
+} = {}) {
+  const agyConfigDir = configDir ?? resolveGlobalConfigDir(process.env, homeDir);
+  const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
+  const agySkillTargetDir = path.join(agyConfigDir, 'skills', MCP_NAME);
+  const agyPolicyFile = path.join(agySkillTargetDir, 'SKILL.md');
+  const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
+  const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
 
-  // AGY/Gemini-compatible global MCP registration.
-  config.mcpServers.supergpt = {
-    command: process.execPath || 'node',
-    args: [mcpBin],
+  // Preflight everything before changing any frontend configuration.
+  const [commonPolicy, agyConfig] = await Promise.all([
+    readFile(policyFile, 'utf8'),
+    readAgyConfig(mcpConfigFile),
+  ]);
+  const versions = {
+    agy: assertFrontendCli(execFileSync, 'agy'),
+    claude: assertFrontendCli(execFileSync, 'claude'),
+    codex: assertFrontendCli(execFileSync, 'codex'),
   };
-  await writeFile(mcpConfigFile, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
-  // Keep the existing AGY skill contract and append the shared policy generated
-  // from the same source used by Claude and Codex. Frontmatter stays first.
-  const baseSkill = existsSync(sourceSkill) ? (await readFile(sourceSkill, 'utf8')).trimEnd() : '';
-  const generatedSkill = [
-    baseSkill,
-    '## Shared front-agent delegation policy',
-    policy.common,
-    policy.agy,
-  ].filter(Boolean).join('\n\n');
-  await writeFile(skillTargetFile, `${generatedSkill}\n`, 'utf8');
+  let claudeRegistered = false;
+  let codexRegistered = false;
+  try {
+    registerClaudeMcp(execFileSync, nodeBin, mcpBin);
+    claudeRegistered = true;
+    registerCodexMcp(execFileSync, nodeBin, mcpBin);
+    codexRegistered = true;
 
-  // Claude and Codex load user-level instruction files in every repository.
-  // Only our marked block is owned; unrelated user content is preserved.
-  await upsertManagedPolicy(claudePolicyFile, `${policy.common}\n\n${policy.claude}`);
-  await upsertManagedPolicy(codexPolicyFile, `${policy.common}\n\n${policy.codex}`);
+    await mkdir(agyConfigDir, { recursive: true });
+    await mkdir(agySkillTargetDir, { recursive: true });
+
+    agyConfig.mcpServers[MCP_NAME] = { command: nodeBin, args: [mcpBin] };
+    await writeFile(mcpConfigFile, `${JSON.stringify(agyConfig, null, 2)}\n`, 'utf8');
+    await writeFile(agyPolicyFile, renderAgySkill(commonPolicy), 'utf8');
+
+    await upsertManagedPolicy(claudePolicyFile, commonPolicy);
+    await upsertManagedPolicy(codexPolicyFile, commonPolicy);
+  } catch (err) {
+    if (codexRegistered) removeCodexMcp(execFileSync);
+    if (claudeRegistered) removeClaudeMcp(execFileSync);
+    throw err;
+  }
 
   return {
     success: true,
+    versions,
+    mcpBin,
     mcpConfigFile,
-    skillTargetFile,
+    agyPolicyFile,
     claudePolicyFile,
     codexPolicyFile,
-    mcpBin,
-    supergptCli,
   };
 }
 
 export async function uninstallGlobal({
-  configDir = resolveGlobalConfigDir(),
+  configDir,
   homeDir = os.homedir(),
+  execFileSync = nodeExecFileSync,
 } = {}) {
-  const mcpConfigFile = path.join(configDir, 'mcp_config.json');
-  const skillTargetDir = path.join(configDir, 'skills', 'supergpt');
+  const agyConfigDir = configDir ?? resolveGlobalConfigDir(process.env, homeDir);
+  const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
+  const agySkillTargetDir = path.join(agyConfigDir, 'skills', MCP_NAME);
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
 
-  let removedFromMcp = false;
+  let removedAgyMcp = false;
   if (existsSync(mcpConfigFile)) {
     try {
-      const raw = await readFile(mcpConfigFile, 'utf8');
-      const config = JSON.parse(raw);
-      if (config?.mcpServers?.supergpt) {
-        delete config.mcpServers.supergpt;
+      const config = JSON.parse(await readFile(mcpConfigFile, 'utf8'));
+      if (config?.mcpServers?.[MCP_NAME]) {
+        delete config.mcpServers[MCP_NAME];
         await writeFile(mcpConfigFile, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
-        removedFromMcp = true;
+        removedAgyMcp = true;
       }
     } catch {
-      /* preserve historical uninstall behavior for malformed unrelated config */
+      // Do not rewrite unrelated malformed user configuration during uninstall.
     }
   }
 
-  let removedSkill = false;
-  if (existsSync(skillTargetDir)) {
-    await rm(skillTargetDir, { recursive: true, force: true });
-    removedSkill = true;
-  }
+  const removedAgyPolicy = existsSync(agySkillTargetDir);
+  if (removedAgyPolicy) await rm(agySkillTargetDir, { recursive: true, force: true });
 
+  const removedClaudeMcp = removeClaudeMcp(execFileSync);
+  const removedCodexMcp = removeCodexMcp(execFileSync);
   const removedClaudePolicy = await removeManagedPolicy(claudePolicyFile);
   const removedCodexPolicy = await removeManagedPolicy(codexPolicyFile);
 
   return {
     success: true,
-    removedFromMcp,
-    removedSkill,
+    removedAgyMcp,
+    removedClaudeMcp,
+    removedCodexMcp,
+    removedAgyPolicy,
     removedClaudePolicy,
     removedCodexPolicy,
   };
 }
 
 export async function checkGlobalStatus({
-  configDir = resolveGlobalConfigDir(),
+  configDir,
   homeDir = os.homedir(),
+  execFileSync = nodeExecFileSync,
 } = {}) {
-  const mcpConfigFile = path.join(configDir, 'mcp_config.json');
-  const skillTargetFile = path.join(configDir, 'skills', 'supergpt', 'SKILL.md');
+  const agyConfigDir = configDir ?? resolveGlobalConfigDir(process.env, homeDir);
+  const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
+  const agyPolicyFile = path.join(agyConfigDir, 'skills', MCP_NAME, 'SKILL.md');
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
 
-  let mcpInstalled = false;
+  let agyMcpInstalled = false;
   let configuredBin = null;
   if (existsSync(mcpConfigFile)) {
     try {
-      const raw = await readFile(mcpConfigFile, 'utf8');
-      const config = JSON.parse(raw);
-      if (config?.mcpServers?.supergpt) {
-        mcpInstalled = true;
-        configuredBin = config.mcpServers.supergpt.args?.[0] ?? null;
+      const config = JSON.parse(await readFile(mcpConfigFile, 'utf8'));
+      const entry = config?.mcpServers?.[MCP_NAME];
+      if (entry) {
+        agyMcpInstalled = true;
+        configuredBin = entry.args?.[0] ?? null;
       }
     } catch {
-      /* ignore */
+      // Status reports false instead of mutating invalid configuration.
     }
   }
 
@@ -233,54 +275,61 @@ export async function checkGlobalStatus({
     }
   };
 
+  const frontendAvailable = (command) => runCli(execFileSync, command, ['--version'], { allowFailure: true }) !== null;
+
   return {
-    configDir,
     mcpConfigFile,
-    mcpInstalled,
     configuredBin,
-    skillInstalled: existsSync(skillTargetFile),
-    skillTargetFile,
-    claudePolicyInstalled: await hasManagedPolicy(claudePolicyFile),
-    claudePolicyFile,
-    codexPolicyInstalled: await hasManagedPolicy(codexPolicyFile),
-    codexPolicyFile,
+    agy: {
+      available: frontendAvailable('agy'),
+      mcpInstalled: agyMcpInstalled,
+      policyInstalled: existsSync(agyPolicyFile),
+      policyFile: agyPolicyFile,
+    },
+    claude: {
+      available: frontendAvailable('claude'),
+      mcpInstalled: hasClaudeMcp(execFileSync),
+      policyInstalled: await hasManagedPolicy(claudePolicyFile),
+      policyFile: claudePolicyFile,
+    },
+    codex: {
+      available: frontendAvailable('codex'),
+      mcpInstalled: hasCodexMcp(execFileSync),
+      policyInstalled: await hasManagedPolicy(codexPolicyFile),
+      policyFile: codexPolicyFile,
+    },
   };
+}
+
+function installedText(frontend) {
+  return frontend.available && frontend.mcpInstalled && frontend.policyInstalled ? 'Installed' : 'Incomplete';
 }
 
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--status')) {
     const status = await checkGlobalStatus();
-    console.log('SuperGPT Global Installation Status:');
-    console.log(`  AGY MCP:        ${status.mcpInstalled ? `Installed (${status.configuredBin})` : 'Not installed'}`);
-    console.log(`  AGY Skill:      ${status.skillInstalled ? `Installed (${status.skillTargetFile})` : 'Not installed'}`);
-    console.log(`  Claude Policy:  ${status.claudePolicyInstalled ? `Installed (${status.claudePolicyFile})` : 'Not installed'}`);
-    console.log(`  Codex Policy:   ${status.codexPolicyInstalled ? `Installed (${status.codexPolicyFile})` : 'Not installed'}`);
+    console.log('SuperGPT Global Frontend Status:');
+    console.log(`  AGY:     ${installedText(status.agy)}`);
+    console.log(`  Claude:  ${installedText(status.claude)}`);
+    console.log(`  Codex:   ${installedText(status.codex)}`);
     return;
   }
 
   if (args.includes('--uninstall')) {
-    const result = await uninstallGlobal();
-    console.log('SuperGPT global integration removed.');
-    console.log(`  AGY MCP entry removed: ${result.removedFromMcp}`);
-    console.log(`  AGY skill removed:     ${result.removedSkill}`);
-    console.log(`  Claude policy removed: ${result.removedClaudePolicy}`);
-    console.log(`  Codex policy removed:  ${result.removedCodexPolicy}`);
+    await uninstallGlobal();
+    console.log('SuperGPT global frontend integration removed.');
     return;
   }
 
   const result = await installGlobal();
-  console.log('SuperGPT installed globally successfully!');
-  console.log(`  AGY MCP:        ${result.mcpConfigFile} -> ${result.mcpBin}`);
-  console.log(`  AGY Skill:      ${result.skillTargetFile}`);
-  console.log(`  Claude Policy:  ${result.claudePolicyFile}`);
-  console.log(`  Codex Policy:   ${result.codexPolicyFile}`);
-  console.log('\nClaude, Codex, and AGY now receive the same global SuperGPT delegation policy in every repository.');
+  console.log('SuperGPT installed globally for AGY, Claude, and Codex.');
+  console.log(`  MCP server: ${result.mcpBin}`);
+  console.log('  Policy:     agent-policy/COMMON.md (single source of truth)');
+  console.log('Restart/open a new frontend session so each client reloads its global MCP and policy.');
 }
 
-const invokedDirectly =
-  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
-
+const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if (invokedDirectly) {
   main().catch((err) => {
     console.error('SuperGPT installation failed:', err.message);

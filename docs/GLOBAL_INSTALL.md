@@ -1,78 +1,85 @@
-# SuperGPT Global Installation & Usage Guide
+# SuperGPT Global Installation
 
-SuperGPT can be installed once on your system to work consistently across **any** Git repository, branch, or linked worktree.
+## Goal
 
-## 1. Quick Install
+One install, one frontend contract:
+
+```text
+Claude ─┐
+Codex  ─┼-> same COMMON policy -> same supergpt MCP -> same SuperGPT Core
+AGY    ─┘
+```
+
+The three frontends are human interfaces and launchers. They do not have separate SuperGPT routing or launch strategies.
+
+## Install
+
+Prerequisites: `node`, `git`, `agy`, `claude`, and `codex` are available locally.
 
 From the SuperGPT repository:
 
 ```bash
 npm run install-global
-# or directly:
-node bin/install-plugin.js
 ```
 
-One install now configures the three front-agent entry points from one repository-owned policy source:
+The installer preflights all three supported frontends before changing configuration. It then installs the same `supergpt` MCP server and the same `agent-policy/COMMON.md` behavior for each frontend.
 
-1. **AGY / Gemini-compatible frontend**
-   - registers the `supergpt` MCP server in `~/.gemini/config/mcp_config.json`;
-   - installs the generated SuperGPT skill in `~/.gemini/config/skills/supergpt/SKILL.md`.
-2. **Claude Code**
-   - installs a managed SuperGPT policy block in the user-level `~/.claude/CLAUDE.md` that Claude loads across projects.
-3. **Codex**
-   - installs a managed SuperGPT policy block in the user-level `~/.codex/AGENTS.md` that Codex loads across projects.
+The only internal differences are configuration mechanics required by the clients:
 
-The source of truth is `agent-policy/COMMON.md`. `CLAUDE.md`, `CODEX.md`, and `AGY.md` beside it contain only frontend-specific integration details. Re-running the installer replaces only SuperGPT's managed blocks and preserves unrelated personal instructions.
+- AGY uses its global Gemini-compatible MCP/skill configuration directory;
+- Claude registers `supergpt` at user scope through Claude Code's MCP CLI;
+- Codex registers `supergpt` in its global user MCP configuration through the Codex CLI.
 
-Claude and Codex prefer `supergpt_*` MCP tools when already available. Their generated policy also records the absolute SuperGPT CLI path as a cross-repository fallback, so a substantial task can still be delegated instead of being silently executed by the front agent itself.
+Those are installer adapters only. The visible tool name, policy, launch sequence, and workflow semantics are identical.
 
-## 2. Check Installation Status
+## Normal frontend launch
+
+All three frontends follow the same sequence:
+
+```text
+supergpt_start({ goal, cwd })
+-> workflowId
+-> supergpt_watch({ workflowId })
+-> terminal result / HUMAN_REQUIRED
+```
+
+The SuperGPT CLI is not an agent fallback. If MCP is unavailable, the frontend should report the installation/configuration problem rather than silently create a second execution path.
+
+## Check status
 
 ```bash
 node bin/install-plugin.js --status
 ```
 
-Expected output reports AGY MCP/skill plus Claude and Codex policy installation independently.
+Expected result:
 
-## 3. Default Delegation Policy
+```text
+SuperGPT Global Frontend Status:
+  AGY:     Installed
+  Claude:  Installed
+  Codex:   Installed
+```
 
-The same global policy is visible from Claude, Codex, and AGY in every repository:
+After install/update, open a new Claude/Codex/AGY session so the client reloads its global policy and MCP configuration.
 
-- explanation, research, and obvious tiny single-step edits can stay with the current front agent;
-- substantial coding work defaults to SuperGPT, especially features, bug fixes, refactors, migrations, multi-file work, testing/debugging, or repeated implement/verify cycles;
-- when uncertain, prefer SuperGPT;
-- once delegated, the front agent must not duplicate Executor or Reviewer work;
-- repository-local instruction files should contain repository-specific build/test/style/architecture rules, not copies of the global SuperGPT routing policy.
+## Policy ownership
 
-V1 intentionally leaves the DIRECT vs SuperGPT judgment with the front agent. A future centralized router can replace that judgment without requiring three separate policy rewrites.
+`agent-policy/COMMON.md` is the only active SuperGPT frontend policy in the repository.
 
-## 4. Supported Ordinary Workspaces
+The installer:
 
-SuperGPT works from:
-- clean workspaces;
-- staged or unstaged changes;
-- untracked files;
-- feature branches and linked worktrees.
+- generates AGY's installed skill from this exact file;
+- inserts this exact policy into the managed SuperGPT block of `~/.claude/CLAUDE.md`;
+- inserts this exact policy into the managed SuperGPT block of `~/.codex/AGENTS.md`.
 
-Invariant: **invocation workspace in → same workspace changes out.** Pre-existing changes remain the baseline and approved SuperGPT changes are delivered back to that same workspace.
+Unrelated personal instructions are preserved. Re-running installation replaces only the SuperGPT-managed content.
 
-## 5. Natural Language Commands
-
-| You Say | What Happens |
-| :--- | :--- |
-| **"I want to implement X. Plan it first."** | Plans tasks without executing; displays task breakdown. |
-| **"Looks good. Run it."** | Runs the full autonomous loop. |
-| **"Use SuperGPT to implement X."** | Plans and executes end-to-end automatically. |
-| **"现在做到哪了？"** | Shows compact semantic status & heartbeat with 0 model tokens. |
-| **"停掉。"** | Safely aborts and terminates child processes. |
-| **"继续。"** | Resumes suspended workflow with your clarification. |
-
-## 6. Uninstalling SuperGPT
+## Uninstall
 
 ```bash
 npm run uninstall-global
-# or:
+# or
 node bin/install-plugin.js --uninstall
 ```
 
-Uninstall removes the AGY MCP/skill installation and only the marked SuperGPT blocks from Claude/Codex global instruction files. Unrelated personal instructions are preserved.
+Uninstall removes the SuperGPT MCP registration and SuperGPT-managed policy from all three frontends while preserving unrelated user configuration.

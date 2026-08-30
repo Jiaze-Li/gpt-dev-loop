@@ -1,186 +1,126 @@
-# SuperGPT V1 architecture — current source of truth
+# SuperGPT V1 Architecture — Current Source of Truth
 
-SuperGPT is a local autonomous coding workflow. Its deterministic core owns
-state, isolation, delivery, progress, and policy; models supply only bounded
-role decisions or execution output.
+This document describes the active V1 architecture. Historical browser-bridge and pre-V1 orchestration designs are not production contracts.
 
-## V1 functional freeze
+## 1. Ownership boundary
 
-V1 is frozen at the production contracts documented here: frontend ->
-AutoRoutePolicy -> `supergpt_prepare` -> `supergpt.request/v1`; role-routed
-Planner, Supervisor, Executor and Reviewer; deterministic Gate; scoped REWORK;
-delivery and cleanup. Cross-cutting policy, quota, health, effort, session,
-usage-callId, anomaly, process-telemetry, acceptance-snapshot and workspace
-contracts are frozen with it. No V1.1 parallel execution behavior is present.
+SuperGPT has two layers:
 
 ```text
-USER / FRONTEND
-  natural engineering request
-    -> AutoRoutePolicy -> supergpt_prepare -> supergpt.request/v1
-    -> persisted deterministic core
+FRONTEND
+Claude / Codex / AGY
+= human interface + launcher
 
 SUPERGPT CORE
-  Planner RoleRouter -> Supervisor RoleRouter -> Executor RoleRouter
-    -> deterministic Gate -> scoped Reviewer RoleRouter
-    -> REWORK (only when required) -> delivery -> cleanup
+= workflow owner
 ```
 
-## Frontends and public contract
+All three frontends use the same `agent-policy/COMMON.md` and the same global `supergpt` MCP server. Client-specific configuration formats are installer details only; they do not create different product behavior.
 
-Frontends are thin adapters. They pass the exact invocation workspace and
-never create internal Task Cards, infer state from logs, or perform review.
-The stable operations are `supergpt_prepare`, `supergpt_plan`,
-`supergpt_run`/`supergpt_start`, `supergpt_status`, `supergpt_wait`,
-`supergpt_resume`, and `supergpt_stop`.
+There is one canonical execution engine: `src/orchestrator/supergpt.js -> runSuperGPT()`.
 
-`supergpt_start` is non-blocking: it immediately returns `{ status: "RUNNING",
-workflowId }` while Core owns the asynchronous workflow and records all terminal
-failures durably. `supergpt_run` is the blocking convenience operation.
-`supergpt_wait` without a target waits for a terminal state; with `targetStatus`
-it waits for that status.
+## 2. Frontend contract
 
-`supergpt_prepare` accepts raw natural-language intent and returns the small
-portable `supergpt.request/v1` object. Planning then creates internal task
-cards. This makes a fresh Gemini, Claude, Codex, or generic frontend
-zero-knowledge: tool discovery tells it to call prepare rather than inventing
-orchestration syntax.
+A frontend may:
 
-Status and wait read persisted local state only. They make no model calls.
-The generic renderer is portable text; the terminal renderer adds an in-place
-spinner, elapsed time, heartbeat, and durable transition lines only for TTYs.
-JSON mode has no ANSI output.
+- accept the user's goal;
+- choose DIRECT vs SuperGPT using the shared V1 policy;
+- invoke SuperGPT MCP operations;
+- display local persisted progress;
+- relay a terminal result or a genuine `HUMAN_REQUIRED` question.
 
-### Human-visible progress and ownership
+A frontend must not create its own Task Cards, duplicate SuperGPT implementation/review work, or use the CLI as an alternate autonomous-agent path.
 
-`FrontendProgressObserver` is the chat/agent frontend binding. Immediately
-after a non-blocking start returns a `workflowId`, the frontend attaches this
-local subscriber and renders only meaningful persisted transitions: task/total
-and title, task-local attempt, stage, routed role/provider/model, Gate and
-Reviewer result, and terminal state. `HUMAN_REQUIRED` is rendered as a
-distinct intervention request with the persisted question. A new frontend can
-attach using the same workflow ID and receives the current canonical state;
-it never invents state from a model response.
-
-The observer polls `status` locally. Spinner, elapsed time, heartbeat,
-last-progress and last-activity formatting are also local. They create zero
-provider/model calls. Stopping or disconnecting an observer only stops its
-timer: workflow state, provider children, isolation and delivery remain Core
-owned. Terminal state stops the observer cleanly.
-
-Supervisor continuity is logical structured continuity, not a promise of one
-persistent physical provider conversation; `agy:gemini` uses `CHECKPOINT_FRESH`.
-Reviewer provider context is fresh per attempt with structured continuity rather
-than transcript replay. Executors are RoleRouter-selected from Sonnet, Codex, or
-Opus rather than always Claude.
-
-Normal internal reports and task artifacts are optional/viewable evidence,
-never approval prompts or a workflow dependency. A frontend must label them
-as optional if its host displays an artifact count. Only `HUMAN_REQUIRED`
-means a blocking human action is needed; `resume` is then the sole way to
-continue that suspended workflow.
-
-## Roles, aliases, quota, and provider health
-
-Roles are independent of frontends and are routed role-first, not provider-first.
-The policy contains stable family aliases; a provider resolves its current
-concrete model at invocation time and records both `requestedFamily` and
-`resolvedModel`. A resolution change emits routing telemetry and does not
-require a policy edit.
+When SuperGPT is selected, the normal launch contract is:
 
 ```text
-Planner:    codex:default > agy:gemini > claude:opus > agy:gpt-oss
-Supervisor: agy:gemini > codex:default > claude:opus > agy:gpt-oss
-Reviewer:   agy:gpt-oss > codex:default > agy:gemini > claude:opus
-Executor:   claude:sonnet > codex:default > claude:opus
-Gate:       local deterministic verification
+supergpt_start({ goal, cwd })
+-> { status: "RUNNING", workflowId }
+-> supergpt_watch({ workflowId })
+-> terminal result
 ```
 
-`RolePolicy`, `QuotaPoolRegistry`, `ProviderHealthRegistry`, `EffortPolicy`,
-and `TokenAwareSessionPolicy` are separate deterministic concerns. The default
-quota topology is Codex (`codex:default`), shared Claude (`claude:sonnet` and
-`claude:opus`), AGY Gemini, and AGY Claude/GPT (`agy:gpt-oss`). Runtime native
-telemetry may add or override family-to-pool membership without changing role
-policy. Pool state is user-level runtime state, never target-repository state.
+`status`, `watch`, and `wait` observe local persisted state. They do not spend model calls asking whether the workflow is still alive.
 
-Readiness, cooldown/reset lookup, routing, effort and session decisions are
-zero-token. A known cooldown is skipped; an UNKNOWN pool is allowed one real
-business invocation when no free native telemetry exists. Quota/rate-limit
-errors update every shared pool immediately. Structured reset time wins;
-otherwise a configurable persisted exponential local backoff moves from
-COOLDOWN to UNKNOWN at expiry. No model prompt is used as a health probe.
+## 3. Normal workflow
 
-Typed provider failures include quota exhaustion, rate limit, auth failure,
-unavailable, timeout, and protocol errors. A recoverable failure emits
-`ROLE_PROVIDER_FAILED` then `ROLE_PROVIDER_SWITCHED`, preserving workflow and
-task state through a local checkpoint. Quota failure never attempts the same
-provider at higher effort.
+For a structured Planner task queue, Core owns ordinary transitions without a model Supervisor:
 
-The handoff uses a deterministic checkpoint: goal, canonical request, plan,
-completed/current/remaining tasks, attempt, Gate/Reviewer results, constraints
-and workflow decisions. It does not copy provider conversation history.
-Supervisor physical sessions reuse by default. Native input/cache/latency,
-context pressure, provider compaction, protocol instability and a safety call
-ceiling can trigger local checkpoint + rotation. Missing telemetry simply
-removes that signal; token values are never estimated.
+```text
+Planner once
+-> Task 1
+-> Executor
+-> deterministic Gate
+-> independent Reviewer
 
-Reasoning effort defaults to medium when supported. Deterministic repeated
-reasoning failure, rework cycles, or high-risk work can escalate to high. A
-provider without an effort API is invoked normally.
+Reviewer PASS
+-> next task automatically
 
-Codex Supervisor uses `codex exec` in read-only, ephemeral,
-`--ignore-user-config` mode by default. It has no repository-editing tools,
-skills, or inherited MCP servers. Native usage is recorded when present; it
-is never estimated. The opt-in `npm run probe:provider-overhead` command is
-the only fixed-prompt live transport measurement and never updates baselines.
+Gate FAIL
+-> Executor repair
 
-## Workflow and safety
+first ordinary Reviewer REWORK
+-> Executor repair using Reviewer findings
 
-The workflow is one task at a time: Supervisor -> fresh Claude Executor ->
-Gate -> task-scoped Reviewer -> Supervisor. REWORK loops back through a fresh
-Executor attempt and preserves the Reviewer for that task. Parallel DAG
-execution is deliberately out of scope for v1.
+last task PASS
+-> WORKFLOW_DONE
+```
 
-Before execution, SuperGPT snapshots the exact invocation workspace into an
-owned isolated worktree. It supports primary checkouts, linked worktrees,
-branches, staged/unstaged edits, and untracked files. Delivery is fail-closed
-and returns approved changes to the same invocation workspace while preserving
-unrelated edits. Successful workflows clean only positively-owned worktrees,
-branches, and children; resumable states retain their owned resources.
+Supervisor is exception-only. Examples include repeated non-convergence, `HUMAN_REQUIRED`, plan/task mismatch, contradictory evidence, or a state Core cannot safely resolve deterministically.
 
-Every workflow ends durably as `WORKFLOW_DONE`, `HUMAN_REQUIRED`, `FAILED`,
-`TIMEOUT`, `STALLED`, or `STOPPED`. Resume retains the workflow ID, completed
-tasks, reviewer state, and required isolation resources. Stop terminates
-owned active children and persists `STOPPED`.
+If Planner output is not reliable enough to define the task queue, Core fails closed to the safe fallback path rather than guessing task progression.
 
-## Token and operational guardrails
+## 4. Role separation
 
-Usage records carry immutable provider call IDs. Deterministic monitoring
-detects duplicate accounting, unexpected call count, prompt inflation, and
-compatible-baseline regressions plus `SESSION_REUSE_INEFFICIENT` conditions.
-`npm test` and `npm run benchmark` make zero model calls. Only explicit live
-commands consume provider quota. `doctor` is local-only and checks runtimes,
-configuration, aliases, configured pools, persisted cooldowns, writable
-storage, and stale owned resources.
+Models are role providers, not workflow owners:
 
-Organic Reviewer REWORK is deliberately reported as **NOT YET OBSERVED** until
-the passive `OrganicReworkRecorder` captures a genuine production occurrence.
-The deterministic REWORK path is verified, and durable recorder evidence is
-preserved independently of workflow cleanup; the absence of organic evidence
-does not downgrade V1 readiness.
+- Planner: creates a bounded structured task queue when planning is needed.
+- Executor: changes code inside the isolated workspace.
+- Gate: local deterministic verification, no model judgment.
+- Reviewer: independently evaluates task scope, diff/evidence, and Gate result.
+- Supervisor: resolves exceptional judgment states only.
 
-## Installation and extension
+Provider families may fail over through the existing role-routing, quota, health, effort, and session policies without changing these logical responsibilities.
 
-`npm run install-global` installs the MCP server and the Gemini-compatible
-skill once; see `docs/GLOBAL_INSTALL.md`. A frontend extension implements the
-thin public contract. A provider extension implements the logical role
-protocol, typed failures, native usage when available, and compact checkpoint
-input; it never changes Core semantics.
+## 5. Workspace and delivery
 
-## History and v1.1
+Before execution, Core snapshots the exact invocation workspace into an owned isolated worktree. Staged, unstaged, and untracked pre-existing changes form the baseline rather than being misclassified as model output.
 
-The legacy Chrome/ChatGPT Web bridge, extension transport, browser tabs, and
-DOM selectors have been physically purged from the V1 codebase; their record is
-retained solely as historical documentation in `docs/handoff/archive/` and in
-Git history. They are not part of the production SuperGPT entrypoints or active
-RoleRouter composition. v1.1 is limited to parallel task DAG execution with
-isolated task worktrees and an explicit integration task; it is not implemented in V1.
+Approved changes are delivered back only through the Core delivery path. Delivery checks for conflicts and unsafe paths and preserves unrelated user work. Frontends and humans should not manually copy/cherry-pick intermediate worktree changes as a substitute for delivery.
+
+## 6. Persistence and terminal states
+
+Core persists workflow state and owns recovery. Normal terminal states are:
+
+- `WORKFLOW_DONE`
+- `HUMAN_REQUIRED`
+- `FAILED`
+- `TIMEOUT`
+- `STALLED`
+- `STOPPED`
+
+A frontend disconnect does not stop the workflow. Resume keeps the workflow identity and required isolation state.
+
+## 7. Installation contract
+
+`npm run install-global` installs the same global launcher contract for AGY, Claude, and Codex:
+
+```text
+same COMMON policy
++ same supergpt MCP server
++ same MCP operation names
+```
+
+There is no active repository-local `.mcp.json`, no separate Claude/Codex/AGY routing policy, and no second agent execution entrypoint.
+
+## 8. Canonical documentation
+
+Active sources of truth:
+
+- `README.md` — product overview;
+- `agent-policy/COMMON.md` — only active front-agent policy;
+- `docs/ARCHITECTURE.md` — V1 architecture;
+- `docs/GLOBAL_INSTALL.md` — global installation contract;
+- `docs/V2_PLAN.md` — only active V2 plan.
+
+Historical browser material belongs only under `docs/handoff/archive/` and Git history. When a new active rule or entrypoint replaces an old one, the old active rule/entrypoint must be removed rather than retained as a parallel fallback.
