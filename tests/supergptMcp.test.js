@@ -342,4 +342,3 @@ test('supergpt_watch invokes watchSuperGptFn and streams progress notifications'
   assert.match(progressEvents[1].message, /SUPERGPT ⟳ DONE/);
   await client.close();
 });
-
