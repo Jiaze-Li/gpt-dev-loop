@@ -1,35 +1,68 @@
 // Whole-process-tree termination for spawned executor / tool CLIs.
 //
 // POSIX does not cascade a signal from a killed process to its descendants.
-// An executor CLI (`claude`, `codex`) that has itself spawned a verification
-// or tool subprocess will leave that descendant running if we only signal the
-// CLI's own PID — the adapter then observes the CLI close and lets stop /
-// resume / retry proceed while an orphan keeps mutating the same worktree.
+// An executor CLI (`claude`, `codex`) or Gate shell that has itself spawned a
+// verification / tool subprocess will leave that descendant running if we only
+// signal the direct child's PID.
 //
-// Spawning the CLI with `detached: true` makes it a process-group leader;
-// signalling the NEGATIVE pid then reaches the whole group. This mirrors the
-// Gate runner's explicit process-tree shutdown (adapters/gateRunner.js).
+// Spawning with `detached: true` makes the child a process-group leader on
+// POSIX. We snapshot that PGID and keep targeting the NEGATIVE pid even after
+// the direct child exits: the leader exiting does NOT imply the rest of the
+// group is gone. Teardown is complete only once the owned group no longer
+// exists. This is the invariant stop/resume/retry rely on.
 
-// Spread into a child_process spawn options object so the child leads its own
-// process group. Callers must NOT `child.unref()` — teardown still awaits the
-// direct child's `close`.
+const POSIX_PROCESS_GROUPS = process.platform !== 'win32';
+
+// Spread into child_process.spawn options. Callers must NOT child.unref(): they
+// still await the direct child's close event in addition to the group teardown.
 export const PROCESS_GROUP_SPAWN_OPTS = Object.freeze({ detached: true });
 
-// Signal the child's whole process group, falling back to the bare child when
-// the group signal is unavailable (no pid yet, already reaped, or a test fake
-// without a real pid).
-export function killProcessTree(child, signal = 'SIGTERM') {
-  if (!child) return;
-  if (child.killed || (child.exitCode !== null && child.exitCode !== undefined)) return;
-  const pid = child.pid;
-  if (pid !== null && pid !== undefined) {
+function groupIdFor(child) {
+  if (!POSIX_PROCESS_GROUPS) return null;
+  const pid = child?.pid;
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function directChildExited(child) {
+  return Boolean(
+    !child ||
+    child.killed ||
+    (child.exitCode !== null && child.exitCode !== undefined)
+  );
+}
+
+// `kill(-pgid, 0)` probes the group without signalling it.
+export function processGroupExists(pgid) {
+  if (!POSIX_PROCESS_GROUPS || !Number.isInteger(pgid) || pgid <= 0) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (err) {
+    if (err?.code === 'ESRCH') return false;
+    // EPERM still proves something with that PGID exists. For any other
+    // unexpected error, fail closed and keep treating the group as alive.
+    return true;
+  }
+}
+
+// Signal the owned process group first. Crucially, this does NOT short-circuit
+// merely because the direct child has exited: descendants can outlive the
+// leader while remaining members of the same process group.
+export function killProcessTree(child, signal = 'SIGTERM', { pgid = groupIdFor(child) } = {}) {
+  if (!child && !pgid) return;
+
+  if (pgid) {
     try {
-      process.kill(-pid, signal);
+      process.kill(-pgid, signal);
       return;
-    } catch {
-      /* group gone or never a leader — fall through to a direct kill */
+    } catch (err) {
+      if (err?.code === 'ESRCH') return;
+      // If process-group signalling is unavailable, fall back to the direct
+      // child only when it is still alive.
     }
   }
+
+  if (directChildExited(child)) return;
   try {
     child.kill(signal);
   } catch {
@@ -37,17 +70,89 @@ export function killProcessTree(child, signal = 'SIGTERM') {
   }
 }
 
-// Escalating teardown: SIGTERM the group now, SIGKILL it after a finite grace
-// so descendants get a chance to unwind but a hung tree still dies. Returns an
-// unref'd timer the caller MUST clear once the child closes.
-export function terminateProcessTree(child, { graceMs = 2000, onKill = null } = {}) {
-  killProcessTree(child, 'SIGTERM');
-  const timer = setTimeout(() => {
-    killProcessTree(child, 'SIGKILL');
+// Escalating, awaitable teardown.
+//
+// Returns { pgid, done, cancel }. `done` resolves only after the POSIX process
+// group no longer exists. A direct-child `close` MUST NOT call cancel(): that
+// is exactly the race this helper prevents. `cancel()` is only for abandoning a
+// teardown before it started to matter (currently unused by production code).
+//
+// On platforms where POSIX process groups are unavailable, we retain the
+// previous best-effort direct-child fallback; callers still await child close.
+export function terminateProcessTree(
+  child,
+  { graceMs = 2000, pollMs = 25, onKill = null } = {}
+) {
+  const pgid = groupIdFor(child);
+  let escalationTimer = null;
+  let pollTimer = null;
+  let settled = false;
+  let resolveDone;
+
+  const done = new Promise((resolve) => { resolveDone = resolve; });
+
+  const clearTimers = () => {
+    if (escalationTimer) clearTimeout(escalationTimer);
+    if (pollTimer) clearTimeout(pollTimer);
+    escalationTimer = null;
+    pollTimer = null;
+  };
+
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    clearTimers();
+    resolveDone();
+  };
+
+  killProcessTree(child, 'SIGTERM', { pgid });
+
+  // Without a verifiable process group, direct-child close remains the caller's
+  // teardown acknowledgement. Still schedule a bounded SIGKILL fallback.
+  if (!pgid) {
+    escalationTimer = setTimeout(() => {
+      killProcessTree(child, 'SIGKILL', { pgid: null });
+      if (typeof onKill === 'function') {
+        try { onKill(); } catch { /* ignore */ }
+      }
+    }, graceMs);
+    if (typeof escalationTimer.unref === 'function') escalationTimer.unref();
+    finish();
+    return { pgid: null, done, cancel: clearTimers };
+  }
+
+  const pollUntilGone = () => {
+    if (settled) return;
+    if (!processGroupExists(pgid)) {
+      finish();
+      return;
+    }
+    pollTimer = setTimeout(pollUntilGone, pollMs);
+    if (typeof pollTimer.unref === 'function') pollTimer.unref();
+  };
+
+  escalationTimer = setTimeout(() => {
+    // Use the snapshotted PGID directly. The leader may already have exited;
+    // child.exitCode / child.killed must not suppress this SIGKILL.
+    killProcessTree(child, 'SIGKILL', { pgid });
     if (typeof onKill === 'function') {
       try { onKill(); } catch { /* ignore */ }
     }
+    pollUntilGone();
   }, graceMs);
-  if (typeof timer.unref === 'function') timer.unref();
-  return timer;
+  if (typeof escalationTimer.unref === 'function') escalationTimer.unref();
+
+  // Resolve early if every member exits cleanly during the TERM grace period.
+  pollUntilGone();
+
+  return {
+    pgid,
+    done,
+    cancel: () => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      resolveDone();
+    },
+  };
 }
