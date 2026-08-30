@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { selectProviders } from '../src/orchestrator/providerSelection.js';
+import { makeFakeCallAgy } from './fixtures/fakeAgy.mjs';
 
 const planned = {
   status: 'READY',
@@ -70,17 +71,21 @@ test('Planner task queue makes Supervisor happy path zero-token', async () => {
 });
 
 test('ordinary rework is local once; repeated identical rework escalates', async () => {
-  const supervisorCalls = [];
   const events = [];
+  const callAgy = makeFakeCallAgy({ action: 'CONTINUE_REWORK' });
   const selection = selectProviders({
     env: {},
     workflowId: 'wf-deterministic-rework',
-    // Planner uses Codex by default, but resolve() below returns without calling it.
-    codexCall: async () => { throw new Error('planner transport should not be called'); },
-    callAgy: async ({ prompt }) => {
-      supervisorCalls.push(prompt);
-      return { text: '{"action":"CONTINUE_REWORK"}', usage: null, durationMs: 1 };
+    // Keep this integration test scoped to deterministic escalation. Planner
+    // capture is local and the escalated Supervisor has exactly one provider.
+    rolePolicy: {
+      planner: [{ family: 'codex:default', effort: 'medium' }],
+      supervisor: [{ family: 'agy:gemini', effort: 'medium' }],
+      reviewer: [],
+      executor: [],
     },
+    codexCall: async () => { throw new Error('planner transport should not be called'); },
+    callAgy,
     onEvent: (event) => events.push(event),
   });
   await selection.runtime.invoke('planner', { resolve: async () => planned }, { operationId: 'wf-deterministic-rework' });
@@ -88,10 +93,10 @@ test('ordinary rework is local once; repeated identical rework escalates', async
   const review = { task_id: 'one', decision: 'REWORK', findings: ['race'], required_changes: ['Fix the race'], rationale: 'still races' };
   const first = await selection.supervisorSession.decide(decisionContext({ latestReviewResult: review }));
   assert.equal(first.action, 'CONTINUE_REWORK');
-  assert.equal(supervisorCalls.length, 0);
+  assert.equal(callAgy.calls.length, 0);
 
   const second = await selection.supervisorSession.decide(decisionContext({ latestReviewResult: review }));
   assert.equal(second.action, 'CONTINUE_REWORK');
-  assert.equal(supervisorCalls.length, 1);
+  assert.equal(callAgy.calls.length, 1);
   assert.ok(events.some((e) => e.type === 'SUPERVISOR_ESCALATED' && e.reason === 'reviewer_rework_nonconvergence'));
 });
