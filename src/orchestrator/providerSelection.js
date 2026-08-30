@@ -30,6 +30,7 @@ import {
 } from './agyProviderSessions.js';
 import { resolveAgySupervisorModel, resolveAgyReviewerModel } from '../agy/agyConfig.js';
 import { supervisorSessionStrategy } from './supervisorCostPolicy.js';
+import { decideDeterministically, validPlannedTasks } from './deterministicSupervisorPolicy.js';
 
 function normalize(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
@@ -55,6 +56,16 @@ function recordPlannerUsage({ result, selection, model, usageTracker, provider }
       exitCode: result?.exitCode ?? null,
     },
   });
+}
+
+function clonePlannedTasks(tasks) {
+  return tasks.map((task) => ({
+    ...task,
+    allowed_files: [...task.allowed_files],
+    verification_commands: [...task.verification_commands],
+    ...(Array.isArray(task.acceptance_criteria) ? { acceptance_criteria: [...task.acceptance_criteria] } : {}),
+    ...(Array.isArray(task.forbidden_files) ? { forbidden_files: [...task.forbidden_files] } : {}),
+  }));
 }
 
 // Returns { supervisorModel, reviewerModel, supervisorSession,
@@ -90,6 +101,26 @@ export function selectProviders({
   const gptOssModel = resolveAgyReviewerModel(env);
   const sessions = new Map();
   const reviewerSessions = new Map();
+
+  // Planner is already required to return the complete ordered task list.
+  // Keep that structured result in Core so obvious Supervisor transitions can
+  // be decided locally. A legacy hand-written plan has no task array and
+  // therefore cleanly falls back to the model Supervisor.
+  let plannedTasks = null;
+  let planSummary = null;
+  const supervisorReworkMemory = new Map();
+  const capturePlannerResolution = (resolved) => {
+    if (validPlannedTasks(resolved?.tasks)) {
+      plannedTasks = clonePlannedTasks(resolved.tasks);
+      planSummary = typeof resolved?.summary === 'string' ? resolved.summary : null;
+    } else {
+      plannedTasks = null;
+      planSummary = null;
+    }
+    return resolved;
+  };
+  const resolveAndCapture = async (resolve, call) => capturePlannerResolution(await resolve(call));
+
   const getSupervisor = (family) => {
     if (!sessions.has(family)) {
       let provider;
@@ -120,24 +151,24 @@ export function selectProviders({
     }),
     adapters: {
       planner: {
-        'codex:default': ({ resolve }, selection) => resolve(async (opts) => {
+        'codex:default': ({ resolve }, selection) => resolveAndCapture(resolve, async (opts) => {
           const result = await (codexCall ?? callCodex)({ prompt: opts.prompt, model: codexModel, timeoutMs, signal });
           recordPlannerUsage({ result, selection, model: codexModel, usageTracker, provider: 'codex' });
           const trimmed = (result.text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
           return { text: trimmed, json: JSON.parse(trimmed), usage: result.usage, durationMs: result.durationMs };
         }),
-        'agy:gemini': ({ resolve }, selection) => resolve(async (opts) => {
+        'agy:gemini': ({ resolve }, selection) => resolveAndCapture(resolve, async (opts) => {
           const result = await callAgy({ ...opts, model: geminiModel, signal });
           recordPlannerUsage({ result, selection, model: geminiModel, usageTracker, provider: 'agy' });
           return result;
         }),
-        'claude:opus': ({ resolve }, selection) => resolve(async (opts) => {
+        'claude:opus': ({ resolve }, selection) => resolveAndCapture(resolve, async (opts) => {
           const result = await (claudeCall ?? callClaude)({ prompt: opts.prompt, model: 'opus', timeoutMs, signal });
           recordPlannerUsage({ result, selection, model: 'opus', usageTracker, provider: 'claude' });
           const trimmed = (result.text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
           return { text: trimmed, json: JSON.parse(trimmed), usage: result.usage, durationMs: result.durationMs };
         }),
-        'agy:gpt-oss': ({ resolve }, selection) => resolve(async (opts) => {
+        'agy:gpt-oss': ({ resolve }, selection) => resolveAndCapture(resolve, async (opts) => {
           const result = await callAgy({ ...opts, model: gptOssModel, signal });
           recordPlannerUsage({ result, selection, model: gptOssModel, usageTracker, provider: 'agy' });
           return result;
@@ -176,7 +207,25 @@ export function selectProviders({
   });
   const supervisorSession = {
     create: async () => ({}), close: async () => {},
-    decide: async (context) => (await runtime.invoke('supervisor', context, { signals: context?.signals, operationId: workflowId })).value,
+    decide: async (context) => {
+      const local = decideDeterministically({
+        context,
+        plannedTasks,
+        planSummary,
+        reworkMemory: supervisorReworkMemory,
+      });
+      if (local.handled) {
+        onEvent?.({
+          type: 'SUPERVISOR_DECISION_DETERMINISTIC',
+          workflowId,
+          action: local.decision.action,
+          reason: local.reason,
+        });
+        return local.decision;
+      }
+      onEvent?.({ type: 'SUPERVISOR_ESCALATED', workflowId, reason: local.reason });
+      return (await runtime.invoke('supervisor', context, { signals: context?.signals, operationId: workflowId })).value;
+    },
   };
   const createReviewerSession = () => ({
     create: async () => ({}), close: async () => {},
