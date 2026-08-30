@@ -77,6 +77,11 @@ export function killProcessTree(child, signal = 'SIGTERM', { pgid = groupIdFor(c
 // is exactly the race this helper prevents. `cancel()` is only for abandoning a
 // teardown before it started to matter (currently unused by production code).
 //
+// POSIX escalation/poll timers intentionally remain REF'D while `done` is
+// pending. A Promise by itself does not keep Node alive; unref'ing these timers
+// would let the owner process exit after the leader closes but before surviving
+// descendants receive SIGKILL.
+//
 // On platforms where POSIX process groups are unavailable, we retain the
 // previous best-effort direct-child fallback; callers still await child close.
 export function terminateProcessTree(
@@ -137,7 +142,6 @@ export function terminateProcessTree(
       return;
     }
     pollTimer = setTimeout(pollUntilGone, pollMs);
-    if (typeof pollTimer.unref === 'function') pollTimer.unref();
   };
 
   escalationTimer = setTimeout(() => {
@@ -149,7 +153,6 @@ export function terminateProcessTree(
     }
     pollUntilGone();
   }, graceMs);
-  if (typeof escalationTimer.unref === 'function') escalationTimer.unref();
 
   // Resolve early if every member exits cleanly during the TERM grace period.
   pollUntilGone();
