@@ -108,7 +108,9 @@ export function terminateProcessTree(
   killProcessTree(child, 'SIGTERM', { pgid });
 
   // Without a verifiable process group, direct-child close remains the caller's
-  // teardown acknowledgement. Still schedule a bounded SIGKILL fallback.
+  // teardown acknowledgement. Still retain a bounded SIGKILL fallback; `done`
+  // is immediately resolved because there is no group-existence primitive to
+  // await on this platform/test fake.
   if (!pgid) {
     escalationTimer = setTimeout(() => {
       killProcessTree(child, 'SIGKILL', { pgid: null });
@@ -117,8 +119,15 @@ export function terminateProcessTree(
       }
     }, graceMs);
     if (typeof escalationTimer.unref === 'function') escalationTimer.unref();
-    finish();
-    return { pgid: null, done, cancel: clearTimers };
+    resolveDone();
+    return {
+      pgid: null,
+      done,
+      cancel: () => {
+        if (escalationTimer) clearTimeout(escalationTimer);
+        escalationTimer = null;
+      },
+    };
   }
 
   const pollUntilGone = () => {
