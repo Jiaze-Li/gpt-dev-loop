@@ -1,10 +1,16 @@
 // Claude Supervisor provider. Tool-free decision transport that takes
 // semantic Supervisor context and returns validated decision protocol.
+//
+// This transport is also reused by Claude Planner/Reviewer adapters. Those
+// roles are decision-only: only the Executor is allowed to mutate repository
+// state. Keep the CLI in plan/read-only permission mode and own its full process
+// group so cancellation cannot leave a descendant running after stop returns.
 
 import { randomUUID } from "node:crypto";
 import { spawn as nodeSpawn } from "node:child_process";
 import { buildAgySupervisorPrompt, parseSupervisorJson } from "./agySupervisorProvider.js";
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from "../errors.js";
+import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from "../processTree.js";
 
 function classify(stderr = "", stdout = "") {
   const combined = `${stderr} ${stdout}`;
@@ -28,15 +34,23 @@ export async function callClaude({
     "-p",
     "--output-format",
     "json",
+    // Planner / Supervisor / Reviewer are decision-only. `acceptEdits` here
+    // would let prompt-injected or mistaken non-Executor roles bypass the
+    // isolated-worktree contract and mutate their cwd directly.
     "--permission-mode",
-    "acceptEdits",
+    "plan",
     ...(model ? ["--model", model] : []),
   ];
   const started = Date.now();
   const result = await new Promise((resolve) => {
     let child;
     try {
-      child = spawn(executable, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
+      child = spawn(executable, args, {
+        cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        ...PROCESS_GROUP_SPAWN_OPTS,
+      });
     } catch (error) {
       resolve({ error });
       return;
@@ -44,29 +58,50 @@ export async function callClaude({
     const out = [];
     const err = [];
     let settled = false;
-    const finish = (value) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener?.("abort", onAbort);
-        resolve(value);
-      }
+    let timedOut = false;
+    let aborted = false;
+    let treeTermination = null;
+
+    const tearDownTree = () => {
+      if (!treeTermination) treeTermination = terminateProcessTree(child);
+      return treeTermination;
     };
+
+    const finish = async (value, { awaitTree = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", onAbort);
+      if (awaitTree && treeTermination) await treeTermination.done;
+      resolve(value);
+    };
+
     const timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch {}
-      finish({ timedOut: true });
+      timedOut = true;
+      try { tearDownTree(); } catch {}
     }, timeoutMs);
     timer.unref?.();
-    const onAbort = () => { try { child.kill("SIGKILL"); } catch {} finish({ aborted: true }); };
+
+    const onAbort = () => {
+      aborted = true;
+      try { tearDownTree(); } catch {}
+    };
     if (signal) signal.addEventListener("abort", onAbort, { once: true });
-    child.on("error", (error) => finish({ error }));
+
+    child.on("error", (error) => {
+      void finish({ error, aborted, timedOut }, { awaitTree: aborted || timedOut });
+    });
     child.stdout?.on("data", (chunk) => out.push(chunk));
     child.stderr?.on("data", (chunk) => err.push(chunk));
-    child.on("close", (exitCode) => finish({
-      exitCode,
-      stdout: Buffer.concat(out).toString("utf8"),
-      stderr: Buffer.concat(err).toString("utf8"),
-    }));
+    child.on("close", (exitCode) => {
+      void finish({
+        exitCode,
+        stdout: Buffer.concat(out).toString("utf8"),
+        stderr: Buffer.concat(err).toString("utf8"),
+        aborted,
+        timedOut,
+      }, { awaitTree: aborted || timedOut });
+    });
     child.stdin?.write(prompt);
     child.stdin?.end();
   });
