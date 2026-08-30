@@ -1,0 +1,219 @@
+// AgyReviewerProvider — the MVP Gemini Reviewer, built on src/agy/agyClient.js.
+//
+// Drop-in for the Reviewer slot the automated loop calls as
+// reviewerSession.review(taskId, taskCard, executionReport, evidence). Returns
+// a Review Result of the same shape gptReviewerAdapter.js's parseReviewResult
+// produces:
+//
+//   { task_id, repository_context, decision, findings, required_changes, rationale }
+//
+//   decision       — exactly one of PASS | REWORK | HUMAN_REQUIRED
+//   required_changes — array of actionable strings on REWORK (non-empty,
+//                      enforced); the string 'none' on PASS/HUMAN_REQUIRED.
+//                      Fed straight into the existing fresh-Claude rework
+//                      path via automatedLoop's persistence.writeState().
+//
+// MVP is STATELESS: one fresh `agy` invocation per review() call (rework
+// rounds included). The prompt carries the complete current Task Card, the
+// attempt number, the Execution Report, and the deterministic gate
+// results + Evidence — everything needed to judge intent-alignment without a
+// persistent conversation.
+//
+// Structured output only (JSON object, fail-closed parse). Reuses
+// gptReviewerAdapter.js's renderTaskCard / renderExecutionReport /
+// renderEvidence so the Reviewer sees the exact same rendered inputs the
+// Chrome Reviewer does — no second rendering path.
+
+import { randomUUID } from 'node:crypto';
+import { callAgy as defaultCallAgy } from '../../agy/agyClient.js';
+import {
+  AgyTimeoutError,
+  AgyExitError,
+  AgyExecutableNotFoundError,
+  AgyError,
+  AgyConversationResumeError,
+} from '../../agy/agyClient.js';
+import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../../agy/agyJson.js';
+import { AGY_REVIEWER_DEFAULT_MODEL } from '../../agy/agyConfig.js';
+import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
+
+const DECISIONS = new Set(['PASS', 'REWORK', 'HUMAN_REQUIRED']);
+
+// This production provider must not import the legacy browser adapter just
+// to render review input. Keep the rendering local and dependency-free so a
+// clean SuperGPT install never loads Playwright or the WebSocket bridge.
+function renderList(items) { return items?.length ? items.map((item) => `- ${item}`).join('\n') : 'none'; }
+function renderContext(ctx = {}) {
+  return `repository_name: ${ctx.repository_name}\nrepository_url: ${ctx.repository_url ?? 'none'}\nbranch: ${ctx.branch}\ncommit_sha: ${ctx.commit_sha}`;
+}
+function renderTaskCard(card) {
+  return `## task_id\n${card.task_id}\n\n## repository_context\n${renderContext(card.repository_context)}\n\n## goal\n${card.goal}\n\n## context\n${card.context}\n\n## scope\n${card.scope}\n\n## allowed_files\n${renderList(card.allowed_files)}\n\n## forbidden_files\n${renderList(card.forbidden_files)}\n\n## acceptance_criteria\n${renderList(card.acceptance_criteria)}\n\n## verification_commands\n${renderList((card.verification_commands ?? []).map((command) => `\`${command}\``))}\n\n## completion_signal\n${card.completion_signal}`;
+}
+function renderExecutionReport(report) {
+  const issues = Array.isArray(report.issues) ? renderList(report.issues) : report.issues ?? 'none';
+  return `## task_id\n${report.task_id}\n\n## repository_context\n${renderContext(report.repository_context)}\n\n## status\n${report.status}\n\n## changed_files\n${renderList(report.changed_files)}\n\n## tests_run\n${renderList(report.tests_run)}\n\n## test_results\n${renderList(report.test_results)}\n\n## issues\n${issues}\n\n## next_recommendation\n${report.next_recommendation}`;
+}
+function renderEvidence(evidence) {
+  const sections = [];
+  if (evidence?.status) sections.push(`### diff status\n${evidence.status}`);
+  if (evidence?.base || evidence?.head) sections.push(`### base/head\nbase: ${evidence.base ?? 'none'}\nhead: ${evidence.head ?? 'none'}`);
+  if (evidence?.baseline) { const b = evidence.baseline; sections.push(`### workflow baseline\nbranch: ${b.branch ?? 'unknown'}\nhead: ${b.head ?? 'unknown'}\nclean: ${b.clean === undefined ? 'unknown' : b.clean}\nisolated_worktree: ${b.isolated_worktree ?? false}`); }
+  if (Array.isArray(evidence?.untracked_files) && evidence.untracked_files.length) sections.push(`### task-produced untracked files\n${evidence.untracked_files.map((f) => f.included ? `- ${f.path} (new file, ${f.bytes} bytes — full contents in the diff below)` : `- ${f.path} (new file, ${f.bytes ?? 'unknown'} bytes — ${f.reason ?? 'omitted'}, contents not shown)`).join('\n')}`);
+  if (evidence?.diff !== undefined) sections.push(`### git diff\n\`\`\`diff\n${evidence.diff || '(no changes)'}\n\`\`\``);
+  const results = evidence?.results ?? [];
+  sections.push(`### gate results\noverall pass: ${evidence?.pass ?? 'unknown'}\n${results.length ? results.map((result) => `- \`${result.command}\`: ${result.pass ? 'pass' : 'fail'} — ${result.output ?? ''}`).join('\n') : 'none'}`);
+  return sections.join('\n\n');
+}
+export function renderReviewInputs(taskCard, executionReport, evidence) {
+  return `# Task Card (TASK_PROTOCOL.md)\n\n${renderTaskCard(taskCard)}\n\n# Execution Report (EXECUTION_REPORT.md)\n\n${renderExecutionReport(executionReport)}\n\n# Evidence\n\n${renderEvidence(evidence)}`;
+}
+
+function invalid(message) {
+  return new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT, message);
+}
+
+export function buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
+  const checkpointBlock = checkpoint && Array.isArray(checkpoint.prior_required_changes)
+    ? `\n## Structured Prior Finding (continuity only)
+Prior required changes are not current evidence and must not be repeated mechanically. Mark one resolved when this attempt's evidence demonstrates resolution; emit REWORK only for a currently unresolved finding.
+${checkpoint.prior_required_changes.length ? checkpoint.prior_required_changes.map((o) => `- ${o}`).join('\n') : '- none'}\n`
+    : '';
+
+  return `You are the Reviewer in an automated development loop. Judge whether the Execution Report satisfies the Task Card's acceptance_criteria, using the evidence. Judge intent-alignment — do not merely restate the gate pass/fail shown in the evidence.
+
+This is attempt ${attempt ?? 'unknown'} for this task.
+${checkpointBlock}
+Reply with ONLY one JSON object, no prose, no code fence. Shape:
+
+{
+  "decision": "PASS" | "REWORK" | "HUMAN_REQUIRED",
+  "findings": ["<specific observation tied to a file/criterion/behavior>", "..."],
+  "required_changes": ["<specific actionable change>", "..."],   // MUST be non-empty when decision == "REWORK"; use [] for PASS
+  "rationale": "<why this decision, tied to acceptance_criteria>"
+}
+
+Use HUMAN_REQUIRED only for a genuine ambiguity a human must resolve, not for a fixable defect (that is REWORK).
+
+${renderReviewInputs(taskCard, executionReport, evidence)}
+
+Reply with the JSON object now.`;
+}
+
+export function parseReviewJson(taskId, obj, repositoryContext) {
+  const decision = obj.decision;
+  if (!DECISIONS.has(decision)) {
+    throw invalid(`reviewer JSON "decision" must be one of PASS, REWORK, HUMAN_REQUIRED — got: ${JSON.stringify(decision)}`);
+  }
+
+  const findings = Array.isArray(obj.findings) ? obj.findings.map(String) : [];
+  const rawChanges = Array.isArray(obj.required_changes) ? obj.required_changes.map(String).filter((s) => s.trim() !== '') : [];
+
+  if (decision === 'REWORK' && rawChanges.length === 0) {
+    throw invalid('reviewer REWORK decision must include a non-empty "required_changes" array');
+  }
+  if (!isNonEmptyString(obj.rationale)) {
+    throw invalid('reviewer JSON must include a non-empty "rationale"');
+  }
+
+  return {
+    task_id: taskId,
+    repository_context: repositoryContext ?? null,
+    decision,
+    findings,
+    required_changes: rawChanges.length ? rawChanges : 'none',
+    rationale: obj.rationale.trim(),
+  };
+}
+
+// Compact, safe one-liner of agy stderr for the AdapterError message.
+// stderr from agy is operational diagnostics (auth / quota / rate-limit /
+// usage), never prompt or reply content — see AgyExitError. Full text is
+// kept in err.details.stderr; here we only inline a bounded summary.
+function summarizeStderr(stderr) {
+  if (typeof stderr !== 'string' || stderr.trim() === '') return '';
+  const oneLine = stderr.trim().replace(/\s*\n\s*/g, ' | ');
+  return oneLine.length > 500 ? `${oneLine.slice(0, 500)}…` : oneLine;
+}
+
+// Preserves the high-level REVIEWER_* code AND the safe underlying agy
+// diagnostics (exit code, stderr, duration, model) — both inlined into the
+// message and structured on err.details for operator logging.
+function mapAgyError(err, model) {
+  const isTimeout = err instanceof AgyTimeoutError;
+  const isAgy =
+    isTimeout ||
+    err instanceof AgyExecutableNotFoundError ||
+    err instanceof AgyExitError ||
+    err instanceof AgyError;
+  if (!isAgy) return err;
+
+  const code = isTimeout ? ADAPTER_ERROR_CODES.REVIEWER_TIMEOUT : ADAPTER_ERROR_CODES.REVIEWER_UNAVAILABLE;
+  const details = {
+    role: 'reviewer',
+    model: model ?? null,
+    agyErrorName: err.name,
+    agyCode: err.code ?? null,
+    exitCode: Number.isFinite(err.exitCode) ? err.exitCode : null,
+    stderr: typeof err.stderr === 'string' ? err.stderr : null,
+    durationMs: Number.isFinite(err.durationMs) ? err.durationMs : null,
+    // Safe operational metadata from a non-zero `agy` exit envelope (never
+    // generated text) — see src/agy/agyErrorEnvelope.js / AgyExitError.
+    agyEnvelope: err.envelope && typeof err.envelope === 'object' ? err.envelope : null,
+  };
+  const stderrSummary = summarizeStderr(err.stderr);
+  const message = stderrSummary ? `${err.message} — agy stderr: ${stderrSummary}` : err.message;
+  return new AdapterError(code, message, details);
+}
+
+export function createAgyReviewerProvider({
+  callAgy = defaultCallAgy,
+  model = AGY_REVIEWER_DEFAULT_MODEL,
+  timeoutMs = 180_000,
+  jsonSchema,
+  signal,
+} = {}) {
+  return {
+    model,
+    // conversationId (optional): resume this task's persistent Reviewer
+    // conversation across REWORK rounds. Forwarded verbatim to callAgy,
+    // which fails closed (AgyConversationResumeError) if agy cannot resume
+    // exactly it. The returned Review Result carries `conversationId` — the
+    // id agy actually used — so the caller can capture it on the first
+    // review() and reuse it for every rework of the same task.
+    async review(taskCard, executionReport, evidence, { attempt, conversationId, checkpoint } = {}) {
+      const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
+
+      let result;
+      try {
+        result = await callAgy({ prompt, model, timeoutMs, jsonSchema, conversationId, signal });
+      } catch (err) {
+        if (err instanceof AgyConversationResumeError) throw err;
+        throw mapAgyError(err, model);
+      }
+
+      let obj;
+      try {
+        obj = parseAgyJsonObject(result);
+      } catch (err) {
+        if (err instanceof AgyStructuredOutputError) throw invalid(err.message);
+        throw err;
+      }
+      const callId = `call-agy-rev-${randomUUID()}`;
+      const reviewResult = {
+        ...parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null),
+        conversationId: result.conversationId ?? null,
+      };
+      const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };
+      try {
+        Object.defineProperties(reviewResult, {
+          callId: { value: callId, writable: true, configurable: true, enumerable: false },
+          usage: { value: usageWithCallId, writable: true, configurable: true, enumerable: false },
+          durationMs: { value: result.durationMs ?? null, writable: true, configurable: true, enumerable: false },
+        });
+      } catch {
+        /* best effort */
+      }
+      return reviewResult;
+    },
+  };
+}

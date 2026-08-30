@@ -1,4 +1,5 @@
 # Dependencies / build outputs
+node_modules
 node_modules/
 dist/
 build/
@@ -29,3 +30,6 @@ state.local.json
 .DS_Store
 .idea/
 .vscode/
+
+# Test output
+work/

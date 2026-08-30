@@ -1,8 +1,7 @@
-# Phase 1 — Usage
+# [HISTORICAL / RETIRED] — Phase 1 browser-bridge usage
+> **Notice**: The Phase 1 browser bridge implementation described below was retired and physically removed in SuperGPT V1. This document is kept for historical context only.
 
-This covers only the Phase 1 handshake PoC described in `PHASE-1-HANDSHAKE.md`.
-It does not describe the Claude/Codex adapters or the review loop — those are
-later phases.
+This covers only the early Phase 1 handshake PoC described in `PHASE-1-HANDSHAKE.md`.
 
 ## What this is
 
@@ -67,9 +66,41 @@ All overrides are environment variables; defaults are otherwise used:
 | --- | --- | --- |
 | `GPT_LOOP_CHATGPT_URL` | `https://chatgpt.com/` | Target page |
 | `GPT_LOOP_PROFILE_DIR` | `~/.gpt-dev-loop/chrome-profile` | Persistent browser profile location (account-equivalent cookies — keep it outside any Git work tree) |
-| `GPT_LOOP_HEADLESS` | `true` | Run Chrome headless; set to `false` to always use a visible window |
 | `GPT_LOOP_LOGIN_TIMEOUT_MS` | `300000` | How long to wait for manual login |
 | `GPT_LOOP_RESPONSE_TIMEOUT_MS` | `120000` | How long to wait for a completed reply |
+| `GPT_BROWSER_MODE` | `launch` | `launch` (default): Playwright launches/owns `GPT_LOOP_PROFILE_DIR`. `cdp`: attach to a Chrome you already have running instead, over `GPT_LOOP_CDP_URL` |
+| `GPT_LOOP_CDP_URL` | `http://localhost:9222` | CDP endpoint to attach to when `GPT_BROWSER_MODE=cdp` (start Chrome with `--remote-debugging-port=9222` first) |
+
+## Live CDP smoke test (optional)
+
+`scripts/test-cdp-live.js` checks the `GPT_BROWSER_MODE=cdp` attach path
+against a real Chrome you already have running — not part of `npm test`,
+since it needs a live browser and talks to real chatgpt.com:
+
+```sh
+# 1. Start a Chrome with its DevTools port open, e.g.:
+open -a "Google Chrome" --args --remote-debugging-port=9222
+
+# 2. Log into chatgpt.com in that Chrome window if you haven't already.
+
+# 3. Run the smoke test:
+npm run test:cdp-live
+```
+
+It checks `localhost:9222` for a CDP service, attaches to it, opens/reuses
+a chatgpt.com tab, sends one fixed prompt, and prints exactly one of:
+
+```
+PASS: CDP_LIVE_TEST_OK
+```
+
+or
+
+```
+FAIL: <reason>
+```
+
+with a non-zero exit code on `FAIL`.
 
 ## Exit codes
 

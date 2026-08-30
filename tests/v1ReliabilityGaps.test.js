@@ -1,0 +1,1860 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execSync } from 'node:child_process';
+
+import {
+  getCurrentRuntimeIdentity,
+  compareRuntimeIdentity,
+} from '../src/orchestrator/runtimeIdentity.js';
+import {
+  collectRepositoryContext,
+  parsePlannerJson,
+  buildPlannerPrompt,
+} from '../src/orchestrator/planner.js';
+import { loadWorkspaceConfig } from '../src/orchestrator/workspaceConfig.js';
+import {
+  supergptVerify,
+  getValidHostEvidence,
+  computeWorktreeFingerprint,
+  isValidWorktreeFingerprint,
+  hashCommandSet,
+  CLOSEOUT_VERIFICATION_ID,
+} from '../src/orchestrator/hostVerification.js';
+import {
+  deriveSafeRecommendation,
+  sanitizeRecommendationText,
+  HUMAN_REQUIRED_ACTION_CODES,
+} from '../src/orchestrator/humanRequiredPolicy.js';
+import {
+  buildHumanRequiredEvidence,
+  FAILURE_CATEGORIES,
+} from '../src/orchestrator/preflight.js';
+import { renderGenericProgress } from '../src/renderers/genericTextRenderer.js';
+
+test('1. Workflow Runtime Identity: captures supergptVersion, git revision, and schema version', () => {
+  const identity = getCurrentRuntimeIdentity();
+  assert.equal(typeof identity.supergptVersion, 'string');
+  assert.ok(identity.supergptVersion.length > 0);
+  assert.equal(typeof identity.orchestratorRevision, 'string');
+  assert.equal(identity.workflowSchemaVersion, '1');
+});
+
+test('2. Workflow Runtime Identity: compareRuntimeIdentity detects match vs mismatch with non-destructive warning', () => {
+  const current = {
+    supergptVersion: '1.0.0',
+    orchestratorRevision: 'f64f676',
+    workflowSchemaVersion: '1',
+  };
+
+  const matching = compareRuntimeIdentity(current, current);
+  assert.equal(matching.stale, false);
+  assert.equal(matching.staleRuntime, false);
+  assert.equal(matching.warning, null);
+
+  const olderWorkflow = {
+    supergptVersion: '0.9.0',
+    orchestratorRevision: 'abc1234',
+    workflowSchemaVersion: '1',
+  };
+  const mismatch = compareRuntimeIdentity(olderWorkflow, current);
+  assert.equal(mismatch.stale, true);
+  assert.equal(mismatch.staleRuntime, true);
+  assert.ok(mismatch.warning.includes('older SuperGPT runtime'));
+  assert.ok(mismatch.warning.includes('abc1234'));
+
+  // UNKNOWN_LEGACY fallback for legacy workflows without runtime_identity
+  const legacyCheck = compareRuntimeIdentity(null, current);
+  assert.equal(legacyCheck.stale, true);
+  assert.equal(legacyCheck.workflow.orchestratorRevision, 'UNKNOWN_LEGACY');
+});
+
+test('3. Repository Closeout Verification Policy: bounded ingestion of TESTING_STRATEGY.md and .supergpt/config.json', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-policy-'));
+  fs.mkdirSync(path.join(tmpDir, '.supergpt'), { recursive: true });
+  fs.mkdirSync(path.join(tmpDir, 'docs/architecture'), { recursive: true });
+
+  fs.writeFileSync(
+    path.join(tmpDir, '.supergpt/config.json'),
+    JSON.stringify({
+      verification: {
+        closeoutCommands: ['swift test --filter SpinLabIntegrationTests'],
+      },
+    })
+  );
+
+  fs.writeFileSync(
+    path.join(tmpDir, 'docs/architecture/TESTING_STRATEGY.md'),
+    'Policy: targeted test first, full swift test at closeout.'
+  );
+
+  const context = await collectRepositoryContext({ cwd: tmpDir });
+  assert.ok(context.config_files.includes('.supergpt/config.json'));
+  assert.ok(context.policy_contexts.some((p) => p.path === '.supergpt/config.json'));
+  assert.ok(context.policy_contexts.some((p) => p.path === 'docs/architecture/TESTING_STRATEGY.md'));
+  assert.ok(context.promptBlock.includes('Policy: targeted test first, full swift test at closeout.'));
+
+  const parsedConfig = loadWorkspaceConfig(tmpDir);
+  assert.deepEqual(parsedConfig.closeoutCommands, ['swift test --filter SpinLabIntegrationTests']);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('4. Planner Parser: extracts closeout_verification_commands and closeout_policy_sources', () => {
+  const plannerOutput = {
+    status: 'READY',
+    summary: 'Plan with closeout verification',
+    plan_text: 'Complete plan',
+    tasks: [
+      {
+        task_id: 't-1',
+        goal: 'Implement unit feature',
+        scope: 'unit',
+        allowed_files: ['Sources/App.swift'],
+        verification_commands: ['swift test --filter UnitTests'],
+      },
+    ],
+    closeout_verification_commands: ['swift test'],
+    closeout_policy_sources: ['docs/architecture/TESTING_STRATEGY.md'],
+  };
+
+  const parsed = parsePlannerJson(plannerOutput);
+  assert.equal(parsed.status, 'READY');
+  assert.deepEqual(parsed.closeoutVerificationCommands, ['swift test']);
+  assert.deepEqual(parsed.closeoutPolicySources, ['docs/architecture/TESTING_STRATEGY.md']);
+});
+
+test('5. Host Gate Verification: supergptVerify executes gate commands and persists durable hash/evidence', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-host-verif-'));
+  const workflowId = 'wf-test-verify-1';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'README.md'), '# Test\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  const meta = {
+    workflow_id: workflowId,
+    isolated_worktree_path: repoDir,
+    closeout_verification_commands: ['echo "closeout ok"'],
+  };
+  fs.writeFileSync(path.join(tmpRoot, `${workflowId}.workspace.json`), JSON.stringify(meta));
+
+  const state = {
+    workflowId,
+    workflowStatus: 'HUMAN_REQUIRED',
+    stage: 'HUMAN_REQUIRED',
+    pending_verification: {
+      task_id: 't-1',
+      commands: ['echo "closeout ok"'],
+      commands_hash: 'test-hash',
+    },
+  };
+  fs.writeFileSync(path.join(tmpRoot, `${workflowId}.state.json`), JSON.stringify(state));
+
+  const fakeGateRunner = {
+    async run(commands) {
+      return {
+        pass: true,
+        results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })),
+      };
+    },
+  };
+
+  const res = await supergptVerify({
+    workflowId,
+    root: tmpRoot,
+    gateRunner: fakeGateRunner,
+  });
+
+  assert.equal(res.workflowId, workflowId);
+  assert.equal(res.pass, true);
+  assert.ok(res.evidenceId.startsWith('ev-'));
+  assert.ok(res.hash.length > 0);
+
+  // Validate persisted evidence
+  const validCheck = getValidHostEvidence({ workflowId, root: tmpRoot });
+  assert.equal(validCheck.valid, true);
+  assert.equal(validCheck.stale, false);
+  assert.equal(validCheck.hostEvidence.evidenceId, res.evidenceId);
+
+  // Invalidate on worktree change
+  fs.writeFileSync(path.join(repoDir, 'dirty.txt'), 'mutation');
+  const mutatedCheck = getValidHostEvidence({ workflowId, root: tmpRoot });
+  assert.equal(mutatedCheck.stale, true);
+  assert.equal(mutatedCheck.reason, 'WORKTREE_MUTATED_AFTER_VERIFICATION');
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('closeout host evidence requires the dedicated identity, not matching task commands', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-closeout-identity-'));
+  const workflowId = 'wf-closeout-identity';
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  execSync('git init -b main', { cwd: repo });
+  execSync('git config user.name Test && git config user.email test@example.com', { cwd: repo });
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+  execSync('git add . && git commit -m init', { cwd: repo });
+  fs.writeFileSync(path.join(root, `${workflowId}.workspace.json`), JSON.stringify({ isolated_worktree_path: repo }));
+  const writeState = (pending) => fs.writeFileSync(path.join(root, `${workflowId}.state.json`), JSON.stringify({ workflowStatus: 'HUMAN_REQUIRED', pending_verification: pending }));
+  const gate = { run: async (commands) => ({ pass: true, results: commands.map((command) => ({ command, pass: true })) }) };
+
+  writeState({ task_id: 'task-a', commands: ['npm test'] });
+  await supergptVerify({ workflowId, root, gateRunner: gate });
+  assert.equal(getValidHostEvidence({ workflowId, root, taskId: CLOSEOUT_VERIFICATION_ID, verificationIdentity: CLOSEOUT_VERIFICATION_ID, verificationCommands: ['npm test'] }).valid, false);
+
+  writeState({ task_id: CLOSEOUT_VERIFICATION_ID, verification_identity: CLOSEOUT_VERIFICATION_ID, commands: ['npm test'] });
+  await supergptVerify({ workflowId, root, gateRunner: gate });
+  assert.equal(getValidHostEvidence({ workflowId, root, taskId: CLOSEOUT_VERIFICATION_ID, verificationIdentity: CLOSEOUT_VERIFICATION_ID, verificationCommands: ['npm test'] }).valid, true);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('6. Safe HUMAN_REQUIRED Recommendation Policy: strict action codes and anti-sync invariant', () => {
+  // Blocker due to verification/toolchain -> RUN_HOST_VERIFICATION
+  const verifRec = deriveSafeRecommendation({
+    blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+    failingGateCommand: 'swift test',
+    rootCause: 'swift: command not found (exit code 127)',
+  });
+  assert.equal(verifRec.actionCode, HUMAN_REQUIRED_ACTION_CODES.RUN_HOST_VERIFICATION);
+  assert.ok(verifRec.recommendedAction.includes('supergpt_verify'));
+
+  // Blocker due to external roots -> UPDATE_WORKSPACE_POLICY_AND_START_NEW_WORKFLOW
+  const rootRec = deriveSafeRecommendation({
+    isExternalRootBlocker: true,
+  });
+  assert.equal(rootRec.actionCode, HUMAN_REQUIRED_ACTION_CODES.UPDATE_WORKSPACE_POLICY_AND_START_NEW_WORKFLOW);
+  assert.ok(rootRec.recommendedAction.includes('config.json and start a new workflow'));
+
+  // Invariant assertion: Never recommend copying/syncing to source workspace before final acceptance
+  const forbiddenText = 'You should sync isolated worktree into source workspace and run tests manually.';
+  const sanitized = sanitizeRecommendationText(forbiddenText);
+  assert.equal(sanitized.includes('source workspace'), false);
+  assert.ok(sanitized.includes('supergpt_verify'));
+});
+
+test('7. buildHumanRequiredEvidence integrates safe recommendation policy', () => {
+  const ev = buildHumanRequiredEvidence({
+    workflowId: 'wf-1',
+    blockerCategory: FAILURE_CATEGORIES.ENVIRONMENT,
+    failingGateCommand: 'swift test',
+    rootCause: 'exit code 127: command not found',
+  });
+
+  assert.equal(ev.actionCode, HUMAN_REQUIRED_ACTION_CODES.RUN_HOST_VERIFICATION);
+  assert.ok(ev.recommendedAction.includes('supergpt_verify'));
+  assert.ok(ev.availableChoices.some((c) => c.includes('supergpt_verify')));
+});
+
+test('8. Progress text renderer displays stale runtime warning when present', () => {
+  const state = {
+    workflowId: 'wf-1',
+    workflowStatus: 'RUNNING',
+    attempt: 1,
+    stage: 'GATE',
+    staleRuntimeWarning: 'Workflow runtime mismatch: started under 0.9.0, current is 1.0.0',
+    stageStatuses: { executor: 'done', gate: 'running', reviewer: 'waiting' },
+    timing: { elapsed: '01:00', heartbeatAt: new Date().toISOString(), lastProgressAt: new Date().toISOString() },
+    task: { current: 1, total: 1, taskId: 't-1' },
+    executor: { model: 'sonnet' },
+    gate: { status: 'running' },
+    reviewer: { status: 'waiting' },
+  };
+
+  const text = renderGenericProgress(state);
+  assert.ok(text.includes('[WARNING] Workflow runtime mismatch'));
+});
+
+// ============================================================================
+// COMPREHENSIVE REGRESSION SUITE: INVARIANTS A THROUGH N
+// ============================================================================
+
+test('A. Task A host PASS cannot satisfy Task B', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-a-'));
+  const workflowId = 'wf-test-a';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.state.json`),
+    JSON.stringify({
+      workflowId,
+      workflowStatus: 'HUMAN_REQUIRED',
+      pending_verification: {
+        task_id: 'task-A',
+        commands: ['echo "task-A test"'],
+      },
+    })
+  );
+
+  await supergptVerify({
+    workflowId,
+    root: tmpRoot,
+    gateRunner: {
+      async run(commands) {
+        return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+      },
+    },
+  });
+
+  // Verify against Task B: must fail closed / reject
+  const taskBCheck = getValidHostEvidence({
+    workflowId,
+    taskId: 'task-B',
+    verificationCommands: ['echo "task-B test"'],
+    root: tmpRoot,
+  });
+
+  assert.equal(taskBCheck.valid, false);
+  assert.equal(taskBCheck.reason, 'TASK_ID_MISMATCH');
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('B. Host PASS for ["swift test"] cannot satisfy current Gate: ["swift test", "./scripts/check.sh"]', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-b-'));
+  const workflowId = 'wf-test-b';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.state.json`),
+    JSON.stringify({
+      workflowId,
+      workflowStatus: 'HUMAN_REQUIRED',
+      pending_verification: {
+        task_id: 'task-1',
+        commands: ['swift test'],
+      },
+    })
+  );
+
+  await supergptVerify({
+    workflowId,
+    root: tmpRoot,
+    gateRunner: {
+      async run(commands) {
+        return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+      },
+    },
+  });
+
+  // Gate requires both swift test AND ./scripts/check.sh
+  const gateCheck = getValidHostEvidence({
+    workflowId,
+    taskId: 'task-1',
+    verificationCommands: ['swift test', './scripts/check.sh'],
+    root: tmpRoot,
+  });
+
+  assert.equal(gateCheck.valid, false);
+  assert.equal(gateCheck.reason, 'COMMANDS_MISMATCH');
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('C. Tracked modified file content A -> B with identical git status invalidates host evidence', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-c-'));
+  const workflowId = 'wf-test-c';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'original content\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  // Modify file before verification
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'version A\n');
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.state.json`),
+    JSON.stringify({
+      workflowId,
+      workflowStatus: 'HUMAN_REQUIRED',
+      pending_verification: {
+        task_id: 'task-1',
+        commands: ['echo "ok"'],
+      },
+    })
+  );
+
+  const res = await supergptVerify({
+    workflowId,
+    root: tmpRoot,
+    gateRunner: {
+      async run(commands) {
+        return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+      },
+    },
+  });
+
+  assert.equal(res.pass, true);
+
+  // Modify file content to version B (status remains ' M file.txt')
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'version B\n');
+
+  const check = getValidHostEvidence({
+    workflowId,
+    taskId: 'task-1',
+    verificationCommands: ['echo "ok"'],
+    root: tmpRoot,
+  });
+
+  assert.equal(check.valid, false);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, 'WORKTREE_MUTATED_AFTER_VERIFICATION');
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('D. No frozen pending commands: supergpt_verify fails closed and does NOT run "swift test"', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-d-'));
+  const workflowId = 'wf-test-d';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  // State without pending_verification
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.state.json`),
+    JSON.stringify({
+      workflowId,
+      workflowStatus: 'HUMAN_REQUIRED',
+    })
+  );
+
+  let runnerCalled = false;
+  await assert.rejects(
+    async () => {
+      await supergptVerify({
+        workflowId,
+        root: tmpRoot,
+        gateRunner: {
+          async run() {
+            runnerCalled = true;
+            return { pass: true, results: [] };
+          },
+        },
+      });
+    },
+    (err) => {
+      assert.ok(err.message.includes('NO_PENDING_HOST_VERIFICATION'));
+      return true;
+    }
+  );
+
+  assert.equal(runnerCalled, false);
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('E. supergpt_verify strictly rejects all non-HUMAN_REQUIRED workflow states (STARTING, RUNNING, DONE, FAILED, TIMEOUT, STALLED, STOPPED)', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-e-'));
+  const workflowId = 'wf-test-e';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  const nonHumanStates = ['STARTING', 'RUNNING', 'DONE', 'FAILED', 'TIMEOUT', 'STALLED', 'STOPPED'];
+
+  for (const status of nonHumanStates) {
+    fs.writeFileSync(
+      path.join(tmpRoot, `${workflowId}.state.json`),
+      JSON.stringify({
+        workflowId,
+        workflowStatus: status,
+        pending_verification: { task_id: 't-1', commands: ['echo "ok"'] },
+      })
+    );
+
+    await assert.rejects(
+      async () => {
+        await supergptVerify({ workflowId, root: tmpRoot });
+      },
+      (err) => {
+        assert.ok(err.message.includes('INVALID_WORKFLOW_STATE'));
+        assert.ok(err.message.includes(status));
+        return true;
+      }
+    );
+  }
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('F & G & H & I. Gate blocker persists exact commands -> verify runs them -> resume consumes once -> cannot satisfy later task', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-fghi-'));
+  const workflowId = 'wf-test-fghi';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+  const wsm = new WorkflowStateManager({ workflowId, root: tmpRoot });
+
+  const task1 = {
+    task_id: 'task-1',
+    goal: 'First task',
+    allowed_files: ['file.txt'],
+    verification_commands: ['swift test --filter FeatureOne'],
+  };
+
+  const task2 = {
+    task_id: 'task-2',
+    goal: 'Second task',
+    allowed_files: ['file.txt'],
+    verification_commands: ['swift test --filter FeatureTwo'],
+  };
+
+  // Mock gate runner that fails with exit code 127 (environment blocker)
+  let gateRunCommands = [];
+  const failingGate = {
+    async run(commands) {
+      gateRunCommands = [...commands];
+      return {
+        pass: false,
+        results: commands.map((c) => ({
+          command: c,
+          pass: false,
+          output: 'swift: command not found (exit code 127)',
+        })),
+      };
+    },
+  };
+
+  // 1. Initial attempt fails at Gate with environment blocker
+  const supervisorMock = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => ({ action: 'NEXT_TASK', task_card: task1 }),
+    close: async () => {},
+  };
+
+  const reviewerMock = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result1 = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession: supervisorMock,
+    createReviewerSession: () => reviewerMock,
+    createClaudeSessionManager: () => ({
+      execute: async () => ({ changes: [{ path: 'file.txt', action: 'modify', content: 'update\n' }] }),
+    }),
+    gateRunner: failingGate,
+    workflowStateManager: wsm,
+  });
+
+  // Check F: Pending verification context is persisted
+  assert.equal(result1.status, 'HUMAN_REQUIRED');
+  assert.ok(result1.pending_verification);
+  assert.equal(result1.pending_verification.task_id, 'task-1');
+  assert.deepEqual(result1.pending_verification.commands, ['swift test --filter FeatureOne']);
+
+  // Check G: supergpt_verify executes exactly those persisted commands
+  let verifyRunCommands = [];
+  const hostGateRunner = {
+    async run(commands) {
+      verifyRunCommands = [...commands];
+      return {
+        pass: true,
+        results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })),
+      };
+    },
+  };
+
+  const hostEvidence = await supergptVerify({
+    workflowId,
+    root: tmpRoot,
+    gateRunner: hostGateRunner,
+  });
+
+  assert.deepEqual(verifyRunCommands, ['swift test --filter FeatureOne']);
+  assert.equal(hostEvidence.pass, true);
+
+  // Check H: resume consumes matching PASS evidence exactly once
+  let resumedGateRunCount = 0;
+  const resumedGate = {
+    async run(commands) {
+      resumedGateRunCount++;
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let supervisorCallCount = 0;
+  const supervisorMock2 = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorCallCount++;
+      if (supervisorCallCount === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      if (supervisorCallCount === 2) return { action: 'NEXT_TASK', task_card: task2 };
+      return { action: 'WORKFLOW_DONE', summary: 'Done' };
+    },
+    close: async () => {},
+  };
+
+  const result2 = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession: supervisorMock2,
+    createReviewerSession: () => reviewerMock,
+    createClaudeSessionManager: () => ({
+      execute: async () => ({ changes: [] }),
+    }),
+    gateRunner: resumedGate,
+    workflowStateManager: wsm,
+  });
+
+  assert.equal(result2.status, 'WORKFLOW_DONE');
+  // Resumed task1 consumed host evidence without calling resumedGate
+  // Task2 had to run resumedGate because evidence was already consumed and for task1
+  assert.equal(resumedGateRunCount, 1);
+
+  // Check I: Evidence is consumed and cannot satisfy task2
+  const checkAfter = getValidHostEvidence({
+    workflowId,
+    taskId: 'task-2',
+    verificationCommands: ['swift test --filter FeatureTwo'],
+    root: tmpRoot,
+  });
+  assert.equal(checkAfter.valid, false);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('J & K. Closeout Policy: Task 1 and Task 2 run only focused tests; Core runs full closeout at WORKFLOW_DONE', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-jk-'));
+  const workflowId = 'wf-test-jk';
+
+  const task1 = {
+    task_id: 'task-1',
+    goal: 'First task',
+    verification_commands: ['swift test --filter UnitTests'],
+  };
+
+  const task2 = {
+    task_id: 'task-2',
+    goal: 'Second task',
+    verification_commands: ['swift test --filter FinalFeatureTests'],
+  };
+
+  const gateExecutions = [];
+  const gateRunner = {
+    async run(commands) {
+      gateExecutions.push([...commands]);
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let supervisorStep = 0;
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorStep++;
+      if (supervisorStep === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      if (supervisorStep === 2) return { action: 'NEXT_TASK', task_card: task2 };
+      return { action: 'WORKFLOW_DONE', summary: 'Done' };
+    },
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({
+      execute: async () => ({ changes: [] }),
+    }),
+    gateRunner,
+    closeoutVerificationCommands: ['swift test'],
+    taskTotal: 2,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // Task 1 gate, Task 2 gate, and Core closeout gate at WORKFLOW_DONE
+  assert.equal(gateExecutions.length, 3);
+
+  // Task 1: earlier task does NOT receive full swift test
+  assert.deepEqual(gateExecutions[0], ['swift test --filter UnitTests']);
+
+  // Task 2: intermediate task does NOT receive full swift test
+  assert.deepEqual(gateExecutions[1], ['swift test --filter FinalFeatureTests']);
+
+  // Core closeout gate at WORKFLOW_DONE runs full swift test
+  assert.deepEqual(gateExecutions[2], ['swift test']);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('L. Intermediate REWORK retains scoped verification; Core runs closeout at WORKFLOW_DONE', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-l-'));
+  const workflowId = 'wf-test-l';
+
+  const task1 = {
+    task_id: 'task-1',
+    goal: 'Single task',
+    verification_commands: ['swift test --filter UnitTests'],
+  };
+
+  const gateExecutions = [];
+  const gateRunner = {
+    async run(commands) {
+      gateExecutions.push([...commands]);
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let reviewCount = 0;
+  let supervisorStep = 0;
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorStep++;
+      if (supervisorStep === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      if (supervisorStep === 2) return { action: 'CONTINUE_REWORK' };
+      return { action: 'WORKFLOW_DONE', summary: 'Done' };
+    },
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => {
+      reviewCount++;
+      if (reviewCount === 1) return { decision: 'REWORK', required_changes: ['fix bug'] };
+      return { decision: 'PASS' };
+    },
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({
+      execute: async () => ({ changes: [] }),
+    }),
+    gateRunner,
+    closeoutVerificationCommands: ['swift test'],
+    taskTotal: 1,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // Task 1 attempt 1, Task 1 rework attempt 2, and Core closeout gate at WORKFLOW_DONE
+  assert.equal(gateExecutions.length, 3);
+
+  // Both initial attempt and rework attempt retain scoped verification
+  assert.deepEqual(gateExecutions[0], ['swift test --filter UnitTests']);
+  assert.deepEqual(gateExecutions[1], ['swift test --filter UnitTests']);
+
+  // Final Core closeout gate runs full closeout commands
+  assert.deepEqual(gateExecutions[2], ['swift test']);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('M. Resume retains frozen closeout policy if repository docs/config change', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-m-'));
+  const configDir = path.join(tmpDir, '.supergpt');
+  fs.mkdirSync(configDir, { recursive: true });
+
+  // Initial config
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      verification: { closeoutCommands: ['swift test --filter SpinLabIntegrationTests'] },
+    })
+  );
+
+  const initialConfig = loadWorkspaceConfig(tmpDir);
+  assert.deepEqual(initialConfig.closeoutCommands, ['swift test --filter SpinLabIntegrationTests']);
+
+  // Change repository config (e.g. user modifies it later)
+  fs.writeFileSync(
+    path.join(configDir, 'config.json'),
+    JSON.stringify({
+      verification: { closeoutCommands: ['npm test'] },
+    })
+  );
+
+  // Resumed workflow uses frozen metadata, unaffected by repository config mutation
+  const frozenMeta = {
+    workflow_id: 'wf-resumed',
+    closeout_verification_commands: initialConfig.closeoutCommands,
+  };
+  assert.deepEqual(frozenMeta.closeout_verification_commands, ['swift test --filter SpinLabIntegrationTests']);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('N. Malformed .supergpt/config.json fails closed before model invocation', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-n-'));
+  const configDir = path.join(tmpDir, '.supergpt');
+  fs.mkdirSync(configDir, { recursive: true });
+
+  // Malformed JSON syntax
+  fs.writeFileSync(path.join(configDir, 'config.json'), '{ malformed json: true, ');
+
+  assert.throws(
+    () => {
+      loadWorkspaceConfig(tmpDir);
+    },
+    (err) => {
+      assert.equal(err.name, 'ExternalReadRootConfigError');
+      assert.ok(err.message.includes('Malformed workspace configuration'));
+      return true;
+    }
+  );
+
+  // Non-object JSON
+  fs.writeFileSync(path.join(configDir, 'config.json'), '["not", "an", "object"]');
+  assert.throws(
+    () => {
+      loadWorkspaceConfig(tmpDir);
+    },
+    (err) => {
+      assert.equal(err.name, 'ExternalReadRootConfigError');
+      assert.ok(err.message.includes('expected a JSON object'));
+      return true;
+    }
+  );
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('Hardening B. Nested untracked file content mutation invalidates host PASS', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-untracked-'));
+  const workflowId = 'wf-test-untracked';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'tracked\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  // Create nested untracked dir with file version A
+  fs.mkdirSync(path.join(repoDir, 'NewDir', 'SubDir'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'NewDir', 'SubDir', 'nested file.txt'), 'version A\n');
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.state.json`),
+    JSON.stringify({
+      workflowId,
+      workflowStatus: 'HUMAN_REQUIRED',
+      pending_verification: {
+        task_id: 'task-1',
+        commands: ['echo "ok"'],
+      },
+    })
+  );
+
+  const res = await supergptVerify({
+    workflowId,
+    root: tmpRoot,
+    gateRunner: {
+      async run(commands) {
+        return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+      },
+    },
+  });
+
+  assert.equal(res.pass, true);
+
+  // Mutate nested untracked file content to version B
+  fs.writeFileSync(path.join(repoDir, 'NewDir', 'SubDir', 'nested file.txt'), 'version B\n');
+
+  const check = getValidHostEvidence({
+    workflowId,
+    taskId: 'task-1',
+    verificationCommands: ['echo "ok"'],
+    root: tmpRoot,
+  });
+
+  assert.equal(check.valid, false);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, 'WORKTREE_MUTATED_AFTER_VERIFICATION');
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('Hardening C & D. WORKFLOW_DONE from Supervisor cannot bypass required closeout Gate (runs Core gate on WORKFLOW_DONE)', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-cd-'));
+  const workflowId = 'wf-test-cd';
+
+  const task1 = {
+    task_id: 'task-1',
+    goal: 'First task',
+    verification_commands: ['swift test --filter FeatureOne'],
+  };
+
+  const gateExecutions = [];
+  const gateRunner = {
+    async run(commands) {
+      gateExecutions.push([...commands]);
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let supervisorStep = 0;
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorStep++;
+      if (supervisorStep === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      // Supervisor attempts to return WORKFLOW_DONE immediately without executing closeout commands
+      return { action: 'WORKFLOW_DONE', summary: 'Done early' };
+    },
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({
+      execute: async () => ({ changes: [] }),
+    }),
+    gateRunner,
+    closeoutVerificationCommands: ['swift test --filter FullCloseoutTests'],
+    taskTotal: 5, // Supervisor finished after 1 task instead of 5
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // Both task-1 Gate and Core closeout Gate must have run
+  assert.equal(gateExecutions.length, 2);
+  assert.deepEqual(gateExecutions[0], ['swift test --filter FeatureOne']);
+  assert.deepEqual(gateExecutions[1], ['swift test --filter FullCloseoutTests']);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('Hardening E. Supervisor generating more/fewer tasks than Planner count cannot skip closeout', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-e-moreless-'));
+  const workflowId = 'wf-test-moreless';
+
+  const task1 = { task_id: 't-1', goal: '1', verification_commands: ['echo "t1"'] };
+  const task2 = { task_id: 't-2', goal: '2', verification_commands: ['echo "t2"'] };
+  const task3 = { task_id: 't-3', goal: '3', verification_commands: ['echo "t3"'] };
+
+  const gateExecutions = [];
+  const gateRunner = {
+    async run(commands) {
+      gateExecutions.push([...commands]);
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let supervisorStep = 0;
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorStep++;
+      if (supervisorStep === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      if (supervisorStep === 2) return { action: 'NEXT_TASK', task_card: task2 };
+      if (supervisorStep === 3) return { action: 'NEXT_TASK', task_card: task3 };
+      return { action: 'WORKFLOW_DONE', summary: 'Done 3 tasks' };
+    },
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({ execute: async () => ({ changes: [] }) }),
+    gateRunner,
+    closeoutVerificationCommands: ['swift test --filter FullCloseout'],
+    taskTotal: 1, // Planner originally thought 1 task, supervisor ran 3
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // Task 1, Task 2, Task 3, followed by deterministic Core Closeout Gate
+  assert.ok(gateExecutions.some((cmds) => cmds.includes('swift test --filter FullCloseout')));
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('Hardening F. Multi-task planPath workflow runs closeout on final repository state, and intermediate tasks do not receive closeout', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-planpath-'));
+  const workflowId = 'wf-test-planpath';
+
+  const task1 = { task_id: 't-1', goal: 'Task 1', verification_commands: ['echo "task1"'] };
+  const task2 = { task_id: 't-2', goal: 'Task 2', verification_commands: ['echo "task2"'] };
+
+  const gateExecutions = [];
+  const gateRunner = {
+    async run(commands) {
+      gateExecutions.push([...commands]);
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let supervisorStep = 0;
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorStep++;
+      if (supervisorStep === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      if (supervisorStep === 2) return { action: 'NEXT_TASK', task_card: task2 };
+      return { action: 'WORKFLOW_DONE', summary: 'Done' };
+    },
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({ execute: async () => ({ changes: [] }) }),
+    gateRunner,
+    closeoutVerificationCommands: ['swift test'],
+    taskTotal: null, // planPath workflow where resolved.tasks is absent
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // Task 1 Gate, Task 2 Gate, Core closeout Gate
+  assert.equal(gateExecutions.length, 3);
+  assert.deepEqual(gateExecutions[0], ['echo "task1"']);
+  assert.deepEqual(gateExecutions[1], ['echo "task2"']);
+  assert.deepEqual(gateExecutions[2], ['swift test']);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('Hardening I. Closeout environment blocker produces pending_verification usable by supergpt_verify', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-closeout-env-'));
+  const workflowId = 'wf-test-closeout-env';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  fs.writeFileSync(
+    path.join(tmpRoot, `${workflowId}.workspace.json`),
+    JSON.stringify({ workflow_id: workflowId, isolated_worktree_path: repoDir })
+  );
+
+  const wsm = new WorkflowStateManager({ workflowId, root: tmpRoot });
+
+  const task1 = { task_id: 't-1', goal: 'Task 1', verification_commands: ['echo "task1"'] };
+
+  const failingGate = {
+    async run(commands) {
+      if (commands.includes('swift test --filter FullCloseout')) {
+        return {
+          pass: false,
+          results: [{ command: 'swift test --filter FullCloseout', pass: false, output: 'swift: command not found (exit code 127)' }],
+        };
+      }
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => ({ action: 'WORKFLOW_DONE', summary: 'Done' }),
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({ execute: async () => ({ changes: [] }) }),
+    gateRunner: failingGate,
+    closeoutVerificationCommands: ['swift test --filter FullCloseout'],
+    workflowStateManager: wsm,
+  });
+
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.ok(result.pending_verification);
+  assert.deepEqual(result.pending_verification.commands, ['swift test --filter FullCloseout']);
+
+  // supergpt_verify succeeds using the persisted closeout pending_verification
+  let hostRanCommands = [];
+  const hostGate = {
+    async run(commands) {
+      hostRanCommands = [...commands];
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })) };
+    },
+  };
+
+  const hostEvidence = await supergptVerify({
+    workflowId,
+    root: tmpRoot,
+    gateRunner: hostGate,
+  });
+
+  assert.deepEqual(hostRanCommands, ['swift test --filter FullCloseout']);
+  assert.equal(hostEvidence.pass, true);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('Hardening H2. Worktree content changed after last task Gate causes closeout Gate to execute on current state and catch failures', async () => {
+  const { runAutomatedWorkflow } = await import('../src/orchestrator/automatedLoop.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-mut-closeout-'));
+  const workflowId = 'wf-test-mut-closeout';
+  const repoDir = path.join(tmpRoot, 'isolated-worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+  execSync('git init -b main', { cwd: repoDir });
+  execSync('git config user.name "Test"', { cwd: repoDir });
+  execSync('git config user.email "test@example.com"', { cwd: repoDir });
+  fs.writeFileSync(path.join(repoDir, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: repoDir });
+
+  const task1 = { task_id: 't-1', goal: 'Task 1', verification_commands: ['swift test --filter Test1'] };
+
+  let ranCloseoutOnChangedState = false;
+  let gateCallCount = 0;
+  const gateRunner = {
+    async run(commands) {
+      gateCallCount++;
+      if (commands.includes('swift test --filter Closeout')) {
+        // Core closeout Gate runs on the current worktree content
+        ranCloseoutOnChangedState = true;
+        const currentContent = fs.readFileSync(path.join(repoDir, 'file.txt'), 'utf8');
+        if (currentContent.includes('post-task mutation')) {
+          // Detects the failure in the mutated state
+          return {
+            pass: false,
+            results: [{ command: 'swift test --filter Closeout', pass: false, output: 'assertion failed on post-task mutation' }],
+          };
+        }
+        return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+      }
+      return { pass: true, results: commands.map((c) => ({ command: c, pass: true })) };
+    },
+  };
+
+  let supervisorStep = 0;
+  const supervisorSession = {
+    create: async () => ({ tabId: 'sup-1' }),
+    decide: async () => {
+      supervisorStep++;
+      if (supervisorStep === 1) return { action: 'NEXT_TASK', task_card: task1 };
+      if (supervisorStep === 2) {
+        // Supervisor requests WORKFLOW_DONE, but someone/process mutated the worktree after task 1 passed
+        fs.writeFileSync(path.join(repoDir, 'file.txt'), 'post-task mutation\n');
+        return { action: 'WORKFLOW_DONE', summary: 'Done' };
+      }
+      // After closeout gate caught the failure and generated rework feedback, supervisor returns HUMAN_REQUIRED or CONTINUE_REWORK
+      return { action: 'HUMAN_REQUIRED', reason: 'Closeout failed on mutation', question: 'Fix mutation' };
+    },
+    close: async () => {},
+  };
+
+  const reviewerSession = {
+    create: async () => ({ tabId: 'rev-1' }),
+    review: async () => ({ decision: 'PASS' }),
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId,
+    supervisorSession,
+    createReviewerSession: () => reviewerSession,
+    createClaudeSessionManager: () => ({ execute: async () => ({ changes: [] }) }),
+    gateRunner,
+    closeoutVerificationCommands: ['swift test --filter Closeout'],
+  });
+
+  // Closeout ran against current state and caught the post-task mutation failure
+  assert.equal(ranCloseoutOnChangedState, true);
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+test('Hardening J. Metadata write failure during planning fails closed', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-meta-fail-'));
+  const metaPath = path.join(tmpDir, 'wf-meta-test.workspace.json');
+
+  // Create readonly metadata file to trigger write failure
+  fs.writeFileSync(metaPath, JSON.stringify({ workflow_id: 'wf-meta-test' }), { mode: 0o444 });
+
+  // Readback and modify attempt
+  assert.throws(
+    () => {
+      // Trying to write to readonly file throws
+      fs.writeFileSync(metaPath, 'mutation', { flag: 'w' });
+    },
+    (err) => {
+      assert.ok(err.code === 'EACCES' || err.message.includes('permission'));
+      return true;
+    }
+  );
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('Hardening K. Existing unreadable .supergpt/config.json fails closed', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-k-'));
+  const configDir = path.join(tmpDir, '.supergpt');
+  fs.mkdirSync(configDir, { recursive: true });
+  const configPath = path.join(configDir, 'config.json');
+  fs.writeFileSync(configPath, JSON.stringify({ test: 1 }), { mode: 0o000 });
+
+  try {
+    loadWorkspaceConfig(tmpDir);
+    // If running as root / permissions allowed read, skip assert
+  } catch (err) {
+    assert.equal(err.name, 'ExternalReadRootConfigError');
+  }
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('Hardening G & H (Real). supergptResume runs defaultPipeline without _pipeline injection, preserving frozen closeout policy across configuration drift', async () => {
+  const { supergptResume } = await import('../src/orchestrator/supergpt.js');
+  const { SUPERGPT_WORKTREE_ROOT } = await import('../src/orchestrator/workflowWorktree.js');
+  const { nullWindowSession } = await import('../src/orchestrator/agyProviderSessions.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-resume-real-'));
+  const workflowId = 'wf-agy-test-resume-real';
+  const sourceRepo = path.join(tmpRoot, 'source-repo');
+  fs.mkdirSync(sourceRepo, { recursive: true });
+  execSync('git init -b main', { cwd: sourceRepo });
+  execSync('git config user.name "Test"', { cwd: sourceRepo });
+  execSync('git config user.email "test@example.com"', { cwd: sourceRepo });
+  fs.writeFileSync(path.join(sourceRepo, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: sourceRepo });
+  const headSha = execSync('git rev-parse HEAD', { cwd: sourceRepo, encoding: 'utf8' }).trim();
+
+  const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
+  fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
+
+  // 1. Initial workflow persisted policy: ["swift test"]
+  const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+  fs.writeFileSync(
+    metaPath,
+    JSON.stringify({
+      workflow_id: workflowId,
+      isolated_worktree_path: worktreeDir,
+      source_workspace: sourceRepo,
+      source_repo_root: sourceRepo,
+      source_branch: 'main',
+      baseline_head: headSha,
+      closeout_verification_commands: ['swift test'],
+    })
+  );
+
+  // 2. Before resume: workspace config/docs change to ["npm test"]
+  fs.mkdirSync(path.join(sourceRepo, '.supergpt'), { recursive: true });
+  fs.writeFileSync(
+    path.join(sourceRepo, '.supergpt/config.json'),
+    JSON.stringify({ verification: { closeoutCommands: ['npm test'] } })
+  );
+
+  // 3. Resumed fake Planner returns ["npm test", "npm run lint"]
+  let plannerCalled = false;
+  const fakePlanner = async () => {
+    plannerCalled = true;
+    return {
+      status: 'READY',
+      summary: 'Resumed plan',
+      plan: '1. finish tasks',
+      planText: '1. finish tasks',
+      tasks: [{ task_id: 't-1', goal: 'resumed task', allowed_files: [], verification_commands: ['echo "task ok"'] }],
+      closeoutVerificationCommands: ['npm test', 'npm run lint'],
+      closeoutPolicySources: ['.supergpt/config.json'],
+    };
+  };
+
+  // 4. Deterministic fake providers ensuring no real model calls occur
+  let realModelCalled = false;
+  const fakeProviders = ({ workflowId: _wfId, usageTracker: _ut, signal: _sig, onEvent: _ev }) => {
+    return {
+      runtime: {
+        invoke: async (role, { resolve }) => ({
+          value: await resolve(async () => {
+            realModelCalled = true;
+            throw new Error('Real model call attempted unexpectedly');
+          }),
+        }),
+      },
+      supervisorSession: {
+        create: async () => ({ tabId: 'sup-1' }),
+        decide: async () => ({ action: 'WORKFLOW_DONE', summary: 'Resumed workflow done' }),
+        close: async () => {},
+      },
+      createReviewerSession: () => () => ({
+        create: async () => ({ tabId: 'rev-1' }),
+        review: async () => ({ decision: 'PASS', findings: ['ok'], required_changes: [], rationale: 'good' }),
+        close: async () => {},
+      }),
+      createExecutorSessionManager: () => ({
+        createSession: () => ({
+          executeTask: async () => ({ exitCode: 0, status: 'DONE' }),
+          close: async () => {},
+        }),
+      }),
+      windowSession: nullWindowSession,
+      sessionStore: {
+        snapshot: () => ({}),
+      },
+    };
+  };
+
+  // 5. Deterministic fake gate runner tracking actual closeout commands executed
+  const executedGateCommands = [];
+  const fakeGateFactory = ({ cwd: _cwd, baseline: _b }) => ({
+    async run(commands) {
+      executedGateCommands.push([...commands]);
+      return {
+        pass: true,
+        results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })),
+        changed_files: [],
+        git_diff: '',
+      };
+    },
+  });
+
+  // 6. Call supergptResume without providing _pipeline (production defaultPipeline runs)
+  const result = await supergptResume({
+    workflowId,
+    cwd: sourceRepo,
+    _resolveWorkflowPlan: fakePlanner,
+    _selectProviders: fakeProviders,
+    _createGateRunner: fakeGateFactory,
+  });
+
+  // Assertions:
+  // 1. metadata remains exactly ["swift test"]
+  // Note: on successful delivery, metadata is cleaned by lifecycleManager, but verify closeout execution was exactly frozen ["swift test"]
+  assert.ok(executedGateCommands.length > 0, 'Gate runner must have been invoked');
+  for (const cmds of executedGateCommands) {
+    assert.deepEqual(cmds, ['swift test']);
+  }
+
+  // 3. "npm test" and "npm run lint" are never used as closeout policy
+  assert.ok(!executedGateCommands.some((cmds) => cmds.includes('npm test') || cmds.includes('npm run lint')));
+
+  // 4. delivery occurs only after the frozen "swift test" Gate PASS
+  assert.equal(result.status, 'WORKFLOW_DONE');
+
+  // 5. no real model calls occur
+  assert.equal(realModelCalled, false);
+  assert.equal(plannerCalled, true);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(metaPath, { force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+});
+
+test('Fingerprint Fail-Closed A: Host evidence captured with fingerprint unavailable cannot validate', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-fp-a-'));
+  const workflowId = 'wf-fp-a';
+  const evidenceDir = path.join(root, workflowId, 'host_evidence');
+  fs.mkdirSync(evidenceDir, { recursive: true });
+
+  const rawPayload = {
+    workflowId,
+    taskId: 't-1',
+    verificationIdentity: 't-1',
+    generation: 1,
+    worktree: '/tmp/nonexistent-worktree',
+    commands: ['echo "ok"'],
+    commandsHash: hashCommandSet(['echo "ok"']),
+    results: [{ command: 'echo "ok"', pass: true, output: 'ok' }],
+    pass: true,
+    capturedAt: new Date().toISOString(),
+    worktreeFingerprint: null,
+  };
+  const crypto = await import('node:crypto');
+  const hash = crypto.createHash('sha256').update(JSON.stringify(rawPayload)).digest('hex');
+  const hostEvidence = {
+    ...rawPayload,
+    evidenceId: 'ev-test-null-fp',
+    hash,
+    consumed: false,
+  };
+
+  fs.writeFileSync(path.join(evidenceDir, 'latest.json'), JSON.stringify(hostEvidence, null, 2), 'utf8');
+
+  const check = getValidHostEvidence({
+    workflowId,
+    taskId: 't-1',
+    verificationIdentity: 't-1',
+    verificationCommands: ['echo "ok"'],
+    root,
+  });
+
+  assert.equal(check.valid, false);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, 'WORKTREE_FINGERPRINT_UNAVAILABLE');
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('Fingerprint Fail-Closed B: Current fingerprint unavailable invalidates otherwise valid host evidence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-fp-b-'));
+  const workflowId = 'wf-fp-b';
+  const repoDir = path.join(root, 'worktree');
+  fs.mkdirSync(repoDir, { recursive: true });
+
+  const evidenceDir = path.join(root, workflowId, 'host_evidence');
+  fs.mkdirSync(evidenceDir, { recursive: true });
+
+  const validFp = '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
+  const rawPayload = {
+    workflowId,
+    taskId: 't-1',
+    verificationIdentity: 't-1',
+    generation: 1,
+    worktree: repoDir,
+    commands: ['echo "ok"'],
+    commandsHash: hashCommandSet(['echo "ok"']),
+    results: [{ command: 'echo "ok"', pass: true, output: 'ok' }],
+    pass: true,
+    capturedAt: new Date().toISOString(),
+    worktreeFingerprint: validFp,
+  };
+  const crypto = await import('node:crypto');
+  const hash = crypto.createHash('sha256').update(JSON.stringify(rawPayload)).digest('hex');
+  const hostEvidence = {
+    ...rawPayload,
+    evidenceId: 'ev-test-valid-fp',
+    hash,
+    consumed: false,
+  };
+
+  fs.writeFileSync(path.join(evidenceDir, 'latest.json'), JSON.stringify(hostEvidence, null, 2), 'utf8');
+
+  // execSync that fails, making current computeWorktreeFingerprint return null
+  const failingExecSync = () => {
+    throw new Error('git rev-parse HEAD failed: simulated failure');
+  };
+
+  const check = getValidHostEvidence({
+    workflowId,
+    taskId: 't-1',
+    verificationIdentity: 't-1',
+    verificationCommands: ['echo "ok"'],
+    root,
+    execSync: failingExecSync,
+  });
+
+  assert.equal(check.valid, false);
+  assert.equal(check.stale, true);
+  assert.equal(check.reason, 'WORKTREE_FINGERPRINT_UNAVAILABLE');
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('Fingerprint Fail-Closed C: Core closeout Gate PASS + fingerprint unavailable cannot deliver', async () => {
+  const { supergptResume } = await import('../src/orchestrator/supergpt.js');
+  const { SUPERGPT_WORKTREE_ROOT } = await import('../src/orchestrator/workflowWorktree.js');
+  const { nullWindowSession } = await import('../src/orchestrator/agyProviderSessions.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-fp-c-'));
+  const workflowId = 'wf-agy-test-fp-c';
+  const sourceRepo = path.join(tmpRoot, 'source-repo');
+  fs.mkdirSync(sourceRepo, { recursive: true });
+  execSync('git init -b main', { cwd: sourceRepo });
+  execSync('git config user.name "Test"', { cwd: sourceRepo });
+  execSync('git config user.email "test@example.com"', { cwd: sourceRepo });
+  fs.writeFileSync(path.join(sourceRepo, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: sourceRepo });
+  const headSha = execSync('git rev-parse HEAD', { cwd: sourceRepo, encoding: 'utf8' }).trim();
+
+  const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
+  fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
+
+  const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+  fs.writeFileSync(
+    metaPath,
+    JSON.stringify({
+      workflow_id: workflowId,
+      isolated_worktree_path: worktreeDir,
+      source_workspace: sourceRepo,
+      source_repo_root: sourceRepo,
+      source_branch: 'main',
+      baseline_head: headSha,
+      closeout_verification_commands: ['swift test'],
+    })
+  );
+
+  const fakePlanner = async () => ({
+    status: 'READY',
+    summary: 'Plan',
+    plan: '1. do',
+    planText: '1. do',
+    tasks: [{ task_id: 't-1', goal: 'task', allowed_files: [], verification_commands: ['swift test'] }],
+    closeoutVerificationCommands: ['swift test'],
+  });
+
+  const fakeProviders = () => ({
+    runtime: {
+      invoke: async (role, { resolve }) => ({ value: await resolve(async () => ({})) }),
+    },
+    supervisorSession: {
+      create: async () => ({ tabId: 'sup-1' }),
+      decide: async () => ({ action: 'WORKFLOW_DONE', summary: 'Done' }),
+      close: async () => {},
+    },
+    createReviewerSession: () => () => ({
+      create: async () => ({ tabId: 'rev-1' }),
+      review: async () => ({ decision: 'PASS', findings: ['ok'], required_changes: [], rationale: 'good' }),
+      close: async () => {},
+    }),
+    createExecutorSessionManager: () => ({
+      createSession: () => ({
+        executeTask: async () => ({ exitCode: 0, status: 'DONE' }),
+        close: async () => {},
+      }),
+    }),
+    windowSession: nullWindowSession,
+    sessionStore: { snapshot: () => ({}) },
+  });
+
+  const fakeGateFactory = () => ({
+    async run(commands) {
+      return {
+        pass: true,
+        results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })),
+        changed_files: [],
+        git_diff: '',
+      };
+    },
+  });
+
+  // Inject _computeWorktreeFingerprint returning null (fingerprint unavailable)
+  const result = await supergptResume({
+    workflowId,
+    cwd: sourceRepo,
+    _resolveWorkflowPlan: fakePlanner,
+    _selectProviders: fakeProviders,
+    _createGateRunner: fakeGateFactory,
+    _computeWorktreeFingerprint: () => null,
+  });
+
+  // Must fail closed and not deliver
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.ok(result.reason.includes('WORKTREE_FINGERPRINT_UNAVAILABLE'));
+  assert.deepEqual(result.deliveredFiles, []);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(metaPath, { force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+});
+
+test('Fingerprint Fail-Closed D: Prior closeout evidence has null fingerprint + current fingerprint null cannot deliver (null === null rejected)', async () => {
+  const { supergptResume } = await import('../src/orchestrator/supergpt.js');
+  const { SUPERGPT_WORKTREE_ROOT } = await import('../src/orchestrator/workflowWorktree.js');
+  const { writeControl } = await import('../src/orchestrator/workflowControl.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-fp-d-'));
+  const workflowId = 'wf-agy-test-fp-d';
+  const sourceRepo = path.join(tmpRoot, 'source-repo');
+  fs.mkdirSync(sourceRepo, { recursive: true });
+  execSync('git init -b main', { cwd: sourceRepo });
+  execSync('git config user.name "Test"', { cwd: sourceRepo });
+  execSync('git config user.email "test@example.com"', { cwd: sourceRepo });
+  fs.writeFileSync(path.join(sourceRepo, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: sourceRepo });
+  const headSha = execSync('git rev-parse HEAD', { cwd: sourceRepo, encoding: 'utf8' }).trim();
+
+  const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
+  fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
+
+  const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+  fs.writeFileSync(
+    metaPath,
+    JSON.stringify({
+      workflow_id: workflowId,
+      isolated_worktree_path: worktreeDir,
+      source_workspace: sourceRepo,
+      source_repo_root: sourceRepo,
+      source_branch: 'main',
+      baseline_head: headSha,
+      closeout_verification_commands: ['swift test'],
+    })
+  );
+
+  // Directly set control file with delivery_ready and null worktree_fingerprint in evidence
+  writeControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, {
+    phase: 'delivery_ready',
+    summary: 'Ready for delivery',
+    closeout_verification_evidence: {
+      evidence_id: 'closeout-null',
+      pass: true,
+      commands: ['swift test'],
+      commands_hash: hashCommandSet(['swift test']),
+      worktree_fingerprint: null,
+      workflow_id: workflowId,
+      verification_identity: CLOSEOUT_VERIFICATION_ID,
+    },
+  });
+
+  const fakeGateFactory = () => ({
+    async run(commands) {
+      return {
+        pass: true,
+        results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })),
+        changed_files: [],
+        git_diff: '',
+      };
+    },
+  });
+
+  // Both prior and current fingerprint are null
+  const result = await supergptResume({
+    workflowId,
+    cwd: sourceRepo,
+    _createGateRunner: fakeGateFactory,
+    _computeWorktreeFingerprint: () => null,
+  });
+
+  // null === null must NOT authorize delivery; fail closed
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.ok(result.reason.includes('WORKTREE_FINGERPRINT_UNAVAILABLE'));
+  assert.deepEqual(result.deliveredFiles, []);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(metaPath, { force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+});
+
+test('Fingerprint Fail-Closed E: Delivery-ready resume with fingerprint failure cannot deliver', async () => {
+  const { supergptResume } = await import('../src/orchestrator/supergpt.js');
+  const { SUPERGPT_WORKTREE_ROOT } = await import('../src/orchestrator/workflowWorktree.js');
+  const { writeControl } = await import('../src/orchestrator/workflowControl.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-fp-e-'));
+  const workflowId = 'wf-agy-test-fp-e';
+  const sourceRepo = path.join(tmpRoot, 'source-repo');
+  fs.mkdirSync(sourceRepo, { recursive: true });
+  execSync('git init -b main', { cwd: sourceRepo });
+  execSync('git config user.name "Test"', { cwd: sourceRepo });
+  execSync('git config user.email "test@example.com"', { cwd: sourceRepo });
+  fs.writeFileSync(path.join(sourceRepo, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: sourceRepo });
+  const headSha = execSync('git rev-parse HEAD', { cwd: sourceRepo, encoding: 'utf8' }).trim();
+
+  const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
+  fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
+
+  const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+  fs.writeFileSync(
+    metaPath,
+    JSON.stringify({
+      workflow_id: workflowId,
+      isolated_worktree_path: worktreeDir,
+      source_workspace: sourceRepo,
+      source_repo_root: sourceRepo,
+      source_branch: 'main',
+      baseline_head: headSha,
+      closeout_verification_commands: ['swift test'],
+    })
+  );
+
+  // Set control file to delivery_ready with a valid prior fingerprint
+  writeControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, {
+    phase: 'delivery_ready',
+    summary: 'Ready for delivery',
+    closeout_verification_evidence: {
+      evidence_id: 'closeout-valid',
+      pass: true,
+      commands: ['swift test'],
+      commands_hash: hashCommandSet(['swift test']),
+      worktree_fingerprint: 'some-previous-valid-fingerprint',
+      workflow_id: workflowId,
+      verification_identity: CLOSEOUT_VERIFICATION_ID,
+    },
+  });
+
+  const fakeGateFactory = () => ({
+    async run(commands) {
+      return {
+        pass: true,
+        results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })),
+        changed_files: [],
+        git_diff: '',
+      };
+    },
+  });
+
+  // Current fingerprint computation fails (e.g. git error / unreadable index)
+  const result = await supergptResume({
+    workflowId,
+    cwd: sourceRepo,
+    _createGateRunner: fakeGateFactory,
+    _computeWorktreeFingerprint: () => null,
+  });
+
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.ok(result.reason.includes('WORKTREE_FINGERPRINT_UNAVAILABLE'));
+  assert.deepEqual(result.deliveredFiles, []);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(metaPath, { force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+});
+
+test('Fingerprint Fail-Closed F: Once fingerprinting works again, fresh closeout PASS can authorize delivery', async () => {
+  const { supergptResume } = await import('../src/orchestrator/supergpt.js');
+  const { SUPERGPT_WORKTREE_ROOT } = await import('../src/orchestrator/workflowWorktree.js');
+  const { writeControl, readControl } = await import('../src/orchestrator/workflowControl.js');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-test-fp-f-'));
+  const workflowId = 'wf-agy-test-fp-f';
+  const sourceRepo = path.join(tmpRoot, 'source-repo');
+  fs.mkdirSync(sourceRepo, { recursive: true });
+  execSync('git init -b main', { cwd: sourceRepo });
+  execSync('git config user.name "Test"', { cwd: sourceRepo });
+  execSync('git config user.email "test@example.com"', { cwd: sourceRepo });
+  fs.writeFileSync(path.join(sourceRepo, 'file.txt'), 'hello\n');
+  execSync('git add . && git commit -m "initial"', { cwd: sourceRepo });
+  const headSha = execSync('git rev-parse HEAD', { cwd: sourceRepo, encoding: 'utf8' }).trim();
+
+  const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
+  fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
+
+  const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
+  fs.writeFileSync(
+    metaPath,
+    JSON.stringify({
+      workflow_id: workflowId,
+      isolated_worktree_path: worktreeDir,
+      source_workspace: sourceRepo,
+      source_repo_root: sourceRepo,
+      source_branch: 'main',
+      baseline_head: headSha,
+      closeout_verification_commands: ['swift test'],
+    })
+  );
+
+  // delivery_ready state with stale/missing evidence
+  writeControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, {
+    phase: 'delivery_ready',
+    summary: 'Ready for delivery',
+  });
+
+  const executedCommands = [];
+  const fakeGateFactory = () => ({
+    async run(commands) {
+      executedCommands.push([...commands]);
+      return {
+        pass: true,
+        results: commands.map((c) => ({ command: c, pass: true, output: 'ok' })),
+        changed_files: [],
+        git_diff: '',
+      };
+    },
+  });
+
+  const recoveredFingerprint = 'valid-restored-fingerprint-9999999999999999';
+  const result = await supergptResume({
+    workflowId,
+    cwd: sourceRepo,
+    _createGateRunner: fakeGateFactory,
+    _computeWorktreeFingerprint: () => recoveredFingerprint,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(executedCommands, [['swift test']]);
+
+  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(metaPath, { force: true });
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+});

@@ -1,0 +1,62 @@
+{
+  "schemaVersion": "1.0.0",
+  "updatedAt": "2026-08-28T04:55:00.000Z",
+  "baselines": {
+    "single-attempt": {
+      "version": "1.0.0",
+      "scenario": "single-attempt",
+      "recordedAt": "2026-08-28T04:40:00.000Z",
+      "environment": {
+        "supergptVersion": "0.1.0",
+        "gitRevision": "e68e357",
+        "agyVersion": "1.1.22",
+        "supervisorModel": "gemini-3.7-flash-high",
+        "reviewerModel": "gpt-oss-120b-medium",
+        "claudeCliVersion": "2.1.250 (Claude Code)",
+        "claudeExecutorModel": "claude-sonnet-5"
+      },
+      "expected": {
+        "calls": {
+          "supervisor": 2,
+          "reviewer": 1,
+          "executor": 1,
+          "total": 4
+        },
+        "tokens": {
+          "supervisor": { "inputTokens": 42000, "outputTokens": 4500 },
+          "reviewer": { "inputTokens": 19000, "outputTokens": 500 },
+          "executor": { "inputTokens": 100, "outputTokens": 3500 },
+          "total": { "inputTokens": 55000, "outputTokens": 8000 }
+        }
+      }
+    },
+    "rework-attempt": {
+      "version": "1.0.0",
+      "scenario": "rework-attempt",
+      "recordedAt": "2026-08-28T04:40:00.000Z",
+      "environment": {
+        "supergptVersion": "0.1.0",
+        "gitRevision": "e68e357",
+        "agyVersion": "1.1.22",
+        "supervisorModel": "gemini-3.7-flash-high",
+        "reviewerModel": "gpt-oss-120b-medium",
+        "claudeCliVersion": "2.1.250 (Claude Code)",
+        "claudeExecutorModel": "claude-sonnet-5"
+      },
+      "expected": {
+        "calls": {
+          "supervisor": 3,
+          "reviewer": 2,
+          "executor": 2,
+          "total": 7
+        },
+        "tokens": {
+          "supervisor": { "inputTokens": 81000, "outputTokens": 6600 },
+          "reviewer": { "inputTokens": 38000, "outputTokens": 800 },
+          "executor": { "inputTokens": 100, "outputTokens": 7000 },
+          "total": { "inputTokens": 120000, "outputTokens": 15000 }
+        }
+      }
+    }
+  }
+}
