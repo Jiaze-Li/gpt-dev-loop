@@ -1,11 +1,6 @@
-// agyClient: minimal non-interactive transport to the locally installed
-// Antigravity CLI (`agy`, /Users/jack/.local/bin/agy, v1.1.22).
-//
-// This is a transport smoke-test primitive only. It is deliberately NOT
-// wired into automatedLoop, the Supervisor/Reviewer sessions, gates, or the
-// Chrome extension. It just proves the repo can shell out to the locally
-// authenticated `agy` binary and get a machine-readable Gemini response
-// back.
+// agyClient: non-interactive transport to the locally installed Antigravity
+// CLI (`agy`, /Users/jack/.local/bin/agy, v1.1.22). It is used by production
+// Planner/Supervisor/Reviewer role routes as well as deterministic smoke tests.
 //
 // Confirmed against the installed binary (`agy --help`, `agy models`):
 //   - executable:        `agy` on PATH -> /Users/jack/.local/bin/agy
@@ -28,6 +23,7 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { extractSafeAgyEnvelopeMetadata } from './agyErrorEnvelope.js';
+import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../orchestrator/processTree.js';
 
 export const DEFAULT_AGY_MODEL = 'gemini-3.7-flash-low';
 export const DEFAULT_AGY_TIMEOUT_MS = 120_000;
@@ -143,7 +139,7 @@ function extractText(json) {
  * @param {string} [opts.agent]             optional dedicated agy agent name
  * @param {string} [opts.cwd]               working dir for the child
  * @param {Function} [opts.spawn]           injectable spawn (for tests)
- * @param {AbortSignal} [opts.signal]       stops the owned agy child and waits for it to exit
+ * @param {AbortSignal} [opts.signal]       stops the owned agy process group and waits for teardown
  * @returns {Promise<{model:string, exitCode:number, text:string|null,
  *                     json:any, stdout:string, durationMs:number,
  *                     conversationId:string|null}>}
@@ -204,7 +200,11 @@ export async function callAgy({
   const { code, stdout, stderr, timedOut, spawnError, aborted } = await new Promise((resolve) => {
     let child;
     try {
-      child = spawn(executable, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = spawn(executable, args, {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        ...PROCESS_GROUP_SPAWN_OPTS,
+      });
     } catch (err) {
       resolve({ spawnError: err });
       return;
@@ -217,27 +217,41 @@ export async function callAgy({
     let settled = false;
     let timer;
     let aborted = false;
+    let timedOut = false;
+    let treeTermination = null;
 
-    const finish = (result) => {
+    const tearDownTree = () => {
+      if (!treeTermination) treeTermination = terminateProcessTree(child);
+      return treeTermination;
+    };
+
+    const finish = async (result, { awaitTree = false } = {}) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
+      if (awaitTree && treeTermination) await treeTermination.done;
       resolve(result);
     };
 
-    timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* already gone */ }
-      finish({ timedOut: true });
-    }, timeoutMs);
-
     const onAbort = () => {
       aborted = true;
-      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      try { tearDownTree(); } catch {}
+      void finish({ aborted: true }, { awaitTree: true });
     };
-    signal?.addEventListener('abort', onAbort, { once: true });
 
-    child.on('error', (err) => finish({ spawnError: err }));
+    timer = setTimeout(() => {
+      timedOut = true;
+      try { tearDownTree(); } catch {}
+      void finish({ timedOut: true }, { awaitTree: true });
+    }, timeoutMs);
+
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+
+    child.on('error', (err) => {
+      void finish({ spawnError: err, aborted, timedOut }, { awaitTree: aborted || timedOut });
+    });
     child.stdout?.on('data', (chunk) => {
       if (outBytes < MAX_CAPTURE_BYTES) { outChunks.push(chunk); outBytes += chunk.length; }
     });
@@ -245,12 +259,13 @@ export async function callAgy({
       if (errBytes < MAX_CAPTURE_BYTES) { errChunks.push(chunk); errBytes += chunk.length; }
     });
     child.on('close', (closeCode) => {
-      finish({
+      void finish({
         code: closeCode,
         aborted,
+        timedOut,
         stdout: Buffer.concat(outChunks).toString('utf8'),
         stderr: Buffer.concat(errChunks).toString('utf8'),
-      });
+      }, { awaitTree: aborted || timedOut });
     });
   });
 

@@ -80,13 +80,13 @@ export async function callClaude({
       timedOut = true;
       try { tearDownTree(); } catch {}
     }, timeoutMs);
-    timer.unref?.();
 
     const onAbort = () => {
       aborted = true;
       try { tearDownTree(); } catch {}
     };
-    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    else if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
     child.on("error", (error) => {
       void finish({ error, aborted, timedOut }, { awaitTree: aborted || timedOut });
