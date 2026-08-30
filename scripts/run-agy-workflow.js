@@ -1,51 +1,30 @@
-#!/usr/bin/env node
-// MVP entry point: run the automated Supervisor -> Claude -> Reviewer loop
-// with BOTH the Supervisor and the Reviewer served by the local Antigravity
-// CLI (`agy` -> Gemini). No Chrome, no GUI, no persistent agy conversation.
+// Internal workflow-preparation helpers shared by the canonical SuperGPT Core.
 //
-//   SUPERVISOR_PROVIDER=agy REVIEWER_PROVIDER=agy \
-//     node scripts/run-agy-workflow.js plan.txt
+// IMPORTANT: this file is no longer an executable workflow entrypoint.
+// The old standalone AGY workflow runner has been removed so there is only
+// one production execution path: src/orchestrator/supergpt.js -> runSuperGPT().
 //
-//   AGY_MODEL overrides the default model (gemini-3.7-flash-high).
-//
-// Reuses, unchanged: automatedLoop's state machine, ClaudeSessionManager
-// (fresh Claude per attempt), the deterministic gate + git evidence
-// collector, the Task Card schema, the REWORK path, and the
-// maxAttemptsPerTask / HUMAN_REQUIRED behavior. This file only selects the
-// agy providers and prints a compact status stream.
-//
-// Fails closed: malformed Gemini output, an agy timeout / nonzero exit, an
-// invalid Task Card, or an invalid Reviewer decision all abort the run with
-// a non-zero exit — none are guessed at or retried.
+// These helpers remain here temporarily because the canonical Core and the
+// deterministic tests reuse them. They do not start Planner/Supervisor/
+// Executor/Reviewer work on their own.
 
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
-import { readFile, writeFile, mkdir, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 
-import { runAutomatedWorkflow } from '../src/orchestrator/automatedLoop.js';
-import { selectProviders } from '../src/orchestrator/providerSelection.js';
-import { createClaudeSessionManager } from '../src/orchestrator/adapters/claudeSessionManager.js';
-import { createGateRunner } from '../src/orchestrator/adapters/gateRunner.js';
-import { createGitEvidenceCollector } from '../src/adapters/gate/git-evidence/index.js';
 import { createWorkflowBaseline } from '../src/orchestrator/workflowBaseline.js';
 import {
   createWorkflowWorktree,
   WorkflowWorktreeError,
   WORKFLOW_WORKTREE_ERROR_CODES,
-  SUPERGPT_WORKTREE_ROOT,
 } from '../src/orchestrator/workflowWorktree.js';
-import { validateWorkflowId, assertPathWithinRoot } from '../src/orchestrator/workflowId.js';
-import { callAgy as defaultCallAgy } from '../src/agy/agyClient.js';
-import { Persistence } from '../src/orchestrator/persistence.js';
-import { deliverWorkflowResult } from '../src/orchestrator/resultDelivery.js';
+import { validateWorkflowId } from '../src/orchestrator/workflowId.js';
 import {
   collectRepositoryContext,
   generatePlan,
   PlannerError,
 } from '../src/orchestrator/planner.js';
 
-// --- compact status stream -------------------------------------------------
+// --- compact status formatting helpers -----------------------------------
 
 const PAD_ROLE = 11;
 const PAD_TAG = 24;
@@ -55,9 +34,6 @@ export function formatStatusLine(role, tag, arrow) {
   return `${`${role} `.padEnd(PAD_ROLE)}${`${tagText} `.padEnd(PAD_TAG)}→ ${arrow}`;
 }
 
-// The role -> model roster, printed once at startup so it is mechanically
-// obvious which model each role runs. The tags are the exact `agy` model
-// IDs (never display names), and the Executor is always plain Claude.
 export function formatRoleRoster({ supervisorModel, reviewerModel }) {
   return [
     formatStatusLine('Supervisor', supervisorModel, 'ready'),
@@ -66,10 +42,6 @@ export function formatRoleRoster({ supervisorModel, reviewerModel }) {
   ].join('\n');
 }
 
-// Translates automatedLoop's internal log lines (identifiers only, never
-// prompt/reply content) into the compact operator stream. Unknown lines are
-// dropped. Pure except for `write`; exported for deterministic testing.
-// Supervisor and Reviewer lines are tagged with their own model ID.
 export function createCompactStatusLogger({ supervisorModel, reviewerModel, write = (s) => console.log(s) }) {
   return function log(line) {
     let m;
@@ -88,12 +60,6 @@ export function createCompactStatusLogger({ supervisorModel, reviewerModel, writ
   };
 }
 
-// Operator-facing diagnostics for a provider (Supervisor/Reviewer) failure.
-// Prints ONLY the safe, non-content fields an AdapterError carries on
-// `.details` (role, model, exit code, stderr, duration). It never has
-// access to — and never prints — prompt text, model reply text, or any
-// auth/credential data. Returns the lines it wrote (for deterministic
-// testing); no-op when there are no structured details.
 export function formatAdapterErrorDiagnostics(err) {
   const d = err && err.details;
   if (!d || typeof d !== 'object') return [];
@@ -109,8 +75,6 @@ export function formatAdapterErrorDiagnostics(err) {
   add('exit code', d.exitCode);
   add('duration ms', d.durationMs);
   if (d.agyEnvelope && typeof d.agyEnvelope === 'object' && Object.keys(d.agyEnvelope).length) {
-    // Whitelisted operational metadata only (status / error_code / model /
-    // token usage). Never the model's generated text — see agyErrorEnvelope.js.
     add('agy envelope', JSON.stringify(d.agyEnvelope));
   }
   if (typeof d.stderr === 'string' && d.stderr.trim() !== '') {
@@ -122,18 +86,8 @@ export function formatAdapterErrorDiagnostics(err) {
   return lines;
 }
 
-function printAdapterErrorDiagnostics(err, write = (s) => console.error(s)) {
-  for (const line of formatAdapterErrorDiagnostics(err)) write(line);
-}
+// --- metadata-only workflow preparation helpers --------------------------
 
-// --- metadata-only diagnostics ------------------------------------------
-//
-// These print ONLY structural counts and identifiers — branch, commit,
-// clean flag, file counts, character/byte sizes. They NEVER print file
-// contents, diff text, or prompt/reply text. Pure; exported for tests.
-
-// Compact CLI diagnostics for the isolated workspace (requirement 8).
-// Identifiers and a path only — never file contents, never a diff.
 export function formatWorktreeDiagnostics({ worktree }) {
   const shortHead = String(worktree?.baseline_head ?? '').slice(0, 10) || 'unknown';
   return [
@@ -144,10 +98,6 @@ export function formatWorktreeDiagnostics({ worktree }) {
   ];
 }
 
-// Safe workflow-state metadata (requirement 6). No file contents.
-// Records the invocation workspace and the repository identity as separate
-// concepts — source_workspace is the exact worktree SuperGPT was launched
-// from and is never rewritten to the primary checkout.
 export function buildWorkspaceMetadata({ worktree }) {
   return {
     workflow_id: worktree.workflow_id,
@@ -155,19 +105,18 @@ export function buildWorkspaceMetadata({ worktree }) {
     repository_identity: worktree.repository_identity ?? null,
     source_branch: worktree.source_branch,
     source_head: worktree.source_head ?? worktree.baseline_head,
-    // This is the effective commit the isolated tree was created from. It is
-    // a snapshot commit (not source_head) when invocation started dirty.
     baseline_head: worktree.baseline_head,
     isolated_worktree_path: worktree.worktree_path,
   };
 }
 
-// Requirement 3: mechanically verify, before Claude starts, that every cwd
-// the workflow will use points at the isolated worktree and that its state
-// matches the captured baseline. Fail closed on any violation.
 export function assertWorkspaceInvariants({ worktree, baseline, claudeCwd, gateCwd }) {
   const fail = (check, message) => {
-    throw new WorkflowWorktreeError(WORKFLOW_WORKTREE_ERROR_CODES.WORKTREE_INVARIANT_VIOLATION, message, { check });
+    throw new WorkflowWorktreeError(
+      WORKFLOW_WORKTREE_ERROR_CODES.WORKTREE_INVARIANT_VIOLATION,
+      message,
+      { check },
+    );
   };
   if (baseline.head !== worktree.baseline_head) {
     fail('baseline_head', `isolated worktree HEAD ${baseline.head} does not equal the captured workflow baseline ${worktree.baseline_head}`);
@@ -186,11 +135,6 @@ export function assertWorkspaceInvariants({ worktree, baseline, claudeCwd, gateC
   }
 }
 
-// End-to-end: create the SuperGPT-managed isolated worktree from the source
-// repo HEAD, re-establish the baseline INSIDE that worktree (always
-// isolated — there is no user opt-in), verify every invariant, and record
-// safe workflow-state metadata. The user's source tree may be dirty; that
-// never blocks this and never leaks past the worktree boundary.
 export async function establishIsolatedWorkspace({
   sourceCwd,
   workflowId,
@@ -201,13 +145,11 @@ export async function establishIsolatedWorkspace({
   validateWorkflowId(workflowId);
   const worktreeApi = createWorktree();
   const worktree = await worktreeApi.establish({ sourceCwd, workflowId });
-  // Everything below is still PRE-EXECUTION setup (no Supervisor / Claude /
-  // task work yet). If any of it fails, the isolated worktree just created
-  // holds no useful workflow result, so tear it down rather than leave
-  // garbage behind. Runtime failures once runAutomatedWorkflow is underway
-  // are handled by the caller and DO preserve the worktree for resume.
   try {
-    const baseline = await createBaseline().establish({ cwd: worktree.worktree_path, isolatedWorktree: true });
+    const baseline = await createBaseline().establish({
+      cwd: worktree.worktree_path,
+      isolatedWorktree: true,
+    });
     assertWorkspaceInvariants({
       worktree,
       baseline,
@@ -219,9 +161,12 @@ export async function establishIsolatedWorkspace({
   } catch (err) {
     if (typeof worktreeApi.remove === 'function') {
       try {
-        await worktreeApi.remove(worktree.worktree_path, { force: true, sourceRepoRoot: sourceCwd });
+        await worktreeApi.remove(worktree.worktree_path, {
+          force: true,
+          sourceRepoRoot: sourceCwd,
+        });
       } catch {
-        /* best effort — the setup violation is the error that matters */
+        /* best effort — preserve the setup error */
       }
     }
     throw err;
@@ -255,13 +200,9 @@ export function formatReviewEvidenceDiagnostics(evidence, { promptChars, promptB
   return lines;
 }
 
-// --- plan resolution ----------------------------------------------------
-//
-// The single CLI argument is EITHER an existing plan file (read verbatim,
-// backward-compatible) OR a natural-language instruction. When it is not a
-// readable file we run the Planner against the given repository, which returns
-// a READY plan (used as the workflow goal) or surfaces an AMBIGUOUS question
-// that must be answered by a human before any execution starts.
+// Resolve either a legacy plan file or a natural-language instruction.
+// This prepares input only; it never starts the workflow. runSuperGPT() is
+// the sole owner of actual orchestration and execution.
 export async function resolveWorkflowPlan({
   planArg,
   cwd,
@@ -304,216 +245,4 @@ export async function resolveWorkflowPlan({
     closeoutPolicySources: result.closeoutPolicySources ?? [],
     source: 'nl',
   };
-}
-
-// --- run -----------------------------------------------------------------
-
-async function main() {
-  const planPath = process.argv[2];
-  if (!planPath) {
-    console.error('usage: SUPERVISOR_PROVIDER=agy REVIEWER_PROVIDER=agy node scripts/run-agy-workflow.js <plan.txt | "instruction">');
-    process.exitCode = 1;
-    return;
-  }
-
-  const sourceCwd = process.cwd();
-  const workflowId = `wf-agy-${randomUUID()}`;
-
-  if (process.env.GPT_DEV_LOOP_ISOLATED_WORKTREE) {
-    console.error(
-      'run-agy-workflow: note — GPT_DEV_LOOP_ISOLATED_WORKTREE is obsolete and ignored. ' +
-        'SuperGPT now always creates and runs inside its own isolated worktree automatically.'
-    );
-  }
-
-  // SuperGPT owns repository isolation. Fail closed BEFORE any provider or
-  // Claude work: create a dedicated, SuperGPT-managed worktree from the
-  // source repo HEAD, re-establish the baseline inside it, and verify every
-  // invariant. The user's source tree may be dirty — that never blocks this
-  // and never leaks into the Reviewer Evidence.
-  let worktree;
-  let baseline;
-  try {
-    const metadataPath = assertPathWithinRoot(SUPERGPT_WORKTREE_ROOT, path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), 'workspace metadata');
-    ({ worktree, baseline } = await establishIsolatedWorkspace({
-      sourceCwd,
-      workflowId,
-      recordMetadata: async (meta) => {
-        await mkdir(SUPERGPT_WORKTREE_ROOT, { recursive: true });
-        await writeFile(metadataPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
-      },
-    }));
-  } catch (err) {
-    console.error(`\nrun-agy-workflow: FAILED (${err.code ?? err.name}) — ${err.message}`);
-    process.exitCode = 1;
-    return;
-  }
-
-  // Every cwd below is the isolated worktree — never the user's source tree.
-  const repoRoot = worktree.worktree_path;
-
-  // Measure the Reviewer prompt size (metadata only — never its content).
-  const reviewerPromptSize = { chars: null, bytes: null };
-  const measuringCallAgy = (opts) => {
-    if (typeof opts?.prompt === 'string' && /You are the Reviewer/.test(opts.prompt)) {
-      reviewerPromptSize.chars = opts.prompt.length;
-      reviewerPromptSize.bytes = Buffer.byteLength(opts.prompt, 'utf8');
-      console.log(`  reviewer prompt chars/bytes  ${reviewerPromptSize.chars} / ${reviewerPromptSize.bytes}`);
-    }
-    return defaultCallAgy(opts);
-  };
-
-  // Runtime/provider state belongs to SuperGPT's owned runtime root, not the
-  // invocation worktree (whose untracked changes are eligible for delivery).
-  const persistence = new Persistence(path.join(SUPERGPT_WORKTREE_ROOT, workflowId, 'persistence'));
-
-  let selection;
-  try {
-    selection = selectProviders({ env: process.env, callAgy: measuringCallAgy, persistence, workflowId });
-  } catch (err) {
-    console.error(err.message);
-    process.exitCode = 1;
-    return;
-  }
-
-  let plan;
-  let planSource = 'file';
-  try {
-    const resolved = await resolveWorkflowPlan({
-      planArg: planPath,
-      cwd: repoRoot,
-      callAgy: defaultCallAgy,
-      log: (m) => console.log(m),
-    });
-    if (resolved.status === 'AMBIGUOUS') {
-      console.error('\nrun-agy-workflow: HUMAN_REQUIRED — the instruction is ambiguous');
-      console.error(`question: ${resolved.question}`);
-      console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
-      process.exitCode = 1;
-      return;
-    }
-    plan = resolved.plan;
-    planSource = resolved.source;
-  } catch (err) {
-    console.error(`\nrun-agy-workflow: FAILED (${err.code ?? err.name}) — ${err.message}`);
-    console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
-    process.exitCode = 1;
-    return;
-  }
-
-  const { supervisorModel, reviewerModel, supervisorSession, createReviewerSession, windowSession } = selection;
-
-  console.log('SUPERGPT');
-  console.log(planSource === 'file' ? `plan       ${path.resolve(planPath)}` : `plan       (generated from instruction)`);
-  console.log('');
-  console.log(formatRoleRoster({ supervisorModel, reviewerModel }));
-  console.log('');
-  for (const line of formatWorktreeDiagnostics({ worktree })) console.log(line);
-  console.log('');
-  for (const line of formatWorkflowBaselineDiagnostics(baseline)) console.log(line);
-  console.log('');
-
-  const status = createCompactStatusLogger({ supervisorModel, reviewerModel });
-
-  const baseGate = createGateRunner({
-    gitEvidenceCollector: createGitEvidenceCollector(),
-    cwd: repoRoot,
-    baseline,
-  });
-  const gateRunner = {
-    async run(commands) {
-      const evidence = await baseGate.run(commands);
-      status(`gate result: ${evidence.pass ? 'PASS' : 'FAIL'}`);
-      for (const line of formatReviewEvidenceDiagnostics(evidence)) console.log(line);
-      return evidence;
-    },
-  };
-
-  let result;
-  try {
-    result = await runAutomatedWorkflow({
-      workflowId,
-      supervisorSession,
-      createReviewerSession,
-      createClaudeSessionManager: ({ taskId }) =>
-        createClaudeSessionManager({ workflowId, taskId, persistence, cwd: repoRoot }),
-      gateRunner,
-      windowSession,
-      persistence,
-      workflowGoal: plan,
-      repositoryContext: {
-        repository_name: path.basename(worktree.source_repo_root),
-        repository_url: null,
-        branch: worktree.source_branch,
-        commit_sha: worktree.baseline_head,
-      },
-      maxAttemptsPerTask: Number(process.env.AGY_MAX_ATTEMPTS) || 3,
-      log: status,
-    });
-  } catch (err) {
-    console.error(`\nrun-agy-workflow: FAILED (${err.code ?? err.name}) — ${err.message}`);
-    printAdapterErrorDiagnostics(err);
-    process.exitCode = 1;
-    return;
-  }
-
-  console.log('');
-  console.log(`run-agy-workflow: ${result.status}`);
-  if (result.status === 'WORKFLOW_DONE') {
-    console.log(result.summary ?? '');
-    const snap = selection.sessionStore?.snapshot?.();
-    if (snap) {
-      console.log('');
-      console.log('Conversations:');
-      console.log(`  Supervisor  ${snap.supervisor?.conversation_id ?? '(none)'}`);
-      for (const [tId, cId] of Object.entries(snap.reviewer?.conversations ?? {})) {
-        console.log(`  Reviewer    ${cId} (task: ${tId})`);
-      }
-    }
-
-    // Automatic safe delivery: carry the approved changes back into the
-    // invocation workspace. Fails closed — a conflict with the user's own
-    // in-flight edits, or any git/fs error, leaves the isolated worktree
-    // intact and exits HUMAN_REQUIRED. A safe delivery cleans the worktree
-    // up automatically.
-    console.log('');
-    let delivery;
-    try {
-      delivery = await deliverWorkflowResult({ worktree });
-    } catch (err) {
-      console.error(`delivery: HUMAN_REQUIRED (${err.code ?? err.name}) — ${err.message}`);
-      console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
-      process.exitCode = 1;
-      return;
-    }
-
-    if (delivery.status === 'HUMAN_REQUIRED') {
-      console.error('delivery: HUMAN_REQUIRED — the approved changes conflict with the invocation workspace');
-      for (const c of delivery.conflicts) {
-        console.error(`  conflict  ${c.reason}${c.path ? ` — ${c.path}` : ''}`);
-      }
-      console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
-      process.exitCode = 1;
-      return;
-    }
-
-    console.log(`delivery: DELIVERED — ${delivery.changed_files.length} file(s) into ${buildWorkspaceMetadata({ worktree }).source_workspace}`);
-    for (const f of delivery.changed_files) console.log(`  delivered  ${f}`);
-    console.log(`Worktree    ${worktree.worktree_path} (delivered, cleaned up)`);
-    return;
-  }
-
-  console.log(`reason:   ${result.reason ?? ''}`);
-  console.log(`question: ${result.question ?? ''}`);
-  process.exitCode = 1;
-  // HUMAN_REQUIRED / failure need the isolated worktree for resume/debug —
-  // never auto-deleted. Always report where it is.
-  console.log(`Worktree    ${worktree.worktree_path} (preserved)`);
-}
-
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
-  main().catch((err) => {
-    console.error(`run-agy-workflow: ${err.stack || err.message}`);
-    process.exitCode = 1;
-  });
 }
