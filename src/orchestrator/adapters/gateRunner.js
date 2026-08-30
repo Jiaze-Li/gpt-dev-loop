@@ -13,33 +13,19 @@
 // a real gate runner in is the caller's job.
 //
 // Cancellation: a verification command can be arbitrarily long-running or
-// hung. `run()` takes an AbortSignal and OWNS every shell process it spawns
-// — on abort it terminates the whole process tree (SIGTERM, then SIGKILL
-// after a short grace) and rejects with GateCancelledError, so a same-process
-// stop or Ctrl-C completes promptly and no gate PASS can be produced after
-// cancellation.
+// hung. `run()` takes an AbortSignal and OWNS every shell process it spawns.
+// Teardown uses the same process-group primitive as Executor adapters and does
+// not complete merely because the shell leader exits: all descendants must be
+// gone before cancellation is acknowledged.
 
 import { spawn as nodeSpawn } from 'node:child_process';
+import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
 
 export class GateCancelledError extends Error {
   constructor(message = 'gate verification cancelled') {
     super(message);
     this.name = 'GateCancelledError';
     this.code = 'GATE_CANCELLED';
-  }
-}
-
-function killTree(child, signal) {
-  if (!child || child.killed || child.exitCode !== null) return;
-  try {
-    // Negative pid => the whole process group started by { detached: true }.
-    process.kill(-child.pid, signal);
-  } catch {
-    try {
-      child.kill(signal);
-    } catch {
-      /* already gone */
-    }
   }
 }
 
@@ -56,7 +42,7 @@ function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 
         cwd,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
-        detached: true, // own process group so we can tear down the whole tree
+        ...PROCESS_GROUP_SPAWN_OPTS,
       });
     } catch (err) {
       reject(err);
@@ -66,43 +52,54 @@ function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 
     const stdoutChunks = [];
     const stderrChunks = [];
     let settled = false;
-    let killTimer = null;
+    let treeTermination = null;
     let onAbort = null;
 
+    const tearDownTree = () => {
+      if (!treeTermination) {
+        treeTermination = terminateProcessTree(child, { graceMs: killGraceMs });
+      }
+      return treeTermination;
+    };
+
     const cleanup = () => {
-      if (killTimer) clearTimeout(killTimer);
       if (onAbort && signal) signal.removeEventListener('abort', onAbort);
+    };
+
+    const finish = async (fn, { awaitTree = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (awaitTree && treeTermination) await treeTermination.done;
+      fn();
     };
 
     onAbort = () => {
       if (settled) return;
-      killTree(child, 'SIGTERM');
-      killTimer = setTimeout(() => killTree(child, 'SIGKILL'), killGraceMs);
-      if (typeof killTimer.unref === 'function') killTimer.unref();
+      try { tearDownTree(); } catch {}
     };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
     child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(err);
+      void finish(() => reject(err), { awaitTree: Boolean(signal?.aborted) });
     });
     child.stdout?.on('data', (chunk) => stdoutChunks.push(chunk));
     child.stderr?.on('data', (chunk) => stderrChunks.push(chunk));
     child.on('close', (code, closeSignal) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      if (signal?.aborted) {
-        reject(new GateCancelledError(`gate command terminated by cancellation (${closeSignal || code})`));
-        return;
-      }
-      resolve({
-        code,
-        stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-        stderr: Buffer.concat(stderrChunks).toString('utf8'),
-      });
+      void finish(
+        () => {
+          if (signal?.aborted) {
+            reject(new GateCancelledError(`gate command terminated by cancellation (${closeSignal || code})`));
+            return;
+          }
+          resolve({
+            code,
+            stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+            stderr: Buffer.concat(stderrChunks).toString('utf8'),
+          });
+        },
+        { awaitTree: Boolean(signal?.aborted) }
+      );
     });
   });
 }
