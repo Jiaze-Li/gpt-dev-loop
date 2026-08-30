@@ -10,7 +10,6 @@ permissions:
 
 jobs:
   fix-test-commit:
-    if: github.event.head_commit.message != 'fix: address remaining Claude PR3 review'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -32,11 +31,12 @@ jobs:
         run: npm run benchmark
       - name: Diff check
         run: git diff --check
-      - name: Commit validated fixes
+      - name: Commit validated fixes and remove temporary validation files
         shell: bash
         run: |
           git config user.name "Jiaze-Li"
           git config user.email "128044415+Jiaze-Li@users.noreply.github.com"
           git add src/orchestrator/preflight.js src/orchestrator/workflowOwnership.js src/orchestrator/supergpt.js
+          git rm .github/workflows/pr3-claude-review-fix.yml scripts/pr3-claude-review-fix.py
           git commit -m "fix: address remaining Claude PR3 review"
           git push origin HEAD:phase1-handshake
