@@ -1,7 +1,6 @@
-// Claude Code / Claude Desktop Frontend Adapter (PART 9).
-//
-// Bridges Anthropic Claude Code & Claude Desktop to SuperGPT via MCP.
-// Contains 0 orchestrator, task, or reviewer logic.
+// Claude frontend transport adapter.
+// Client-specific responsibility is limited to MCP configuration mechanics.
+// Shared routing and launch behavior lives only in agent-policy/COMMON.md.
 
 import { BaseFrontendAdapter } from './baseFrontendAdapter.js';
 
@@ -20,20 +19,5 @@ export class ClaudeFrontendAdapter extends BaseFrontendAdapter {
         },
       },
     };
-  }
-
-  generateClaudeInstructions() {
-    return `# SuperGPT Integration for Claude Code
-
-When the user asks to use SuperGPT (e.g. "Use SuperGPT to build X" or "Plan X with SuperGPT"):
-
-1. Use the \`supergpt_plan\` tool to create a structured plan first if the user requested planning.
-2. For normal autonomous execution, use \`supergpt_start({ goal, cwd })\`. It immediately returns \`{ status: "RUNNING", workflowId }\`; then immediately attach \`supergpt_watch({ workflowId })\` to display live streaming progress until terminal. Do NOT repeatedly reason and call \`supergpt_status\`.
-3. Use \`supergpt_status\` only for on-demand progress snapshots without calling external LLMs.
-4. If SuperGPT returns \`HUMAN_REQUIRED\`, ask the user the exact question and call \`supergpt_resume\` with their answer.
-5. Never micromanage SuperGPT or duplicate reviewer/worker logic.
-
-\`supergpt_run\` is only a blocking convenience API for callers that explicitly want one call to wait for the full terminal result.
-`;
   }
 }

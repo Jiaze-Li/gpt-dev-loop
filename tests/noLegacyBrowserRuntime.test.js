@@ -101,14 +101,16 @@ test('3. package.json dependencies contain no browser automation / CDP / websock
   }
 });
 
-test('4. .mcp.json exposes only the current SuperGPT MCP server', () => {
-  const mcpConfigPath = path.join(REPO_ROOT, '.mcp.json');
-  assert.ok(existsSync(mcpConfigPath), '.mcp.json must exist');
-  const mcpConfig = JSON.parse(readFileSync(mcpConfigPath, 'utf8'));
+test('4. repo-local MCP config is retired and global installer owns the single frontend MCP integration', () => {
+  const repoMcpConfig = path.join(REPO_ROOT, '.mcp.json');
+  assert.equal(existsSync(repoMcpConfig), false, '.mcp.json must not recreate a repo-local frontend entrypoint');
 
-  assert.deepEqual(Object.keys(mcpConfig.mcpServers ?? {}), ['supergpt']);
-  assert.equal(mcpConfig.mcpServers.supergpt.command, 'node');
-  assert.deepEqual(mcpConfig.mcpServers.supergpt.args, ['bin/supergpt-mcp.js']);
+  const installer = readFileSync(path.join(REPO_ROOT, 'bin', 'install-plugin.js'), 'utf8');
+  assert.match(installer, /agent-policy['"], ['"]COMMON\.md/);
+  assert.match(installer, /registerClaudeMcp/);
+  assert.match(installer, /registerCodexMcp/);
+  assert.match(installer, /mcp_config\.json/);
+  assert.match(installer, /const MCP_NAME = ['"]supergpt['"]/);
 });
 
 test('5. package.json public bins are the intended V1 production bins', () => {
@@ -121,12 +123,11 @@ test('5. package.json public bins are the intended V1 production bins', () => {
   });
 });
 
-test('6. active skill and architecture documentation does not instruct frontends to use Chrome extension or browser bridge', () => {
+test('6. active frontend policy and architecture documentation does not instruct use of Chrome extension or browser bridge', () => {
   const activeDocFiles = [
     path.join(REPO_ROOT, 'README.md'),
     path.join(REPO_ROOT, 'docs', 'ARCHITECTURE.md'),
-    path.join(REPO_ROOT, 'skills', 'supergpt', 'SKILL.md'),
-    path.join(REPO_ROOT, '.agents', 'skills', 'supergpt', 'SKILL.md'),
+    path.join(REPO_ROOT, 'agent-policy', 'COMMON.md'),
   ];
 
   const forbiddenInstructions = [
@@ -138,7 +139,6 @@ test('6. active skill and architecture documentation does not instruct frontends
   ];
 
   for (const docFile of activeDocFiles) {
-    if (!existsSync(docFile)) continue;
     const content = readFileSync(docFile, 'utf8');
     for (const pattern of forbiddenInstructions) {
       assert.doesNotMatch(

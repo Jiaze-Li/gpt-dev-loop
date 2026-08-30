@@ -1,35 +1,57 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-
-import { GeminiFrontendAdapter } from '../src/adapters/frontend/geminiAdapter.js';
-import { ClaudeFrontendAdapter } from '../src/adapters/frontend/claudeAdapter.js';
-import { CodexFrontendAdapter } from '../src/adapters/frontend/codexAdapter.js';
 
 const repoUrl = new URL('..', import.meta.url);
 
-test('installed skill and frontend rules default normal autonomous execution to non-blocking supergpt_start', async () => {
-  const rootSkill = await readFile(new URL('skills/supergpt/SKILL.md', repoUrl), 'utf8');
-  const agentSkill = await readFile(new URL('.agents/skills/supergpt/SKILL.md', repoUrl), 'utf8');
-  const rule = await readFile(new URL('.agents/rules/supergpt.md', repoUrl), 'utf8');
-  const instructions = [
-    rootSkill,
-    agentSkill,
-    rule,
-    new GeminiFrontendAdapter().generateSkillDefinition(),
-    new ClaudeFrontendAdapter().generateClaudeInstructions(),
-    new CodexFrontendAdapter().generateCodexInstructions(),
-  ];
+const adapterFiles = [
+  'src/adapters/frontend/geminiAdapter.js',
+  'src/adapters/frontend/claudeAdapter.js',
+  'src/adapters/frontend/codexAdapter.js',
+];
 
-  for (const text of instructions) {
-    assert.match(text, /supergpt_start\(\{ goal, cwd \}\)/);
-    assert.match(text, /status: "RUNNING", workflowId/);
-    assert.match(text, /supergpt_run/);
-    assert.match(text, /blocking convenience API/i);
+const retiredPolicyFiles = [
+  'skills/supergpt/SKILL.md',
+  '.agents/skills/supergpt/SKILL.md',
+  '.agents/rules/supergpt.md',
+  'agent-policy/CLAUDE.md',
+  'agent-policy/CODEX.md',
+  'agent-policy/AGY.md',
+];
+
+test('COMMON.md is the sole active front-agent routing and launch contract', async () => {
+  const common = await readFile(new URL('agent-policy/COMMON.md', repoUrl), 'utf8');
+  const installer = await readFile(new URL('bin/install-plugin.js', repoUrl), 'utf8');
+
+  assert.match(common, /single active SuperGPT policy/i);
+  assert.match(common, /default to SuperGPT/i);
+  assert.match(common, /supergpt_start\(\{ goal, cwd \}\)/);
+  assert.match(common, /supergpt_watch\(\{ workflowId \}\)/);
+  assert.match(common, /supergpt_run/);
+  assert.match(common, /blocking convenience operation/i);
+  assert.match(common, /do not use the SuperGPT CLI as an agent fallback/i);
+
+  assert.match(installer, /agent-policy['"], ['"]COMMON\.md/);
+  assert.doesNotMatch(installer, /POLICY_FILE[\s\S]*skills[\/\\]supergpt/i);
+
+  for (const relativePath of retiredPolicyFiles) {
+    assert.equal(
+      existsSync(new URL(relativePath, repoUrl)),
+      false,
+      `Retired parallel policy must not exist: ${relativePath}`,
+    );
   }
+});
 
-  assert.doesNotMatch(rootSkill, /Call `supergpt_run` with the goal/);
-  assert.doesNotMatch(agentSkill, /Call `supergpt_run` with the goal/);
-  assert.doesNotMatch(agentSkill, /\| \*"Use SuperGPT to implement X"\*[\s\S]*?\| If sufficiently clear, call `supergpt_run/);
-  assert.doesNotMatch(rule, /normal autonomous chat\/frontend execution, invoke `supergpt_run/);
+test('frontend adapters contain transport mechanics only, not duplicated behavior policy', async () => {
+  for (const relativePath of adapterFiles) {
+    const text = await readFile(new URL(relativePath, repoUrl), 'utf8');
+    assert.match(text, /generateMcpConfig/);
+    assert.match(text, /agent-policy\/COMMON\.md/);
+    assert.doesNotMatch(text, /supergpt_(?:start|watch|run|plan|status|resume|stop)/);
+    assert.doesNotMatch(text, /HUMAN_REQUIRED/);
+    assert.doesNotMatch(text, /Normal autonomous/i);
+    assert.doesNotMatch(text, /Use SuperGPT to/i);
+  }
 });
