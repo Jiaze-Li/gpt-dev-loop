@@ -19,18 +19,33 @@ import { existsSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
 
-export function isSuperGptOwnedWorktree(targetPath, root = SUPERGPT_WORKTREE_ROOT) {
+export function isSuperGptOwnedWorktree(targetPath, root = SUPERGPT_WORKTREE_ROOT, workflowId = null) {
   if (typeof targetPath !== 'string' || !targetPath) return false;
   const resolvedTarget = path.resolve(targetPath);
   const resolvedRoot = path.resolve(root);
 
-  // Must be strictly inside the SuperGPT worktrees root
-  if (!resolvedTarget.startsWith(resolvedRoot) || resolvedTarget === resolvedRoot) {
+  // Must be strictly inside the SuperGPT worktrees root. path.relative keeps
+  // sibling prefixes (for example worktrees-other) outside the trust boundary.
+  const relative = path.relative(resolvedRoot, resolvedTarget);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     return false;
   }
 
-  // Must follow SuperGPT naming convention containing -wf-agy- or -wf-
   const basename = path.basename(resolvedTarget);
+
+  // When the lifecycle manager knows the workflow ID, apply the same central
+  // validation used by createWorkflowWorktree() and require the exact suffix
+  // that creator constructs: <repo-basename>-<workflowId>.
+  if (workflowId !== null && workflowId !== undefined) {
+    try {
+      validateWorkflowId(workflowId);
+    } catch {
+      return false;
+    }
+    return basename.length > workflowId.length + 1 && basename.endsWith(`-${workflowId}`);
+  }
+
+  // Generic discovery remains conservative for legacy/default generated names.
   return /-wf-(agy-)?[0-9a-fA-F-]+/.test(basename);
 }
 
@@ -117,7 +132,7 @@ export class WorkflowLifecycleManager {
   }
 
   trackWorktree(worktreePath, { taskId = null, branch = null } = {}) {
-    if (!isSuperGptOwnedWorktree(worktreePath, this.root)) {
+    if (!isSuperGptOwnedWorktree(worktreePath, this.root, this.workflowId)) {
       throw new Error(`Refusing to track non-SuperGPT worktree path: ${worktreePath}`);
     }
     const existing = this.resources.worktrees.find((w) => w.path === worktreePath);
@@ -153,7 +168,7 @@ export class WorkflowLifecycleManager {
   }
 
   async removeSingleWorktree(worktreePath) {
-    if (!isSuperGptOwnedWorktree(worktreePath, this.root)) {
+    if (!isSuperGptOwnedWorktree(worktreePath, this.root, this.workflowId)) {
       return { skipped: true, reason: 'not_owned' };
     }
 

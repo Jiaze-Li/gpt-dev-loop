@@ -116,6 +116,36 @@ function renderAgySkill(commonPolicy) {
   return `---\nname: supergpt\ndescription: Shared SuperGPT frontend launcher contract.\n---\n\n${String(commonPolicy).trim()}\n`;
 }
 
+async function snapshotFileState(filePath) {
+  try {
+    return { existed: true, content: await readFile(filePath) };
+  } catch (err) {
+    if (err?.code === 'ENOENT') return { existed: false, content: null };
+    throw err;
+  }
+}
+
+async function restoreFileState(filePath, snapshot) {
+  // Remove any partial replacement first, including an unexpected directory
+  // or symlink at a path that used to be absent or a regular file.
+  await rm(filePath, { recursive: true, force: true });
+  if (!snapshot?.existed) return;
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(filePath, snapshot.content);
+}
+
+async function restoreFileStates(snapshots) {
+  const errors = [];
+  for (const [filePath, snapshot] of snapshots) {
+    try {
+      await restoreFileState(filePath, snapshot);
+    } catch (err) {
+      errors.push(`${filePath}: ${err?.message || err}`);
+    }
+  }
+  return errors;
+}
+
 async function readAgyConfig(mcpConfigFile) {
   let config = { mcpServers: {} };
   if (existsSync(mcpConfigFile)) {
@@ -161,13 +191,31 @@ export async function installGlobal({
     codex: assertFrontendCli(execFileSync, 'codex'),
   };
 
-  let claudeRegistered = false;
-  let codexRegistered = false;
+  const claudeMcpConfigFile = path.join(homeDir, '.claude.json');
+  const codexMcpConfigFile = path.join(homeDir, '.codex', 'config.toml');
+  const transactionalPaths = [
+    mcpConfigFile,
+    agyPolicyFile,
+    claudePolicyFile,
+    codexPolicyFile,
+    claudeMcpConfigFile,
+    codexMcpConfigFile,
+  ];
+  const snapshots = new Map();
+  for (const filePath of transactionalPaths) {
+    snapshots.set(filePath, await snapshotFileState(filePath));
+  }
+
+  // Validate existing managed policy blocks before the first MCP registration
+  // mutates frontend state.
+  for (const policyPath of [claudePolicyFile, codexPolicyFile]) {
+    const snapshot = snapshots.get(policyPath);
+    if (snapshot?.existed) stripManagedPolicy(snapshot.content.toString('utf8'));
+  }
+
   try {
     registerClaudeMcp(execFileSync, nodeBin, mcpBin);
-    claudeRegistered = true;
     registerCodexMcp(execFileSync, nodeBin, mcpBin);
-    codexRegistered = true;
 
     await mkdir(agyConfigDir, { recursive: true });
     await mkdir(agySkillTargetDir, { recursive: true });
@@ -179,8 +227,15 @@ export async function installGlobal({
     await upsertManagedPolicy(claudePolicyFile, commonPolicy);
     await upsertManagedPolicy(codexPolicyFile, commonPolicy);
   } catch (err) {
-    if (codexRegistered) removeCodexMcp(execFileSync);
-    if (claudeRegistered) removeClaudeMcp(execFileSync);
+    // Registration helpers remove/replace existing entries. Remove any partial
+    // new entry, then restore exact pre-install bytes for every frontend file.
+    removeCodexMcp(execFileSync);
+    removeClaudeMcp(execFileSync);
+    const rollbackErrors = await restoreFileStates(snapshots);
+    if (rollbackErrors.length > 0) {
+      err.rollbackErrors = rollbackErrors;
+      err.message = `${err.message} (rollback incomplete: ${rollbackErrors.join('; ')})`;
+    }
     throw err;
   }
 

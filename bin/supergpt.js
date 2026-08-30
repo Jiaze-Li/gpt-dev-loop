@@ -288,7 +288,7 @@ async function main() {
     const state = await supergptWait({
       workflowId: opts.workflowId,
       timeoutMs: opts.timeoutMs ?? 60000,
-      predicate: (s) => (opts.targetStatus ? s.workflowStatus === opts.targetStatus : true),
+      predicate: (s) => (opts.targetStatus ? s.workflowStatus === opts.targetStatus : ['DONE', 'HUMAN_REQUIRED', 'FAILED', 'TIMEOUT', 'STALLED', 'STOPPED'].includes(s.workflowStatus)),
     });
     if (opts.outputFormat === 'json') {
       process.stdout.write(`${JSON.stringify(state, null, 2)}\n`);
