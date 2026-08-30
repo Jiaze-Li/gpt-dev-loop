@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { buildAgySupervisorPrompt, parseSupervisorJson } from './agySupervisorProvider.js';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
+import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
 
 function classify(stderr = '') {
   if (/quota|rate.?limit|usage limit/i.test(stderr)) return 'PROVIDER_QUOTA_EXHAUSTED';
@@ -17,7 +18,7 @@ function classify(stderr = '') {
 async function callCodex({ prompt, model, timeoutMs = 180000, executable = 'codex', spawn = nodeSpawn, effort = null, conversationId = null, signal = null } = {}) {
   if (signal?.aborted) throw new ProviderCancelledError('Codex Supervisor call cancelled before launch', { model: model ?? null });
   // Codex persists a thread locally so BOUNDED_STICKY can use its documented
-  // `exec resume <session-id>` transport.  CHECKPOINT_FRESH callers simply
+  // `exec resume <session-id>` transport. CHECKPOINT_FRESH callers simply
   // omit the id and get a new physical thread.
   const args = conversationId ? ['exec', 'resume', conversationId, '--json', '--skip-git-repo-check', '--ignore-user-config'] : ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '--ignore-user-config'];
   if (model) args.push('--model', model);
@@ -26,32 +27,67 @@ async function callCodex({ prompt, model, timeoutMs = 180000, executable = 'code
   const started = Date.now();
   const result = await new Promise((resolve) => {
     let child;
-    try { child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'] }); } catch (error) { resolve({ error }); return; }
-    const out = []; const err = []; let settled = false;
-    const finish = (value) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener?.('abort', onAbort);
-        resolve(value);
-      }
+    try {
+      child = spawn(executable, args, { stdio: ['ignore', 'pipe', 'pipe'], ...PROCESS_GROUP_SPAWN_OPTS });
+    } catch (error) {
+      resolve({ error });
+      return;
+    }
+    const out = [];
+    const err = [];
+    let settled = false;
+    let timedOut = false;
+    let aborted = false;
+    let treeTermination = null;
+
+    const tearDownTree = () => {
+      if (!treeTermination) treeTermination = terminateProcessTree(child);
+      return treeTermination;
     };
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} finish({ timedOut: true }); }, timeoutMs);
+
+    const finish = async (value, { awaitTree = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
+      if (awaitTree && treeTermination) await treeTermination.done;
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { tearDownTree(); } catch {}
+    }, timeoutMs);
     timer.unref?.();
-    // A cancellation kills the already-launched child immediately so it can
-    // never keep running for its full timeout after the workflow stopped.
-    const onAbort = () => { try { child.kill('SIGKILL'); } catch {} finish({ aborted: true }); };
+
+    const onAbort = () => {
+      aborted = true;
+      try { tearDownTree(); } catch {}
+    };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
-    child.on('error', (error) => finish({ error }));
+
+    child.on('error', (error) => {
+      void finish({ error, aborted, timedOut }, { awaitTree: aborted || timedOut });
+    });
     child.stdout?.on('data', (chunk) => out.push(chunk));
     child.stderr?.on('data', (chunk) => err.push(chunk));
-    child.on('close', (exitCode) => finish({ exitCode, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
+    child.on('close', (exitCode) => {
+      void finish({
+        exitCode,
+        stdout: Buffer.concat(out).toString('utf8'),
+        stderr: Buffer.concat(err).toString('utf8'),
+        aborted,
+        timedOut,
+      }, { awaitTree: aborted || timedOut });
+    });
   });
   const durationMs = Date.now() - started;
   if (result.aborted || signal?.aborted) throw new ProviderCancelledError('Codex Supervisor call cancelled', { durationMs, model: model ?? null });
   if (result.timedOut) throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_TIMEOUT, 'Codex Supervisor timed out', { providerFailure: 'PROVIDER_TIMEOUT', durationMs, model: model ?? null });
   if (result.error || result.exitCode !== 0) throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_UNAVAILABLE, 'Codex Supervisor transport unavailable', { providerFailure: classify(result.stderr), durationMs, model: model ?? null, exitCode: result.exitCode ?? null });
-  let text = null; let usage = null; let returnedConversationId = null;
+  let text = null;
+  let usage = null;
+  let returnedConversationId = null;
   for (const line of result.stdout.split('\n')) {
     try {
       const event = JSON.parse(line);
