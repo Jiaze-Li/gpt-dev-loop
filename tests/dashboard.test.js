@@ -120,10 +120,10 @@ test('3. API reads RUNNING and DONE workflows accurately without model tokens', 
     escalationAttempts: 0,
     maxEscalationAttempts: 2,
     modelEscalated: false,
-    startedAt: '2026-08-31T04:00:00.000Z',
-    heartbeatAt: '2026-08-31T04:01:00.000Z',
-    lastProgressAt: '2026-08-31T04:00:30.000Z',
-    lastActivityAt: '2026-08-31T04:00:55.000Z',
+    startedAt: new Date().toISOString(),
+    heartbeatAt: new Date().toISOString(),
+    lastProgressAt: new Date().toISOString(),
+    lastActivityAt: new Date().toISOString(),
     executorModel: 'claude-sonnet-5',
     tokenUsage: {
       planner: { totalTokens: 1200 },
@@ -997,7 +997,8 @@ test('S. Security: Dismiss is forbidden on active RUNNING / STARTING / APPLYING 
       kind: 'USER',
       workflowStatus: 'RUNNING',
       stage: 'EXECUTOR',
-      startedAt: '2026-08-31T10:00:00.000Z',
+      startedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
     }));
 
     const wfApplying = 'wf-agy-applying-security-2222';
@@ -1006,7 +1007,8 @@ test('S. Security: Dismiss is forbidden on active RUNNING / STARTING / APPLYING 
       kind: 'USER',
       workflowStatus: 'RUNNING',
       stage: 'APPLYING',
-      startedAt: '2026-08-31T10:00:00.000Z',
+      startedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
     }));
 
     const server = createDashboardServer({ port: 0, root });
@@ -1026,3 +1028,64 @@ test('S. Security: Dismiss is forbidden on active RUNNING / STARTING / APPLYING 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('T. Zombie / stale workflow lifecycle: dead process & expired heartbeat reconciles to STOPPED and moves out of Running', async () => {
+  const root = makeTempWorktreeRoot();
+  try {
+    const wfZombie = 'wf-agy-zombie-old-1111';
+    fs.writeFileSync(path.join(root, `${wfZombie}.state.json`), JSON.stringify({
+      workflowId: wfZombie,
+      kind: 'USER',
+      workflowStatus: 'STARTING',
+      stage: 'EXECUTOR',
+      startedAt: '2026-08-28T10:00:00.000Z',
+      heartbeatAt: '2026-08-28T10:05:00.000Z',
+      taskName: 'Old zombie task',
+    }));
+
+    const wfLive = 'wf-agy-live-active-2222';
+    fs.writeFileSync(path.join(root, `${wfLive}.state.json`), JSON.stringify({
+      workflowId: wfLive,
+      kind: 'USER',
+      workflowStatus: 'RUNNING',
+      stage: 'EXECUTOR',
+      startedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      taskName: 'Real live active task',
+    }));
+
+    const server = createDashboardServer({ port: 0, root });
+    const { url } = await server.start();
+    try {
+      // 1. GET /api/workflows
+      const res = await requestGet(`${url}/api/workflows`);
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers['x-supergpt-running-count'], '1', 'Only real live workflow counts in Running');
+
+      const workflows = res.json();
+      // Zombie workflow should NOT be in default Attention view
+      assert.equal(workflows.some(w => w.workflowId === wfZombie), false);
+      assert.equal(workflows.some(w => w.workflowId === wfLive), true);
+
+      // 2. View History -> Zombie workflow has been reconciled to STOPPED
+      const historyRes = await requestGet(`${url}/api/workflows?view=history`);
+      const history = historyRes.json();
+      const zombieInHistory = history.find(w => w.workflowId === wfZombie);
+      assert.ok(zombieInHistory);
+      assert.equal(zombieInHistory.canonicalStatus, 'STOPPED');
+      assert.equal(zombieInHistory.requiresAttention, false);
+
+      // 3. Check persisted state file on disk: reconciled with reason and data preserved
+      const disk = JSON.parse(fs.readFileSync(path.join(root, `${wfZombie}.state.json`), 'utf8'));
+      assert.equal(disk.workflowStatus, 'STOPPED');
+      assert.equal(disk.stage, 'STOPPED');
+      assert.ok(disk.stoppedReason.includes('zombie_reconciled'));
+      assert.equal(disk.taskName, 'Old zombie task', 'Preserves task and history');
+    } finally {
+      await server.close();
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+

@@ -12,8 +12,9 @@
 
 import path from 'node:path';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
+import { readOwnerLease, isLeaseOwnerAlive } from './workflowOwnership.js';
 import { appendProviderProcessDiagnostic } from './providerProcessTelemetry.js';
 import { validateWorkflowId, assertPathWithinRoot, isTestWorkflowId } from './workflowId.js';
 
@@ -509,6 +510,131 @@ export function readCloseoutReviewer({
     repairRounds: closeout.repairRounds ?? 0,
     maxRepairRounds: closeout.maxRepairRounds ?? null,
   };
+}
+
+export const HEARTBEAT_STALE_TIMEOUT_MS = 2 * 60_000; // 2 minutes
+
+/**
+ * Check if a workflow is actively alive (owner process running or fresh heartbeat).
+ * Consumes zero model tokens.
+ */
+export function checkWorkflowLiveness({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+  state = null,
+  now = Date.now(),
+  staleTimeoutMs = HEARTBEAT_STALE_TIMEOUT_MS,
+} = {}) {
+  const rawState = state ?? readLiveWorkflowState({ workflowId, root });
+  if (!rawState) return { isAlive: false, isZombie: false, reason: 'state_not_found' };
+
+  const s = String(rawState.stage || '').toUpperCase();
+  const w = String(rawState.workflowStatus || '').toUpperCase();
+  const term = [
+    WORKFLOW_STATUSES.DONE,
+    WORKFLOW_STATUSES.HUMAN_REQUIRED,
+    WORKFLOW_STATUSES.FAILED,
+    WORKFLOW_STATUSES.TIMEOUT,
+    WORKFLOW_STATUSES.STALLED,
+    WORKFLOW_STATUSES.STOPPED,
+    'SUPERSEDED',
+    'DISMISSED',
+  ];
+  if (term.includes(w)) {
+    return { isAlive: true, isZombie: false, reason: 'resolved_status' };
+  }
+
+  // 1. Check ownership lease
+  const lease = readOwnerLease({ root, workflowId });
+  if (lease) {
+    const ownerAlive = isLeaseOwnerAlive(lease);
+    if (ownerAlive) {
+      return { isAlive: true, isZombie: false, ownerPid: lease.pid, lease };
+    }
+    // Owner lease was published with a recorded local PID that is demonstrably dead -> zombie!
+    return {
+      isAlive: false,
+      isZombie: true,
+      reason: 'owner_pid_dead',
+      ownerPid: lease.pid,
+      lease,
+    };
+  }
+
+  // 2. No lease directory: check heartbeat
+  if (rawState.heartbeatAt) {
+    const lastHeartbeat = Date.parse(rawState.heartbeatAt);
+    if (Number.isFinite(lastHeartbeat) && (now - lastHeartbeat) > staleTimeoutMs) {
+      return {
+        isAlive: false,
+        isZombie: true,
+        reason: 'heartbeat_expired',
+        ageMs: now - lastHeartbeat,
+      };
+    }
+  } else if (rawState.startedAt) {
+    const startedMs = Date.parse(rawState.startedAt);
+    if (Number.isFinite(startedMs) && (now - startedMs) > 24 * 60 * 60_000) {
+      return {
+        isAlive: false,
+        isZombie: true,
+        reason: 'started_long_ago_no_lease',
+        ageMs: now - startedMs,
+      };
+    }
+  }
+
+  // Within initialization / test grace window
+  return { isAlive: true, isZombie: false, reason: 'within_grace_window' };
+}
+
+/**
+ * Reconcile stale/zombie workflow state to STOPPED and requiresAttention=false.
+ * Preserves all checkpoints, events, evidence, and worktrees.
+ */
+export function reconcileStaleWorkflowState({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+  state = null,
+  now = Date.now(),
+  staleTimeoutMs = HEARTBEAT_STALE_TIMEOUT_MS,
+} = {}) {
+  validateWorkflowId(workflowId);
+  const statePath = assertPathWithinRoot(root, path.join(root, `${workflowId}.state.json`), 'state file');
+  const rawState = state ?? readLiveWorkflowState({ workflowId, root });
+  if (!rawState) return null;
+
+  const liveness = checkWorkflowLiveness({
+    workflowId,
+    root,
+    state: rawState,
+    now,
+    staleTimeoutMs,
+  });
+
+  if (!liveness.isZombie) {
+    return rawState;
+  }
+
+  const reconciled = { ...rawState };
+  reconciled.workflowStatus = WORKFLOW_STATUSES.STOPPED;
+  reconciled.stage = WORKFLOW_STAGES.STOPPED;
+  reconciled.stoppedAt = rawState.heartbeatAt || rawState.lastProgressAt || new Date(now).toISOString();
+  reconciled.stoppedReason = `zombie_reconciled:${liveness.reason}`;
+  reconciled.requiresAttention = false;
+  reconciled.reconciledAt = new Date(now).toISOString();
+
+  try {
+    const tmpPath = `${statePath}.tmp.${Date.now()}`;
+    writeFileSync(tmpPath, `${JSON.stringify(reconciled, null, 2)}\n`, 'utf8');
+    renameSync(tmpPath, statePath);
+  } catch {
+    try {
+      writeFileSync(statePath, `${JSON.stringify(reconciled, null, 2)}\n`, 'utf8');
+    } catch {}
+  }
+
+  return reconciled;
 }
 
 /**

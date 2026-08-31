@@ -10,6 +10,8 @@ import { SUPERGPT_WORKTREE_ROOT } from '../orchestrator/workflowWorktree.js';
 import {
   readLiveWorkflowState,
   toCanonicalProgress,
+  checkWorkflowLiveness,
+  reconcileStaleWorkflowState,
 } from '../orchestrator/workflowState.js';
 import { validateWorkflowId } from '../orchestrator/workflowId.js';
 import { readControl } from '../orchestrator/workflowControl.js';
@@ -98,8 +100,13 @@ export function listRecentWorkflows({
       const workflowId = file.replace(/\.state\.json$/, '');
       try {
         validateWorkflowId(workflowId);
-        const live = readLiveWorkflowState({ workflowId, root });
+        let live = readLiveWorkflowState({ workflowId, root });
         if (!live) continue;
+
+        const liveness = checkWorkflowLiveness({ workflowId, root, state: live });
+        if (liveness.isZombie) {
+          live = reconcileStaleWorkflowState({ workflowId, root, state: live }) || live;
+        }
 
         const kind = live.kind || (isTestWorkflowId(workflowId) ? 'INTERNAL_TEST' : 'USER');
         const isTest = kind === 'INTERNAL_TEST' || isTestWorkflowId(workflowId);
@@ -111,10 +118,11 @@ export function listRecentWorkflows({
         const canonicalStatus = getCanonicalWorkflowStatus({
           stage: live.stage,
           workflowStatus: live.workflowStatus,
+          isAlive: liveness.isAlive,
         });
         const focus = getDashboardFocus({ root });
         const isFocused = focus?.focusWorkflowId ? workflowId === focus.focusWorkflowId : false;
-        const requiresAttention = computeRequiresAttention(live);
+        const requiresAttention = computeRequiresAttention(live, { isAlive: liveness.isAlive });
 
         const item = {
           workflowId,
@@ -124,7 +132,7 @@ export function listRecentWorkflows({
           rawStatus: live.workflowStatus || 'UNKNOWN',
           status: canonicalStatus,
           canonicalStatus,
-          badge: canonicalWorkflowBadge({ stage: live.stage, workflowStatus: live.workflowStatus }),
+          badge: canonicalWorkflowBadge({ stage: live.stage, workflowStatus: live.workflowStatus, isAlive: liveness.isAlive }),
           task: canonical?.task?.title || live.taskName || live.taskId || '-',
           stage: live.stage || 'INIT',
           elapsed: canonical?.timing?.elapsed || '00:00',
@@ -133,6 +141,7 @@ export function listRecentWorkflows({
           superseded: Boolean(live.superseded || live.supersededBy),
           supersededBy: live.supersededBy || null,
           dismissed: Boolean(live.dismissed),
+          isAlive: liveness.isAlive,
         };
 
         if (requiresAttention) {
@@ -175,14 +184,19 @@ export function listRecentWorkflows({
 
 export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } = {}) {
   validateWorkflowId(workflowId);
-  const live = readLiveWorkflowState({ workflowId, root });
+  let live = readLiveWorkflowState({ workflowId, root });
   if (!live) return null;
+
+  const liveness = checkWorkflowLiveness({ workflowId, root, state: live });
+  if (liveness.isZombie) {
+    live = reconcileStaleWorkflowState({ workflowId, root, state: live }) || live;
+  }
 
   const canonical = toCanonicalProgress(live);
   const checkpoint = readCheckpoint({ workflowId, root });
   const task = computeTaskProjection(live, checkpoint);
-  const canonicalStatus = getCanonicalWorkflowStatus({ stage: live.stage, workflowStatus: live.workflowStatus });
-  const badge = canonicalWorkflowBadge({ stage: live.stage, workflowStatus: live.workflowStatus });
+  const canonicalStatus = getCanonicalWorkflowStatus({ stage: live.stage, workflowStatus: live.workflowStatus, isAlive: liveness.isAlive });
+  const badge = canonicalWorkflowBadge({ stage: live.stage, workflowStatus: live.workflowStatus, isAlive: liveness.isAlive });
   const kind = live.kind || (isTestWorkflowId(workflowId) ? 'INTERNAL_TEST' : 'USER');
   const focus = getDashboardFocus({ root });
   const isFocused = focus?.focusWorkflowId ? workflowId === focus.focusWorkflowId : false;
@@ -209,12 +223,13 @@ export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } 
     escalationAttempts: live.escalationAttempts ?? 0,
     maxEscalationAttempts: live.maxEscalationAttempts ?? 2,
     escalationActive: Boolean(live.escalationActive || live.modelEscalated),
-    requiresAttention: computeRequiresAttention(live),
+    requiresAttention: computeRequiresAttention(live, { isAlive: liveness.isAlive }),
     dismissed: Boolean(live.dismissed),
     superseded: Boolean(live.superseded),
     supersededBy: live.supersededBy || null,
     stageStatuses: live.stageStatuses ?? {},
     timeline,
+    isAlive: liveness.isAlive,
   };
 }
 

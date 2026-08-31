@@ -48,7 +48,7 @@ const BADGE_PRESENTATION = {
 const RUNNING_STAGES = new Set(['EXECUTOR', 'GATE', 'REVIEWER', 'REWORK', 'ESCALATION', 'SUPERVISOR', 'APPLYING']);
 const STARTING_STAGES = new Set(['STARTING', 'PLANNING', 'INIT', 'PREFLIGHT']);
 
-export function getCanonicalWorkflowStatus({ stage, workflowStatus } = {}) {
+export function getCanonicalWorkflowStatus({ stage, workflowStatus, isAlive = true } = {}) {
   const s = String(stage || '').toUpperCase();
   const w = String(workflowStatus || '').toUpperCase();
 
@@ -59,6 +59,10 @@ export function getCanonicalWorkflowStatus({ stage, workflowStatus } = {}) {
   if (w === 'HUMAN_REQUIRED') return 'HUMAN_REQUIRED';
   if (w === 'FAILED' || w === 'TIMEOUT' || w === 'STALLED') return 'FAILED';
   if (w === 'STOPPED') return 'STOPPED';
+
+  if (isAlive === false) {
+    return 'STOPPED';
+  }
 
   // 2. Active stages -> RUNNING
   if (RUNNING_STAGES.has(s)) return 'RUNNING';
@@ -72,22 +76,24 @@ export function getCanonicalWorkflowStatus({ stage, workflowStatus } = {}) {
   return 'STARTING';
 }
 
-export function canonicalWorkflowBadge({ stage, workflowStatus } = {}) {
-  const key = getCanonicalWorkflowStatus({ stage, workflowStatus });
+export function canonicalWorkflowBadge({ stage, workflowStatus, isAlive = true } = {}) {
+  const key = getCanonicalWorkflowStatus({ stage, workflowStatus, isAlive });
   const pres = BADGE_PRESENTATION[key] || BADGE_PRESENTATION.STARTING;
   return { key, icon: pres.icon, text: `SUPERGPT ${pres.icon} ${key}` };
 }
 
-export function computeRequiresAttention(live) {
+export function computeRequiresAttention(live, { isAlive = true } = {}) {
   if (!live || typeof live !== 'object') return false;
   const workflowId = live.workflowId || '';
   const isTest = live.kind === 'INTERNAL_TEST' || /^(?:wf-)?(?:agy-)?test[-_]|^test[-_]/i.test(workflowId);
   if (isTest) return false;
   if (live.superseded || live.supersededBy || live.dismissed || live.archived) return false;
+  if (live.isAlive === false || isAlive === false) return false;
 
   const canonicalStatus = getCanonicalWorkflowStatus({
     stage: live.stage,
     workflowStatus: live.workflowStatus,
+    isAlive,
   });
 
   if (canonicalStatus === 'STARTING' || canonicalStatus === 'RUNNING') {
