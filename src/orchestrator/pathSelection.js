@@ -28,13 +28,17 @@
 // `frozenDecision`. Resume never recomputes the path and never weakens the
 // bounded scope.
 
+import { parsePrCloseoutGoal } from './prCloseoutIntent.js';
+
 export const WORKFLOW_PATHS = Object.freeze({
   FAST: 'FAST',
   FULL: 'FULL',
+  PR_CLOSEOUT: 'PR_CLOSEOUT',
 });
 
 export const PATH_SELECTION_REASONS = Object.freeze({
   FAST_BOUNDED_SINGLE_TASK: 'fast_bounded_single_task',
+  PR_CLOSEOUT_INTENT: 'pr_closeout_intent',
   FULL_NO_BOUNDED_TASK: 'full_no_bounded_task',
   FULL_EXPLICIT_REQUEST: 'full_explicit_request',
   FULL_EXPLICIT_MULTI_STEP: 'full_explicit_multi_step',
@@ -240,8 +244,20 @@ export function restorePathDecision(frozen) {
   if (!frozen || typeof frozen !== 'object') {
     throw new Error('restorePathDecision: persisted path decision is missing or not an object');
   }
-  if (frozen.path !== WORKFLOW_PATHS.FAST && frozen.path !== WORKFLOW_PATHS.FULL) {
+  if (frozen.path !== WORKFLOW_PATHS.FAST && frozen.path !== WORKFLOW_PATHS.FULL && frozen.path !== WORKFLOW_PATHS.PR_CLOSEOUT) {
     throw new Error(`restorePathDecision: persisted path "${frozen.path}" is not a recognized workflow path`);
+  }
+  if (frozen.path === WORKFLOW_PATHS.PR_CLOSEOUT) {
+    return Object.freeze({
+      path: frozen.path,
+      reason: frozen.reason ?? PATH_SELECTION_REASONS.RESTORED_FROM_STATE,
+      reasonDetail: frozen.reasonDetail ?? 'restored from persisted workflow state',
+      prNumber: frozen.prNumber ?? null,
+      repository: frozen.repository ?? null,
+      taskContract: null,
+      frozenPlan: null,
+      restored: true,
+    });
   }
   let taskContract = null;
   if (frozen.path === WORKFLOW_PATHS.FAST) {
@@ -262,22 +278,39 @@ export function restorePathDecision(frozen) {
 }
 
 /**
- * Select Fast Path or Full Path.
+ * Select Fast Path, Full Path, or PR Closeout mode.
  *
  * @param {object} opts
  * @param {string} [opts.goal]              natural-language request text
+ * @param {string} [opts.cwd]               workspace directory
  * @param {object} [opts.boundedTask]       caller-supplied structured single-task
  *                                          contract from trusted input; its
  *                                          absence forces Full Path
  * @param {boolean} [opts.explicitFullPath] caller explicitly wants planning
  * @param {object} [opts.frozenDecision]    persisted decision restored on resume
  * @returns {Readonly<{path:string, reason:string, reasonDetail:string|null,
+ *                     prNumber?:number|null, repository?:string|null,
  *                     taskContract:object|null, frozenPlan:object|null,
  *                     restored:boolean}>}
  */
-export function selectWorkflowPath({ goal, boundedTask, explicitFullPath = false, frozenDecision = null } = {}) {
+export function selectWorkflowPath({ goal, cwd = process.cwd(), boundedTask, explicitFullPath = false, frozenDecision = null } = {}) {
   if (frozenDecision) {
     return restorePathDecision(frozenDecision);
+  }
+
+  // 1. Natural-language PR Closeout intent recognition -> PR_CLOSEOUT mode directly
+  const prIntent = parsePrCloseoutGoal(goal, { cwd });
+  if (prIntent && prIntent.isPrCloseout && prIntent.prNumber) {
+    return Object.freeze({
+      path: WORKFLOW_PATHS.PR_CLOSEOUT,
+      reason: PATH_SELECTION_REASONS.PR_CLOSEOUT_INTENT,
+      reasonDetail: `PR Closeout mode for PR #${prIntent.prNumber}${prIntent.repository ? ` (${prIntent.repository})` : ''}`,
+      prNumber: prIntent.prNumber,
+      repository: prIntent.repository ?? null,
+      taskContract: null,
+      frozenPlan: null,
+      restored: false,
+    });
   }
 
   if (explicitFullPath === true) {
@@ -319,6 +352,8 @@ export function serializePathDecision(decision) {
     path: decision.path,
     reason: decision.reason,
     reasonDetail: decision.reasonDetail ?? null,
+    prNumber: decision.prNumber ?? null,
+    repository: decision.repository ?? null,
     taskContract: decision.taskContract ?? null,
     frozenPlan: decision.frozenPlan ?? null,
   };

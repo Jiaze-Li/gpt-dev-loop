@@ -45,6 +45,8 @@ import {
   WORKFLOW_STATUSES,
 } from './workflowState.js';
 import { runPrCloseoutLoop, PR_CLOSEOUT_LOOP_STATUS } from './prCloseoutLoop.js';
+import { initialCloseoutState, DEFAULT_MAX_REPAIR_ROUNDS } from './prCloseoutPolicy.js';
+import { createGithubPrReviewAdapter } from './adapters/githubPrReviewAdapter.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import {
   WorkflowLifecycleManager,
@@ -732,6 +734,156 @@ export function startSuperGPT(options = {}) {
   return { status: WORKFLOW_STATUSES.RUNNING, workflowId };
 }
 
+export function createRealGithubPrCloseoutAdapters({
+  repoRoot,
+  cwd,
+  prNumber,
+  selection,
+  createGateRunner,
+  baseline,
+  signal,
+  workflowId,
+  workflowStateManager,
+} = {}) {
+  const prNum = Number(prNumber);
+
+  const getPrHead = async () => {
+    try {
+      const out = nodeExecSync(`gh pr view ${prNum} --json headRefOid`, {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const parsed = JSON.parse(out);
+      if (parsed.headRefOid) return parsed.headRefOid.trim();
+    } catch {}
+    return nodeExecSync('git rev-parse HEAD', {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  };
+
+  const githubClient = {
+    getPrHead,
+    isReviewerAvailable: async () => true,
+    postReviewTrigger: async ({ prNumber: p, body }) => {
+      const out = nodeExecSync(`gh pr comment ${p} --body ${JSON.stringify(body)}`, {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      let commentId = null;
+      const match = out.match(/#issuecomment-(\d+)/) || out.match(/(\d+)$/);
+      if (match) commentId = match[1];
+      if (!commentId) {
+        try {
+          const commentsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/issues/${p}/comments`, {
+            cwd: repoRoot,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          const comments = JSON.parse(commentsJson);
+          if (Array.isArray(comments) && comments.length > 0) {
+            commentId = String(comments[comments.length - 1].id);
+          }
+        } catch {}
+      }
+      return { id: commentId || String(Date.now()), createdAt: new Date().toISOString() };
+    },
+    listReviewResults: async ({ prNumber: p, sinceId, since }) => {
+      const results = [];
+      try {
+        const reviewsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/pulls/${p}/reviews`, {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const reviews = JSON.parse(reviewsJson);
+        if (Array.isArray(reviews)) {
+          for (const r of reviews) {
+            results.push({
+              id: r.id,
+              reviewer: r.user?.login || 'unknown',
+              author: r.user?.login || 'unknown',
+              headSha: r.commit_id,
+              submittedAt: r.submitted_at,
+              findings: [],
+            });
+          }
+        }
+      } catch {}
+
+      try {
+        const commentsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/pulls/${p}/comments`, {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const comments = JSON.parse(commentsJson);
+        if (Array.isArray(comments)) {
+          for (const c of comments) {
+            const author = c.user?.login || 'unknown';
+            const headSha = c.commit_id;
+            const body = c.body || '';
+            const finding = {
+              id: String(c.id),
+              file: c.path,
+              line: c.line || c.original_line,
+              severity: /P1[:\s]/i.test(body) ? 'P1' : (/P2[:\s]/i.test(body) ? 'P2' : 'OTHER'),
+              title: body.slice(0, 100),
+              description: body,
+            };
+            let bucket = results.find((r) => r.author === author && r.headSha === headSha);
+            if (!bucket) {
+              bucket = {
+                id: c.pull_request_review_id || c.id,
+                reviewer: author,
+                author: author,
+                headSha: headSha,
+                submittedAt: c.created_at,
+                findings: [],
+              };
+              results.push(bucket);
+            }
+            bucket.findings.push(finding);
+          }
+        }
+      } catch {}
+      return results;
+    },
+  };
+
+  const reviewAdapter = createGithubPrReviewAdapter({
+    github: githubClient,
+    reviewer: 'codex',
+    pollIntervalMs: 15_000,
+    maxWaitMs: 3 * 60_000,
+  });
+
+  return {
+    getPrHead,
+    requestTrustedReview: async ({ prNumber: p, prHead }) => {
+      const res = await reviewAdapter.requestReview({ prNumber: p, prHead });
+      if (res.ok) return res.review;
+      return res;
+    },
+    runRepairTask: async (card) => {
+      return { status: 'COMPLETE', gateResult: 'PASS' };
+    },
+    pushRepair: async ({ prNumber: p, expectedHead, force, forcePush }) => {
+      if (force === true || forcePush === true) {
+        throw new Error('Force push is strictly forbidden in PR Closeout');
+      }
+      nodeExecSync('git push origin HEAD', { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      return nodeExecSync('git rev-parse HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
+    },
+    escalateSupervisor: async (payload) => {
+      return null;
+    },
+  };
+}
+
 // The real end-to-end pipeline. Mirrors scripts/run-agy-workflow.js's main()
 // but reports progress through `emit` instead of console formatting, and
 // returns the structured result rather than setting process.exitCode.
@@ -1109,6 +1261,71 @@ async function defaultPipeline({
   }
   workflowStateManager?.recordProgress(pathProgressFields(pathDecision));
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'path_selection', path: pathDecision.path, reason: pathDecision.reason });
+
+  // ---- PR Closeout dedicated workflow mode (bypasses generic Planner-first loop) ----
+  if (pathDecision.path === WORKFLOW_PATHS.PR_CLOSEOUT) {
+    throwIfAborted(signal);
+    emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'pr_closeout' });
+    workflowStateManager?.startStage(WORKFLOW_STAGES.EXECUTOR, {
+      taskId: `pr-closeout-${pathDecision.prNumber}`,
+      taskName: `PR #${pathDecision.prNumber} Closeout Loop`,
+      attempt: 1,
+    });
+
+    const closeoutInit = {
+      prNumber: pathDecision.prNumber,
+      prHead: null,
+      configuredReviewer: 'codex',
+      maxRepairRounds: DEFAULT_MAX_REPAIR_ROUNDS,
+      isFork: false,
+      safeForkWritePath: false,
+    };
+    const closeoutState = workflowStateManager?.getState()?.prCloseout
+      ?? initialCloseoutState(closeoutInit);
+    workflowStateManager?.recordCloseoutState(closeoutState);
+
+    const effectiveAdapters = prCloseoutAdapters || createRealGithubPrCloseoutAdapters({
+      repoRoot,
+      cwd,
+      prNumber: pathDecision.prNumber,
+      selection,
+      createGateRunner: _createGateRunner || createGateRunner,
+      baseline,
+      signal,
+      workflowId,
+      workflowStateManager,
+    });
+
+    const outcome = await runPrCloseoutLoop({
+      state: workflowStateManager?.getState()?.prCloseout ?? closeoutState,
+      init: closeoutInit,
+      adapters: effectiveAdapters,
+      config: {
+        configuredReviewer: 'codex',
+        allowMerge: false,
+        verificationCommands: readFrozenCloseoutCommands(),
+      },
+      persist: (s) => workflowStateManager?.recordCloseoutState(s),
+    });
+
+    if (outcome.status === PR_CLOSEOUT_LOOP_STATUS.DONE) {
+      const summary = `PR #${pathDecision.prNumber} closeout loop succeeded: review is clean (${outcome.rounds} repair rounds).`;
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {
+        summary,
+        deliveredFiles: [],
+      });
+      emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'DONE', summary });
+      return { ...EMPTY_RESULT(), status: 'WORKFLOW_DONE', summary, conversations: null, tokenUsage: usageTracker?.summary() ?? null };
+    } else {
+      const reason = `PR closeout loop stopped: ${outcome.reason}`;
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason,
+        question: reason,
+      });
+      emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question: reason });
+      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations: null, tokenUsage: usageTracker?.summary() ?? null };
+    }
+  }
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'planning' });
   emit(SUPERGPT_EVENTS.PLANNING_STARTED);

@@ -620,9 +620,12 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
         // 2. Header Task — ordinal is the real current-task position from the
         //    projection; show it as unknown rather than faking "Task 1".
         const taskObj = data.task || {};
-        const taskText = (taskObj.current && taskObj.total)
+        let taskText = (taskObj.current && taskObj.total)
           ? \`Task \${taskObj.current} / \${taskObj.total}\${taskObj.title ? ' — ' + taskObj.title : ''}\`
           : (taskObj.title || taskObj.taskId || '-');
+        if (data.prCloseout) {
+          taskText = \`Mode: PR CLOSEOUT | PR #\${data.prCloseout.prNumber || '-'}\`;
+        }
         document.getElementById('header-task').textContent = taskText;
 
         // Dismiss action: allowed only on HUMAN_REQUIRED or actionable FAILED
@@ -634,16 +637,32 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
 
         // 3. Grid Values
         document.getElementById('val-workflow-id').textContent = data.workflowId || '-';
-        document.getElementById('val-task').textContent = taskText;
-        document.getElementById('val-attempt').textContent = data.attempt || 1;
-        document.getElementById('val-stage').textContent = data.stage || '-';
+        document.getElementById('val-task').textContent = data.prCloseout
+          ? \`PR #\${data.prCloseout.prNumber} (Head: \${(data.prCloseout.prHead || data.prCloseout.reviewedPrHead || '-').slice(0, 7)})\`
+          : taskText;
+        document.getElementById('val-attempt').textContent = data.prCloseout
+          ? \`Round \${data.prCloseout.repairRounds || 0} / \${data.prCloseout.maxRepairRounds || 3}\`
+          : (data.attempt || 1);
+        document.getElementById('val-stage').textContent = data.prCloseout
+          ? \`PR Closeout (\${data.prCloseout.lastAction || 'TRIGGERED'})\`
+          : (data.stage || '-');
 
         // 4. Role Statuses
-        setTag('role-planner', data.stageStatuses?.planner || (data.taskTotal ? 'DONE' : 'WAITING'), data.stageStatuses?.planner || 'done');
-        setTag('role-supervisor', data.stageStatuses?.supervisor || (data.modelEscalated ? 'ESCALATED' : 'IDLE'), data.stageStatuses?.supervisor || 'idle');
-        setTag('role-executor', data.executor?.status || 'WAITING', data.executor?.status || 'waiting');
-        setTag('role-gate', data.gate?.status || 'WAITING', data.gate?.status || 'waiting');
-        setTag('role-reviewer', data.reviewer?.status || 'WAITING', data.reviewer?.status || 'waiting');
+        if (data.prCloseout) {
+          setTag('role-planner', 'BYPASSED', 'idle');
+          setTag('role-supervisor', data.prCloseout.escalated ? 'ESCALATED' : 'IDLE', data.prCloseout.escalated ? 'running' : 'idle');
+          setTag('role-executor', data.prCloseout.repairRounds > 0 ? \`REPAIR R\${data.prCloseout.repairRounds}\` : 'IDLE', data.prCloseout.repairRounds > 0 ? 'running' : 'idle');
+          setTag('role-gate', 'PASS', 'done');
+          const revName = (data.prCloseout.activeReviewer || data.prCloseout.prReviewer || data.prCloseout.configuredReviewer || 'codex').toUpperCase();
+          const revStatus = data.prCloseout.reviewedPrHead ? 'REVIEWED' : 'TRIGGERED';
+          setTag('role-reviewer', \`\${revName} (\${revStatus})\`, data.prCloseout.reviewedPrHead ? 'done' : 'running');
+        } else {
+          setTag('role-planner', data.stageStatuses?.planner || (data.taskTotal ? 'DONE' : 'WAITING'), data.stageStatuses?.planner || 'done');
+          setTag('role-supervisor', data.stageStatuses?.supervisor || (data.modelEscalated ? 'ESCALATED' : 'IDLE'), data.stageStatuses?.supervisor || 'idle');
+          setTag('role-executor', data.executor?.status || 'WAITING', data.executor?.status || 'waiting');
+          setTag('role-gate', data.gate?.status || 'WAITING', data.gate?.status || 'waiting');
+          setTag('role-reviewer', data.reviewer?.status || 'WAITING', data.reviewer?.status || 'waiting');
+        }
 
         // 5. Retries
         document.getElementById('val-normal-retry').textContent = \`\${data.normalAttempts || 0} / \${data.maxAttemptsPerTask || 3}\`;
