@@ -130,10 +130,102 @@ test('Reviewer HUMAN_REQUIRED and plan/history mismatch escalate', () => {
   assert.equal(mismatch.reason, 'plan_history_mismatch');
 });
 
+test('Reviewer OUT_OF_SCOPE closes the task and advances to the next planned task', () => {
+  const memory = new Map([['one', 'some prior signature']]);
+  const result = decideDeterministically({
+    context: ctx({
+      latestReviewResult: { task_id: 'one', decision: 'OUT_OF_SCOPE', required_changes: ['touch src/other.js'] },
+    }),
+    plannedTasks: tasks,
+    reworkMemory: memory,
+  });
+  assert.equal(result.handled, true);
+  assert.equal(result.decision.action, 'NEXT_TASK');
+  assert.equal(result.decision.task_card.task_id, 'one');
+  assert.equal(result.reason, 'review_out_of_scope_next_task');
+  // The closed task's rework memory is cleared, exactly as it is on PASS.
+  assert.equal(memory.has('one'), false);
+});
+
+test('an OUT_OF_SCOPE history entry counts as a completed task (queue advances past it)', () => {
+  const next = decideDeterministically({
+    context: ctx({
+      history: [{ task_id: 'one', decision: 'OUT_OF_SCOPE', attempts: 1 }],
+      latestReviewResult: { task_id: 'one', decision: 'OUT_OF_SCOPE', required_changes: ['x'] },
+    }),
+    plannedTasks: tasks,
+  });
+  assert.equal(next.decision.action, 'NEXT_TASK');
+  assert.equal(next.decision.task_card.task_id, 'two');
+
+  const done = decideDeterministically({
+    context: ctx({
+      history: [
+        { task_id: 'one', decision: 'OUT_OF_SCOPE', attempts: 1 },
+        { task_id: 'two', decision: 'PASS', attempts: 1 },
+      ],
+      latestReviewResult: { task_id: 'two', decision: 'PASS' },
+    }),
+    plannedTasks: tasks,
+    planSummary: 'shipped',
+  });
+  assert.equal(done.decision.action, 'WORKFLOW_DONE');
+});
+
+test('OUT_OF_SCOPE closure is honoured deterministically after a persistence reload (no re-execution)', () => {
+  // A checkpoint serialized and reloaded through persistence: the first task
+  // was closed OUT_OF_SCOPE before the crash. On resume the deterministic
+  // policy must advance past it, never re-select it, and reach DONE once the
+  // remaining task passes — with no Supervisor call.
+  const reloadedHistory = JSON.parse(JSON.stringify([
+    { task_id: 'one', decision: 'OUT_OF_SCOPE', attempts: 2, out_of_scope_changes: ['touch src/other.js'] },
+  ]));
+  const afterReload = decideDeterministically({
+    context: ctx({ history: reloadedHistory, latestReviewResult: null }),
+    plannedTasks: tasks,
+  });
+  assert.equal(afterReload.handled, true);
+  assert.equal(afterReload.decision.action, 'NEXT_TASK');
+  assert.equal(afterReload.decision.task_card.task_id, 'two', 'closed task is not re-selected');
+
+  const done = decideDeterministically({
+    context: ctx({
+      history: [...reloadedHistory, { task_id: 'two', decision: 'PASS', attempts: 1 }],
+      latestReviewResult: { task_id: 'two', decision: 'PASS' },
+    }),
+    plannedTasks: tasks,
+    planSummary: 'shipped',
+  });
+  assert.equal(done.decision.action, 'WORKFLOW_DONE');
+});
+
 test('materialized task preserves explicit acceptance criteria when Planner provides them', () => {
   const card = materializePlannedTask({
     ...tasks[0], acceptance_criteria: ['returns 200', 'rejects invalid input'], forbidden_files: ['src/secret.js'],
   }, { repositoryContext, workflowGoal: 'goal' });
   assert.deepEqual(card.acceptance_criteria, ['returns 200', 'rejects invalid input']);
   assert.deepEqual(card.forbidden_files, ['src/secret.js']);
+});
+
+test('deterministic closeout fast path: Gate PASS + Reviewer PASS + queue empty -> deterministic WORKFLOW_DONE without model calls', () => {
+  const context = ctx({
+    history: [
+      { task_id: 'one', decision: 'PASS', attempts: 1 },
+      { task_id: 'two', decision: 'PASS', attempts: 1 },
+    ],
+    latestReviewResult: {
+      task_id: 'two',
+      decision: 'PASS',
+      findings: ['Everything verified cleanly'],
+      required_changes: [],
+    },
+    plannedTasks: tasks,
+    planSummary: 'All tasks completed successfully',
+  });
+
+  const result = decideDeterministically({ context, plannedTasks: tasks });
+  assert.equal(result.handled, true);
+  assert.equal(result.reason, 'all_planned_tasks_passed');
+  assert.equal(result.decision.action, 'WORKFLOW_DONE');
+  assert.equal(result.decision.summary, 'All tasks completed successfully');
 });

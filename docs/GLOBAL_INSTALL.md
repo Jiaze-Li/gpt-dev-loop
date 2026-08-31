@@ -26,7 +26,7 @@ The installer preflights all three supported frontends before changing configura
 
 The only internal differences are configuration mechanics required by the clients:
 
-- AGY uses its global Gemini-compatible MCP/skill configuration directory;
+- AGY uses its global Gemini-compatible MCP/skill configuration directory and its auto-loaded `~/.gemini/GEMINI.md` rules file;
 - Claude registers `supergpt` at user scope through Claude Code's MCP CLI;
 - Codex registers `supergpt` in its global user MCP configuration through the Codex CLI.
 
@@ -68,9 +68,11 @@ After install/update, open a new Claude/Codex/AGY session so the client reloads 
 
 The installer:
 
-- generates AGY's installed skill from this exact file;
-- inserts this exact policy into the managed SuperGPT block of `~/.claude/CLAUDE.md`;
-- inserts this exact policy into the managed SuperGPT block of `~/.codex/AGENTS.md`.
+- inserts this exact policy into the managed SuperGPT block of `~/.claude/CLAUDE.md` (Claude's auto-loaded rules);
+- inserts this exact policy into the managed SuperGPT block of `~/.codex/AGENTS.md` (Codex's auto-loaded rules);
+- inserts this exact policy into the managed SuperGPT block of `~/.gemini/GEMINI.md` (AGY's auto-loaded rules), and also generates AGY's on-demand skill and MCP registration from the same file.
+
+All three auto-loaded rule targets are checked for content consistency against `agent-policy/COMMON.md`; a target file that exists but lacks the correct managed block counts as not installed.
 
 Unrelated personal instructions are preserved. Re-running installation replaces only the SuperGPT-managed content.
 

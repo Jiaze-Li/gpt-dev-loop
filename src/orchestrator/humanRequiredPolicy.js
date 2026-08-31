@@ -94,6 +94,23 @@ export function deriveSafeRecommendation({
     };
   }
 
+  // 3b. Executor ran an unauthorized environment probe (a command outside the
+  // Task Card's verification_commands) and hit its own security boundary. This
+  // is NOT an environment failure: the remedy is to confirm the approved
+  // verification_commands and resume, not to run host verification.
+  if (blockerCategory === 'EXECUTOR_UNAUTHORIZED_PROBE') {
+    return {
+      actionCode: HUMAN_REQUIRED_ACTION_CODES.PROVIDE_GUIDANCE_AND_RESUME,
+      recommendedAction:
+        'The Executor was denied permission for commands outside the Task Card verification_commands. Confirm the approved verification_commands are correct, then resume.',
+      availableChoices: [
+        'Confirm verification_commands and resume',
+        'Modify task verification_commands and resume',
+        'Stop workflow',
+      ],
+    };
+  }
+
   // 4. Verification / Toolchain / Permission blocker on Gate commands -> RUN_HOST_VERIFICATION
   if (
     isVerificationOrToolchainBlocker ||

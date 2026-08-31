@@ -7,11 +7,21 @@ import os from "node:os";
 import {
   runPreflight,
   checkExecutable,
+  extractExecutablesFromCommand,
   scanAndSnapshotExternalSymlinks,
   buildHumanRequiredEvidence,
   FAILURE_CATEGORIES,
   PREFLIGHT_BLOCKER_TYPES,
 } from "../src/orchestrator/preflight.js";
+
+test("extractExecutablesFromCommand handles quoted strings and inline scripts with semicolons", () => {
+  const inlineNode = `node -e "const fs=require('node:fs'); const p='tmp/supergpt-e2e-a.txt'; if(fs.readFileSync(p,'utf8')!=='PROMPT-A-DONE\\n') process.exit(1)"`;
+  const exes = extractExecutablesFromCommand(inlineNode);
+  assert.deepEqual(exes, ['node']);
+
+  const chained = `test -f tmp/supergpt-e2e-a.txt && grep -q "PROMPT-A-DONE" tmp/supergpt-e2e-a.txt`;
+  assert.deepEqual(extractExecutablesFromCommand(chained), ['grep']);
+});
 
 test("checkExecutable passes for existing system binary and fails for nonexistent", async () => {
   const nodeCheck = await checkExecutable("node");

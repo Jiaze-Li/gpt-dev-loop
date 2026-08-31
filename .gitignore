@@ -33,3 +33,4 @@ state.local.json
 
 # Test output
 work/
+tmp/

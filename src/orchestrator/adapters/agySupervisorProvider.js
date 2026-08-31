@@ -39,13 +39,14 @@ import { AGY_SUPERVISOR_DEFAULT_MODEL } from '../../agy/agyConfig.js';
 import { parseTaskCard, REQUIRED_FIELDS } from '../taskCard.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
 
-const ACTIONS = new Set(['NEXT_TASK', 'CONTINUE_REWORK', 'WORKFLOW_DONE', 'HUMAN_REQUIRED']);
+const ACTIONS = new Set(['NEXT_TASK', 'CONTINUE_REWORK', 'WORKFLOW_DONE', 'HUMAN_REQUIRED', 'OUT_OF_SCOPE']);
 const SCALAR_TASK_FIELDS = ['task_id', 'goal', 'context', 'scope', 'completion_signal'];
 const LIST_TASK_FIELDS = ['allowed_files', 'forbidden_files', 'acceptance_criteria', 'verification_commands'];
 
 function invalid(message) {
   return new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT, message);
 }
+
 
 function renderRepositoryContext(ctx) {
   const c = ctx ?? {};
@@ -68,6 +69,22 @@ function renderHistory(history) {
     .join('\n');
 }
 
+function cleanRationale(rationale) {
+  if (!rationale || typeof rationale !== 'string') return '';
+  return rationale
+    .split('\n')
+    .filter((line) => {
+      // Drop internal node test runner frames and async hooks
+      if (/^\s*at\s+(?:TestContext|Test\.run|Test\.start|startSubtest|processTicksAndRejections|node:internal|node:async_hooks)/.test(line)) {
+        return false;
+      }
+      return true;
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function renderReviewResult(reviewResult) {
   if (!reviewResult) return 'none';
   if (reviewResult.decision === 'PASS') {
@@ -76,10 +93,11 @@ function renderReviewResult(reviewResult) {
   const changes = Array.isArray(reviewResult.required_changes)
     ? reviewResult.required_changes.map((c) => `- ${c}`).join('\n')
     : String(reviewResult.required_changes ?? 'none');
+  const cleanedRationale = cleanRationale(reviewResult.rationale);
   return `decision: ${reviewResult.decision}
 task_id: ${reviewResult.task_id ?? 'current'}
 required_changes:
-${changes}${reviewResult.rationale ? `\nrationale: ${reviewResult.rationale}` : ''}`;
+${changes}${cleanedRationale ? `\nrationale: ${cleanedRationale}` : ''}`;
 }
 
 function renderCheckpoint(checkpoint) {
@@ -216,11 +234,25 @@ ${tc.completion_signal}`;
 export function parseSupervisorJson(obj) {
   const action = obj.action;
   if (!ACTIONS.has(action)) {
-    throw invalid(`supervisor JSON "action" must be one of NEXT_TASK, CONTINUE_REWORK, WORKFLOW_DONE, HUMAN_REQUIRED — got: ${JSON.stringify(action)}`);
+    throw invalid(`supervisor JSON "action" must be one of NEXT_TASK, CONTINUE_REWORK, WORKFLOW_DONE, HUMAN_REQUIRED, OUT_OF_SCOPE — got: ${JSON.stringify(action)}`);
   }
 
   if (action === 'CONTINUE_REWORK') {
-    return { action };
+    const res = { action };
+    if (isNonEmptyString(obj.guidance)) res.guidance = obj.guidance.trim();
+    if (isNonEmptyString(obj.repair_guidance)) res.repair_guidance = obj.repair_guidance.trim();
+    if (isNonEmptyString(obj.strategy)) res.strategy = obj.strategy.trim();
+    if (isNonEmptyString(obj.executor_model)) res.executor_model = obj.executor_model.trim();
+    if (isNonEmptyString(obj.model)) res.model = obj.model.trim();
+    if (isNonEmptyString(obj.provider)) res.provider = obj.provider.trim();
+    return res;
+  }
+
+  if (action === 'OUT_OF_SCOPE') {
+    return {
+      action: 'OUT_OF_SCOPE',
+      reason: isNonEmptyString(obj.reason) ? obj.reason.trim() : 'Supervisor judged finding as OUT_OF_SCOPE',
+    };
   }
   if (action === 'WORKFLOW_DONE') {
     if (!isNonEmptyString(obj.summary)) throw invalid('WORKFLOW_DONE decision must include a non-empty "summary"');
@@ -242,6 +274,7 @@ export function parseSupervisorJson(obj) {
   }
   return { action, task_card: taskCard };
 }
+
 
 function mapAgyError(err, model) {
   const isTimeout = err instanceof AgyTimeoutError;

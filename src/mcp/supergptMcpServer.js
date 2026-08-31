@@ -35,6 +35,7 @@ import {
   supergptVerify,
   supergptFormatProgress,
   toCanonicalProgress,
+  SUPERGPT_WATCH_TIMEOUT_MS,
 } from '../orchestrator/supergpt.js';
 import { SUPERGPT_WORKTREE_ROOT } from '../orchestrator/workflowWorktree.js';
 import { validateWorkflowId } from '../orchestrator/workflowId.js';
@@ -42,7 +43,9 @@ import { resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import { compileSuperGptRequest } from '../control/requestCompiler.js';
+import { supergptRoute as defaultSupergptRoute } from '../control/autoRoutePolicy.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from '../orchestrator/runtimeIdentity.js';
+import { ensureDashboardOpen as defaultEnsureDashboardOpen } from '../dashboard/launcher.js';
 
 const WORKSPACE_METADATA_SUFFIX = '.workspace.json';
 
@@ -119,6 +122,8 @@ export async function readWorkflowStatus({
       runtimeCheck,
       status: live?.workflowStatus ?? 'UNKNOWN',
       stage: live?.stage ?? 'UNKNOWN',
+      path: live?.workflowPath ?? meta?.workflow_path ?? null,
+      pathSelectionReason: live?.pathSelectionReason ?? meta?.path_selection?.reason ?? null,
       taskIndex: live?.taskIndex ?? null,
       taskTotal: live?.taskTotal ?? null,
       taskId: live?.taskId ?? null,
@@ -156,10 +161,41 @@ export function createSuperGptMcpServer({
   watchSuperGptFn = supergptWatch,
   resolveWorkflowPlanFn = resolveWorkflowPlan,
   readWorkflowStatusFn = readWorkflowStatus,
+  supergptRouteFn = defaultSupergptRoute,
+  ensureDashboardOpenFn = defaultEnsureDashboardOpen,
   callAgy = defaultCallAgy,
   cwd = process.cwd(),
 } = {}) {
   const server = new McpServer({ name: 'supergpt', version: '1.0.0' });
+
+  server.registerTool(
+    'supergpt_route',
+    {
+      description:
+        'Authoritative deterministic router deciding whether a request should be handled DIRECT by the front agent or delegated to SUPERGPT. Consumes 0 model tokens.',
+      inputSchema: {
+        goal: z.string().min(1).describe('natural-language user request'),
+        cwd: z.string().optional().describe('invocation workspace (default: server cwd)'),
+      },
+      outputSchema: {
+        decision: z.enum(['DIRECT', 'SUPERGPT']),
+        rule: z.string(),
+        reason: z.string(),
+      },
+    },
+    async ({ goal, cwd: requestCwd }) => {
+      const result = supergptRouteFn({ goal, cwd: requestCwd ? path.resolve(requestCwd) : cwd });
+      const structured = {
+        decision: result.decision,
+        rule: result.rule,
+        reason: result.reason,
+      };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+        structuredContent: structured,
+      };
+    },
+  );
 
   server.registerTool(
     'supergpt_prepare',
@@ -244,6 +280,7 @@ export function createSuperGptMcpServer({
       reason: result.reason ?? null,
       question: result.question ?? null,
       tokenUsage: result.tokenUsage ?? null,
+      path: result.path ?? null,
       events,
     };
     return {
@@ -271,6 +308,7 @@ export function createSuperGptMcpServer({
         reason: z.string().nullable(),
         question: z.string().nullable(),
         tokenUsage: z.record(z.string(), z.any()).nullable().optional(),
+        path: z.string().nullable().optional(),
         events: z.array(z.record(z.string(), z.any())),
       },
     },
@@ -284,6 +322,7 @@ export function createSuperGptMcpServer({
       inputSchema: {
         goal: z.string().min(1).optional().describe('natural-language instruction'),
         planPath: z.string().min(1).optional().describe('path to an existing plan file'),
+        supersedesWorkflowId: z.string().optional().describe('optional prior workflowId to explicitly supersede when retrying/rerunning the same task'),
         cwd: z.string().optional().describe('invocation workspace (default: server cwd)'),
       },
       outputSchema: {
@@ -291,15 +330,49 @@ export function createSuperGptMcpServer({
         workflowId: z.string().nullable(),
       },
     },
-    async ({ goal, planPath, cwd: runCwd }) => {
+    async ({ goal, planPath, supersedesWorkflowId, cwd: runCwd }) => {
       if (!goal && !planPath) throw new Error('supergpt_start requires either "goal" or "planPath"');
       const started = startSuperGptFn({
         goal,
         planPath,
+        supersedesWorkflowId,
         cwd: runCwd ? path.resolve(runCwd) : cwd,
       });
+      // Fire-and-forget background dashboard ensure & browser open
+      if (started?.workflowId) {
+        Promise.resolve(ensureDashboardOpenFn({ workflowId: started.workflowId })).catch(() => {});
+      }
       const structured = { status: 'RUNNING', workflowId: started.workflowId };
       return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
+    },
+  );
+
+  server.registerTool(
+    'supergpt_dashboard_open',
+    {
+      description:
+        'Ensure the local zero-token read-only SuperGPT dashboard is running on 127.0.0.1:4317 and open the workflow view in the system browser. Consumes 0 model tokens.',
+      inputSchema: {
+        workflowId: workflowIdArg('workflow id to open'),
+        port: z.number().optional().describe('dashboard port (default: 4317)'),
+      },
+      outputSchema: {
+        opened: z.boolean(),
+        url: z.string(),
+        serverStarted: z.boolean(),
+      },
+    },
+    async ({ workflowId, port = 4317 }) => {
+      const res = await ensureDashboardOpenFn({ workflowId, port });
+      const structured = {
+        opened: Boolean(res?.opened),
+        url: res?.url || `http://127.0.0.1:${port}/workflow/${encodeURIComponent(workflowId)}`,
+        serverStarted: Boolean(res?.serverStarted),
+      };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+        structuredContent: structured,
+      };
     },
   );
 
@@ -339,6 +412,7 @@ export function createSuperGptMcpServer({
         workflowId: z.string(),
         status: z.string(),
         stage: z.string(),
+        path: z.string().nullable().optional(),
         formattedProgress: z.string(),
         evidence: z.record(z.string(), z.any()).nullable().optional(),
       },
@@ -353,6 +427,7 @@ export function createSuperGptMcpServer({
         workflowId,
         status: state.workflowStatus,
         stage: state.stage,
+        path: state.workflowPath ?? null,
         formattedProgress: renderGenericProgress(toCanonicalProgress(state) || state),
         evidence: state.evidence ?? null,
       };
@@ -371,12 +446,13 @@ export function createSuperGptMcpServer({
       inputSchema: {
         workflowId: workflowIdArg('workflow id to watch'),
         intervalMs: z.number().optional().describe('refresh interval in milliseconds (default: 1000)'),
-        timeoutMs: z.number().optional().describe('optional maximum milliseconds to watch before returning (default: runs until terminal or cancelled)'),
+        timeoutMs: z.number().optional().describe(`optional maximum milliseconds to watch before returning (default: ${SUPERGPT_WATCH_TIMEOUT_MS})`),
       },
       outputSchema: {
         workflowId: z.string(),
         status: z.string(),
         stage: z.string(),
+        path: z.string().nullable().optional(),
         formattedProgress: z.string(),
         summary: z.string().nullable().optional(),
         reason: z.string().nullable().optional(),
@@ -389,7 +465,7 @@ export function createSuperGptMcpServer({
         cancelled: z.boolean().optional(),
       },
     },
-    async ({ workflowId, intervalMs = 1000, timeoutMs }, extra) => {
+    async ({ workflowId, intervalMs = 1000, timeoutMs = SUPERGPT_WATCH_TIMEOUT_MS }, extra) => {
       const progressToken = extra?._meta?.progressToken;
       const structured = await watchSuperGptFn({
         workflowId,
@@ -441,6 +517,7 @@ export function createSuperGptMcpServer({
         reason: z.string().nullable(),
         question: z.string().nullable(),
         tokenUsage: z.record(z.string(), z.any()).nullable().optional(),
+        path: z.string().nullable().optional(),
         events: z.array(z.record(z.string(), z.any())),
       },
     },
@@ -460,6 +537,7 @@ export function createSuperGptMcpServer({
         reason: result.reason ?? null,
         question: result.question ?? null,
         tokenUsage: result.tokenUsage ?? null,
+        path: result.path ?? null,
         events,
       };
       return {

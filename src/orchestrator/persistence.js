@@ -50,6 +50,21 @@ export class Persistence {
     await writeFile(path.join(dir, 'workflow.json'), JSON.stringify(state, null, 2), 'utf8');
   }
 
+  // Shallow read-modify-write merge of the workflow-scoped snapshot. Used to
+  // persist PR Closeout reviewer selection / fallback progress / repair-round
+  // budget without clobbering unrelated workflow state. On process restart the
+  // merged snapshot is what prevents re-triggering a pending reviewer/head or
+  // switching an already-locked reviewer.
+  async updateWorkflowState(workflowId, patch) {
+    if (typeof workflowId !== 'string' || workflowId === '') {
+      throw new Error('updateWorkflowState requires a non-empty workflowId');
+    }
+    const current = (await this.readWorkflowState(workflowId)) ?? {};
+    const next = { ...current, ...(patch ?? {}) };
+    await this.writeWorkflowState(workflowId, next);
+    return next;
+  }
+
   async readWorkflowState(workflowId) {
     try {
       const raw = await readFile(path.join(this.workflowDir(workflowId), 'workflow.json'), 'utf8');

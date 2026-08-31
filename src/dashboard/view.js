@@ -1,0 +1,711 @@
+// Dashboard HTML UI Template for SuperGPT Local Dashboard.
+// Single-page, zero heavy frameworks, clean GitHub-inspired light theme.
+
+// Home page polls /api/workflows on this cadence. Zero model tokens, no Core
+// state-machine dependency -- it is a plain GET against the read-only server.
+export const DASHBOARD_POLL_INTERVAL_MS = 1000;
+
+// Stable current-workflow selection rule shared by the server-rendered page and
+// this module's tests (injected verbatim into the client via toString()).
+//
+// Inputs:
+//   currentId    - the workflow currently being viewed ('' if none yet)
+//   lastKnownId  - the most recent workflow that was actually available
+//   workflows    - list from /api/workflows (workflowId, kind, status, badge, startedAt, requiresAttention)
+//
+// Rules:
+//   - An active selection (currentId or lastKnownId still in list) NEVER auto-switches.
+//     Whether it is RUNNING, STARTING, HUMAN_REQUIRED, or DONE/FAILED/STOPPED (terminal),
+//     it remains pinned to that workflow until the human manually chooses another or
+//     an explicit new workflow URL is opened.
+//   - No preemption: newer RUNNING workflows and internal test workflows never steal focus.
+//   - Initial auto-selection (no current selection): prioritizes Attention USER workflows
+//     (unresolved HUMAN_REQUIRED first, then newest RUNNING/STARTING), falls back to
+//     newest USER workflow, then to the first entry.
+export function chooseWorkflow({ currentId = '', lastKnownId = '', workflows = [] } = {}) {
+  const list = Array.isArray(workflows) ? workflows : [];
+  const isTestId = (id) => /^(?:wf-)?(?:agy-)?test[-_]|^test[-_]/i.test(String(id || ''));
+  const isUserWorkflow = (w) => (w && w.kind ? w.kind === 'USER' : !isTestId(w?.workflowId));
+  const isAttention = (w) => {
+    if (!isUserWorkflow(w)) return false;
+    if (w.requiresAttention === true) return true;
+    const key = String((w && w.badge && w.badge.key) || (w && w.status) || '').toUpperCase();
+    return key === 'RUNNING' || key === 'STARTING' || key === 'HUMAN_REQUIRED';
+  };
+  const isHR = (w) => {
+    const key = String((w && w.badge && w.badge.key) || (w && w.status) || '').toUpperCase();
+    return key === 'HUMAN_REQUIRED';
+  };
+  const startedMs = (w) => (w && w.startedAt ? new Date(w.startedAt).getTime() : 0);
+
+  // 1. If current selection exists in the list, KEEP IT.
+  // Pinned/selected workflow stays put while RUNNING and remains on its final result when DONE.
+  const current = list.find((w) => w.workflowId === currentId) || null;
+  if (current) {
+    return current.workflowId;
+  }
+
+  // 2. If lastKnownId exists in the list, stay on it.
+  const lastKnown = list.find((w) => w.workflowId === lastKnownId) || null;
+  if (lastKnown) {
+    return lastKnown.workflowId;
+  }
+
+  // 3. No current selection: prioritize Attention USER workflows (HUMAN_REQUIRED first, then newest RUNNING/STARTING).
+  const userWorkflows = list.filter(isUserWorkflow);
+  const attentionCandidates = userWorkflows.filter(isAttention);
+  if (attentionCandidates.length > 0) {
+    const hr = attentionCandidates.filter(isHR).sort((a, b) => startedMs(b) - startedMs(a));
+    if (hr.length > 0) return hr[0].workflowId;
+    const running = attentionCandidates.sort((a, b) => startedMs(b) - startedMs(a));
+    return running[0].workflowId;
+  }
+
+  const sortedCandidates = [...userWorkflows].sort((a, b) => startedMs(b) - startedMs(a));
+  if (sortedCandidates.length > 0) {
+    return sortedCandidates[0].workflowId;
+  }
+
+  return currentId || (list[0] && list[0].workflowId) || '';
+}
+
+export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SuperGPT Local Dashboard</title>
+  <style>
+    :root {
+      --bg: #f6f8fa;
+      --card-bg: #ffffff;
+      --card-border: #d0d7de;
+      --text: #24292f;
+      --text-bright: #1f2328;
+      --text-muted: #57606a;
+      --accent: #0969da;
+      --success: #1a7f37;
+      --warning: #9a6700;
+      --danger: #cf222e;
+      --idle: #6e7781;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      line-height: 1.5;
+      padding: 20px;
+      min-height: 100vh;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 24px;
+      gap: 12px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      font-weight: 700;
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 0.9rem;
+      letter-spacing: 0.5px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .badge-RUNNING { background: #ddf4ff; color: #0969da; border: 1px solid #54aeff; }
+    .badge-STARTING { background: #ddf4ff; color: #0969da; border: 1px solid #54aeff; }
+    .badge-DONE { background: #dafbe1; color: #1a7f37; border: 1px solid #4ac26b; }
+    .badge-HUMAN_REQUIRED { background: #fff8c5; color: #9a6700; border: 1px solid #d4a72c; }
+    .badge-FAILED { background: #ffebe9; color: #cf222e; border: 1px solid #ff8182; }
+    .badge-STOPPED { background: #f6f8fa; color: #57606a; border: 1px solid #d0d7de; }
+    .badge-SUPERSEDED { background: #f6f8fa; color: #57606a; border: 1px solid #d0d7de; }
+    .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    select {
+      background: var(--card-bg);
+      color: var(--text-bright);
+      border: 1px solid var(--card-border);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      outline: none;
+      cursor: pointer;
+    }
+    .btn-toggle {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      color: var(--text-muted);
+      font-weight: 600;
+      transition: all 0.15s ease;
+    }
+    .btn-toggle:hover {
+      border-color: var(--text-muted);
+    }
+    .btn-toggle.active {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: #ddf4ff;
+    }
+    .summary-counts {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      font-weight: 600;
+      display: inline-flex;
+      gap: 12px;
+      margin-left: 8px;
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--success);
+      display: inline-block;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(26, 127, 55, 0.7); }
+      70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(26, 127, 55, 0); }
+      100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(26, 127, 55, 0); }
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 1px 3px rgba(31, 35, 40, 0.05);
+    }
+    .card-title {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-muted);
+      margin-bottom: 12px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+    }
+    .prop-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      padding: 6px 0;
+      border-bottom: 1px solid #eaeef2;
+      font-size: 0.9rem;
+    }
+    .prop-row:last-child { border-bottom: none; }
+    .prop-key { color: var(--text-muted); }
+    .prop-val { font-weight: 600; color: var(--text-bright); text-align: right; word-break: break-all; }
+    .tag {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      border: 1px solid transparent;
+    }
+    .tag-waiting { background: #f6f8fa; color: #57606a; border-color: #d0d7de; }
+    .tag-running { background: #ddf4ff; color: #0969da; border-color: #54aeff; }
+    .tag-done, .tag-pass { background: #dafbe1; color: #1a7f37; border-color: #4ac26b; }
+    .tag-fail, .tag-rework { background: #ffebe9; color: #cf222e; border-color: #ff8182; }
+    .tag-idle { background: #f6f8fa; color: #57606a; border-color: #d0d7de; }
+    
+    .timeline-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 20px;
+      box-shadow: 0 1px 3px rgba(31, 35, 40, 0.05);
+    }
+    .timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .timeline-item {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      position: relative;
+      padding-left: 20px;
+    }
+    .timeline-item::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 6px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+    .timeline-item.pass::before { background: var(--success); }
+    .timeline-item.fail::before, .timeline-item.rework::before { background: var(--danger); }
+    .timeline-item.escalation::before { background: var(--warning); }
+    .time-col {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      min-width: 75px;
+      font-weight: 500;
+    }
+    .content-col { flex: 1; font-size: 0.9rem; }
+    .content-label { color: var(--text-bright); font-weight: 600; }
+    .content-detail { color: var(--text-muted); font-size: 0.8rem; margin-top: 2px; }
+    .empty-state { text-align: center; color: var(--text-muted); padding: 40px 0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <span class="badge badge-STARTING" id="status-badge">SUPERGPT ⟳ STARTING</span>
+        <span style="font-size: 0.9rem; color: var(--text-muted); font-weight: 500;" id="header-task">-</span>
+        <div class="summary-counts" id="summary-counts">
+          <span>Running <strong id="cnt-running" style="color: var(--accent);">0</strong></span>
+          <span>Needs attention <strong id="cnt-attention" style="color: var(--warning);">0</strong></span>
+        </div>
+      </div>
+      <div class="controls">
+        <span class="pulse-dot" title="Live Polling (1s)"></span>
+        <select id="workflow-select" onchange="onSelectWorkflow(this.value)">
+          <option value="">Loading workflows...</option>
+        </select>
+        <button id="btn-dismiss" class="btn-toggle" style="display: none; color: #cf222e; border-color: #ff8182;" onclick="dismissCurrentWorkflow()">Dismiss</button>
+        <button id="btn-history" class="btn-toggle" onclick="toggleHistory()">History</button>
+        <label style="font-size: 0.8rem; color: var(--text-muted); display: inline-flex; align-items: center; gap: 4px; cursor: pointer;">
+          <input type="checkbox" id="chk-test" onchange="toggleTestWorkflows(this.checked)"> Show test
+        </label>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- 1. Task Card Overview -->
+      <div class="card">
+        <div class="card-title">Workflow &amp; Task</div>
+        <div class="prop-row">
+          <span class="prop-key">Workflow</span>
+          <span class="prop-val" id="val-workflow-id">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Task</span>
+          <span class="prop-val" id="val-task">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Attempt</span>
+          <span class="prop-val" id="val-attempt">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Stage</span>
+          <span class="prop-val" id="val-stage">-</span>
+        </div>
+      </div>
+
+      <!-- 2. Role Statuses -->
+      <div class="card">
+        <div class="card-title">Role Statuses</div>
+        <div class="prop-row">
+          <span class="prop-key">Planner</span>
+          <span class="prop-val"><span class="tag tag-idle" id="role-planner">-</span></span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Supervisor</span>
+          <span class="prop-val"><span class="tag tag-idle" id="role-supervisor">-</span></span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Executor</span>
+          <span class="prop-val"><span class="tag tag-idle" id="role-executor">-</span></span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Gate</span>
+          <span class="prop-val"><span class="tag tag-idle" id="role-gate">-</span></span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Reviewer</span>
+          <span class="prop-val"><span class="tag tag-idle" id="role-reviewer">-</span></span>
+        </div>
+      </div>
+
+      <!-- 3. Retries & Escalation -->
+      <div class="card">
+        <div class="card-title">Retry &amp; Escalation</div>
+        <div class="prop-row">
+          <span class="prop-key">Normal retry</span>
+          <span class="prop-val" id="val-normal-retry">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Escalation retry</span>
+          <span class="prop-val" id="val-escalation-retry">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Escalation active</span>
+          <span class="prop-val" id="val-escalation-active">No</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Terminal</span>
+          <span class="prop-val" id="val-terminal">-</span>
+        </div>
+      </div>
+
+      <!-- 4. Timing & Heartbeat -->
+      <div class="card">
+        <div class="card-title">Activity &amp; Timing</div>
+        <div class="prop-row">
+          <span class="prop-key">Elapsed</span>
+          <span class="prop-val" id="val-elapsed">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Heartbeat</span>
+          <span class="prop-val" id="val-heartbeat">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Last progress</span>
+          <span class="prop-val" id="val-progress">-</span>
+        </div>
+        <div class="prop-row">
+          <span class="prop-key">Last activity</span>
+          <span class="prop-val" id="val-activity">-</span>
+        </div>
+      </div>
+
+      <!-- 5. Execution & Usage -->
+      <div class="card" style="grid-column: 1 / -1;">
+        <div class="card-title">Execution &amp; Token Breakdown</div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+          <div>
+            <div class="prop-row"><span class="prop-key">Provider</span><span class="prop-val" id="val-provider">-</span></div>
+            <div class="prop-row"><span class="prop-key">Model</span><span class="prop-val" id="val-model">-</span></div>
+          </div>
+          <div>
+            <div class="prop-row"><span class="prop-key">Planner Tokens</span><span class="prop-val" id="tok-planner">0</span></div>
+            <div class="prop-row"><span class="prop-key">Supervisor Tokens</span><span class="prop-val" id="tok-supervisor">0</span></div>
+          </div>
+          <div>
+            <div class="prop-row"><span class="prop-key">Reviewer Tokens</span><span class="prop-val" id="tok-reviewer">0</span></div>
+            <div class="prop-row"><span class="prop-key">Total Tokens</span><span class="prop-val" style="color: var(--accent); font-weight:700;" id="tok-total">0</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Timeline -->
+    <div class="timeline-card">
+      <div class="card-title">Workflow Timeline</div>
+      <div class="timeline" id="timeline-container">
+        <div class="empty-state">No events recorded yet.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let currentWorkflowId = '${initialWorkflowId}';
+    let lastKnownWorkflowId = currentWorkflowId;
+    let lastSeenServerFocusId = '';
+    let knownWorkflows = [];
+    let showHistory = false;
+    let showTest = false;
+    const POLL_INTERVAL_MS = ${DASHBOARD_POLL_INTERVAL_MS};
+
+    ${chooseWorkflow.toString()}
+
+    function formatTime(iso) {
+      if (!iso) return '-';
+      try {
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return iso;
+        return d.toTimeString().split(' ')[0];
+      } catch { return iso; }
+    }
+
+    function setTag(elId, text, type) {
+      const el = document.getElementById(elId);
+      if (!el) return;
+      el.textContent = text || '-';
+      el.className = 'tag tag-' + (type || 'idle').toLowerCase();
+    }
+
+    function toggleHistory() {
+      showHistory = !showHistory;
+      const btn = document.getElementById('btn-history');
+      if (btn) {
+        btn.className = showHistory ? 'btn-toggle active' : 'btn-toggle';
+        btn.textContent = showHistory ? 'Attention Only' : 'History';
+      }
+      fetchWorkflowList();
+    }
+
+    function toggleTestWorkflows(checked) {
+      showTest = Boolean(checked);
+      fetchWorkflowList();
+    }
+
+    async function dismissCurrentWorkflow() {
+      if (!currentWorkflowId) return;
+      try {
+        const res = await fetch('/api/workflows/' + encodeURIComponent(currentWorkflowId) + '/dismiss', { method: 'POST' });
+        if (res.ok) {
+          fetchWorkflowList();
+          updateWorkflowDetail();
+        }
+      } catch (err) {}
+    }
+
+    async function fetchWorkflowList() {
+      try {
+        const params = new URLSearchParams();
+        if (showTest) params.set('test', '1');
+        if (showHistory) params.set('all', '1');
+        const res = await fetch('/api/workflows' + (params.toString() ? '?' + params.toString() : ''));
+        if (!res.ok) return;
+        const list = await res.json();
+        knownWorkflows = list;
+
+        const runningCount = res.headers.get('X-SuperGPT-Running-Count');
+        const attentionCount = res.headers.get('X-SuperGPT-Attention-Count');
+        if (runningCount != null) {
+          const el = document.getElementById('cnt-running');
+          if (el) el.textContent = runningCount;
+        }
+        if (attentionCount != null) {
+          const el = document.getElementById('cnt-attention');
+          if (el) el.textContent = attentionCount;
+        }
+
+        const serverFocusId = res.headers.get('X-SuperGPT-Focus') || (list.find(w => w.isFocused)?.workflowId) || '';
+        let changed = false;
+
+        // When a new user prompt explicitly starts a new USER workflow, the server focus changes.
+        // In that event, update focus to the new workflow in this same tab.
+        if (serverFocusId && lastSeenServerFocusId && serverFocusId !== lastSeenServerFocusId) {
+          lastSeenServerFocusId = serverFocusId;
+          changed = (serverFocusId !== currentWorkflowId);
+          currentWorkflowId = serverFocusId;
+          lastKnownWorkflowId = serverFocusId;
+        } else {
+          if (!lastSeenServerFocusId && serverFocusId) {
+            lastSeenServerFocusId = serverFocusId;
+            if (!currentWorkflowId) {
+              currentWorkflowId = serverFocusId;
+              lastKnownWorkflowId = serverFocusId;
+              changed = true;
+            }
+          }
+          const nextId = chooseWorkflow({
+            currentId: currentWorkflowId,
+            lastKnownId: lastKnownWorkflowId,
+            workflows: list,
+          });
+          if (nextId && nextId !== currentWorkflowId) {
+            currentWorkflowId = nextId;
+            changed = true;
+          }
+        }
+
+        if (currentWorkflowId && list.some(w => w.workflowId === currentWorkflowId)) {
+          lastKnownWorkflowId = currentWorkflowId;
+        }
+
+        const select = document.getElementById('workflow-select');
+        select.innerHTML = '';
+
+        const attentionItems = list.filter(w => w.requiresAttention);
+        const historyItems = list.filter(w => !w.requiresAttention);
+
+        if (showHistory) {
+          if (attentionItems.length > 0) {
+            const grpAtt = document.createElement('optgroup');
+            grpAtt.label = 'Attention (' + attentionItems.length + ')';
+            attentionItems.forEach(w => {
+              const opt = document.createElement('option');
+              opt.value = w.workflowId;
+              const badgeKey = (w.badge && w.badge.key) || w.status;
+              opt.textContent = '[' + badgeKey + '] ' + w.workflowId.slice(0, 18) + '... (' + (w.elapsed || '00:00') + ')';
+              if (w.workflowId === currentWorkflowId) opt.selected = true;
+              grpAtt.appendChild(opt);
+            });
+            select.appendChild(grpAtt);
+          }
+          if (historyItems.length > 0) {
+            const grpHist = document.createElement('optgroup');
+            grpHist.label = 'History (' + historyItems.length + ')';
+            historyItems.forEach(w => {
+              const opt = document.createElement('option');
+              opt.value = w.workflowId;
+              const badgeKey = (w.badge && w.badge.key) || w.status;
+              opt.textContent = '[' + badgeKey + '] ' + w.workflowId.slice(0, 18) + '... (' + (w.elapsed || '00:00') + ')';
+              if (w.workflowId === currentWorkflowId) opt.selected = true;
+              grpHist.appendChild(opt);
+            });
+            select.appendChild(grpHist);
+          }
+          if (select.children.length === 0) {
+            select.innerHTML = '<option value="">No workflows found</option>';
+          }
+        } else {
+          // Attention-only view
+          if (attentionItems.length === 0 && !currentWorkflowId) {
+            select.innerHTML = '<option value="">No active workflows</option>';
+          } else {
+            attentionItems.forEach(w => {
+              const opt = document.createElement('option');
+              opt.value = w.workflowId;
+              const badgeKey = (w.badge && w.badge.key) || w.status;
+              opt.textContent = '[' + badgeKey + '] ' + w.workflowId.slice(0, 18) + '... (' + (w.elapsed || '00:00') + ')';
+              if (w.workflowId === currentWorkflowId) opt.selected = true;
+              select.appendChild(opt);
+            });
+
+            // If user is currently looking at a finished/history workflow X, keep X in the dropdown so selection isn't lost
+            if (currentWorkflowId && !attentionItems.some(w => w.workflowId === currentWorkflowId)) {
+              const curHist = historyItems.find(w => w.workflowId === currentWorkflowId);
+              const opt = document.createElement('option');
+              opt.value = currentWorkflowId;
+              const badgeKey = (curHist && curHist.badge && curHist.badge.key) || (curHist && curHist.status) || 'CURRENT';
+              opt.textContent = '[' + badgeKey + '] ' + currentWorkflowId.slice(0, 18) + '... (Current)';
+              opt.selected = true;
+              select.appendChild(opt);
+            }
+          }
+        }
+
+        if (currentWorkflowId) {
+          select.value = currentWorkflowId;
+        }
+
+        if (changed) {
+          window.history.replaceState(null, '', '/workflow/' + encodeURIComponent(currentWorkflowId));
+          updateWorkflowDetail();
+        }
+      } catch (err) {}
+    }
+
+    async function updateWorkflowDetail() {
+      if (!currentWorkflowId) return;
+      try {
+        const res = await fetch('/api/workflows/' + encodeURIComponent(currentWorkflowId));
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // 1. Badge — single canonical mapping computed server-side; header and
+        //    workflow selector both consume it so they can never disagree.
+        const badge = document.getElementById('status-badge');
+        const badgeInfo = data.badge || { key: 'STARTING', text: 'SUPERGPT ⟳ STARTING' };
+        badge.className = 'badge badge-' + badgeInfo.key;
+        badge.textContent = badgeInfo.text;
+
+        // 2. Header Task — ordinal is the real current-task position from the
+        //    projection; show it as unknown rather than faking "Task 1".
+        const taskObj = data.task || {};
+        const taskText = (taskObj.current && taskObj.total)
+          ? \`Task \${taskObj.current} / \${taskObj.total}\${taskObj.title ? ' — ' + taskObj.title : ''}\`
+          : (taskObj.title || taskObj.taskId || '-');
+        document.getElementById('header-task').textContent = taskText;
+
+        // Dismiss action: allowed only on HUMAN_REQUIRED or actionable FAILED
+        const btnDismiss = document.getElementById('btn-dismiss');
+        if (btnDismiss) {
+          const canDismiss = data.requiresAttention && (data.canonicalStatus === 'HUMAN_REQUIRED' || data.canonicalStatus === 'FAILED');
+          btnDismiss.style.display = canDismiss ? 'inline-block' : 'none';
+        }
+
+        // 3. Grid Values
+        document.getElementById('val-workflow-id').textContent = data.workflowId || '-';
+        document.getElementById('val-task').textContent = taskText;
+        document.getElementById('val-attempt').textContent = data.attempt || 1;
+        document.getElementById('val-stage').textContent = data.stage || '-';
+
+        // 4. Role Statuses
+        setTag('role-planner', data.stageStatuses?.planner || (data.taskTotal ? 'DONE' : 'WAITING'), data.stageStatuses?.planner || 'done');
+        setTag('role-supervisor', data.stageStatuses?.supervisor || (data.modelEscalated ? 'ESCALATED' : 'IDLE'), data.stageStatuses?.supervisor || 'idle');
+        setTag('role-executor', data.executor?.status || 'WAITING', data.executor?.status || 'waiting');
+        setTag('role-gate', data.gate?.status || 'WAITING', data.gate?.status || 'waiting');
+        setTag('role-reviewer', data.reviewer?.status || 'WAITING', data.reviewer?.status || 'waiting');
+
+        // 5. Retries
+        document.getElementById('val-normal-retry').textContent = \`\${data.normalAttempts || 0} / \${data.maxAttemptsPerTask || 3}\`;
+        document.getElementById('val-escalation-retry').textContent = \`\${data.escalationAttempts || 0} / \${data.maxEscalationAttempts || 2}\`;
+        document.getElementById('val-escalation-active').textContent = data.escalationActive ? 'Yes' : 'No';
+        document.getElementById('val-terminal').textContent = data.terminal ? 'Yes' : 'No';
+
+        // 6. Timing
+        const timing = data.timing || {};
+        document.getElementById('val-elapsed').textContent = timing.elapsed || '00:00';
+        document.getElementById('val-heartbeat').textContent = formatTime(timing.heartbeatAt);
+        document.getElementById('val-progress').textContent = formatTime(timing.lastProgressAt);
+        document.getElementById('val-activity').textContent = formatTime(timing.lastActivityAt);
+
+        // 7. Execution & Usage
+        document.getElementById('val-provider').textContent = data.executor?.provider || (data.activeProcesses?.[0]?.provider) || 'claude';
+        document.getElementById('val-model').textContent = data.executor?.model || (data.activeProcesses?.[0]?.resolvedModel) || 'sonnet';
+        
+        const usage = data.usage || {};
+        document.getElementById('tok-planner').textContent = (usage.planner?.totalTokens || 0).toLocaleString();
+        document.getElementById('tok-supervisor').textContent = (usage.supervisor?.totalTokens || 0).toLocaleString();
+        document.getElementById('tok-reviewer').textContent = (usage.reviewer?.totalTokens || 0).toLocaleString();
+        document.getElementById('tok-total').textContent = (usage.total?.totalTokens || 0).toLocaleString();
+
+        // 8. Timeline
+        const tlContainer = document.getElementById('timeline-container');
+        const events = data.timeline || [];
+        if (events.length === 0) {
+          tlContainer.innerHTML = '<div class="empty-state">No events recorded yet.</div>';
+        } else {
+          tlContainer.innerHTML = events.map(ev => {
+            const cls = ev.type.includes('PASS') ? 'pass' : (ev.type.includes('FAIL') || ev.type.includes('REWORK')) ? 'fail' : ev.type.includes('ESCALATION') ? 'escalation' : '';
+            return \`
+              <div class="timeline-item \${cls}">
+                <div class="time-col">\${ev.time || '--:--:--'}</div>
+                <div class="content-col">
+                  <div class="content-label">\${ev.label}</div>
+                  \${ev.detail ? \`<div class="content-detail">\${ev.detail}</div>\` : ''}
+                </div>
+              </div>
+            \`;
+          }).join('');
+        }
+      } catch (err) {}
+    }
+
+    function onSelectWorkflow(id) {
+      if (!id) return;
+      currentWorkflowId = id;
+      lastKnownWorkflowId = id;
+      lastSeenServerFocusId = id;
+      window.history.replaceState(null, '', '/workflow/' + encodeURIComponent(id));
+      updateWorkflowDetail();
+    }
+
+    // Auto-poll loop: refresh the workflow list and current detail every 1s.
+    fetchWorkflowList().then(() => updateWorkflowDetail());
+    setInterval(() => {
+      fetchWorkflowList();
+      updateWorkflowDetail();
+    }, POLL_INTERVAL_MS);
+  </script>
+</body>
+</html>`;
+}

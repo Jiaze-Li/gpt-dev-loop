@@ -27,9 +27,11 @@ test('lists the frontend-neutral prepare/run/plan/status contract with schemas',
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, [
+    'supergpt_dashboard_open',
     'supergpt_plan',
     'supergpt_prepare',
     'supergpt_resume',
+    'supergpt_route',
     'supergpt_run',
     'supergpt_start',
     'supergpt_status',

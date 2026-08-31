@@ -16,6 +16,7 @@ import {
   toCanonicalProgress,
   readCanonicalProgress,
   defaultOrganicReworkRecorder,
+  SUPERGPT_WATCH_TIMEOUT_MS,
 } from '../orchestrator/supergpt.js';
 import { SUPERGPT_WORKTREE_ROOT } from '../orchestrator/workflowWorktree.js';
 import {
@@ -24,6 +25,7 @@ import {
   renderGenericPlan,
 } from '../renderers/genericTextRenderer.js';
 import { compileSuperGptRequest } from './requestCompiler.js';
+import { supergptRoute } from './autoRoutePolicy.js';
 
 export class SuperGptControlService {
   constructor({
@@ -49,6 +51,10 @@ export class SuperGptControlService {
 
   prepare({ goal, cwd, constraints, preferences, mode = 'prepare' } = {}) {
     return compileSuperGptRequest({ goal, cwd, constraints, preferences, mode });
+  }
+
+  route({ goal, cwd } = {}) {
+    return supergptRoute({ goal, cwd });
   }
 
   async run({
@@ -111,7 +117,7 @@ export class SuperGptControlService {
   async watch({
     workflowId,
     intervalMs = 1000,
-    timeoutMs = Infinity,
+    timeoutMs = SUPERGPT_WATCH_TIMEOUT_MS,
     signal,
     onProgress,
     root = this.root,

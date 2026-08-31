@@ -101,6 +101,32 @@ test('readTaskCard accepts the standard example Task Card from TASK_PROTOCOL.md 
   assert.equal(taskCard.completion_signal, 'DONE');
 });
 
+test('parseTaskCard normalizes unstable allowed_files paths to stable workspace-relative form', () => {
+  const card = sampleCard().replace('- src/**', '- ./src/./a.js\n- src/lib/../a.js\n- tests//a.test.js');
+  const taskCard = parseTaskCard(card);
+  assert.deepEqual(taskCard.allowed_files, ['src/a.js', 'tests/a.test.js']);
+});
+
+test('parseTaskCard collapses post-normalization duplicate allowed_files', () => {
+  const card = sampleCard().replace('- src/**', '- src/a.js\n- ./src/a.js\n- src/./a.js');
+  assert.deepEqual(parseTaskCard(card).allowed_files, ['src/a.js']);
+});
+
+test('parseTaskCard rejects an absolute path in allowed_files', () => {
+  const card = sampleCard().replace('- src/**', '- /etc/passwd');
+  assert.throws(() => parseTaskCard(card), /unsafe path.*absolute/);
+});
+
+test('parseTaskCard rejects a path escape in forbidden_files', () => {
+  const card = sampleCard().replace('- docs/workflow/**', '- ../../outside');
+  assert.throws(() => parseTaskCard(card), /unsafe path.*escapes/);
+});
+
+test('parseTaskCard keeps a boundary path that normalizes within the workspace', () => {
+  const card = sampleCard().replace('- src/**', '- ./src/nested/../keep.js');
+  assert.deepEqual(parseTaskCard(card).allowed_files, ['src/keep.js']);
+});
+
 test('parseTaskCard gives a clear, field-specific error for each required field missing in turn', () => {
   for (const field of [
     'task_id',

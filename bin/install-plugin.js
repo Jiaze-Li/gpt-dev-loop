@@ -33,21 +33,38 @@ function managedBlock(content) {
   return `${MANAGED_BEGIN}\n${String(content).trim()}\n${MANAGED_END}`;
 }
 
-export function stripManagedPolicy(text = '') {
+function locateManagedPolicy(text) {
   const raw = String(text);
   const begin = raw.indexOf(MANAGED_BEGIN);
   const end = raw.indexOf(MANAGED_END);
-  if (begin === -1 && end === -1) return raw;
+  if (begin === -1 && end === -1) return null;
   if (begin === -1 || end === -1 || end < begin) {
     throw new Error('Refusing to modify malformed SuperGPT managed policy block');
   }
   if (raw.indexOf(MANAGED_BEGIN, begin + MANAGED_BEGIN.length) !== -1) {
     throw new Error('Refusing to modify duplicate SuperGPT managed policy blocks');
   }
+  return { raw, begin, end: end + MANAGED_END.length };
+}
+
+export function stripManagedPolicy(text = '') {
+  const located = locateManagedPolicy(text);
+  if (!located) return String(text);
+  const { raw, begin, end } = located;
   const before = raw.slice(0, begin).trimEnd();
-  const after = raw.slice(end + MANAGED_END.length).trimStart();
+  const after = raw.slice(end).trimStart();
   if (before && after) return `${before}\n\n${after}`;
   return before || after;
+}
+
+// Returns the normalized content of the sole managed block, or null when the
+// file carries no block. Throws on malformed or duplicate markers so callers
+// can treat a corrupt file as "not correctly installed".
+export function extractManagedPolicy(text = '') {
+  const located = locateManagedPolicy(text);
+  if (!located) return null;
+  const { raw, begin, end } = located;
+  return raw.slice(begin + MANAGED_BEGIN.length, end - MANAGED_END.length).trim();
 }
 
 async function upsertManagedPolicy(filePath, content) {
@@ -179,6 +196,7 @@ export async function installGlobal({
   const agyPolicyFile = path.join(agySkillTargetDir, 'SKILL.md');
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
+  const geminiPolicyFile = path.join(homeDir, '.gemini', 'GEMINI.md');
 
   // Preflight everything before changing any frontend configuration.
   const [commonPolicy, agyConfig] = await Promise.all([
@@ -198,6 +216,7 @@ export async function installGlobal({
     agyPolicyFile,
     claudePolicyFile,
     codexPolicyFile,
+    geminiPolicyFile,
     claudeMcpConfigFile,
     codexMcpConfigFile,
   ];
@@ -208,7 +227,7 @@ export async function installGlobal({
 
   // Validate existing managed policy blocks before the first MCP registration
   // mutates frontend state.
-  for (const policyPath of [claudePolicyFile, codexPolicyFile]) {
+  for (const policyPath of [claudePolicyFile, codexPolicyFile, geminiPolicyFile]) {
     const snapshot = snapshots.get(policyPath);
     if (snapshot?.existed) stripManagedPolicy(snapshot.content.toString('utf8'));
   }
@@ -226,6 +245,7 @@ export async function installGlobal({
 
     await upsertManagedPolicy(claudePolicyFile, commonPolicy);
     await upsertManagedPolicy(codexPolicyFile, commonPolicy);
+    await upsertManagedPolicy(geminiPolicyFile, commonPolicy);
   } catch (err) {
     // Registration helpers remove/replace existing entries. Remove any partial
     // new entry, then restore exact pre-install bytes for every frontend file.
@@ -247,6 +267,7 @@ export async function installGlobal({
     agyPolicyFile,
     claudePolicyFile,
     codexPolicyFile,
+    geminiPolicyFile,
   };
 }
 
@@ -260,6 +281,7 @@ export async function uninstallGlobal({
   const agySkillTargetDir = path.join(agyConfigDir, 'skills', MCP_NAME);
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
+  const geminiPolicyFile = path.join(homeDir, '.gemini', 'GEMINI.md');
 
   let removedAgyMcp = false;
   if (existsSync(mcpConfigFile)) {
@@ -282,6 +304,7 @@ export async function uninstallGlobal({
   const removedCodexMcp = removeCodexMcp(execFileSync);
   const removedClaudePolicy = await removeManagedPolicy(claudePolicyFile);
   const removedCodexPolicy = await removeManagedPolicy(codexPolicyFile);
+  const removedGeminiPolicy = await removeManagedPolicy(geminiPolicyFile);
 
   return {
     success: true,
@@ -291,19 +314,24 @@ export async function uninstallGlobal({
     removedAgyPolicy,
     removedClaudePolicy,
     removedCodexPolicy,
+    removedGeminiPolicy,
   };
 }
 
 export async function checkGlobalStatus({
   configDir,
   homeDir = os.homedir(),
+  policyFile = POLICY_FILE,
   execFileSync = nodeExecFileSync,
 } = {}) {
   const agyConfigDir = configDir ?? resolveGlobalConfigDir(process.env, homeDir);
   const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
-  const agyPolicyFile = path.join(agyConfigDir, 'skills', MCP_NAME, 'SKILL.md');
+  const agySkillFile = path.join(agyConfigDir, 'skills', MCP_NAME, 'SKILL.md');
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
+  const geminiPolicyFile = path.join(homeDir, '.gemini', 'GEMINI.md');
+
+  const expectedPolicy = (await readFile(policyFile, 'utf8')).trim();
 
   let agyMcpInstalled = false;
   let configuredBin = null;
@@ -320,17 +348,36 @@ export async function checkGlobalStatus({
     }
   }
 
-  const hasManagedPolicy = async (filePath) => {
-    if (!existsSync(filePath)) return false;
+  // A managed policy target counts as installed only when the file carries
+  // exactly one well-formed SuperGPT block whose normalized content matches the
+  // current COMMON policy. Missing files, missing/duplicate/corrupt markers, and
+  // stale content all report false.
+  const managedPolicyState = async (filePath) => {
+    if (!existsSync(filePath)) return { policyInstalled: false, reason: 'missing-file' };
+    let text;
     try {
-      const text = await readFile(filePath, 'utf8');
-      return text.includes(MANAGED_BEGIN) && text.includes(MANAGED_END);
+      text = await readFile(filePath, 'utf8');
     } catch {
-      return false;
+      return { policyInstalled: false, reason: 'unreadable' };
     }
+    let content;
+    try {
+      content = extractManagedPolicy(text);
+    } catch (err) {
+      return { policyInstalled: false, reason: 'corrupt-block', detail: err.message };
+    }
+    if (content === null) return { policyInstalled: false, reason: 'missing-block' };
+    if (content !== expectedPolicy) return { policyInstalled: false, reason: 'stale-content' };
+    return { policyInstalled: true, reason: 'ok' };
   };
 
   const frontendAvailable = (command) => runCli(execFileSync, command, ['--version'], { allowFailure: true }) !== null;
+
+  const [claudePolicy, codexPolicy, geminiPolicy] = await Promise.all([
+    managedPolicyState(claudePolicyFile),
+    managedPolicyState(codexPolicyFile),
+    managedPolicyState(geminiPolicyFile),
+  ]);
 
   return {
     mcpConfigFile,
@@ -338,26 +385,39 @@ export async function checkGlobalStatus({
     agy: {
       available: frontendAvailable('agy'),
       mcpInstalled: agyMcpInstalled,
-      policyInstalled: existsSync(agyPolicyFile),
-      policyFile: agyPolicyFile,
+      policyInstalled: geminiPolicy.policyInstalled,
+      policyReason: geminiPolicy.reason,
+      policyDetail: geminiPolicy.detail,
+      policyFile: geminiPolicyFile,
+      skillInstalled: existsSync(agySkillFile),
+      skillFile: agySkillFile,
     },
     claude: {
       available: frontendAvailable('claude'),
       mcpInstalled: hasClaudeMcp(execFileSync),
-      policyInstalled: await hasManagedPolicy(claudePolicyFile),
+      policyInstalled: claudePolicy.policyInstalled,
+      policyReason: claudePolicy.reason,
+      policyDetail: claudePolicy.detail,
       policyFile: claudePolicyFile,
     },
     codex: {
       available: frontendAvailable('codex'),
       mcpInstalled: hasCodexMcp(execFileSync),
-      policyInstalled: await hasManagedPolicy(codexPolicyFile),
+      policyInstalled: codexPolicy.policyInstalled,
+      policyReason: codexPolicy.reason,
+      policyDetail: codexPolicy.detail,
       policyFile: codexPolicyFile,
     },
   };
 }
 
 function installedText(frontend) {
-  return frontend.available && frontend.mcpInstalled && frontend.policyInstalled ? 'Installed' : 'Incomplete';
+  if (frontend.available && frontend.mcpInstalled && frontend.policyInstalled) return 'Installed';
+  const notes = [];
+  if (!frontend.available) notes.push('frontend unavailable');
+  if (!frontend.mcpInstalled) notes.push('MCP not registered');
+  if (!frontend.policyInstalled) notes.push(`policy ${frontend.policyReason || 'not installed'}`);
+  return `Incomplete (${notes.join(', ')})`;
 }
 
 async function main() {
@@ -365,7 +425,7 @@ async function main() {
   if (args.includes('--status')) {
     const status = await checkGlobalStatus();
     console.log('SuperGPT Global Frontend Status:');
-    console.log(`  AGY:     ${installedText(status.agy)}`);
+    console.log(`  AGY:     ${installedText(status.agy)}${status.agy.skillInstalled ? '' : ' [skill missing]'}`);
     console.log(`  Claude:  ${installedText(status.claude)}`);
     console.log(`  Codex:   ${installedText(status.codex)}`);
     return;
@@ -381,6 +441,9 @@ async function main() {
   console.log('SuperGPT installed globally for AGY, Claude, and Codex.');
   console.log(`  MCP server: ${result.mcpBin}`);
   console.log('  Policy:     agent-policy/COMMON.md (single source of truth)');
+  console.log(`  Claude:     ${result.claudePolicyFile} (managed block)`);
+  console.log(`  Codex:      ${result.codexPolicyFile} (managed block)`);
+  console.log(`  AGY:        ${result.geminiPolicyFile} (managed block) + ${result.agyPolicyFile} (skill)`);
   console.log('Restart/open a new frontend session so each client reloads its global MCP and policy.');
 }
 

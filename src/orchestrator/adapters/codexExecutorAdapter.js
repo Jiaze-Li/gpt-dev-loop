@@ -120,6 +120,11 @@ export function createCodexExecutorAdapter({
   model = null,
   cwd = process.cwd(),
   env = process.env,
+  // `codex exec` exposes no supported per-command / per-tool timeout knob we
+  // can rely on, so CLI invocation is left unchanged: a hung tool call is
+  // bounded only by this whole-process timeoutMs, which surfaces as
+  // EXECUTOR_TIMEOUT and drives provider candidate failover without spending
+  // an implementation retry.
   timeoutMs = 10 * 60 * 1000,
   spawn = nodeSpawn,
   onActivity,

@@ -14,7 +14,7 @@ const adapterFiles = [
 const retiredPolicyFiles = [
   'skills/supergpt/SKILL.md',
   '.agents/skills/supergpt/SKILL.md',
-  '.agents/rules/supergpt.md',
+  '.agents/rules/',
   'agent-policy/CLAUDE.md',
   'agent-policy/CODEX.md',
   'agent-policy/AGY.md',
@@ -26,6 +26,7 @@ test('COMMON.md is the sole active front-agent routing and launch contract', asy
 
   assert.match(common, /single active SuperGPT policy/i);
   assert.match(common, /default to SuperGPT/i);
+  assert.match(common, /supergpt_route\(\{ goal, cwd \}\)/);
   assert.match(common, /supergpt_start\(\{ goal, cwd \}\)/);
   assert.match(common, /supergpt_watch\(\{ workflowId \}\)/);
   assert.match(common, /supergpt_run/);

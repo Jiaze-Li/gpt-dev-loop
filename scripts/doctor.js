@@ -3,13 +3,99 @@
 // Frontends are symmetric launchers, so AGY, Claude, and Codex are all
 // required local prerequisites for the supported global installation.
 
+import path from 'node:path';
+import os from 'node:os';
 import { execSync as nodeExecSync } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
-import { existsSync, accessSync, constants } from 'node:fs';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { existsSync, accessSync, constants, readFileSync } from 'node:fs';
+import { extractManagedPolicy, resolveGlobalConfigDir } from '../bin/install-plugin.js';
 import { SUPERGPT_WORKTREE_ROOT } from '../src/orchestrator/workflowWorktree.js';
 import { resolveAgySupervisorModel, resolveAgyReviewerModel } from '../src/agy/agyConfig.js';
 import { DEFAULT_ROLE_POLICY, PRODUCTION_ROLE_CAPABILITIES, QuotaPoolRegistry } from '../src/orchestrator/roleRouting.js';
 import { defaultOrganicReworkRecorder } from '../src/orchestrator/organicReworkRecorder.js';
+
+const DEFAULT_POLICY_FILE = fileURLToPath(new URL('../agent-policy/COMMON.md', import.meta.url));
+const MCP_NAME = 'supergpt';
+
+// Deterministic check that the three auto-loaded frontend rule targets (Claude
+// CLAUDE.md, Codex AGENTS.md, AGY GEMINI.md) each carry exactly one well-formed
+// SuperGPT managed block whose normalized content matches the current COMMON
+// policy, and that the AGY MCP registration and on-demand skill are still in
+// place. File existence alone is never treated as installed.
+export function checkGlobalPolicy({
+  homeDir = os.homedir(),
+  configDir,
+  env = process.env,
+  policyFile = DEFAULT_POLICY_FILE,
+} = {}) {
+  const agyConfigDir = configDir ?? resolveGlobalConfigDir(env, homeDir);
+  const targets = {
+    claude: path.join(homeDir, '.claude', 'CLAUDE.md'),
+    codex: path.join(homeDir, '.codex', 'AGENTS.md'),
+    agy: path.join(homeDir, '.gemini', 'GEMINI.md'),
+  };
+  const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
+  const skillFile = path.join(agyConfigDir, 'skills', MCP_NAME, 'SKILL.md');
+
+  let expected;
+  try {
+    expected = readFileSync(policyFile, 'utf8').trim();
+  } catch (err) {
+    return { name: 'global_policy', ok: false, error: `unreadable COMMON policy: ${err.message}` };
+  }
+
+  const frontends = {};
+  const issues = [];
+  for (const [frontend, filePath] of Object.entries(targets)) {
+    let state;
+    if (!existsSync(filePath)) {
+      state = { ok: false, reason: 'missing-file' };
+    } else {
+      let text;
+      try {
+        text = readFileSync(filePath, 'utf8');
+      } catch {
+        text = null;
+      }
+      if (text === null) {
+        state = { ok: false, reason: 'unreadable' };
+      } else {
+        let content;
+        try {
+          content = extractManagedPolicy(text);
+        } catch (err) {
+          content = undefined;
+          state = { ok: false, reason: 'corrupt-block', detail: err.message };
+        }
+        if (content === null) state = { ok: false, reason: 'missing-block' };
+        else if (content === undefined) { /* corrupt-block already set */ }
+        else if (content !== expected) state = { ok: false, reason: 'stale-content' };
+        else state = { ok: true, reason: 'ok' };
+      }
+    }
+    frontends[frontend] = { ...state, file: filePath };
+    if (!state.ok) issues.push(`${frontend} policy ${state.reason}${state.detail ? ` (${state.detail})` : ''} at ${filePath}`);
+  }
+
+  let agyMcp = { ok: false, reason: 'missing-file', file: mcpConfigFile };
+  if (existsSync(mcpConfigFile)) {
+    try {
+      const config = JSON.parse(readFileSync(mcpConfigFile, 'utf8'));
+      agyMcp = config?.mcpServers?.[MCP_NAME]
+        ? { ok: true, reason: 'ok', file: mcpConfigFile }
+        : { ok: false, reason: 'not-registered', file: mcpConfigFile };
+    } catch (err) {
+      agyMcp = { ok: false, reason: 'invalid-config', detail: err.message, file: mcpConfigFile };
+    }
+  }
+  if (!agyMcp.ok) issues.push(`AGY MCP ${agyMcp.reason}${agyMcp.detail ? ` (${agyMcp.detail})` : ''} at ${mcpConfigFile}`);
+
+  const agySkill = { ok: existsSync(skillFile), file: skillFile };
+  if (!agySkill.ok) issues.push(`AGY skill missing at ${skillFile}`);
+
+  const ok = Object.values(frontends).every((f) => f.ok) && agyMcp.ok && agySkill.ok;
+  return { name: 'global_policy', ok, frontends, agyMcp, agySkill, issues };
+}
 
 function probe(execSync, command) {
   return String(execSync(command, { stdio: ['ignore', 'pipe', 'ignore'] })).trim();
@@ -67,23 +153,36 @@ export function checkModels({ env = process.env } = {}) {
   }
 }
 
-export function runDoctor({ execSync, log, env } = {}) {
+export function runDoctor({ execSync, log, env, policyOptions } = {}) {
   const exec = execSync || nodeExecSync;
   const write = log || console.log;
   const environment = env || process.env;
 
-  const results = [
+  const policy = checkGlobalPolicy({ env: environment, ...(policyOptions || {}) });
+  // Core local runtime prerequisites. global_policy is reported as diagnostic
+  // info/warning only — a missing or stale global install never fails runDoctor.
+  const coreResults = [
     checkGit({ execSync: exec }),
     checkNode({ env: environment }),
     checkAgy({ execSync: exec }),
     checkClaude({ execSync: exec }),
     checkCodex({ execSync: exec }),
   ];
-  const ok = results.every((r) => r.ok);
+  const results = [...coreResults, policy];
+  const ok = coreResults.every((r) => r.ok);
 
-  for (const r of results) {
+  for (const r of coreResults) {
     if (r.ok) write(`  ok    ${r.name}${r.version ? ` (${r.version})` : ''}`);
     else write(`  FAIL  ${r.name}: ${r.error || 'not found'}`);
+  }
+
+  if (policy.ok) {
+    write('  ok    global_policy (Claude, Codex, AGY managed blocks match COMMON; AGY MCP + skill present)');
+  } else if (policy.error) {
+    write(`  warn  global_policy: ${policy.error} (diagnostic only — run install to configure global rules)`);
+  } else {
+    for (const issue of policy.issues) write(`  warn  global_policy: ${issue}`);
+    write('  info  global_policy issues are non-fatal — run the plugin installer to configure or refresh global rules');
   }
 
   const runtimeCheck = checkRuntimeDir();

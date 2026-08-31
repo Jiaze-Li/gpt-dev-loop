@@ -38,6 +38,13 @@ export class WorkflowIdError extends Error {
 export const WORKFLOW_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 export const WORKFLOW_ID_MAX_LENGTH = 128;
 
+const TEST_WORKFLOW_REGEX = /^(?:wf-)?(?:agy-)?test[-_]|^test[-_]/i;
+
+export function isTestWorkflowId(workflowId) {
+  if (!workflowId || typeof workflowId !== 'string') return false;
+  return TEST_WORKFLOW_REGEX.test(workflowId);
+}
+
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 

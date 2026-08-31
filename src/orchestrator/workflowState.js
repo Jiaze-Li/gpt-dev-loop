@@ -15,7 +15,12 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { appendProviderProcessDiagnostic } from './providerProcessTelemetry.js';
-import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
+import { validateWorkflowId, assertPathWithinRoot, isTestWorkflowId } from './workflowId.js';
+
+export const WORKFLOW_KINDS = Object.freeze({
+  USER: 'USER',
+  INTERNAL_TEST: 'INTERNAL_TEST',
+});
 
 export const WORKFLOW_STAGES = Object.freeze({
   INIT: 'INIT',
@@ -69,6 +74,8 @@ function formatDuration(ms) {
 export class WorkflowStateManager {
   constructor({
     workflowId,
+    kind,
+    parentWorkflowId = null,
     root = SUPERGPT_WORKTREE_ROOT,
     onStateChange,
   } = {}) {
@@ -79,9 +86,12 @@ export class WorkflowStateManager {
     this.onStateChange = onStateChange;
     this.heartbeatTimer = null;
 
+    const resolvedKind = kind || (isTestWorkflowId(workflowId) ? WORKFLOW_KINDS.INTERNAL_TEST : WORKFLOW_KINDS.USER);
     const now = new Date().toISOString();
     this.state = {
       workflowId,
+      kind: resolvedKind,
+      parentWorkflowId: parentWorkflowId ?? null,
       workflowStatus: WORKFLOW_STATUSES.STARTING,
       taskIndex: null,
       taskTotal: null,
@@ -108,11 +118,15 @@ export class WorkflowStateManager {
       routing: { planner: null, supervisor: null, executor: null, reviewer: null, quotaPools: [] },
       taskHistory: [], // completed tasks history with { taskId, decision, attempts }
       taskAttempts: [], // task-scoped attempt history with { taskId, attempt, executorCallId, gateResult, reviewerDecision, requiredChanges, reviewerCallId }
+      stageHistory: [], // chronological stage transition history with { stage, startedAt, taskId, taskName, attempt }
       error: null,
       question: null,
       summary: null,
       evidence: null,
       blockers: [],
+      // V2-C durable PR closeout loop state (round count, reviewed head,
+      // finding signatures, last action) — null until the closeout loop runs.
+      prCloseout: null,
     };
   }
 
@@ -168,6 +182,15 @@ export class WorkflowStateManager {
     if (details.taskIndex !== undefined) this.state.taskIndex = details.taskIndex;
     if (details.taskTotal !== undefined) this.state.taskTotal = details.taskTotal;
     if (details.attempt !== undefined) this.state.attempt = details.attempt;
+
+    if (!this.state.stageHistory) this.state.stageHistory = [];
+    this.state.stageHistory.push({
+      stage,
+      startedAt: now,
+      taskId: details.taskId ?? this.state.taskId ?? null,
+      taskName: details.taskName ?? this.state.taskName ?? null,
+      attempt: details.attempt ?? this.state.attempt ?? null,
+    });
 
     if (stage === WORKFLOW_STAGES.EXECUTOR) {
       this.state.stageStatuses.executor = 'running';
@@ -242,13 +265,22 @@ export class WorkflowStateManager {
 
   recordTaskAttempt(attemptRecord = {}) {
     if (!this.state.taskAttempts) this.state.taskAttempts = [];
+    const now = new Date().toISOString();
     const index = this.state.taskAttempts.findIndex(
       (a) => a.taskId === attemptRecord.taskId && a.attempt === attemptRecord.attempt
     );
     if (index >= 0) {
-      this.state.taskAttempts[index] = { ...this.state.taskAttempts[index], ...attemptRecord };
+      this.state.taskAttempts[index] = {
+        ...this.state.taskAttempts[index],
+        ...attemptRecord,
+        updatedAt: now,
+      };
     } else {
-      this.state.taskAttempts.push({ ...attemptRecord });
+      this.state.taskAttempts.push({
+        createdAt: now,
+        updatedAt: now,
+        ...attemptRecord,
+      });
     }
     this.persist();
   }
@@ -256,6 +288,18 @@ export class WorkflowStateManager {
   recordCompletedTask(taskSummary = {}) {
     if (!this.state.taskHistory) this.state.taskHistory = [];
     this.state.taskHistory.push({ ...taskSummary });
+    this.persist();
+  }
+
+  // V2-C — persist the durable PR closeout loop state after every transition
+  // so a crashed or suspended closeout loop resumes from the last decision.
+  // Pass null to clear it.
+  recordCloseoutState(closeoutState) {
+    this.state.prCloseout = closeoutState
+      ? JSON.parse(JSON.stringify(closeoutState))
+      : null;
+    this.state.lastProgressAt = new Date().toISOString();
+    this.notify();
     this.persist();
   }
 
@@ -427,6 +471,47 @@ export function readLiveWorkflowState({
 }
 
 /**
+ * V2-C — read the persisted PR closeout loop state for a workflow, or null.
+ * Consumes zero model tokens.
+ */
+export function readCloseoutState({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+} = {}) {
+  const live = readLiveWorkflowState({ workflowId, root });
+  return live?.prCloseout ?? null;
+}
+
+/**
+ * PR Closeout — the reviewer the workflow is (or would be) using, plus the
+ * durable repair-round budget. Reads only persisted state; zero model tokens.
+ * Returns null when no closeout loop state has been recorded yet.
+ */
+export function readCloseoutReviewer({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+  state = null,
+} = {}) {
+  const closeout = state ?? readCloseoutState({ workflowId, root });
+  if (!closeout || typeof closeout !== 'object') return null;
+  const order = Array.isArray(closeout.reviewerCandidateOrder)
+    ? closeout.reviewerCandidateOrder
+    : [];
+  const active = closeout.reviewerLocked && closeout.activeReviewer
+    ? closeout.activeReviewer
+    : (order[closeout.reviewerCandidateIndex ?? 0] ?? closeout.prReviewer ?? null);
+  return {
+    reviewer: active,
+    locked: Boolean(closeout.reviewerLocked),
+    candidateOrder: order,
+    candidateIndex: closeout.reviewerCandidateIndex ?? 0,
+    failovers: Array.isArray(closeout.reviewerFailovers) ? closeout.reviewerFailovers : [],
+    repairRounds: closeout.repairRounds ?? 0,
+    maxRepairRounds: closeout.maxRepairRounds ?? null,
+  };
+}
+
+/**
  * Programmatic local state waiter (PHASE B5).
  * Consumes zero model tokens.
  */
@@ -526,9 +611,28 @@ export function toCanonicalProgress(rawState, now = Date.now()) {
   if (!rawState) return null;
   const currentNow = typeof now === 'number' ? now : (now instanceof Date ? now.getTime() : Date.now());
   const elapsedMs = rawState.startedAt ? Math.max(0, currentNow - new Date(rawState.startedAt).getTime()) : 0;
+
+  const s = String(rawState.stage || '').toUpperCase();
+  const w = String(rawState.workflowStatus || '').toUpperCase();
+  let canonicalStatus;
+  if (w === 'DONE') canonicalStatus = 'DONE';
+  else if (w === 'HUMAN_REQUIRED') canonicalStatus = 'HUMAN_REQUIRED';
+  else if (w === 'FAILED' || w === 'TIMEOUT' || w === 'STALLED') canonicalStatus = 'FAILED';
+  else if (w === 'STOPPED') canonicalStatus = 'STOPPED';
+  else if (['EXECUTOR', 'GATE', 'REVIEWER', 'REWORK', 'ESCALATION', 'SUPERVISOR', 'APPLYING'].includes(s) || ['EXECUTOR', 'GATE', 'REVIEWER', 'REWORK', 'ESCALATION', 'SUPERVISOR', 'APPLYING'].includes(w)) canonicalStatus = 'RUNNING';
+  else if (['STARTING', 'PLANNING', 'INIT', 'PREFLIGHT'].includes(s) || ['STARTING', 'PLANNING', 'INIT', 'PREFLIGHT'].includes(w) || w === 'STARTING') canonicalStatus = 'STARTING';
+  else canonicalStatus = 'STARTING';
+
   return {
     workflowId: rawState.workflowId ?? null,
+    kind: rawState.kind ?? (isTestWorkflowId(rawState.workflowId) ? WORKFLOW_KINDS.INTERNAL_TEST : WORKFLOW_KINDS.USER),
+    parentWorkflowId: rawState.parentWorkflowId ?? null,
     workflowStatus: rawState.workflowStatus ?? 'UNKNOWN',
+    rawStatus: rawState.workflowStatus ?? 'UNKNOWN',
+    status: canonicalStatus,
+    canonicalStatus,
+    path: rawState.workflowPath ?? null,
+    pathSelectionReason: rawState.pathSelectionReason ?? null,
     task: {
       current: rawState.taskIndex ?? null,
       total: rawState.taskTotal ?? null,
@@ -576,6 +680,7 @@ export function toCanonicalProgress(rawState, now = Date.now()) {
     blockerCategory: rawState.blockerCategory ?? null,
     deliveredFiles: rawState.deliveredFiles ?? [],
     activeProcesses: rawState.activeProcesses ?? [],
+    prCloseout: rawState.prCloseout ?? null,
   };
 }
 

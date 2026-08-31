@@ -1,5 +1,26 @@
 import fs from "node:fs";
 import path from "node:path";
+import {
+  DEFAULT_PR_REVIEWER,
+  DEFAULT_MAX_PR_REPAIR_ROUNDS,
+  normalizePrReviewer,
+} from "./prCloseoutPolicy.js";
+
+// PR Closeout dedicated reviewer config resolution. This is scoped entirely to
+// the PR Closeout Review path and must not influence the ordinary Task Reviewer.
+export function resolvePrCloseoutConfig(parsed) {
+  const closeout = parsed && typeof parsed.prCloseout === "object" && parsed.prCloseout
+    ? parsed.prCloseout
+    : {};
+  const rawReviewer = parsed?.prReviewer ?? parsed?.pr_reviewer ?? closeout.reviewer ?? closeout.prReviewer;
+  const rawMaxRounds = parsed?.maxPrRepairRounds ?? parsed?.max_pr_repair_rounds
+    ?? closeout.maxRepairRounds ?? closeout.maxPrRepairRounds;
+  const prReviewer = normalizePrReviewer(rawReviewer, DEFAULT_PR_REVIEWER);
+  const maxPrRepairRounds = Number.isInteger(rawMaxRounds) && rawMaxRounds > 0
+    ? rawMaxRounds
+    : DEFAULT_MAX_PR_REPAIR_ROUNDS;
+  return { prReviewer, maxPrRepairRounds };
+}
 
 /**
  * Safely resolves canonical realpath for a given path, or null if it cannot be resolved.
@@ -14,17 +35,194 @@ export function safeRealpath(p) {
 }
 
 /**
+ * Raised when a workspace file reference cannot be safely represented as a
+ * stable workspace-relative path (empty, absolute, or escapes the workspace
+ * root via "..").
+ */
+export class WorkspacePathError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "WorkspacePathError";
+    this.details = details;
+  }
+}
+
+/**
+ * Normalize a single workspace file reference to a stable, workspace-relative
+ * POSIX path. Collapses redundant "." segments, duplicate separators and
+ * resolvable ".." segments, folds "\\" to "/", and strips a leading "./" and
+ * trailing slashes. Globs are preserved verbatim.
+ *
+ * Throws WorkspacePathError when the input is not a non-empty string, is an
+ * absolute path (POSIX or Windows drive/UNC), resolves to the workspace root
+ * itself, or escapes the workspace root via "..".
+ *
+ * @param {string} input
+ * @returns {string}
+ */
+export function normalizeWorkspaceRelativePath(input) {
+  if (typeof input !== "string" || input.trim() === "") {
+    throw new WorkspacePathError("workspace file path must be a non-empty string", {
+      input,
+      reason: "empty",
+    });
+  }
+  const raw = input.trim();
+  if (path.isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw) || raw.startsWith("\\")) {
+    throw new WorkspacePathError(
+      `workspace file path "${raw}" must be workspace-relative, not absolute`,
+      { input: raw, reason: "absolute" }
+    );
+  }
+  const normalized = path.posix.normalize(raw.replace(/\\/g, "/"));
+  if (normalized === ".." || normalized.startsWith("../")) {
+    throw new WorkspacePathError(
+      `workspace file path "${raw}" escapes the workspace root`,
+      { input: raw, reason: "escape" }
+    );
+  }
+  const cleaned = normalized.replace(/^\.\//, "").replace(/\/+$/, "");
+  if (cleaned === "" || cleaned === ".") {
+    throw new WorkspacePathError(
+      `workspace file path "${raw}" does not reference a file within the workspace`,
+      { input: raw, reason: "empty" }
+    );
+  }
+  return cleaned;
+}
+
+/**
+ * Normalize a list of workspace file references, dropping post-normalization
+ * duplicates while preserving first-seen order.
+ *
+ * @param {string[]} inputs
+ * @param {object} [opts]
+ * @param {boolean} [opts.throwOnInvalid=true]  when false, unsafe entries are
+ *        dropped (and reported in `dropped`) instead of throwing.
+ * @returns {{ paths: string[], dropped: {input:string, reason:string}[] }}
+ */
+export function normalizeWorkspaceRelativePaths(inputs, { throwOnInvalid = true } = {}) {
+  const list = Array.isArray(inputs) ? inputs : [];
+  const seen = new Set();
+  const paths = [];
+  const dropped = [];
+  for (const item of list) {
+    let normalized;
+    try {
+      normalized = normalizeWorkspaceRelativePath(item);
+    } catch (err) {
+      if (throwOnInvalid || !(err instanceof WorkspacePathError)) throw err;
+      dropped.push({
+        input: typeof item === "string" ? item : String(item),
+        reason: err.details?.reason ?? "invalid",
+      });
+      continue;
+    }
+    if (seen.has(normalized)) {
+      dropped.push({ input: String(item), reason: "duplicate" });
+      continue;
+    }
+    seen.add(normalized);
+    paths.push(normalized);
+  }
+  return { paths, dropped };
+}
+
+/**
+ * Resolves a workspace relative path against actual repository files.
+ * If the path already exists, returns it as-is.
+ * If the path does not exist but matches exactly ONE existing file in the repository
+ * (e.g. missing subdirectories like 'adapters/'), it automatically corrects to that file.
+ * If there are multiple candidates or zero candidates (e.g. brand new file), returns original normalized path.
+ *
+ * @param {string} input
+ * @param {string[]|Set<string>} [repoFiles]
+ * @returns {string}
+ */
+export function resolveRepoPath(input, repoFiles) {
+  const normalized = normalizeWorkspaceRelativePath(input);
+  if (!repoFiles) return normalized;
+
+  const fileSet = repoFiles instanceof Set ? repoFiles : new Set(repoFiles);
+  if (fileSet.size === 0 || fileSet.has(normalized)) {
+    return normalized;
+  }
+
+  // Preserve globs verbatim
+  if (normalized.includes('*') || normalized.includes('?')) {
+    return normalized;
+  }
+
+  const targetSegments = normalized.split('/').filter(Boolean);
+  const targetBasename = targetSegments[targetSegments.length - 1];
+
+  const candidates = [];
+  for (const existingFile of fileSet) {
+    const candidateSegments = existingFile.split('/').filter(Boolean);
+    const candidateBasename = candidateSegments[candidateSegments.length - 1];
+    if (candidateBasename !== targetBasename) continue;
+
+    // Check if target directory segments appear as a subsequence in candidate directory segments
+    let tIdx = 0;
+    for (let i = 0; i < candidateSegments.length && tIdx < targetSegments.length; i++) {
+      if (candidateSegments[i] === targetSegments[tIdx]) {
+        tIdx++;
+      }
+    }
+    if (tIdx === targetSegments.length) {
+      candidates.push(existingFile);
+    }
+  }
+
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+
+  return normalized;
+}
+
+/**
+ * Resolves and normalizes a list of workspace file references with repository-aware path correction.
+ *
+ * @param {string[]} inputs
+ * @param {object} [opts]
+ * @param {string[]|Set<string>} [opts.repoFiles]
+ * @param {boolean} [opts.throwOnInvalid=true]
+ * @returns {{ paths: string[], dropped: {input:string, reason:string}[] }}
+ */
+export function resolveRepoRelativePaths(inputs, { repoFiles, throwOnInvalid = true } = {}) {
+  const { paths: normalizedPaths, dropped } = normalizeWorkspaceRelativePaths(inputs, { throwOnInvalid });
+  const seen = new Set();
+  const paths = [];
+  for (const p of normalizedPaths) {
+    const resolved = resolveRepoPath(p, repoFiles);
+    if (!seen.has(resolved)) {
+      seen.add(resolved);
+      paths.push(resolved);
+    }
+  }
+  return { paths, dropped };
+}
+
+
+/**
  * Loads repository/workspace-level SuperGPT configuration from .supergpt/config.json.
  * Returns parsed configuration object with validated externalReadRoots.
  */
 export function loadWorkspaceConfig(workspaceCwd = process.cwd()) {
+  const defaults = {
+    externalReadRoots: [],
+    prReviewer: DEFAULT_PR_REVIEWER,
+    maxPrRepairRounds: DEFAULT_MAX_PR_REPAIR_ROUNDS,
+  };
+
   if (!workspaceCwd || typeof workspaceCwd !== "string") {
-    return { externalReadRoots: [] };
+    return { ...defaults };
   }
 
   const configPath = path.join(workspaceCwd, ".supergpt", "config.json");
   if (!fs.existsSync(configPath)) {
-    return { externalReadRoots: [] };
+    return { ...defaults };
   }
 
   try {
@@ -68,10 +266,14 @@ export function loadWorkspaceConfig(workspaceCwd = process.cwd()) {
       }
     }
 
+    const { prReviewer, maxPrRepairRounds } = resolvePrCloseoutConfig(parsed);
+
     return {
       ...parsed,
       externalReadRoots,
       closeoutCommands,
+      prReviewer,
+      maxPrRepairRounds,
     };
   } catch (err) {
     if (err instanceof ExternalReadRootConfigError) {

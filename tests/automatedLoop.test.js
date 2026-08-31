@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 
 import { runAutomatedWorkflow } from '../src/orchestrator/automatedLoop.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
+import { createProductionRoleRuntime } from '../src/orchestrator/productionRoleRuntime.js';
+import { QuotaPoolRegistry, ProviderHealthRegistry } from '../src/orchestrator/roleRouting.js';
 
 function demoTaskCard(overrides = {}) {
   return {
@@ -564,7 +566,7 @@ test('8. Reviewer PASS but Supervisor illegally returns CONTINUE_REWORK -> rejec
   assert.equal(createClaudeSessionManager.managers[0].executions.length, 1);
 });
 
-test('9. maxAttemptsPerTask stops an infinite CONTINUE_REWORK loop with HUMAN_REQUIRED', async () => {
+test('9. maxAttemptsPerTask and maxEscalationAttempts stop an infinite CONTINUE_REWORK loop with HUMAN_REQUIRED', async () => {
   const taskCard = demoTaskCard();
   // Supervisor is willing to CONTINUE_REWORK forever; the loop's own guard must stop it.
   const decisions = [{ action: 'NEXT_TASK', task_card: taskCard }];
@@ -590,15 +592,17 @@ test('9. maxAttemptsPerTask stops an infinite CONTINUE_REWORK loop with HUMAN_RE
     workflowGoal: 'ship it',
     repositoryContext: taskCard.repository_context,
     maxAttemptsPerTask: 3,
+    maxEscalationAttempts: 2,
   });
 
   assert.equal(result.status, 'HUMAN_REQUIRED');
-  assert.match(result.reason, /maxAttemptsPerTask/);
+  assert.match(result.reason, /exhausted escalation attempts/);
   assert.equal(result.taskId, taskCard.task_id);
-  assert.equal(createClaudeSessionManager.managers[0].executions.length, 3);
+  assert.equal(createClaudeSessionManager.managers[0].executions.length, 5);
   // Same "preserve state to continue later" contract as direct HUMAN_REQUIRED.
   assert.equal(windowSession.closedWindowId(), null);
 });
+
 
 test('10. Reviewer tab closes when a task ends, but its ChatGPT conversation is never deleted', async () => {
   const taskCard = demoTaskCard();
@@ -1926,3 +1930,1250 @@ test('P1-1. Gate FAIL routes to REWORK with zero Reviewer calls; PASS after fix 
   // The failing Gate output was persisted as actionable rework feedback.
   assert.ok(persistence.writes.some((w) => /1 failing/.test(w.last_error || '')));
 });
+
+// A ClaudeSessionManager whose execute() delegates to the real
+// productionRoleRuntime, so a provider-candidate timeout is resolved by
+// candidate-level failover *inside* one execute() call — exactly how the
+// production wiring behaves. Used to prove the loop's implementation-retry
+// accounting (attemptCount / history.attempts) is not charged for provider
+// failover.
+function makeRuntimeBackedClaudeManagerFactory({ rolePolicy, adapters, onEvent } = {}) {
+  const managers = [];
+  function createClaudeSessionManager({ taskId }) {
+    const executions = [];
+    const runtime = createProductionRoleRuntime({
+      rolePolicy,
+      quotaRegistry: new QuotaPoolRegistry({ filePath: null }),
+      providerHealth: new ProviderHealthRegistry(),
+      resolveFamily: (family) => ({
+        requestedFamily: family,
+        resolvedModel: family.split(':')[1] || family,
+        provider: family.split(':')[0],
+        capabilities: { roles: ['executor'] },
+      }),
+      adapters,
+      onEvent,
+    });
+    const manager = {
+      taskId,
+      executions,
+      async execute(taskCard, { signal } = {}) {
+        executions.push({ taskCard });
+        const { value } = await runtime.invoke('executor', { taskCard }, { signal });
+        return value;
+      },
+    };
+    managers.push(manager);
+    return manager;
+  }
+  createClaudeSessionManager.managers = managers;
+  return createClaudeSessionManager;
+}
+
+test('regression: an Executor provider timeout fails over sonnet -> codex -> opus inside one attempt, without consuming an implementation retry', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done after failover' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const attempted = [];
+  const events = [];
+  const timeout = (name) => async () => {
+    attempted.push(name);
+    throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${name}" did not respond within 600000ms`);
+  };
+  const createClaudeSessionManager = makeRuntimeBackedClaudeManagerFactory({
+    rolePolicy: {
+      executor: [{ family: 'claude:sonnet' }, { family: 'codex:default' }, { family: 'claude:opus' }],
+    },
+    adapters: {
+      executor: {
+        'claude:sonnet': timeout('claude:sonnet'),
+        'codex:default': timeout('codex:default'),
+        'claude:opus': async (payload) => {
+          attempted.push('claude:opus');
+          return demoExecutionReport(payload.taskCard.task_id);
+        },
+      },
+    },
+    onEvent: (e) => events.push(e),
+  });
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-timeout-failover',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+
+  // Candidate-level failover ran in the mandated order, each candidate exactly
+  // once — no per-candidate retry.
+  assert.deepEqual(attempted, ['claude:sonnet', 'codex:default', 'claude:opus']);
+
+  // The whole failover happened inside a single execute() call: one Executor
+  // attempt, one Gate run, history charged for exactly one attempt.
+  assert.equal(createClaudeSessionManager.managers.length, 1);
+  assert.equal(createClaudeSessionManager.managers[0].executions.length, 1);
+  assert.equal(gateRunner.runs.length, 1);
+  assert.deepEqual(result.history, [{ task_id: taskCard.task_id, decision: 'PASS', attempts: 1 }]);
+
+  // The timeouts were classified as provider-level failover, not swallowed or
+  // reclassified as a different failure mode.
+  const failed = events.filter((e) => e.type === 'ROLE_INVOCATION_FAILED');
+  assert.deepEqual(failed.map((e) => e.failure), ['PROVIDER_TIMEOUT', 'PROVIDER_TIMEOUT']);
+  assert.equal(events.filter((e) => e.type === 'ROLE_INVOCATION_SUCCEEDED').length, 1);
+});
+
+// --- Executor unauthorized-probe attribution & Escalation Budget Tests ---
+
+function makeScriptedClaudeManagerFactory(reportsByTaskId) {
+  const managers = [];
+  function createClaudeSessionManager({ taskId }) {
+    const executions = [];
+    const manager = {
+      taskId,
+      executions,
+      async execute(taskCard) {
+        executions.push({ taskCard });
+        const queue = reportsByTaskId[taskCard.task_id] || [];
+        const spec = queue.shift() || {};
+        const report = demoExecutionReport(taskCard.task_id, {
+          status: spec.status ?? 'DONE',
+          issues: spec.issues ?? 'none',
+          next_recommendation: spec.next_recommendation ?? 'proceed',
+        });
+        Object.defineProperty(report, 'permissionDenials', {
+          value: spec.permissionDenials ?? [],
+          enumerable: false,
+        });
+        return report;
+      },
+    };
+    managers.push(manager);
+    return manager;
+  }
+  createClaudeSessionManager.managers = managers;
+  return createClaudeSessionManager;
+}
+
+test('executor: a denied UNLISTED probe command is not reclassified as ENVIRONMENT and does not burn a retry', async () => {
+  const taskCard = demoTaskCard({ verification_commands: ['npm test'] });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'all done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      {
+        status: 'BLOCKED',
+        issues: 'node and npm appear unavailable in this environment',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'node --test tests/probe.test.js' } }],
+      },
+      { status: 'DONE' },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-probe-1',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 1,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  const execs = createClaudeSessionManager.managers[0].executions;
+  assert.equal(execs.length, 2);
+  assert.ok(execs[1].taskCard.unauthorized_probe_guidance);
+  assert.deepEqual(execs[1].taskCard.unauthorized_probe_guidance.denied_commands, ['node --test tests/probe.test.js']);
+  assert.deepEqual(execs[1].taskCard.unauthorized_probe_guidance.approved_verification_commands, ['npm test']);
+  assert.equal('unauthorized_probe_guidance' in execs[0].taskCard, false);
+});
+
+test('executor: a denied APPROVED verification command IS an ENVIRONMENT blocker -> HUMAN_REQUIRED', async () => {
+  const taskCard = demoTaskCard({ verification_commands: ['npm test'] });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [] });
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      {
+        status: 'BLOCKED',
+        issues: 'permission denied executing npm test',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'npm test' } }],
+      },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-probe-2',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+  });
+
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.equal(result.blockerCategory, 'ENVIRONMENT');
+  assert.equal(gateRunner.runs.length, 0);
+});
+
+test('executor: probe comparison is strictly verbatim — whitespace variants and redirects are EXECUTOR_UNAUTHORIZED_PROBE', async () => {
+  const taskCard = demoTaskCard({ verification_commands: ['node --test tests/a.test.js'] });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'all done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      // Probe 1: leading space
+      {
+        status: 'BLOCKED',
+        issues: 'blocked probe',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: ' node --test tests/a.test.js' } }],
+      },
+      // Probe 2: pipe and tail
+      {
+        status: 'BLOCKED',
+        issues: 'blocked probe 2',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'node --test tests/a.test.js 2>&1 | tail -10' } }],
+      },
+      { status: 'DONE' },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-probe-strict',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 1,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  const execs = createClaudeSessionManager.managers[0].executions;
+  assert.equal(execs.length, 3);
+  assert.deepEqual(execs[1].taskCard.unauthorized_probe_guidance.denied_commands, [' node --test tests/a.test.js']);
+  assert.deepEqual(execs[2].taskCard.unauthorized_probe_guidance.denied_commands, ['node --test tests/a.test.js 2>&1 | tail -10']);
+});
+
+test('Case A: normalAttempts=1 -> Executor unauthorized probe -> 自动 fresh Executor -> normalAttempts 仍为 1 -> HUMAN_REQUIRED=false', async () => {
+  const taskCard = demoTaskCard({ verification_commands: ['node --test tests/a.test.js'] });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      {
+        status: 'BLOCKED',
+        issues: 'blocked probe',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'node --test tests/a.test.js 2>&1; echo "EXIT: $?"' } }],
+      },
+      { status: 'DONE' },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const checkpoints = [];
+  const onCheckpoint = (cp) => checkpoints.push(cp);
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-case-a',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'case a test',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+    onCheckpoint,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.notEqual(result.status, 'HUMAN_REQUIRED');
+  const execs = createClaudeSessionManager.managers[0].executions;
+  assert.equal(execs.length, 2);
+  const finalCp = checkpoints[checkpoints.length - 1];
+  assert.equal(finalCp.normalAttempts, 1);
+});
+
+test('Case B: 连续两次 unauthorized probe -> 都不消耗 implementation budget -> Core 每次注入 approved-command-only guidance -> 不进入 Reviewer', async () => {
+  const taskCard = demoTaskCard({ verification_commands: ['node --test tests/b.test.js'] });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  let reviewerCalls = 0;
+  const rawReviewerFactory = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const createReviewerSession = () => {
+    const session = rawReviewerFactory();
+    const origReview = session.review;
+    session.review = async (...args) => {
+      reviewerCalls += 1;
+      return origReview.apply(session, args);
+    };
+    return session;
+  };
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      {
+        status: 'BLOCKED',
+        issues: 'blocked probe 1',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'git log -1' } }],
+      },
+      {
+        status: 'BLOCKED',
+        issues: 'blocked probe 2',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'node --test tests/b.test.js | grep ok' } }],
+      },
+      { status: 'DONE' },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const checkpoints = [];
+  const onCheckpoint = (cp) => checkpoints.push(cp);
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-case-b',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'case b test',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+    onCheckpoint,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  const execs = createClaudeSessionManager.managers[0].executions;
+  assert.equal(execs.length, 3);
+  assert.deepEqual(execs[1].taskCard.unauthorized_probe_guidance.denied_commands, ['git log -1']);
+  assert.deepEqual(execs[2].taskCard.unauthorized_probe_guidance.denied_commands, ['node --test tests/b.test.js | grep ok']);
+  // Reviewer called exactly once at the end, zero times during probes
+  assert.equal(reviewerCalls, 1);
+  const finalCp = checkpoints[checkpoints.length - 1];
+  assert.equal(finalCp.normalAttempts, 1);
+});
+
+test('Case C: unauthorized probe 后 fresh Executor 使用精确批准命令 -> 正常进入 Gate -> 后续 implementation REWORK 递增 normalAttempts', async () => {
+  const taskCard = demoTaskCard({ verification_commands: ['node --test tests/c.test.js'] });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'CONTINUE_REWORK' },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({
+    [taskCard.task_id]: [
+      { task_id: taskCard.task_id, decision: 'REWORK', findings: ['need fix'], required_changes: ['fix it'], rationale: 'r1' },
+      passResult(taskCard.task_id),
+    ],
+  });
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      // Attempt 1: unauthorized probe
+      {
+        status: 'BLOCKED',
+        issues: 'blocked probe',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'node --test tests/c.test.js 2>&1' } }],
+      },
+      // Attempt 1 retry: clean execution -> Gate passes -> Reviewer returns REWORK
+      { status: 'DONE' },
+      // Attempt 2: clean execution -> Gate passes -> Reviewer passes
+      { status: 'DONE' },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const checkpoints = [];
+  const onCheckpoint = (cp) => checkpoints.push(cp);
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-case-c',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'case c test',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+    onCheckpoint,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  const execs = createClaudeSessionManager.managers[0].executions;
+  assert.equal(execs.length, 3);
+  const finalCp = checkpoints[checkpoints.length - 1];
+  assert.equal(finalCp.normalAttempts, 2);
+});
+
+test('Case D: 1 次真实 REWORK -> unauthorized probe -> 再 2 次真实 REWORK -> 此时才达到 normalAttempts = 3 -> 自动 Supervisor escalation -> 全程不 HUMAN_REQUIRED', async () => {
+  const taskCard = demoTaskCard({ verification_commands: ['node --test tests/d.test.js'] });
+  let supervisorCalled = false;
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'CONTINUE_REWORK' }, // after attempt 1
+    { action: 'CONTINUE_REWORK' }, // after attempt 2
+    { action: 'CONTINUE_REWORK', guidance: 'supervisor escalation guidance' }, // after attempt 3 (escalation)
+    { action: 'WORKFLOW_DONE', summary: 'done on escalation' },
+  ]);
+  const reworkRes = (r) => ({
+    task_id: taskCard.task_id,
+    decision: 'REWORK',
+    findings: ['fix'],
+    required_changes: ['fix'],
+    rationale: r,
+  });
+  const createReviewerSession = makeFakeReviewerFactory({
+    [taskCard.task_id]: [
+      reworkRes('r1'), // after attempt 1
+      reworkRes('r2'), // after attempt 2
+      reworkRes('r3'), // after attempt 3
+      passResult(taskCard.task_id), // after escalation attempt 4
+    ],
+  });
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      // Attempt 1: real execution -> REWORK (normalAttempts = 1)
+      { status: 'DONE' },
+      // Attempt 2 try 1: unauthorized probe -> does NOT burn attempt
+      {
+        status: 'BLOCKED',
+        issues: 'blocked probe in attempt 2',
+        permissionDenials: [{ tool_name: 'Bash', tool_input: { command: 'node --test tests/d.test.js 2>&1; echo $?' } }],
+      },
+      // Attempt 2 try 2: real execution -> REWORK (normalAttempts = 2)
+      { status: 'DONE' },
+      // Attempt 3: real execution -> REWORK (normalAttempts = 3 -> triggers escalation)
+      { status: 'DONE' },
+      // Escalation Attempt (attempt 4, escalationAttempts = 1): real execution -> PASS
+      { status: 'DONE' },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const checkpoints = [];
+  const onCheckpoint = (cp) => checkpoints.push(cp);
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-case-d',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'case d test',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+    maxEscalationAttempts: 2,
+    onCheckpoint,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.notEqual(result.status, 'HUMAN_REQUIRED');
+  const execs = createClaudeSessionManager.managers[0].executions;
+  assert.equal(execs.length, 5);
+  // Escalation guidance was passed to final attempt
+  assert.equal(execs[4].taskCard.supervisor_guidance, 'supervisor escalation guidance');
+  const finalCp = checkpoints[checkpoints.length - 1];
+  assert.equal(finalCp.normalAttempts, 3);
+  assert.equal(finalCp.escalationAttempts, 1);
+  assert.equal(finalCp.escalationActive, true);
+});
+
+test('Nested Route Error: Executor BLOCKED reporting missing supergpt_route / supergpt MCP does NOT trigger HUMAN_REQUIRED and recovers autonomously', async () => {
+  const taskCard = demoTaskCard({ task_id: 'task-nested-route' });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'all done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({
+    [taskCard.task_id]: [passResult(taskCard.task_id)],
+  });
+  const createClaudeSessionManager = makeScriptedClaudeManagerFactory({
+    [taskCard.task_id]: [
+      // Attempt 1: Executor erroneously reports BLOCKED due to supergpt_route MCP tool absence
+      {
+        status: 'BLOCKED',
+        issues: ['Required `supergpt_route` MCP tool is unavailable. Global repository policy prohibits proceeding directly when SuperGPT MCP is unavailable.'],
+        next_recommendation: 'Configure or restore the SuperGPT MCP tools, then retry this task.',
+      },
+      // Attempt 2: After guidance, Executor executes Task Card directly and finishes
+      { status: 'DONE' },
+    ],
+  });
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-nested-route-recovery',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'nested route recovery test',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.notEqual(result.status, 'HUMAN_REQUIRED');
+  const execs = createClaudeSessionManager.managers[0].executions;
+  assert.equal(execs.length, 2);
+  assert.match(execs[1].taskCard.unauthorized_probe_guidance.message, /internal Executor.*active SuperGPT workflow/);
+});
+
+test('deterministic closeout fast path: Gate PASS + Reviewer PASS + queue empty -> deterministic WORKFLOW_DONE without model supervisor calls', async () => {
+  const taskCard = demoTaskCard();
+  const plannedTasks = [
+    {
+      task_id: taskCard.task_id,
+      goal: taskCard.goal,
+      scope: taskCard.scope,
+      allowed_files: taskCard.allowed_files,
+      verification_commands: taskCard.verification_commands,
+    },
+  ];
+  let supervisorCallCount = 0;
+  const supervisor = {
+    async create() { return { tabId: 501, conversationId: null }; },
+    async decide(context) {
+      supervisorCallCount += 1;
+      throw new Error('Supervisor model should NOT be called on deterministic closeout fast path');
+    },
+    async close() {},
+    getIdentity() { return { tabId: 501, conversationId: null }; },
+  };
+
+  const createReviewerSession = makeFakeReviewerFactory({
+    [taskCard.task_id]: [passResult(taskCard.task_id)],
+  });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  // Initial task is supplied via NEXT_TASK
+  const supervisorWithInit = {
+    ...supervisor,
+    async decide(context) {
+      if (context.latestReviewResult?.decision === 'PASS') {
+        supervisorCallCount += 1;
+        throw new Error('Supervisor model should NOT be called after Reviewer PASS');
+      }
+      return { action: 'NEXT_TASK', task_card: taskCard };
+    },
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-deterministic-closeout',
+    supervisorSession: supervisorWithInit,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'deterministic closeout',
+    repositoryContext: taskCard.repository_context,
+    plannedTasks,
+    planSummary: 'done fast',
+    maxAttemptsPerTask: 3,
+  });
+
+  // After PASS, loop completes with WORKFLOW_DONE and did not call supervisor for closeout
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.equal(supervisorCallCount, 0);
+});
+
+test('escalation: normal attempts=3 exhausted automatically enters Supervisor escalation and finishes without HUMAN_REQUIRED', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'CONTINUE_REWORK' },
+    { action: 'CONTINUE_REWORK' },
+    { action: 'CONTINUE_REWORK', guidance: 'focus on fix' },
+    { action: 'WORKFLOW_DONE', summary: 'completed on escalation' },
+  ]);
+  const reworkRes = (rationale) => ({
+    task_id: taskCard.task_id,
+    decision: 'REWORK',
+    findings: ['fix defect'],
+    required_changes: ['fix defect'],
+    rationale,
+  });
+  const createReviewerSession = makeFakeReviewerFactory({
+    [taskCard.task_id]: [
+      reworkRes('r1'),
+      reworkRes('r2'),
+      reworkRes('r3'),
+      passResult(taskCard.task_id),
+    ],
+  });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const checkpoints = [];
+  const onCheckpoint = (cp) => checkpoints.push(cp);
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-escalation-1',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+    maxEscalationAttempts: 2,
+    onCheckpoint,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(result.history, [
+    {
+      task_id: taskCard.task_id,
+      decision: 'PASS',
+      attempts: 4,
+    },
+  ]);
+  const finalCp = checkpoints[checkpoints.length - 1];
+  assert.equal(finalCp.normalAttempts, 3);
+  assert.equal(finalCp.escalationAttempts, 1);
+  assert.equal(finalCp.escalationActive, true);
+});
+
+test('escalation: exhausting escalation budget triggers HUMAN_REQUIRED', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'CONTINUE_REWORK' },
+    { action: 'CONTINUE_REWORK' },
+  ]);
+  const reworkRes = {
+    task_id: taskCard.task_id,
+    decision: 'REWORK',
+    findings: ['still failing'],
+    required_changes: ['still failing'],
+  };
+  const createReviewerSession = makeFakeReviewerFactory({
+    [taskCard.task_id]: [reworkRes, reworkRes],
+  });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const checkpoint = {
+    history: [],
+    currentTaskCard: taskCard,
+    currentTaskId: taskCard.task_id,
+    attempt: 3,
+    normalAttempts: 3,
+    escalationAttempts: 0,
+    escalationActive: true,
+    latestReviewResult: reworkRes,
+  };
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-escalation-exhaust',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+    maxEscalationAttempts: 1,
+    humanAnswer: 'proceed with escalation',
+    checkpoint,
+  });
+
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.match(result.reason, /exhausted escalation attempts/);
+});
+
+test('escalation: retry-phase consumption never touches the escalation budget', async () => {
+  const taskCard = demoTaskCard();
+  const decisions = [{ action: 'NEXT_TASK', task_card: taskCard }];
+  for (let i = 0; i < 10; i += 1) decisions.push({ action: 'CONTINUE_REWORK' });
+  const supervisor = makeFakeSupervisor(decisions);
+  const reworkQueue = [];
+  for (let i = 0; i < 10; i += 1) reworkQueue.push(reworkResult(taskCard.task_id));
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: reworkQueue });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const checkpoints = [];
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-budget-independence',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    maxAttemptsPerTask: 3,
+    maxEscalationAttempts: 2,
+    onCheckpoint: (cp) => checkpoints.push(cp),
+  });
+
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.match(result.reason, /exhausted escalation attempts/);
+  // Every checkpoint written during the retry phase (first 3 attempts) kept escalation at zero
+  // and inactive — retries did not draw down the escalation quota early.
+  const retryPhaseCheckpoints = checkpoints.filter((cp) => cp.normalAttempts < 3 || (cp.normalAttempts === 3 && !cp.escalationActive && cp.escalationAttempts === 0));
+  assert.ok(retryPhaseCheckpoints.length >= 3);
+  for (const cp of retryPhaseCheckpoints) {
+    assert.equal(cp.escalationAttempts, 0);
+    assert.equal(cp.escalationActive, false);
+  }
+  const last = checkpoints[checkpoints.length - 1];
+  assert.equal(last.normalAttempts, 3);
+  assert.equal(last.escalationAttempts, 2);
+});
+
+
+function outOfScopeResult(taskId) {
+  return {
+    task_id: taskId,
+    decision: 'OUT_OF_SCOPE',
+    findings: ['acceptance criterion needs a file outside allowed_files'],
+    required_changes: ['modify src/other-module.js (not in this Task Card allowed_files)'],
+    rationale: 'the only way to satisfy the criterion is outside declared scope',
+  };
+}
+
+test('OUT_OF_SCOPE: Reviewer OUT_OF_SCOPE closes the task deterministically and the workflow proceeds', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done; one task closed out-of-scope' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [outOfScopeResult(taskCard.task_id)] });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const checkpoints = [];
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-oos-1',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    onCheckpoint: (cp) => checkpoints.push(cp),
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // Recorded in history, distinct from PASS, and auditable.
+  assert.equal(result.history.length, 1);
+  assert.equal(result.history[0].task_id, taskCard.task_id);
+  assert.equal(result.history[0].decision, 'OUT_OF_SCOPE');
+  assert.deepEqual(result.history[0].out_of_scope_changes, [
+    'modify src/other-module.js (not in this Task Card allowed_files)',
+  ]);
+  // No rework loop — exactly one Executor attempt, one review.
+  assert.equal(createClaudeSessionManager.managers[0].executions.length, 1);
+  assert.equal(createReviewerSession.created[0].reviewCalls, 1);
+  // The lifecycle result is persisted for resume.
+  const last = checkpoints[checkpoints.length - 1];
+  assert.equal(last.latestReviewResult.decision, 'OUT_OF_SCOPE');
+});
+
+test('OUT_OF_SCOPE: after OUT_OF_SCOPE a Supervisor CONTINUE_REWORK is an illegal transition', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'CONTINUE_REWORK' }, // illegal: the task is closed (OUT_OF_SCOPE)
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [outOfScopeResult(taskCard.task_id)] });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  await assert.rejects(
+    () => runAutomatedWorkflow({
+      workflowId: 'wf-oos-2',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      windowSession,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    }),
+    (err) => {
+      assert.ok(err instanceof AdapterError);
+      assert.equal(err.code, ADAPTER_ERROR_CODES.SUPERVISOR_ILLEGAL_TRANSITION);
+      return true;
+    }
+  );
+  assert.equal(createClaudeSessionManager.managers[0].executions.length, 1);
+});
+
+test('stale REWORK isolation: a checkpoint REWORK from a superseded round is not resumed as mid-flight', async () => {
+  const taskCard = demoTaskCard({ task_id: 'stale-task' });
+  const freshTask = demoTaskCard({ task_id: 'fresh-task' });
+  // reviewRound has advanced to 5; the persisted REWORK is stamped round 2.
+  const checkpoint = {
+    history: [],
+    currentTaskCard: taskCard,
+    currentTaskId: taskCard.task_id,
+    attempt: 2,
+    normalAttempts: 2,
+    escalationAttempts: 0,
+    escalationActive: false,
+    reviewRound: 5,
+    latestReviewResult: {
+      task_id: taskCard.task_id,
+      decision: 'REWORK',
+      round: 2,
+      required_changes: ['stale ask from an old round'],
+      findings: 'x',
+      rationale: 'y',
+    },
+  };
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: freshTask },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ 'fresh-task': [passResult('fresh-task')] });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const lines = [];
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-stale-1',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    checkpoint,
+    maxAttemptsPerTask: 3,
+    log: (l) => lines.push(l),
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // The stale task was never re-executed; only the fresh task ran.
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['fresh-task']);
+  assert.deepEqual(result.history.map((h) => h.task_id), ['fresh-task']);
+  assert.ok(lines.some((l) => /stale REWORK ignored/.test(l)), 'expected a stale-REWORK diagnostic log line');
+});
+
+test('stale REWORK isolation: a current-round REWORK checkpoint DOES still resume the task', async () => {
+  const taskCard = demoTaskCard({ task_id: 'live-task' });
+  const checkpoint = {
+    history: [],
+    currentTaskCard: taskCard,
+    currentTaskId: taskCard.task_id,
+    attempt: 1,
+    normalAttempts: 1,
+    escalationAttempts: 0,
+    escalationActive: false,
+    reviewRound: 1,
+    latestReviewResult: {
+      task_id: taskCard.task_id,
+      decision: 'REWORK',
+      round: 1,
+      required_changes: ['a genuinely current ask'],
+      findings: 'x',
+      rationale: 'y',
+    },
+  };
+  const supervisor = makeFakeSupervisor([
+    { action: 'CONTINUE_REWORK' },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ 'live-task': [passResult('live-task')] });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-live-1',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    persistence: { async writeState() {} },
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    checkpoint,
+    maxAttemptsPerTask: 5,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['live-task']);
+  assert.deepEqual(result.history.map((h) => h.task_id), ['live-task']);
+});
+
+// A checkpoint serialized and reloaded through persistence (JSON round-trip)
+// must not resume a persisted REWORK unless it is POSITIVELY identified as the
+// restored task AND the restored round. These cases each strip one piece of
+// that identity and prove the loop treats the result as stale.
+const reloadCheckpoint = (cp) => JSON.parse(JSON.stringify(cp));
+
+function runResumeExpectingNoMidFlight(checkpoint, freshTaskId = 'fresh-task') {
+  const freshTask = demoTaskCard({ task_id: freshTaskId });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: freshTask },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [freshTaskId]: [passResult(freshTaskId)] });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const lines = [];
+  return runAutomatedWorkflow({
+    workflowId: 'wf-stale-reload',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    workflowGoal: 'ship it',
+    repositoryContext: freshTask.repository_context,
+    checkpoint: reloadCheckpoint(checkpoint),
+    maxAttemptsPerTask: 3,
+    log: (l) => lines.push(l),
+  }).then((result) => ({ result, createClaudeSessionManager, lines }));
+}
+
+test('stale REWORK after persistence reload: new-format checkpoint whose persisted REWORK has no round metadata is stale', async () => {
+  const staleTask = demoTaskCard({ task_id: 'stale-task' });
+  const checkpoint = {
+    history: [],
+    currentTaskCard: staleTask,
+    currentTaskId: staleTask.task_id,
+    attempt: 2,
+    normalAttempts: 2,
+    escalationAttempts: 0,
+    escalationActive: false,
+    reviewRound: 3, // new-format checkpoint
+    latestReviewResult: {
+      task_id: staleTask.task_id, // task identity present…
+      decision: 'REWORK',
+      // …but NO round — cannot be positively tied to reviewRound 3.
+      required_changes: ['legacy ask without round metadata'],
+      findings: 'x',
+      rationale: 'y',
+    },
+  };
+  const { result, createClaudeSessionManager, lines } = await runResumeExpectingNoMidFlight(checkpoint);
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['fresh-task']);
+  assert.deepEqual(result.history.map((h) => h.task_id), ['fresh-task']);
+  assert.ok(lines.some((l) => /stale REWORK ignored/.test(l)));
+});
+
+test('stale REWORK after persistence reload: persisted REWORK for a different task id is stale', async () => {
+  const restoredTask = demoTaskCard({ task_id: 'restored-task' });
+  const checkpoint = {
+    history: [],
+    currentTaskCard: restoredTask,
+    currentTaskId: restoredTask.task_id,
+    attempt: 1,
+    normalAttempts: 1,
+    escalationAttempts: 0,
+    escalationActive: false,
+    reviewRound: 1,
+    latestReviewResult: {
+      task_id: 'some-other-task', // cross-task REWORK
+      decision: 'REWORK',
+      round: 1, // round matches, identity does not
+      required_changes: ['ask that belongs to another task'],
+      findings: 'x',
+      rationale: 'y',
+    },
+  };
+  const { result, createClaudeSessionManager, lines } = await runResumeExpectingNoMidFlight(checkpoint);
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['fresh-task']);
+  assert.deepEqual(result.history.map((h) => h.task_id), ['fresh-task']);
+  assert.ok(lines.some((l) => /stale REWORK ignored/.test(l)));
+});
+
+test('stale REWORK after persistence reload: a completed (PASS) review reload never re-executes the closed task', async () => {
+  const doneTask = demoTaskCard({ task_id: 'done-task' });
+  const checkpoint = {
+    history: [{ task_id: 'done-task', decision: 'PASS', attempts: 2 }],
+    currentTaskCard: doneTask, // still present in the snapshot…
+    currentTaskId: doneTask.task_id,
+    attempt: 2,
+    normalAttempts: 2,
+    escalationAttempts: 0,
+    escalationActive: false,
+    reviewRound: 2,
+    latestReviewResult: { task_id: 'done-task', decision: 'PASS', round: 2, required_changes: 'none', findings: 'ok', rationale: 'ok' },
+  };
+  const freshTask = demoTaskCard({ task_id: 'next-task' });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: freshTask },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ 'next-task': [passResult('next-task')] });
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-pass-reload',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    workflowGoal: 'ship it',
+    repositoryContext: freshTask.repository_context,
+    checkpoint: reloadCheckpoint(checkpoint),
+  });
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  // done-task was accepted before the crash; it is never re-executed.
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['next-task']);
+  assert.deepEqual(result.history.map((h) => h.task_id), ['done-task', 'next-task']);
+});
+
+test('legacy checkpoint (no reviewRound field) still resumes a non-terminal REWORK — migration rule', async () => {
+  const legacyTask = demoTaskCard({ task_id: 'legacy-task' });
+  const checkpoint = {
+    history: [],
+    currentTaskCard: legacyTask,
+    currentTaskId: legacyTask.task_id,
+    attempt: 1,
+    normalAttempts: 1,
+    // no reviewRound, no round on the review result — pre-stamping format
+    latestReviewResult: { task_id: 'legacy-task', decision: 'REWORK', required_changes: ['fix'], findings: 'x', rationale: 'y' },
+  };
+  const supervisor = makeFakeSupervisor([
+    { action: 'CONTINUE_REWORK' },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-legacy-reload',
+    supervisorSession: supervisor,
+    createReviewerSession: makeFakeReviewerFactory({ 'legacy-task': [passResult('legacy-task')] }),
+    createClaudeSessionManager,
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    persistence: { async writeState() {} },
+    workflowGoal: 'ship it',
+    repositoryContext: legacyTask.repository_context,
+    checkpoint: reloadCheckpoint(checkpoint),
+    maxAttemptsPerTask: 5,
+  });
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['legacy-task']);
+  assert.deepEqual(result.history.map((h) => h.task_id), ['legacy-task']);
+});
+
+test('OUT_OF_SCOPE survives a persistence reload: task stays closed, history preserved, no re-execution, genuine REWORK still handled', async () => {
+  const oosTask = demoTaskCard({ task_id: 'oos-task' });
+  // Phase 1: run to the OUT_OF_SCOPE closure and capture the checkpoint.
+  const checkpoints = [];
+  const sup1 = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: oosTask },
+    { action: 'HUMAN_REQUIRED', reason: 'pause here', question: 'q?' },
+  ]);
+  const res1 = await runAutomatedWorkflow({
+    workflowId: 'wf-oos-reload',
+    supervisorSession: sup1,
+    createReviewerSession: makeFakeReviewerFactory({ 'oos-task': [outOfScopeResult('oos-task')] }),
+    createClaudeSessionManager: makeFakeClaudeManagerFactory(),
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    workflowGoal: 'ship it',
+    repositoryContext: oosTask.repository_context,
+    onCheckpoint: (cp) => checkpoints.push(cp),
+  });
+  assert.equal(res1.status, 'HUMAN_REQUIRED');
+  const snapshot = checkpoints[checkpoints.length - 1];
+  assert.equal(snapshot.latestReviewResult.decision, 'OUT_OF_SCOPE');
+  assert.deepEqual(snapshot.history.map((h) => h.decision), ['OUT_OF_SCOPE']);
+
+  // Phase 2: reload the serialized checkpoint. The closed task must not run
+  // again; a following task that genuinely needs REWORK still converges.
+  const reworkTask = demoTaskCard({ task_id: 'rework-task' });
+  const sup2 = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: reworkTask },
+    { action: 'CONTINUE_REWORK' },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+  const exec2 = makeFakeClaudeManagerFactory();
+  const res2 = await runAutomatedWorkflow({
+    workflowId: 'wf-oos-reload',
+    supervisorSession: sup2,
+    createReviewerSession: makeFakeReviewerFactory({
+      'rework-task': [reworkResult('rework-task'), passResult('rework-task')],
+    }),
+    createClaudeSessionManager: exec2,
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    persistence: { async writeState() {} },
+    workflowGoal: 'ship it',
+    repositoryContext: reworkTask.repository_context,
+    checkpoint: reloadCheckpoint(snapshot),
+    maxAttemptsPerTask: 5,
+  });
+  assert.equal(res2.status, 'WORKFLOW_DONE');
+  // oos-task never re-executed on resume.
+  assert.deepEqual(exec2.managers.map((m) => m.taskId), ['rework-task']);
+  // History still carries the OUT_OF_SCOPE closure, then the reworked PASS.
+  assert.deepEqual(res2.history.map((h) => [h.task_id, h.decision]), [
+    ['oos-task', 'OUT_OF_SCOPE'],
+    ['rework-task', 'PASS'],
+  ]);
+  // The genuine REWORK was honoured: rework-task took two executor attempts.
+  assert.equal(exec2.managers[0].executions.length, 2);
+});
+
+test('two-budget recovery: a restored checkpoint with partly-spent retry AND escalation keeps the counters independent', async () => {
+  const taskCard = demoTaskCard({ task_id: 'budget-task' });
+  // Crash point: retry budget fully spent (3/3), escalation partly spent (1/2),
+  // escalation phase active. Positively-identified current-round REWORK.
+  const checkpoint = {
+    history: [],
+    currentTaskCard: taskCard,
+    currentTaskId: taskCard.task_id,
+    attempt: 4,
+    normalAttempts: 3,
+    escalationAttempts: 1,
+    escalationActive: true,
+    reviewRound: 4,
+    latestReviewResult: {
+      task_id: 'budget-task',
+      decision: 'REWORK',
+      round: 4,
+      required_changes: ['still not converged'],
+      findings: 'x',
+      rationale: 'y',
+    },
+  };
+  const checkpoints = [];
+  const supervisor = makeFakeSupervisor([
+    { action: 'CONTINUE_REWORK' },
+    { action: 'CONTINUE_REWORK' },
+  ]);
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-two-budget',
+    supervisorSession: supervisor,
+    createReviewerSession: makeFakeReviewerFactory({ 'budget-task': [reworkResult('budget-task')] }),
+    createClaudeSessionManager: makeFakeClaudeManagerFactory(),
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    persistence: { async writeState() {} },
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+    checkpoint: reloadCheckpoint(checkpoint),
+    maxAttemptsPerTask: 3,
+    maxEscalationAttempts: 2,
+    humanAnswer: 'continue escalation',
+    onCheckpoint: (cp) => checkpoints.push(cp),
+  });
+
+  // One more escalation attempt (1 -> 2) then the escalation budget is spent.
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  assert.match(result.reason, /exhausted escalation attempts/);
+  // The retry counter was never reset, reused, or mixed into escalation.
+  for (const cp of checkpoints) {
+    assert.equal(cp.normalAttempts, 3, 'retry counter stayed frozen at its exhausted value');
+    assert.equal(cp.escalationActive, true);
+  }
+  const last = checkpoints[checkpoints.length - 1];
+  assert.equal(last.escalationAttempts, 2);
+  assert.equal(last.normalAttempts, 3);
+});
+
+test('legacy checkpoint: missing task_id on persisted REWORK is treated as stale (fail-closed)', async () => {
+  const legacyTask = demoTaskCard({ task_id: 'legacy-task-no-id' });
+  const checkpoint = {
+    history: [],
+    currentTaskCard: legacyTask,
+    currentTaskId: legacyTask.task_id,
+    attempt: 1,
+    normalAttempts: 1,
+    // Legacy format (no reviewRound), but persistedReview has NO task_id
+    latestReviewResult: { decision: 'REWORK', required_changes: ['fix'], findings: 'x', rationale: 'y' },
+  };
+  const { result, createClaudeSessionManager, lines } = await runResumeExpectingNoMidFlight(checkpoint);
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['fresh-task']);
+  assert.ok(lines.some((l) => /stale REWORK ignored/.test(l)));
+});
+
+test('legacy checkpoint: mismatched task_id on persisted REWORK is treated as stale (fail-closed)', async () => {
+  const legacyTask = demoTaskCard({ task_id: 'legacy-task-mismatch' });
+  const checkpoint = {
+    history: [],
+    currentTaskCard: legacyTask,
+    currentTaskId: legacyTask.task_id,
+    attempt: 1,
+    normalAttempts: 1,
+    // Legacy format (no reviewRound), but persistedReview has DIFFERENT task_id
+    latestReviewResult: { task_id: 'other-task', decision: 'REWORK', required_changes: ['fix'], findings: 'x', rationale: 'y' },
+  };
+  const { result, createClaudeSessionManager, lines } = await runResumeExpectingNoMidFlight(checkpoint);
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['fresh-task']);
+  assert.ok(lines.some((l) => /stale REWORK ignored/.test(l)));
+});
+
+test('REVIEW_PENDING checkpoint: mismatched task_id does not restore as pending review', async () => {
+  const pendingTask = demoTaskCard({ task_id: 'pending-task' });
+  const checkpoint = {
+    history: [],
+    phase: 'REVIEW_PENDING',
+    currentTaskCard: pendingTask,
+    currentTaskId: 'different-task-id',
+    executionReport: { output: 'done' },
+    gateEvidence: { pass: true, results: [] },
+    attempt: 1,
+    normalAttempts: 1,
+    latestReviewResult: { task_id: 'different-task-id', decision: 'REWORK', required_changes: ['fix'] },
+  };
+  const { result, createClaudeSessionManager } = await runResumeExpectingNoMidFlight(checkpoint);
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['fresh-task']);
+});
+

@@ -31,9 +31,12 @@ export function validPlannedTasks(tasks) {
   return true;
 }
 
-export function materializePlannedTask(task, { repositoryContext = {}, workflowGoal = '' } = {}) {
+import { resolveRepoRelativePaths } from './workspaceConfig.js';
+
+export function materializePlannedTask(task, { repositoryContext = {}, workflowGoal = '', repoFiles } = {}) {
   const verificationCommands = asList(task.verification_commands);
   const acceptanceCriteria = asList(task.acceptance_criteria);
+  const allowedFiles = resolveRepoRelativePaths(asList(task.allowed_files), { repoFiles }).paths;
   return {
     task_id: task.task_id.trim(),
     repository_context: { ...repositoryContext },
@@ -42,7 +45,7 @@ export function materializePlannedTask(task, { repositoryContext = {}, workflowG
       ? task.context.trim()
       : String(workflowGoal ?? '').trim(),
     scope: typeof task.scope === 'string' && task.scope.trim() ? task.scope.trim() : task.goal.trim(),
-    allowed_files: asList(task.allowed_files),
+    allowed_files: allowedFiles,
     forbidden_files: asList(task.forbidden_files),
     acceptance_criteria: acceptanceCriteria.length
       ? acceptanceCriteria
@@ -63,15 +66,20 @@ export function decideDeterministically({
   planSummary = null,
   reworkMemory = new Map(),
 } = {}) {
-  if (!validPlannedTasks(plannedTasks)) {
+  const effectivePlannedTasks = context.plannedTasks || plannedTasks;
+  const effectivePlanSummary = context.planSummary || planSummary;
+
+  if (!validPlannedTasks(effectivePlannedTasks)) {
     return { handled: false, reason: 'no_structured_task_queue' };
   }
 
   const history = Array.isArray(context.history) ? context.history : [];
-  const plannedIds = new Set(plannedTasks.map((task) => task.task_id.trim()));
+  const plannedIds = new Set(effectivePlannedTasks.map((task) => task.task_id.trim()));
   const completedIds = new Set();
   for (const entry of history) {
-    if (entry?.decision !== 'PASS' || typeof entry?.task_id !== 'string') continue;
+    // OUT_OF_SCOPE closes a task deterministically just like PASS: it is done
+    // and the planned queue advances past it (it is not re-selected).
+    if ((entry?.decision !== 'PASS' && entry?.decision !== 'OUT_OF_SCOPE') || typeof entry?.task_id !== 'string') continue;
     const id = entry.task_id.trim();
     // A checkpoint from a different plan means the current queue cannot be
     // trusted to advance deterministically; escalate instead of guessing.
@@ -85,11 +93,18 @@ export function decideDeterministically({
   }
 
   if (review?.decision === 'REWORK') {
+    const maxAttempts = context.maxAttemptsPerTask || 3;
+    const normalAttempts = Number.isFinite(context.normalAttempts) ? context.normalAttempts : (context.attempt || 0);
+    if (normalAttempts >= maxAttempts && !context.escalationActive) {
+      return { handled: false, reason: 'exhausted_normal_attempts_escalation' };
+    }
+
     // Gate failures are mechanical code/test failures. Environment/toolchain
     // failures are already intercepted by automatedLoop as HUMAN_REQUIRED.
     if (review.source === 'GATE') {
       return { handled: true, decision: { action: 'CONTINUE_REWORK' }, reason: 'gate_rework' };
     }
+
 
     const taskId = typeof review.task_id === 'string' ? review.task_id.trim() : '';
     const signature = reworkSignature(review);
@@ -105,19 +120,25 @@ export function decideDeterministically({
     return { handled: true, decision: { action: 'CONTINUE_REWORK' }, reason: 'ordinary_reviewer_rework' };
   }
 
-  if (review && review.decision !== 'PASS') {
+  if (review && review.decision !== 'PASS' && review.decision !== 'OUT_OF_SCOPE') {
     return { handled: false, reason: 'unknown_review_state' };
   }
 
-  if (review?.decision === 'PASS' && typeof review.task_id === 'string') {
+  // PASS and OUT_OF_SCOPE both close the current task; clear its rework memory
+  // and let the queue advance to the next planned task (or DONE).
+  if ((review?.decision === 'PASS' || review?.decision === 'OUT_OF_SCOPE') && typeof review.task_id === 'string') {
     reworkMemory.delete(review.task_id.trim());
   }
 
-  const nextTask = plannedTasks.find((task) => !completedIds.has(task.task_id.trim()));
+  const nextTask = effectivePlannedTasks.find((task) => !completedIds.has(task.task_id.trim()));
   if (nextTask) {
     return {
       handled: true,
-      reason: review?.decision === 'PASS' ? 'review_pass_next_task' : 'initial_task',
+      reason: review?.decision === 'PASS'
+        ? 'review_pass_next_task'
+        : review?.decision === 'OUT_OF_SCOPE'
+          ? 'review_out_of_scope_next_task'
+          : 'initial_task',
       decision: {
         action: 'NEXT_TASK',
         task_card: materializePlannedTask(nextTask, {
@@ -133,9 +154,9 @@ export function decideDeterministically({
     reason: 'all_planned_tasks_passed',
     decision: {
       action: 'WORKFLOW_DONE',
-      summary: typeof planSummary === 'string' && planSummary.trim()
-        ? planSummary.trim()
-        : `Completed ${plannedTasks.length} planned task(s); all passed deterministic Gate and independent Reviewer checks.`,
+      summary: typeof effectivePlanSummary === 'string' && effectivePlanSummary.trim()
+        ? effectivePlanSummary.trim()
+        : `Completed ${effectivePlannedTasks.length} planned task(s); all passed deterministic Gate and independent Reviewer checks.`,
     },
   };
 }

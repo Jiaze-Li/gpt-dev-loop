@@ -7,12 +7,19 @@ import { isCancellation, ProviderCancelledError } from './errors.js';
 const RETRYABLE = new Set([
   'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_RATE_LIMITED', 'PROVIDER_AUTH_FAILED',
   'PROVIDER_UNAVAILABLE', 'PROVIDER_TIMEOUT', 'PROVIDER_PROTOCOL_ERROR',
+  'EXECUTOR_TIMEOUT', 'COMMAND_TIMEOUT',
 ]);
 
 export function providerFailure(error) {
   const code = error?.details?.providerFailure ?? error?.providerFailure ?? error?.code;
+  if (code === 'EXECUTOR_TIMEOUT') {
+    return { code: 'PROVIDER_TIMEOUT', resetAt: error?.details?.resetAt ?? error?.resetAt ?? null, retryAfter: error?.details?.retryAfter ?? error?.retryAfter ?? null };
+  }
   if (RETRYABLE.has(code)) return { code, resetAt: error?.details?.resetAt ?? error?.resetAt ?? null, retryAfter: error?.details?.retryAfter ?? error?.retryAfter ?? null };
   const diagnostic = `${error?.message ?? ''} ${error?.details?.stderr ?? ''}`;
+  if (/timeout|did not respond within/i.test(diagnostic)) {
+    return { code: 'PROVIDER_TIMEOUT', resetAt: error?.details?.resetAt ?? null, retryAfter: error?.details?.retryAfter ?? null };
+  }
   if (/quota|usage.?limit|rate.?limit|too many requests/i.test(diagnostic)) {
     return { code: /rate.?limit|too many requests/i.test(diagnostic) ? 'PROVIDER_RATE_LIMITED' : 'PROVIDER_QUOTA_EXHAUSTED', resetAt: error?.details?.resetAt ?? null, retryAfter: error?.details?.retryAfter ?? null };
   }

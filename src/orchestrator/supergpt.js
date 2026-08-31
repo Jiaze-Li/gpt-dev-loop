@@ -15,7 +15,7 @@
 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { execSync as nodeExecSync } from 'node:child_process';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 
@@ -27,7 +27,7 @@ import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.
 import { Persistence } from './persistence.js';
 import { deliverWorkflowResult, createResultDelivery } from './resultDelivery.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
-import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
+import { validateWorkflowId, assertPathWithinRoot, isTestWorkflowId } from './workflowId.js';
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
@@ -44,6 +44,7 @@ import {
   WORKFLOW_STAGES,
   WORKFLOW_STATUSES,
 } from './workflowState.js';
+import { runPrCloseoutLoop, PR_CLOSEOUT_LOOP_STATUS } from './prCloseoutLoop.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import {
   WorkflowLifecycleManager,
@@ -85,6 +86,14 @@ import {
   clearControl,
 } from './workflowControl.js';
 import { advanceTaskBaseline } from './taskBaseline.js';
+import {
+  selectWorkflowPath,
+  serializePathDecision,
+  pathProgressFields,
+  fastPathResolvedPlan,
+  WORKFLOW_PATHS,
+} from './pathSelection.js';
+import { recordDashboardFocus } from '../dashboard/focus.js';
 
 // The complete typed-event vocabulary emitted through onEvent. Every event
 // object is { type, timestamp, ...payload }.
@@ -191,6 +200,7 @@ const EMPTY_RESULT = () => ({
   reason: null,
   question: null,
   tokenUsage: null,
+  path: null,
 });
 
 // Resume metadata is written by buildWorkspaceMetadata() in
@@ -296,6 +306,15 @@ export async function runSuperGPT({
   answer = null,
   externalReadRoots = [],
   approvedExternalRoots = [],
+  boundedTask = null,
+  explicitFullPath = false,
+  // V2-C — injected PR closeout adapters (getPrHead, requestTrustedReview,
+  // runRepairTask, pushRepair, escalateSupervisor). Absent by default, so the
+  // closeout loop only runs when a caller wires real PR/reviewer adapters and
+  // the workspace config opts in.
+  kind,
+  parentWorkflowId = null,
+  prCloseoutAdapters = null,
   _pipeline = defaultPipeline,
   _resolveWorkflowPlan,
   _selectProviders,
@@ -410,7 +429,12 @@ export async function runSuperGPT({
   let usageTracker;
   try {
     if (typeof _afterOwnershipAcquired === 'function') _afterOwnershipAcquired({ workflowId, ownerToken: ownershipToken });
-    workflowStateManager = new WorkflowStateManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
+    workflowStateManager = new WorkflowStateManager({
+      workflowId,
+      kind,
+      parentWorkflowId,
+      root: SUPERGPT_WORKTREE_ROOT,
+    });
     workflowStateManager.startHeartbeat(1000);
     lifecycleManager = new WorkflowLifecycleManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd });
     usageTracker = new UsageTracker();
@@ -566,8 +590,11 @@ export async function runSuperGPT({
           usageTracker,
           isResume,
           answer,
+          boundedTask,
+          explicitFullPath,
           externalReadRoots: resolvedExternalRoots,
           approvedExternalRoots: resolvedExternalRoots,
+          prCloseoutAdapters,
           _resolveWorkflowPlan,
           _selectProviders,
           _createGateRunner,
@@ -646,6 +673,8 @@ export async function runSuperGPT({
     // completionPromise sees teardown actually finished.
     finalizeActiveWorkflow();
     if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
+    // Expose the selected path consistently on every terminal result.
+    result.path = result.path ?? workflowStateManager?.state?.workflowPath ?? null;
   }
 
   // A fully delivered workflow needs no durable control record any more.
@@ -658,11 +687,44 @@ export async function runSuperGPT({
   return result;
 }
 
+export function supersedeWorkflow({ targetWorkflowId, supersededBy, root = SUPERGPT_WORKTREE_ROOT } = {}) {
+  if (!targetWorkflowId || !supersededBy) return false;
+  validateWorkflowId(targetWorkflowId);
+  validateWorkflowId(supersededBy);
+  if (!existsSync(root)) return false;
+  const statePath = path.join(root, `${targetWorkflowId}.state.json`);
+  if (!existsSync(statePath)) return false;
+  try {
+    const raw = readFileSync(statePath, 'utf8');
+    const state = JSON.parse(raw);
+    state.workflowStatus = WORKFLOW_STATUSES.STOPPED;
+    state.stage = WORKFLOW_STAGES.STOPPED;
+    state.superseded = true;
+    state.supersededBy = supersededBy;
+    state.supersededAt = new Date().toISOString();
+    state.reason = `Superseded by workflow ${supersededBy}`;
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Start is intentionally separate from run: Core retains the promise and all
 // lifecycle ownership while callers get a durable id without waiting for work.
 export function startSuperGPT(options = {}) {
   const workflowId = options.workflowId ?? `wf-agy-${randomUUID()}`;
   validateWorkflowId(workflowId);
+  const root = options.root ?? SUPERGPT_WORKTREE_ROOT;
+  
+  // Explicit replacement binding ONLY: starting a new workflow NEVER indiscriminately
+  // closes or supersedes unrelated workflows. Only an explicit supersedesWorkflowId targets a workflow.
+  const supersedesWorkflowId = options.supersedesWorkflowId ?? options.supersedes ?? null;
+  if (supersedesWorkflowId) {
+    supersedeWorkflow({ targetWorkflowId: supersedesWorkflowId, supersededBy: workflowId, root });
+  }
+
+  recordDashboardFocus({ workflowId, kind: options.kind, root });
   const run = runSuperGPT({ ...options, workflowId });
   // runSuperGPT converts workflow failures into durable terminal state/result;
   // this final catch is only a last-resort guard against an unhandled rejection.
@@ -686,8 +748,11 @@ async function defaultPipeline({
   usageTracker,
   isResume = false,
   answer = null,
+  boundedTask = null,
+  explicitFullPath = false,
   externalReadRoots = [],
   approvedExternalRoots = [],
+  prCloseoutAdapters = null,
   _resolveWorkflowPlan,
   _selectProviders,
   _createGateRunner,
@@ -856,6 +921,49 @@ async function defaultPipeline({
         worktree_fingerprint: postGateFingerprint, captured_at: new Date().toISOString(), workflow_id: workflowId, verification_identity: CLOSEOUT_VERIFICATION_ID,
       }});
     }
+
+    // V2-C — trusted PR Closeout Loop. Runs only when the workspace config opts
+    // in AND the caller wired real PR/reviewer adapters; otherwise this is
+    // inert and delivery proceeds unchanged. The task queue and closeout
+    // verification have both completed at this point, so the PR head is a
+    // legitimate review target. A non-DONE outcome (P1/P2 unresolved after the
+    // bounded repair loop, a fork with no safe write path) stops before
+    // delivery and surfaces HUMAN_REQUIRED.
+    if (prCloseoutAdapters) {
+      let closeoutCfg = null;
+      try { closeoutCfg = loadWorkspaceConfig(cwd)?.prCloseout ?? null; } catch { closeoutCfg = null; }
+      if (closeoutCfg?.enabled === true) {
+        throwIfAborted(signal);
+        emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'pr_closeout' });
+        const outcome = await runPrCloseoutLoop({
+          state: workflowStateManager?.getState()?.prCloseout ?? null,
+          init: {
+            prNumber: closeoutCfg.prNumber ?? null,
+            configuredReviewer: closeoutCfg.configuredReviewer ?? null,
+            maxRepairRounds: closeoutCfg.maxRepairRounds,
+            isFork: closeoutCfg.isFork === true,
+            safeForkWritePath: closeoutCfg.safeForkWritePath === true,
+          },
+          adapters: prCloseoutAdapters,
+          config: {
+            configuredReviewer: closeoutCfg.configuredReviewer ?? null,
+            allowMerge: closeoutCfg.allowMerge === true,
+            repositoryContext: closeoutCfg.repositoryContext ?? {},
+            verificationCommands: commands,
+          },
+          persist: (s) => workflowStateManager?.recordCloseoutState(s),
+        });
+        if (outcome.status !== PR_CLOSEOUT_LOOP_STATUS.DONE) {
+          const reason = `PR closeout loop stopped: ${outcome.reason}`;
+          workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+            reason,
+            question: reason,
+          });
+          return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
+        }
+      }
+    }
+
     let delivery;
     try {
       throwIfAborted(signal);
@@ -971,17 +1079,56 @@ async function defaultPipeline({
   const persistence = new Persistence(workflowRuntimeDirectory(workflowId));
   const selection = (_selectProviders || selectProviders)({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal, onEvent: (event) => emit(event.type, event) });
 
+  // ---- Fast Path vs Full Path selection (deterministic, zero model tokens) ----
+  // Selected once here, before the first model invocation. Persisted into the
+  // frozen workspace metadata so a resume restores the exact same path and
+  // bounded scope instead of silently reclassifying.
+  const metaExists = existsSync(metadataPath);
+  let frozenPathDecision = null;
+  if (metaExists) {
+    try {
+      frozenPathDecision = JSON.parse(readFileSync(metadataPath, 'utf8')).path_selection ?? null;
+    } catch { frozenPathDecision = null; }
+  }
+  const pathDecision = selectWorkflowPath(
+    frozenPathDecision ? { frozenDecision: frozenPathDecision } : { goal, boundedTask, explicitFullPath },
+  );
+  if (!frozenPathDecision && metaExists && !isResume) {
+    try {
+      const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      meta.path_selection = serializePathDecision(pathDecision);
+      meta.workflow_path = pathDecision.path;
+      writeFileSync(metadataPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+    } catch (err) {
+      if (lifecycleManager) await lifecycleManager.onInitFailed();
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, {
+        reason: `Failed to persist path selection: ${err.message}`,
+      });
+      throw err;
+    }
+  }
+  workflowStateManager?.recordProgress(pathProgressFields(pathDecision));
+  emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'path_selection', path: pathDecision.path, reason: pathDecision.reason });
+
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'planning' });
   emit(SUPERGPT_EVENTS.PLANNING_STARTED);
   workflowStateManager?.startStage(WORKFLOW_STAGES.PLANNING);
-  let planArg = planPath ?? goal;
-  if (answer && !planPath) {
-    planArg = `${planArg}\n\n[User Clarification / Answer]:\n${answer}`;
+  let resolved;
+  if (pathDecision.path === WORKFLOW_PATHS.FAST) {
+    // Fast Path bypasses the Planner and the model Supervisor. The frozen
+    // single-task contract becomes the plan directly; Executor -> deterministic
+    // Gate -> independent Reviewer -> DONE | ordinary REWORK still runs below.
+    resolved = fastPathResolvedPlan(pathDecision, { goal });
+  } else {
+    let planArg = planPath ?? goal;
+    if (answer && !planPath) {
+      planArg = `${planArg}\n\n[User Clarification / Answer]:\n${answer}`;
+    }
+    const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
+    resolved = (await selection.runtime.invoke('planner', {
+      resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
+    }, { operationId: workflowId })).value;
   }
-  const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
-  const resolved = (await selection.runtime.invoke('planner', {
-    resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
-  }, { operationId: workflowId })).value;
   if (resolved.status === 'AMBIGUOUS') {
     emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason: 'plan_ambiguous', question: resolved.question });
     await lifecycleManager?.onWorkflowSuspended('plan_ambiguous');
@@ -999,14 +1146,20 @@ async function defaultPipeline({
   }
   emit(SUPERGPT_EVENTS.PLANNING_COMPLETED, { tasksCount: resolved.tasks?.length ?? 1 });
 
-  // If this is a new workflow (not a resume) and the planner identified closeout commands, update workflow metadata to freeze them durably
-  if (!isResume && Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0) {
+  // If this is a new workflow (not a resume) and closeout commands exist, update workflow metadata to freeze them durably
+  const closeoutToPersist = Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0
+    ? resolved.closeoutVerificationCommands
+    : (Array.isArray(resolved.tasks)
+      ? [...new Set(resolved.tasks.flatMap((t) => (Array.isArray(t.verification_commands) ? t.verification_commands : [])).map(String).map((c) => c.trim()).filter(Boolean))]
+      : []);
+
+  if (!isResume && closeoutToPersist.length > 0) {
     try {
       if (existsSync(metadataPath)) {
         const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
         const mergedCloseout = [...new Set([
           ...(meta.closeout_verification_commands || []),
-          ...resolved.closeoutVerificationCommands,
+          ...closeoutToPersist,
         ])];
         meta.closeout_verification_commands = mergedCloseout;
         if (resolved.closeoutPolicySources?.length > 0) {
@@ -1089,6 +1242,8 @@ async function defaultPipeline({
     externalReadRoots: resolvedApprovedRoots,
     approvedExternalRoots: resolvedApprovedRoots,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
+    maxEscalationAttempts: Number(env.AGY_MAX_ESCALATION_ATTEMPTS) || 2,
+    humanAnswer: answer,
     closeoutVerificationCommands: frozenCloseoutCommands,
     onCloseoutPass: async (proof) => {
       const fingerprint = getFingerprint(worktree.worktree_path);
@@ -1104,6 +1259,8 @@ async function defaultPipeline({
       }
     },
     taskTotal: resolved.tasks?.length ?? 1,
+    plannedTasks: resolved.tasks ?? null,
+    planSummary: resolved.summary ?? null,
     workflowStateManager,
     usageTracker,
     signal,
@@ -1247,11 +1404,13 @@ function watchedWorkflowIsKnown({ workflowId, root }) {
   return false;
 }
 
+const SUPERGPT_WATCH_TIMEOUT_MS = 45000;
+
 export async function supergptWatch({
   workflowId,
   root = SUPERGPT_WORKTREE_ROOT,
   intervalMs = 1000,
-  timeoutMs = Infinity,
+  timeoutMs = SUPERGPT_WATCH_TIMEOUT_MS,
   startupGraceMs = 15000,
   signal = null,
   onProgress = null,
@@ -1262,7 +1421,9 @@ export async function supergptWatch({
 } = {}) {
   validateWorkflowId(workflowId);
 
-  const effectiveTimeout = timeoutMs === null || timeoutMs === undefined ? Infinity : timeoutMs;
+  const effectiveTimeout = Number.isFinite(timeoutMs) && timeoutMs >= 0
+    ? timeoutMs
+    : (timeoutMs === Infinity ? Infinity : SUPERGPT_WATCH_TIMEOUT_MS);
   const grace = Number.isFinite(startupGraceMs) && startupGraceMs >= 0 ? startupGraceMs : 15000;
   const startTime = _now();
   let progressSeq = 1;
@@ -1696,6 +1857,7 @@ export async function supergptPlan({
 }
 
 export {
+  SUPERGPT_WATCH_TIMEOUT_MS,
   WorkflowStateManager,
   WorkflowLifecycleManager,
   UsageTracker,

@@ -37,7 +37,7 @@ import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '
 import { AGY_REVIEWER_DEFAULT_MODEL } from '../../agy/agyConfig.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
 
-const DECISIONS = new Set(['PASS', 'REWORK', 'HUMAN_REQUIRED']);
+const DECISIONS = new Set(['PASS', 'REWORK', 'HUMAN_REQUIRED', 'OUT_OF_SCOPE']);
 
 // This production provider must not import the legacy browser adapter just
 // to render review input. Keep the rendering local and dependency-free so a
@@ -86,13 +86,14 @@ ${checkpointBlock}
 Reply with ONLY one JSON object, no prose, no code fence. Shape:
 
 {
-  "decision": "PASS" | "REWORK" | "HUMAN_REQUIRED",
+  "decision": "PASS" | "REWORK" | "HUMAN_REQUIRED" | "OUT_OF_SCOPE",
   "findings": ["<specific observation tied to a file/criterion/behavior>", "..."],
-  "required_changes": ["<specific actionable change>", "..."],   // MUST be non-empty when decision == "REWORK"; use [] for PASS
+  "required_changes": ["<specific actionable change>", "..."],   // MUST be non-empty when decision == "REWORK" or "OUT_OF_SCOPE"; use [] for PASS
   "rationale": "<why this decision, tied to acceptance_criteria>"
 }
 
 Use HUMAN_REQUIRED only for a genuine ambiguity a human must resolve, not for a fixable defect (that is REWORK).
+Use OUT_OF_SCOPE only when the change the acceptance_criteria would require lies outside this Task Card's declared scope or allowed_files — list those out-of-scope changes in required_changes. Do NOT use OUT_OF_SCOPE to wave through an in-scope defect.
 
 ${renderReviewInputs(taskCard, executionReport, evidence)}
 
@@ -102,7 +103,7 @@ Reply with the JSON object now.`;
 export function parseReviewJson(taskId, obj, repositoryContext) {
   const decision = obj.decision;
   if (!DECISIONS.has(decision)) {
-    throw invalid(`reviewer JSON "decision" must be one of PASS, REWORK, HUMAN_REQUIRED — got: ${JSON.stringify(decision)}`);
+    throw invalid(`reviewer JSON "decision" must be one of PASS, REWORK, HUMAN_REQUIRED, OUT_OF_SCOPE — got: ${JSON.stringify(decision)}`);
   }
 
   const findings = Array.isArray(obj.findings) ? obj.findings.map(String) : [];
@@ -110,6 +111,9 @@ export function parseReviewJson(taskId, obj, repositoryContext) {
 
   if (decision === 'REWORK' && rawChanges.length === 0) {
     throw invalid('reviewer REWORK decision must include a non-empty "required_changes" array');
+  }
+  if (decision === 'OUT_OF_SCOPE' && rawChanges.length === 0) {
+    throw invalid('reviewer OUT_OF_SCOPE decision must list the out-of-scope changes in a non-empty "required_changes" array');
   }
   if (!isNonEmptyString(obj.rationale)) {
     throw invalid('reviewer JSON must include a non-empty "rationale"');

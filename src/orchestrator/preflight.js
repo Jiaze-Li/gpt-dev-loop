@@ -167,27 +167,110 @@ export async function isGitTracked(relPath, { cwd = process.cwd(), gitBin = 'git
  * Extract executable command names from a shell command string.
  * Handles environment prefix (e.g. `FOO=1 bar`), subshell/chaining (`cd x && y`), etc.
  */
+export function splitShellSubCommands(commandStr) {
+  if (typeof commandStr !== 'string' || !commandStr.trim()) return [];
+  const subCommands = [];
+  let current = '';
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inBacktick = false;
+  let isEscaped = false;
+
+  for (let i = 0; i < commandStr.length; i++) {
+    const char = commandStr[i];
+
+    if (isEscaped) {
+      current += char;
+      isEscaped = false;
+      continue;
+    }
+
+    if (char === '\\' && !inSingleQuote) {
+      isEscaped = true;
+      current += char;
+      continue;
+    }
+
+    if (char === "'" && !inDoubleQuote && !inBacktick) {
+      inSingleQuote = !inSingleQuote;
+      current += char;
+      continue;
+    }
+
+    if (char === '"' && !inSingleQuote && !inBacktick) {
+      inDoubleQuote = !inDoubleQuote;
+      current += char;
+      continue;
+    }
+
+    if (char === '`' && !inSingleQuote && !inDoubleQuote) {
+      inBacktick = !inBacktick;
+      current += char;
+      continue;
+    }
+
+    // If inside quotes, don't split
+    if (inSingleQuote || inDoubleQuote || inBacktick) {
+      current += char;
+      continue;
+    }
+
+    // Check for logical operators outside quotes: &&, ||, |, ;, &
+    if (char === ';') {
+      if (current.trim()) subCommands.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    if (char === '&') {
+      if (commandStr[i + 1] === '&') {
+        if (current.trim()) subCommands.push(current.trim());
+        current = '';
+        i += 1;
+        continue;
+      }
+      if (current.trim()) subCommands.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    if (char === '|') {
+      if (commandStr[i + 1] === '|') {
+        if (current.trim()) subCommands.push(current.trim());
+        current = '';
+        i += 1;
+        continue;
+      }
+      if (current.trim()) subCommands.push(current.trim());
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  if (current.trim()) {
+    subCommands.push(current.trim());
+  }
+
+  return subCommands;
+}
+
 export function extractExecutablesFromCommand(commandStr) {
   if (typeof commandStr !== 'string' || !commandStr.trim()) return [];
   const executables = [];
-
-  // Split on logical operators (&&, ||, ;, |)
-  const subCommands = commandStr.split(/&&|\|\||;|\|/);
+  const subCommands = splitShellSubCommands(commandStr);
 
   for (const rawSub of subCommands) {
-    const tokens = rawSub.trim().split(/\s+/).filter(Boolean);
-    if (tokens.length === 0) continue;
+    const match = rawSub.trim().match(/^([A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*([^\s]+)/);
+    if (!match) continue;
+    let cmd = match[2];
+    if (!cmd) continue;
 
-    // Skip environment assignments (e.g., `FOO=bar`, `PATH=...`)
-    let cmdIdx = 0;
-    while (cmdIdx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cmdIdx])) {
-      cmdIdx += 1;
-    }
-    if (cmdIdx >= tokens.length) continue;
+    cmd = cmd.replace(/^['"`]|['"`]$/g, '');
 
-    const cmd = tokens[cmdIdx];
-    // Ignore shell builtins that don't need PATH binaries
-    if (['cd', 'echo', 'true', 'false', 'test', 'export', 'set', 'unset', 'read', 'exit'].includes(cmd)) {
+    // Ignore shell builtins and keywords that don't require external PATH binaries
+    if (['cd', 'echo', 'true', 'false', 'test', 'export', 'set', 'unset', 'read', 'exit', 'if', 'then', 'else', 'fi', 'for', 'while', 'do', 'done', 'case', 'esac', 'return', 'exec', '{', '}'].includes(cmd)) {
       continue;
     }
     executables.push(cmd);

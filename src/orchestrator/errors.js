@@ -46,6 +46,28 @@ export function isCancellation(error, signal) {
   return codes.has(code);
 }
 
+// V2-C trusted PR-closeout trust-boundary failures. Every one of these is a
+// fail-closed condition: the deterministic closeout loop must stop and surface
+// the reason rather than guess when reviewer identity, PR head, write
+// capability, or repair safety cannot be established.
+export class PrCloseoutError extends Error {
+  constructor(code, message, details) {
+    super(message ?? code);
+    this.name = 'PrCloseoutError';
+    this.code = code;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+export const PR_CLOSEOUT_ERROR_CODES = Object.freeze({
+  UNTRUSTED_REVIEWER: 'UNTRUSTED_REVIEWER',
+  STALE_REVIEW_HEAD: 'STALE_REVIEW_HEAD',
+  MALFORMED_REVIEW: 'MALFORMED_REVIEW',
+  UNSAFE_REPAIR_ACTION: 'UNSAFE_REPAIR_ACTION',
+  FORK_WRITE_FORBIDDEN: 'FORK_WRITE_FORBIDDEN',
+  REPAIR_GATE_NOT_PASSED: 'REPAIR_GATE_NOT_PASSED',
+});
+
 export const ADAPTER_ERROR_CODES = Object.freeze({
   EXECUTOR_UNAVAILABLE: 'EXECUTOR_UNAVAILABLE',
   EXECUTOR_TIMEOUT: 'EXECUTOR_TIMEOUT',

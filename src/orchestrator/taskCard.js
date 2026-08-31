@@ -10,6 +10,8 @@
 
 import { readFile } from 'node:fs/promises';
 
+import { normalizeWorkspaceRelativePaths, WorkspacePathError } from './workspaceConfig.js';
+
 export const REQUIRED_FIELDS = [
   'task_id',
   'repository_context',
@@ -62,6 +64,20 @@ function parseVerificationCommands(raw) {
   return parseBulletList(raw).map((item) => item.replace(/^`|`$/g, ''));
 }
 
+// allowed_files / forbidden_files are workspace file references. Normalize
+// them to stable workspace-relative paths and reject absolute paths or
+// escapes at the Task Card boundary (TASK_PROTOCOL.md §2 trust boundary).
+function parseWorkspaceFileList(field, raw) {
+  try {
+    return normalizeWorkspaceRelativePaths(parseBulletList(raw)).paths;
+  } catch (err) {
+    if (err instanceof WorkspacePathError) {
+      throw new Error(`task card "${field}" contains an unsafe path: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
 export function parseTaskCard(text) {
   const headingRe = /^##\s+(\w+)\s*$/gm;
   const matches = [...text.matchAll(headingRe)];
@@ -94,8 +110,8 @@ export function parseTaskCard(text) {
     goal: sections.goal.trim(),
     context: sections.context.trim(),
     scope: sections.scope.trim(),
-    allowed_files: parseBulletList(sections.allowed_files),
-    forbidden_files: parseBulletList(sections.forbidden_files),
+    allowed_files: parseWorkspaceFileList('allowed_files', sections.allowed_files),
+    forbidden_files: parseWorkspaceFileList('forbidden_files', sections.forbidden_files),
     acceptance_criteria: parseAcceptanceCriteria(sections.acceptance_criteria),
     verification_commands: parseVerificationCommands(sections.verification_commands),
     completion_signal: completionSignal,

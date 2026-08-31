@@ -82,10 +82,33 @@ export class QuotaPoolRegistry {
 }
 
 export class ProviderHealthRegistry {
-  constructor({ now = () => Date.now() } = {}) { this.now = now; this.providers = new Map(); }
-  get(provider) { return this.providers.get(provider) ?? { provider, status: 'UNKNOWN', checkedAt: null, reason: null }; }
-  record(provider, status, reason = null) { this.providers.set(provider, { provider, status, reason, checkedAt: nowIso(this.now()) }); }
-  usable(provider) { return this.get(provider).status !== 'UNAVAILABLE' && this.get(provider).status !== 'AUTH_FAILED'; }
+  constructor({ now = () => Date.now() } = {}) {
+    this.now = now;
+    this.providers = new Map();
+    this.candidates = new Map();
+  }
+  get(target) {
+    return this.candidates.get(target) ?? this.providers.get(target) ?? { provider: target, status: 'UNKNOWN', checkedAt: null, reason: null };
+  }
+  record(target, status, reason = null) {
+    const entry = { provider: target, status, reason, checkedAt: nowIso(this.now()) };
+    if (typeof target === 'string' && target.includes(':')) {
+      this.candidates.set(target, entry);
+    } else {
+      this.providers.set(target, entry);
+    }
+  }
+  usable(target, provider = null) {
+    const cand = this.candidates.get(target);
+    if (cand && (cand.status === 'UNAVAILABLE' || cand.status === 'AUTH_FAILED')) return false;
+    if (provider) {
+      const prov = this.providers.get(provider);
+      if (prov && (prov.status === 'UNAVAILABLE' || prov.status === 'AUTH_FAILED')) return false;
+    }
+    const direct = this.providers.get(target);
+    if (direct && (direct.status === 'UNAVAILABLE' || direct.status === 'AUTH_FAILED')) return false;
+    return true;
+  }
 }
 
 export class EffortPolicy {
@@ -112,7 +135,7 @@ export class RoleRouter {
       // probe.  Resolvers that predate capability metadata remain compatible.
       if (Array.isArray(resolved.capabilities?.roles) && !resolved.capabilities.roles.includes(role)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'capability' }); continue; }
       if (!this.quotaRegistry.usable(candidate.family)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'quota_cooldown', pools: this.quotaRegistry.poolsFor(candidate.family) }); continue; }
-      if (!this.providerHealth.usable(provider)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'provider_health' }); continue; }
+      if (!this.providerHealth.usable(candidate.family, provider)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'provider_health' }); continue; }
       const effort = this.effortPolicy.select({ candidate, capabilities: resolved.capabilities, signals });
       const selected = { role, requestedFamily: candidate.family, resolvedModel: resolved.resolvedModel ?? null, provider, quotaPools: this.quotaRegistry.poolsFor(candidate.family), effort, degraded: Boolean(candidate.degraded) };
       this.onEvent?.({ type: 'ROLE_ROUTE_SELECTED', ...selected }); return selected;
@@ -121,7 +144,10 @@ export class RoleRouter {
   }
   recordFailure(selection, failure) {
     this.quotaRegistry.recordProviderFailure(selection.requestedFamily, failure);
-    if (['PROVIDER_AUTH_FAILED', 'PROVIDER_UNAVAILABLE', 'PROVIDER_PROTOCOL_ERROR'].includes(failure.code)) this.providerHealth.record(selection.provider, failure.code === 'PROVIDER_AUTH_FAILED' ? 'AUTH_FAILED' : 'UNAVAILABLE', failure.code);
+    if (['PROVIDER_AUTH_FAILED', 'PROVIDER_UNAVAILABLE', 'PROVIDER_PROTOCOL_ERROR', 'PROVIDER_TIMEOUT', 'EXECUTOR_TIMEOUT'].includes(failure.code)) {
+      // Record failure on the specific candidate family so other models under the same provider remain eligible
+      this.providerHealth.record(selection.requestedFamily, failure.code === 'PROVIDER_AUTH_FAILED' ? 'AUTH_FAILED' : 'UNAVAILABLE', failure.code);
+    }
     this.onEvent?.({ type: 'ROLE_PROVIDER_FAILED', role: selection.role, family: selection.requestedFamily, reason: failure.code });
   }
 }

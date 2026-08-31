@@ -103,11 +103,33 @@ export class OrganicReworkRecorder {
     reviewerProvider = 'agy',
     requiredChanges = [],
     evidence = null,
+    round = null,
     nonConvergence = false,
   }) {
     if (!workflowId || !taskId || !attempt) return;
 
     const key = `${workflowId}:${taskId}`;
+
+    // Stale-sequence isolation: an in-flight REWORK sequence for this
+    // (workflow, task) that belongs to an earlier round has been superseded —
+    // e.g. the task was re-run under a fresh plan/round. A new initial REWORK
+    // on a strictly newer round retires the stale sequence instead of being
+    // dropped or appended to it.
+    const priorInFlight = this.inFlightSequences.get(key);
+    if (
+      priorInFlight
+      && Number.isFinite(round)
+      && Number.isFinite(priorInFlight.round)
+      && round > priorInFlight.round
+      && reviewerDecision === 'REWORK'
+    ) {
+      priorInFlight.supersededAt = new Date().toISOString();
+      priorInFlight.superseded = true;
+      const records = this._readAllRecords();
+      const i = records.findIndex((r) => r.workflowId === workflowId && r.taskId === taskId && !r.reworkLiveVerified);
+      if (i >= 0) { records[i] = priorInFlight; this._rewriteAllRecords(records); }
+      this.inFlightSequences.delete(key);
+    }
     const normalizedChanges = Array.isArray(requiredChanges)
       ? requiredChanges.filter((c) => typeof c === 'string' && c.trim() !== '' && c !== 'none')
       : typeof requiredChanges === 'string' && requiredChanges.trim() !== '' && requiredChanges !== 'none'
@@ -122,6 +144,7 @@ export class OrganicReworkRecorder {
         schema: 'supergpt.rework-evidence/v1',
         workflowId,
         taskId,
+        round: Number.isFinite(round) ? round : null,
         startedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         reworkLiveVerified: false,
@@ -172,6 +195,18 @@ export class OrganicReworkRecorder {
     inFlight.retryAttempts.push(retryRecord);
     inFlight.updatedAt = new Date().toISOString();
 
+    // OUT_OF_SCOPE is a deterministic terminal for the task, not a convergence:
+    // the sequence closes without ever being promoted to LIVE_VERIFIED.
+    if (reviewerDecision === 'OUT_OF_SCOPE') {
+      inFlight.closedOutOfScope = true;
+      inFlight.closedAt = new Date().toISOString();
+      const all = this._readAllRecords();
+      const i = all.findIndex((r) => r.workflowId === workflowId && r.taskId === taskId && !r.reworkLiveVerified && !r.superseded);
+      if (i >= 0) { all[i] = inFlight; this._rewriteAllRecords(all); }
+      this.inFlightSequences.delete(key);
+      return;
+    }
+
     // Check for valid convergence:
     // 1. Prior attempt was REWORK with structured required_changes
     // 2. Current attempt Gate is PASS
@@ -195,9 +230,15 @@ export class OrganicReworkRecorder {
       };
     }
 
-    // Sync back to storage
+    // Sync back to storage — target this sequence's own record, never a
+    // superseded or already-verified one for the same (workflow, task).
     const allRecords = this._readAllRecords();
-    const idx = allRecords.findIndex((r) => r.workflowId === workflowId && r.taskId === taskId);
+    let idx = allRecords.findIndex(
+      (r) => r.workflowId === workflowId && r.taskId === taskId
+        && !r.superseded && !r.reworkLiveVerified
+        && (!Number.isFinite(inFlight.round) || !Number.isFinite(r.round) || r.round === inFlight.round)
+    );
+    if (idx < 0) idx = allRecords.findIndex((r) => r.workflowId === workflowId && r.taskId === taskId && !r.superseded);
     if (idx >= 0) {
       allRecords[idx] = inFlight;
       this._rewriteAllRecords(allRecords);
@@ -229,7 +270,9 @@ export class OrganicReworkRecorder {
       };
     }
 
-    const inProgress = all.find((r) => !r.reworkLiveVerified && r.initialAttempt);
+    const inProgress = all.find(
+      (r) => !r.reworkLiveVerified && r.initialAttempt && !r.superseded && !r.closedOutOfScope
+    );
     if (inProgress) {
       return {
         status: REWORK_VERIFICATION_STATUSES.OBSERVED_IN_PROGRESS,

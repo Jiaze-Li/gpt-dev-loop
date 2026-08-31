@@ -9,6 +9,8 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
 
@@ -54,11 +56,14 @@ function parseRepositoryContext(raw) {
 }
 
 // TASK_PROTOCOL.md §3 template, filled from the in-memory task_card object.
+// Renders ONLY the current Task Card's authorized scope — the goal, scope,
+// allowed_files, verification_commands and completion_signal that authorize
+// this attempt. Prior-attempt evidence (rework_feedback,
+// unauthorized_probe_guidance) is deliberately NOT rendered here; it belongs
+// in the separate read-only historical-evidence layer (renderHistoricalEvidence)
+// so it can never be mistaken for executable authorization or leak between
+// tasks.
 export function renderTaskCard(taskCard) {
-  const rework = taskCard.rework_feedback;
-  const reworkFeedback = rework
-    ? `\n\n## rework_feedback\nThis is a rework attempt. Correct these Reviewer-identified issues; do not preserve an intentional first-attempt defect.\n\nfindings:\n${renderList(rework.findings)}\n\nrequired_changes:\n${renderList(rework.required_changes)}\n\nrationale:\n${rework.rationale ?? 'none'}`
-    : '';
   return `## task_id
 ${taskCard.task_id}
 
@@ -87,7 +92,45 @@ ${renderList(taskCard.acceptance_criteria)}
 ${renderList((taskCard.verification_commands ?? []).map((command) => `\`${command}\``))}
 
 ## completion_signal
-${taskCard.completion_signal}${reworkFeedback}`;
+${taskCard.completion_signal}`;
+}
+
+// Layer 4 — read-only background. Records describe PRIOR attempts at THIS SAME
+// task only. They never expand allowed_files, add verification commands, or
+// change the goal, and they are scoped to `taskCard.task_id` so nothing from a
+// previous, later, or sibling task can be carried in.
+export function renderHistoricalEvidence(taskCard) {
+  const blocks = [];
+
+  const rework = taskCard.rework_feedback;
+  if (rework) {
+    blocks.push(`## rework_feedback
+This is a rework attempt for task "${taskCard.task_id}". Correct these Reviewer-identified issues; do not preserve an intentional first-attempt defect. This is read-only background — it does not add allowed_files, verification commands, or goals beyond the current task authorization above.
+
+findings:
+${renderList(rework.findings)}
+
+required_changes:
+${renderList(rework.required_changes)}
+
+rationale:
+${rework.rationale ?? 'none'}`);
+  }
+
+  const probe = taskCard.unauthorized_probe_guidance;
+  if (probe) {
+    blocks.push(`## unauthorized_probe_guidance
+A previous attempt at task "${taskCard.task_id}" was denied permission to run command(s) that are NOT in this Task Card's verification_commands:
+${renderList((probe.denied_commands ?? []).map((c) => `\`${c}\``))}
+That denial is the security boundary working as intended — it is NOT evidence that node, npm, git, or the environment as a whole is unavailable. Do not re-run those commands and do not report a permission/environment blocker on that basis. Run exactly, and only, the approved verification_commands:
+${renderList((probe.approved_verification_commands ?? []).map((c) => `\`${c}\``))}
+Do NOT add 2>&1, pipe operators (|), echo (e.g. echo "EXIT: $?"), compound commands (; or &&), git log, or any other unlisted auxiliary probe commands.`);
+  }
+
+  if (blocks.length === 0) {
+    return 'No prior attempts recorded for this task. This is the first attempt.';
+  }
+  return blocks.join('\n\n');
 }
 
 // Instructs the CLI to act as Executor and reply with nothing but an
@@ -96,11 +139,41 @@ ${taskCard.completion_signal}${reworkFeedback}`;
 export function buildPrompt(taskCard) {
   return `You are the Executor in an automated dev loop. Act on the Task Card below exactly as scoped — respect allowed_files/forbidden_files and acceptance_criteria — then run the listed verification_commands yourself.
 
-Reply with ONLY an Execution Report: one Markdown document, one "## field_name" heading per field, in exactly this order: task_id, repository_context, status, changed_files, tests_run, test_results, issues, next_recommendation. repository_context.commit_sha must be the commit you actually left the repo at, which is not necessarily the Task Card's commit_sha. No text before or after it.
+This prompt is built in four separate layers. Only Layer 2 authorizes you to act. Layers 1 and 4 are read-only context. Never merge a goal, writable path, verification command, or ad-hoc instruction from Layer 1 or Layer 4 into the Layer 2 authorization.
+
+===== LAYER 1 · WORKFLOW BACKGROUND (read-only) =====
+You are an internal Executor session executing a single scoped Task Card in an active, running SuperGPT workflow.
+SUPERGPT-OWNED WORKFLOW CONTEXT:
+- You are ALREADY inside an active SuperGPT workflow. You are NOT the front agent and this is NOT a new user prompt.
+- Do NOT attempt to call 'supergpt_route', 'supergpt_start', 'supergpt_plan', or any other 'supergpt_*' launcher MCP tools.
+- Do NOT refuse execution or report a blocker due to the absence of 'supergpt_*' MCP tools.
+- Your sole job is to edit the 'allowed_files' and run the 'verification_commands' specified in Layer 2.
+
+This layer explains where you sit in the dev loop. It grants no authorization and names no files or commands you may act on.
+
+===== LAYER 2 · CURRENT TASK — THE ONLY EXECUTABLE AUTHORIZATION =====
+Everything in this layer, and nothing outside it, authorizes you to act. The goal, scope, allowed_files, forbidden_files, acceptance_criteria and verification_commands below belong to task "${taskCard.task_id}" alone. Do not inherit or reuse the goal, writable paths, verification commands, or temporary execution instructions of any other task — one executed before this, one that will execute after, or a sibling task in the same batch.
 
 # Task Card
 
 ${renderTaskCard(taskCard)}
+
+===== LAYER 3 · EXECUTION RULES =====
+- Do NOT attempt to route, replan, or spawn top-level workflows. 'supergpt_route' is exclusively for the outer human interface. Focus 100% on the Task Card above.
+Verification contract:
+- The Task Card's verification_commands are the mandatory and authoritative verification gate. Run every one of them yourself, in the order listed, and report each real result. Do not skip, substitute, or reorder them, and do not consider the task complete until they have all been run.
+- You MAY additionally run only simple, fast, local, read-only auxiliary checks — for example a single unit-test file, a linter, a type-check, \`git status\`, \`git diff\`, or reading a file.
+- You MUST NOT invent additional "required" verification. Unless a command appears verbatim in verification_commands, do not run it — and do not treat it as necessary verification — if it calls an external model or API, needs network access, spawns another agent, starts a long-lived or background child process, or performs live-smoke or integration-smoke testing. If you believe such a step is needed, record it under issues instead of running it.
+- If such a command IS listed verbatim in verification_commands, run it as required verification even when it is a live-smoke, integration-smoke, or otherwise long-running command.
+- Do NOT run an undeclared test, build, or toolchain command as an environment probe. If an auxiliary command you attempt is permission-denied, that only means the security boundary held; it is NOT evidence that node, npm, git, or the environment as a whole is unavailable, and you MUST NOT report a permission or environment BLOCKED on that basis. Report a permission/environment BLOCKED only when one of this Task Card's own verification_commands is itself denied or fails to execute by a system permission error — never because an unlisted probe command was denied.
+- Do NOT add redirections (2>&1), pipe operators (|), echo chaining (e.g. echo "EXIT: $?"), compound shell commands (; or &&), or unlisted commands (such as git log). Run exactly and only the verbatim approved verification_commands as single discrete commands. Any modified or compound command will be rejected by the security sandbox.
+
+Reply with ONLY an Execution Report: one Markdown document, one "## field_name" heading per field, in exactly this order: task_id, repository_context, status, changed_files, tests_run, test_results, issues, next_recommendation. repository_context.commit_sha must be the commit you actually left the repo at, which is not necessarily the Task Card's commit_sha. No text before or after it.
+
+===== LAYER 4 · HISTORICAL EVIDENCE (read-only background) =====
+The records below describe PRIOR attempts at THIS SAME task "${taskCard.task_id}". They exist so you do not repeat an earlier mistake. They do NOT expand allowed_files, add verification commands, or change the goal in Layer 2. Anything not present in Layer 2 remains out of scope no matter what appears here.
+
+${renderHistoricalEvidence(taskCard)}
 
 # Execution Report template
 
@@ -321,34 +394,141 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
   });
 }
 
+const DANGEROUS_COMMAND_PATTERNS = [
+  /\brm(\s+|$)/i,
+  /\bcurl(\s+|$)/i,
+  /\bwget(\s+|$)/i,
+  /\bgit\s+(push|commit|checkout|reset|rebase|merge|clean|tag|branch\s+-[dD])\b/i,
+  /\bnpm\s+(install|i|add|publish|unpublish|uninstall|remove|rm)\b/i,
+  /\bnpx(\s+|$)/i,
+  /\bsudo(\s+|$)/i,
+  /\bchmod(\s+|$)/i,
+  /\bchown(\s+|$)/i,
+  /\bmv(\s+|$)/i,
+  /\bdd(\s+|$)/i,
+  /\bmkfs(\s+|$)/i,
+  /\b(bash|sh|zsh|dash|ksh|csh|tcsh)(\s+|$)/i,
+  /\beval\b/i,
+  /\bexec\b/i,
+];
+
+const DANGEROUS_PATH_PATTERNS = [
+  /(^|\s|\/)\.\.\//,        // path traversal ../
+  /(^|\s)\/tmp(\/|\s|$)/,   // /tmp
+  /(^|\s)\/etc(\/|\s|$)/,   // /etc
+  /(^|\s)\/var(\/|\s|$)/,   // /var
+  /(^|\s)\/usr(\/|\s|$)/,   // /usr
+  /(^|\s)~(\/|\s|$)/,       // home dir ~
+];
+
+export function isDangerousVerificationCommand(cmdStr) {
+  if (typeof cmdStr !== 'string') return true;
+  for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
+    if (pattern.test(cmdStr)) return true;
+  }
+  for (const pattern of DANGEROUS_PATH_PATTERNS) {
+    if (pattern.test(cmdStr)) return true;
+  }
+  if (/[><|;&`$\r\n]/.test(cmdStr)) {
+    return true;
+  }
+  return false;
+}
+
+export function buildAllowedVerificationTools(taskCard, { cwd = process.cwd() } = {}) {
+  const allowedTools = new Set();
+  const commands = Array.isArray(taskCard?.verification_commands) ? taskCard.verification_commands : [];
+
+  let packageScripts = new Set();
+  try {
+    const pkgPath = path.join(cwd, 'package.json');
+    if (existsSync(pkgPath)) {
+      const parsed = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      if (parsed?.scripts && typeof parsed.scripts === 'object') {
+        packageScripts = new Set(Object.keys(parsed.scripts));
+      }
+    }
+  } catch {}
+
+  for (const rawCmd of commands) {
+    if (typeof rawCmd !== 'string') continue;
+    const cmd = rawCmd.trim();
+    if (!cmd) continue;
+
+    // Filter dangerous commands and unauthorized paths immediately
+    if (isDangerousVerificationCommand(cmd)) {
+      continue;
+    }
+
+    // Claude's Bash permission rules are prefix-capable. Only emit the complete
+    // Task Card command: broad companions such as `Bash(node *)` would also
+    // authorize node -e and arbitrary repository scripts.
+    if (/^node --test(?:\s+[^\s]+)+$/.test(cmd)) {
+      allowedTools.add(`Bash(${cmd})`);
+      continue;
+    }
+
+    // Permit an explicitly named repository script, but no Node switches.
+    if (/^node\s+(?!-)(?:\.\/)?[A-Za-z0-9_.\/-]+\.m?js(?:\s+[^\s]+)*$/.test(cmd)) {
+      allowedTools.add(`Bash(${cmd})`);
+      continue;
+    }
+
+    // npm arguments are intentionally forbidden: the approval is for this
+    // exact invocation, not for arguments forwarded to its underlying script.
+    if (cmd === 'npm test') {
+      allowedTools.add(`Bash(${cmd})`);
+      continue;
+    }
+
+    const npmRunMatch = cmd.match(/^npm run ([a-zA-Z0-9_:.-]+)$/);
+    if (npmRunMatch) {
+      const scriptName = npmRunMatch[1];
+      if (packageScripts.has(scriptName)) {
+        allowedTools.add(`Bash(${cmd})`);
+      }
+    }
+  }
+
+  return [...allowedTools];
+}
+
 export function createClaudeExecutorAdapter({
   command = 'claude',
   // Runs non-interactively with no TTY to approve prompts, so file edits
   // must be pre-authorized or every task reports BLOCKED before it can
   // touch allowed_files. acceptEdits still leaves Bash and other
   // permission classes gated normally — only file edits are auto-accepted.
+  // Approved verification_commands from the Task Card and project npm test scripts
+  // are pre-authorized via --allowedTools without exposing arbitrary shell permissions.
   args,
   model = 'sonnet',
   cwd = process.cwd(),
   env = process.env,
+  // The `claude` CLI exposes no supported per-Bash-command / per-tool timeout
+  // flag (verified against `claude --help`), so we do not pass one. A single
+  // hung tool call inside the Executor is bounded only by this whole-process
+  // timeoutMs, after which the provider candidate is failed over
+  // (sonnet -> codex -> opus) without consuming an implementation retry.
   timeoutMs = 10 * 60 * 1000,
   spawn = nodeSpawn,
   onActivity,
   onProcessStarted,
   onProcessExited,
 } = {}) {
-  const resolvedArgs = args ?? [
-    '-p',
-    '--output-format',
-    'json',
-    '--permission-mode',
-    'acceptEdits',
-    ...(model ? ['--model', model] : []),
-  ];
-
   return {
     model,
     async execute(taskCard, { signal } = {}) {
+      const allowedTools = buildAllowedVerificationTools(taskCard, { cwd });
+      const resolvedArgs = args ? [...args] : [
+        '-p',
+        '--output-format',
+        'json',
+        '--permission-mode',
+        'acceptEdits',
+        ...(model ? ['--model', model] : []),
+        ...(allowedTools.length > 0 ? ['--allowedTools', ...allowedTools] : []),
+      ];
       const prompt = buildPrompt(taskCard);
       const result = await runProcess({
         command,
@@ -375,6 +555,7 @@ export function createClaudeExecutorAdapter({
       let usage = null;
       let costUsd = null;
       let modelUsed = model;
+      let permissionDenials = [];
 
       try {
         const parsed = JSON.parse(result.stdout.trim());
@@ -398,12 +579,21 @@ export function createClaudeExecutorAdapter({
             const keys = Object.keys(parsed.modelUsage);
             if (keys.length > 0) modelUsed = keys[0];
           }
+          if (Array.isArray(parsed.permission_denials)) {
+            permissionDenials = [...parsed.permission_denials];
+          }
         }
       } catch {
         /* plain text fallback */
       }
 
       const report = parseExecutionReport(taskCard.task_id, reportText);
+      Object.defineProperty(report, 'permissionDenials', {
+        value: permissionDenials,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
       const callId = `call-claude-exe-${randomUUID()}`;
       try {
         Object.defineProperty(report, 'callId', {
