@@ -145,6 +145,10 @@ export function initialCloseoutState({
     resolvedSignatures: [],
     // Audit trail of Supervisor escalation decisions applied to this workflow.
     supervisorEscalations: [],
+    // Original actionable findings awaiting verification/resolution. These
+    // survive checkpoints so a resume never loses the exact GitHub identity.
+    reviewFindings: [],
+    repairReviewer: null,
     // PR Closeout reviewer selection + three-stage failover progress. Once a
     // reviewer produces a valid review the workflow LOCKS onto it
     // (reviewerLocked) and later repair / push / re-review keep using it;

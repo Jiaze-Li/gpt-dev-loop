@@ -61,6 +61,11 @@ export class Persistence {
     }
     const current = (await this.readWorkflowState(workflowId)) ?? {};
     const next = { ...current, ...(patch ?? {}) };
+    // Closeout contains durable finding/thread evidence. Partial transition
+    // updates must not discard evidence needed after a checkpoint resume.
+    if (current.prCloseout && patch?.prCloseout) {
+      next.prCloseout = { ...current.prCloseout, ...patch.prCloseout };
+    }
     await this.writeWorkflowState(workflowId, next);
     return next;
   }

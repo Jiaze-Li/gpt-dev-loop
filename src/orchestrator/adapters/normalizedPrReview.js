@@ -36,6 +36,19 @@ export const NORMALIZED_REVIEW_STATUS = Object.freeze({
 export const NORMALIZED_FINDING_SEVERITIES = Object.freeze(['P1', 'P2', 'OTHER']);
 export const BLOCKING_SEVERITIES = Object.freeze(['P1', 'P2']);
 
+export const FINDING_LIFECYCLE = Object.freeze({
+  OPEN: 'OPEN',
+  FIXED: 'FIXED',
+  RESOLVED: 'RESOLVED',
+});
+
+export const THREAD_RESOLUTION_STATUS = Object.freeze({
+  NOT_ATTEMPTED: 'NOT_ATTEMPTED',
+  PENDING: 'PENDING',
+  RESOLVED: 'RESOLVED',
+  FAILED: 'FAILED',
+});
+
 export const REVIEW_PROVIDERS = Object.freeze(['codex', 'claude', 'internal']);
 
 // Reasons a provider result normalizes to FAILED (drives reviewer failover in
@@ -84,6 +97,67 @@ export function normalizedFindingSignature(finding) {
   return `${severity}:${file}:${body}`;
 }
 
+function identity(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+// Resolution is deliberately fail-closed. A location or matching body is not
+// a GitHub thread identity and must never be used as one.
+export function hasReliableThreadIdentity(finding) {
+  return Boolean(
+    identity(finding?.reviewId ?? finding?.review_id)
+    && identity(finding?.threadNodeId ?? finding?.threadId ?? finding?.thread_node_id ?? finding?.thread_id)
+    && identity(finding?.commentId ?? finding?.comment_id)
+    && identity(finding?.signature),
+  );
+}
+
+export const isFindingIdentityReliable = hasReliableThreadIdentity;
+
+export function markFindingFixed(finding, { verificationReviewId, resolvedOnHead } = {}) {
+  const copy = { ...finding };
+  if (!hasReliableThreadIdentity(copy) || !identity(verificationReviewId) || !identity(resolvedOnHead)) {
+    return { ...copy, lifecycle: FINDING_LIFECYCLE.OPEN };
+  }
+  return {
+    ...copy,
+    lifecycle: FINDING_LIFECYCLE.FIXED,
+    threadResolutionStatus: THREAD_RESOLUTION_STATUS.PENDING,
+    verificationReviewId: identity(verificationReviewId),
+    resolvedOnHead: identity(resolvedOnHead),
+  };
+}
+
+export function recordThreadResolution(finding, {
+  success,
+  resolvedAt,
+  threadId,
+} = {}) {
+  const copy = { ...finding };
+  if (copy.lifecycle === FINDING_LIFECYCLE.RESOLVED) return copy;
+  if (copy.lifecycle !== FINDING_LIFECYCLE.FIXED || !hasReliableThreadIdentity(copy)) {
+    return { ...copy, lifecycle: FINDING_LIFECYCLE.OPEN };
+  }
+  if (!success) {
+    return { ...copy, threadResolutionStatus: THREAD_RESOLUTION_STATUS.FAILED };
+  }
+  const originalThreadId = identity(copy.threadNodeId ?? copy.threadId);
+  const exactThreadId = identity(threadId ?? originalThreadId);
+  if (!exactThreadId || exactThreadId !== originalThreadId || !identity(resolvedAt)) {
+    return { ...copy, threadResolutionStatus: THREAD_RESOLUTION_STATUS.FAILED };
+  }
+  return {
+    ...copy,
+    threadId: exactThreadId,
+    threadNodeId: exactThreadId,
+    lifecycle: FINDING_LIFECYCLE.RESOLVED,
+    threadResolutionStatus: THREAD_RESOLUTION_STATUS.RESOLVED,
+    resolvedAt: identity(resolvedAt),
+    resolvedBy: 'supergpt',
+  };
+}
+
 function toInt(value) {
   return Number.isInteger(value) ? value
     : (Number.isFinite(Number(value)) && String(value).trim() !== '' ? Math.trunc(Number(value)) : null);
@@ -102,6 +176,10 @@ export function normalizeReviewFinding(raw) {
     : (typeof raw.path === 'string' && raw.path.trim() ? raw.path.trim() : null);
   if (!title && !description && !file) return null;
   const normalized = {
+    reviewId: identity(raw.reviewId ?? raw.review_id ?? raw.review?.id),
+    threadId: identity(raw.threadId ?? raw.thread_id ?? raw.threadNodeId ?? raw.thread_node_id),
+    threadNodeId: identity(raw.threadNodeId ?? raw.thread_node_id ?? raw.threadId ?? raw.thread_id),
+    commentId: identity(raw.commentId ?? raw.comment_id ?? raw.id),
     severity,
     file,
     line: toInt(raw.line ?? raw.lineNumber ?? raw.start_line),
@@ -109,6 +187,19 @@ export function normalizeReviewFinding(raw) {
     description: description || title,
   };
   normalized.signature = normalizedFindingSignature({ id: raw.id, ...normalized });
+  normalized.lifecycle = Object.values(FINDING_LIFECYCLE).includes(raw.lifecycle)
+    ? raw.lifecycle : FINDING_LIFECYCLE.OPEN;
+  normalized.threadResolutionStatus = Object.values(THREAD_RESOLUTION_STATUS).includes(raw.threadResolutionStatus)
+    ? raw.threadResolutionStatus : THREAD_RESOLUTION_STATUS.NOT_ATTEMPTED;
+  normalized.resolvedAt = identity(raw.resolvedAt);
+  normalized.resolvedBy = identity(raw.resolvedBy);
+  normalized.resolvedOnHead = identity(raw.resolvedOnHead);
+  normalized.verificationReviewId = identity(raw.verificationReviewId);
+  normalized.identityReliable = hasReliableThreadIdentity(normalized);
+  if (!normalized.identityReliable && normalized.lifecycle !== FINDING_LIFECYCLE.OPEN) {
+    normalized.lifecycle = FINDING_LIFECYCLE.OPEN;
+    normalized.threadResolutionStatus = THREAD_RESOLUTION_STATUS.NOT_ATTEMPTED;
+  }
   return normalized;
 }
 
@@ -221,7 +312,10 @@ export function normalizeProviderReview({
     });
   }
 
-  const findings = rawFindings.map(normalizeReviewFinding).filter(Boolean);
+  const findings = rawFindings.map((finding) => normalizeReviewFinding({
+    ...finding,
+    reviewId: finding?.reviewId ?? finding?.review_id ?? reviewId ?? null,
+  })).filter(Boolean);
   const blocking = findings.filter((f) => isBlockingSeverity(f.severity));
 
   return {

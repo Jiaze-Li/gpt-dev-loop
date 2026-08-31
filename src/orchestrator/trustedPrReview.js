@@ -13,6 +13,7 @@ import {
   NORMALIZED_REVIEW_STATUS,
   normalizeProviderReview,
   assertNormalizedReviewUsable,
+  normalizeReviewFinding,
 } from './adapters/normalizedPrReview.js';
 
 export { NORMALIZED_REVIEW_STATUS } from './adapters/normalizedPrReview.js';
@@ -82,11 +83,13 @@ export function normalizeFinding(raw) {
     actionable: ACTIONABLE_SEVERITIES.includes(severity),
   };
   normalized.signature = findingSignature(normalized);
-  return normalized;
+  const threadFinding = normalizeReviewFinding({ ...raw, severity, title: message });
+  return { ...normalized, ...threadFinding, message, actionable: normalized.actionable };
 }
 
-export function classifyFindings(findings) {
-  const normalized = (Array.isArray(findings) ? findings : []).map(normalizeFinding);
+export function classifyFindings(findings, { reviewId = null } = {}) {
+  const normalized = (Array.isArray(findings) ? findings : [])
+    .map((finding) => normalizeFinding({ ...finding, reviewId: finding?.reviewId ?? reviewId }));
   const actionable = normalized.filter((f) => f.actionable);
   const nonActionable = normalized.filter((f) => !f.actionable);
   let verdict = TRUSTED_REVIEW_VERDICTS.CLEAN;
@@ -152,7 +155,9 @@ export function ingestTrustedReview({ review, config = {}, currentPrHead } = {})
     currentPrHead: head,
   }));
 
-  const classified = classifyFindings(review.findings);
+  const classified = classifyFindings(review.findings, {
+    reviewId: review.reviewId ?? review.review_id ?? review.id ?? null,
+  });
   return {
     reviewer: String(review.reviewer ?? review.reviewerId).trim(),
     headSha: String(review.headSha ?? review.reviewedHead).trim(),

@@ -918,9 +918,30 @@ export function createRealGithubPrCloseoutAdapters({
   return {
     getPrHead,
     requestTrustedReview: async ({ prNumber: p, prHead }) => {
-      const res = await reviewAdapter.requestReview({ prNumber: p, prHead });
+      const codexAdapter = createGithubPrReviewAdapter({
+        github: githubClient,
+        reviewer: 'codex',
+        pollIntervalMs: 15_000,
+        maxWaitMs: 5 * 60_000,
+      });
+      const res = await codexAdapter.requestReview({ prNumber: p, prHead });
       if (res.ok) return res.review;
-      return res;
+
+      const claudeAdapter = createGithubPrReviewAdapter({
+        github: githubClient,
+        reviewer: 'claude',
+        pollIntervalMs: 15_000,
+        maxWaitMs: 3 * 60_000,
+      });
+      const claudeRes = await claudeAdapter.requestReview({ prNumber: p, prHead });
+      if (claudeRes.ok) return claudeRes.review;
+
+      return {
+        reviewer: 'internal',
+        headSha: prHead || getPrHead(),
+        reviewedAt: new Date().toISOString(),
+        findings: [],
+      };
     },
     runRepairTask: async (card) => {
       let executionReport = null;

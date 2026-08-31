@@ -4,6 +4,8 @@
 // into a clean chronological list of safe, sanitized status milestone events.
 // Consumes ZERO model tokens and exposes NO secrets or raw shell dumps.
 
+import { projectReviewThreads } from './meta.js';
+
 function formatTimestamp(isoString) {
   if (!isoString) return '--:--:--';
   try {
@@ -39,6 +41,17 @@ export function deriveWorkflowTimeline(rawState) {
 
   const rawEvents = [];
   const startIso = rawState.startedAt || null;
+
+  const reviewThreads = projectReviewThreads(rawState);
+  if (reviewThreads.findings.length > 0) {
+    rawEvents.push({
+      iso: rawState.lastProgressAt || startIso,
+      type: 'REVIEW_THREADS',
+      label: `Review Threads: Open ${reviewThreads.open}, Resolved ${reviewThreads.resolved}, Resolution Failed ${reviewThreads.resolutionFailed}`,
+      detail: reviewThreads.findings.map((finding) =>
+        `${finding.lifecycle} ${finding.severity || ''} ${finding.file || finding.title}`.replace(/\s+/g, ' ').trim()).join('; '),
+    });
+  }
 
   // 1. Workflow Start
   if (startIso) {

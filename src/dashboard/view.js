@@ -442,6 +442,12 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
     </div>
 
     <!-- Timeline -->
+    <div class="timeline-card" id="review-threads-card" style="display: none;">
+      <div class="card-title">Review Threads</div>
+      <div id="review-threads-summary" class="content-label">Open 0 · Resolved 0 · Resolution Failed 0</div>
+      <div id="review-findings" style="margin-top: 12px;"></div>
+    </div>
+
     <div class="timeline-card">
       <div class="card-title">Workflow Timeline</div>
       <div class="timeline" id="timeline-container">
@@ -765,7 +771,23 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
           document.getElementById('val-internal-reviewer-status').textContent = hasIntRev ? 'Invoked' : 'Not invoked';
         }
 
-        // 8. Timeline
+        // 8. Durable review-thread state. Counts and finding badges are a
+        // direct rendering of the server projection; the browser infers no
+        // resolution from head movement or other review metadata.
+        const reviewThreads = data.reviewThreads || { open: 0, resolved: 0, resolutionFailed: 0, findings: [] };
+        const reviewCard = document.getElementById('review-threads-card');
+        reviewCard.style.display = reviewThreads.findings.length > 0 ? 'block' : 'none';
+        document.getElementById('review-threads-summary').textContent =
+          \`Open \${reviewThreads.open} · Resolved \${reviewThreads.resolved} · Resolution Failed \${reviewThreads.resolutionFailed}\`;
+        document.getElementById('review-findings').innerHTML = reviewThreads.findings.map(finding => {
+          const status = ['OPEN', 'FIXED', 'RESOLVED'].includes(finding.lifecycle) ? finding.lifecycle : 'OPEN';
+          const tagClass = status === 'RESOLVED' ? 'done' : (finding.threadResolutionStatus === 'FAILED' ? 'failed' : status === 'FIXED' ? 'running' : 'waiting');
+          const location = finding.file ? finding.file + (finding.line == null ? '' : ':' + finding.line) : (finding.title || 'Review finding');
+          const failed = finding.threadResolutionStatus === 'FAILED' ? ' · Resolution Failed' : '';
+          return \`<div class="prop-row"><span class="prop-key">\${escapeHtml(location)}</span><span class="prop-val"><span class="tag tag-\${tagClass}">\${escapeHtml(status)}</span>\${escapeHtml(failed)}</span></div>\`;
+        }).join('');
+
+        // 9. Timeline
         const tlContainer = document.getElementById('timeline-container');
         const events = data.timeline || [];
         if (events.length === 0) {

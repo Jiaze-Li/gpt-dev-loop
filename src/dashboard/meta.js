@@ -6,7 +6,46 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const DASHBOARD_VERSION = '1.2.0';
+export const DASHBOARD_VERSION = '1.3.0';
+
+// Read-only projection of the durable PR-closeout finding state.  In
+// particular, resolution API failure never gets inferred as resolution from a
+// code-fix lifecycle value.
+export function projectReviewThreads(rawState) {
+  const persisted = rawState?.prCloseout?.reviewFindings ?? rawState?.reviewFindings;
+  const findings = (Array.isArray(persisted) ? persisted : []).map((finding) => {
+    const resolution = String(finding?.threadResolutionStatus || 'NOT_ATTEMPTED').toUpperCase();
+    let lifecycle = String(finding?.lifecycle || 'OPEN').toUpperCase();
+    if (!['OPEN', 'FIXED', 'RESOLVED'].includes(lifecycle)) lifecycle = 'OPEN';
+    if (resolution === 'FAILED' && lifecycle === 'RESOLVED') lifecycle = 'FIXED';
+    if (lifecycle === 'RESOLVED' && resolution !== 'RESOLVED') lifecycle = 'FIXED';
+
+    return {
+      reviewId: finding?.reviewId ?? null,
+      threadId: finding?.threadId ?? null,
+      threadNodeId: finding?.threadNodeId ?? null,
+      commentId: finding?.commentId ?? null,
+      file: finding?.file ?? null,
+      line: finding?.line ?? null,
+      severity: finding?.severity ?? null,
+      signature: finding?.signature ?? null,
+      title: finding?.title ?? finding?.description ?? 'Review finding',
+      lifecycle,
+      threadResolutionStatus: resolution,
+    };
+  });
+
+  const resolved = findings.filter((finding) =>
+    finding.lifecycle === 'RESOLVED' && finding.threadResolutionStatus === 'RESOLVED').length;
+  const resolutionFailed = findings.filter((finding) =>
+    finding.threadResolutionStatus === 'FAILED').length;
+  return {
+    open: findings.length - resolved,
+    resolved,
+    resolutionFailed,
+    findings,
+  };
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

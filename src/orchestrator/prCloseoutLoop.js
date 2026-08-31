@@ -35,11 +35,17 @@ import {
   applySupervisorEscalationOutcome,
 } from './prCloseoutPolicy.js';
 import { ingestTrustedReview } from './trustedPrReview.js';
+import {
+  FINDING_LIFECYCLE,
+  THREAD_RESOLUTION_STATUS,
+  markFindingFixed,
+} from './adapters/normalizedPrReview.js';
 
 export const PR_CLOSEOUT_LOOP_STATUS = Object.freeze({
   DONE: 'DONE',
   HUMAN_REQUIRED: 'HUMAN_REQUIRED',
   REVIEW_ONLY: 'REVIEW_ONLY',
+  CLEAN_WITH_UNRESOLVED_THREADS: 'CLEAN_WITH_UNRESOLVED_THREADS',
 });
 
 // A single, explicit list of the fields that make up the durable closeout
@@ -64,6 +70,8 @@ const STATE_FIELDS = [
   'repairLog',
   'resolvedSignatures',
   'supervisorEscalations',
+  'reviewFindings',
+  'repairReviewer',
 ];
 
 const STATE_ARRAY_FIELDS = new Set([
@@ -72,6 +80,7 @@ const STATE_ARRAY_FIELDS = new Set([
   'repairLog',
   'resolvedSignatures',
   'supervisorEscalations',
+  'reviewFindings',
 ]);
 
 // Normalize any closeout-state-shaped object (fresh, persisted, or hand-built)
@@ -172,6 +181,7 @@ export async function runPrCloseoutLoop({
     pushRepair,
     escalateSupervisor,
     refreshReview,
+    resolveReviewThread,
   } = adapters;
 
   if (typeof getPrHead !== 'function' || typeof requestTrustedReview !== 'function') {
@@ -256,6 +266,15 @@ export async function runPrCloseoutLoop({
     return { newHead, repair, trusted };
   }
 
+  function rememberRepairFindings(trusted) {
+    const existing = new Map((current.reviewFindings ?? []).map((f) => [f.signature, f]));
+    for (const finding of trusted.actionable ?? []) {
+      if (!existing.has(finding.signature)) existing.set(finding.signature, { ...finding });
+    }
+    current.reviewFindings = [...existing.values()];
+    current.repairReviewer = trusted.reviewer;
+  }
+
   for (let iteration = 0; iteration < cap; iteration += 1) {
     const head = String(await getPrHead() ?? '').trim();
     if (!head) {
@@ -273,12 +292,65 @@ export async function runPrCloseoutLoop({
       ? await requestTrustedReview({ prNumber: current.prNumber, prHead: head })
       : await requestReview({ prNumber: current.prNumber, prHead: head });
 
+    // A pushed repair is only confirmed by the same reviewer examining the
+    // new head.  Compare stable signatures; absence confirms only that exact
+    // subset.  Merely moving the head never changes finding lifecycle.
+    if ((current.reviewFindings ?? []).some((f) => f.lifecycle === FINDING_LIFECYCLE.OPEN)) {
+      const verification = ingestForRepair(review, { head, state: current, config });
+      const sameReviewer = String(verification.reviewer ?? '').trim().toLowerCase()
+        === String(current.repairReviewer ?? '').trim().toLowerCase();
+      const reviewId = verification.normalized?.review_id ?? review?.reviewId ?? review?.review_id ?? review?.id;
+      if (sameReviewer && verification.headSha === head && current.prHead === head) {
+        const live = new Set(verification.actionableSignatures ?? []);
+        current.reviewFindings = current.reviewFindings.map((finding) => {
+          if (finding.lifecycle !== FINDING_LIFECYCLE.OPEN || live.has(finding.signature)) return finding;
+          return markFindingFixed(finding, { verificationReviewId: reviewId, resolvedOnHead: head });
+        });
+
+        // Resolution is deliberately per finding and idempotent. A failure
+        // does not roll a confirmed code fix back to OPEN and cannot prevent
+        // other confirmed findings from resolving.
+        for (let index = 0; index < current.reviewFindings.length; index += 1) {
+          const finding = current.reviewFindings[index];
+          if (finding.lifecycle !== FINDING_LIFECYCLE.FIXED
+            || finding.threadResolutionStatus === THREAD_RESOLUTION_STATUS.RESOLVED) continue;
+          if (typeof resolveReviewThread !== 'function') {
+            current.reviewFindings[index] = {
+              ...finding,
+              threadResolutionStatus: THREAD_RESOLUTION_STATUS.FAILED,
+            };
+            continue;
+          }
+          const result = await resolveReviewThread(finding, {
+            prNumber: current.prNumber,
+            prHead: head,
+            verificationReviewId: reviewId,
+          });
+          current.reviewFindings[index] = result?.finding ?? (result?.ok
+            ? { ...finding, lifecycle: FINDING_LIFECYCLE.RESOLVED,
+              threadResolutionStatus: THREAD_RESOLUTION_STATUS.RESOLVED,
+              ...(result.evidence ?? {}) }
+            : { ...finding, threadResolutionStatus: THREAD_RESOLUTION_STATUS.FAILED });
+        }
+        await savedPersist();
+      }
+    }
+
     const decision = decideCloseout({ state: current, review, currentPrHead: head, config });
     current = decision.state;
     await savedPersist();
 
     switch (decision.action) {
       case PR_CLOSEOUT_ACTIONS.DONE:
+        if ((current.reviewFindings ?? []).some((finding) =>
+          finding.lifecycle === FINDING_LIFECYCLE.FIXED
+          && finding.threadResolutionStatus === THREAD_RESOLUTION_STATUS.FAILED)) {
+          return terminal(
+            PR_CLOSEOUT_LOOP_STATUS.CLEAN_WITH_UNRESOLVED_THREADS,
+            'clean_with_unresolved_threads',
+            current,
+          );
+        }
         return terminal(PR_CLOSEOUT_LOOP_STATUS.DONE, decision.reason, current);
 
       case PR_CLOSEOUT_ACTIONS.REVIEW_ONLY:
@@ -347,6 +419,7 @@ export async function runPrCloseoutLoop({
                 : 'escalation repair (new strategy)'),
             gateEvidence: outcome.repair.gateResult,
           });
+          rememberRepairFindings(outcome.trusted);
           current = invalidateReviewEvidence(current, outcome.newHead);
           await savedPersist();
         }
@@ -367,6 +440,7 @@ export async function runPrCloseoutLoop({
           repairSummary: outcome.repair.summary ?? null,
           gateEvidence: outcome.repair.gateResult,
         });
+        rememberRepairFindings(outcome.trusted);
         current = invalidateReviewEvidence(current, outcome.newHead);
         await savedPersist();
         continue;

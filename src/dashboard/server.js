@@ -17,7 +17,7 @@ import { validateWorkflowId } from '../orchestrator/workflowId.js';
 import { readControl } from '../orchestrator/workflowControl.js';
 import { deriveWorkflowTimeline } from './timeline.js';
 import { renderDashboardHtml } from './view.js';
-import { getDashboardMeta, canonicalWorkflowBadge, getCanonicalWorkflowStatus, computeRequiresAttention } from './meta.js';
+import { getDashboardMeta, canonicalWorkflowBadge, getCanonicalWorkflowStatus, computeRequiresAttention, projectReviewThreads } from './meta.js';
 import { getDashboardFocus } from './focus.js';
 
 const TERMINAL_STATES = new Set(['DONE', 'HUMAN_REQUIRED', 'FAILED', 'STOPPED', 'TIMEOUT', 'STALLED', 'SUPERSEDED']);
@@ -206,6 +206,7 @@ export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } 
   // newest-first, so reverse a display copy — never reverse in place.
   const timelineChronological = deriveWorkflowTimeline(live);
   const timeline = [...timelineChronological].reverse();
+  const reviewThreads = projectReviewThreads(live);
 
   return {
     ...canonical,
@@ -229,6 +230,7 @@ export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } 
     supersededBy: live.supersededBy || null,
     stageStatuses: live.stageStatuses ?? {},
     timeline,
+    reviewThreads,
     isAlive: liveness.isAlive,
   };
 }

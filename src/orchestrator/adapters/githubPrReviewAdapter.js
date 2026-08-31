@@ -26,6 +26,12 @@
 // review, rebinds to the new head, de-dupes, and re-triggers.
 
 import { PrCloseoutError, PR_CLOSEOUT_ERROR_CODES } from '../errors.js';
+import {
+  FINDING_LIFECYCLE,
+  THREAD_RESOLUTION_STATUS,
+  hasReliableThreadIdentity,
+  recordThreadResolution,
+} from './normalizedPrReview.js';
 
 // Canonical, evidence-backed trigger comment bodies. `resolveTriggerText`
 // allows a tested injection override (metadata / config) but never silently
@@ -63,6 +69,121 @@ export const MIN_POLL_INTERVAL_MS = 15_000;
 export const MAX_POLL_INTERVAL_MS = 30_000;
 export const DEFAULT_POLL_INTERVAL_MS = 20_000;
 export const DEFAULT_MAX_WAIT_MS = 15 * 60_000;
+export const DEFAULT_THREAD_RESOLUTION_MAX_ATTEMPTS = 3;
+export const DEFAULT_THREAD_RESOLUTION_RETRY_MS = 1_000;
+
+const RESOLVE_REVIEW_THREAD_MUTATION = `
+  mutation ResolveReviewThread($threadId: ID!) {
+    resolveReviewThread(input: { threadId: $threadId }) {
+      thread { id isResolved }
+    }
+  }
+`;
+
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function resolutionError(error) {
+  return {
+    code: String(error?.code ?? error?.name ?? 'GITHUB_THREAD_RESOLUTION_FAILED'),
+    message: String(error?.message ?? 'GitHub review thread resolution failed'),
+    status: Number.isFinite(Number(error?.status ?? error?.statusCode))
+      ? Number(error.status ?? error.statusCode) : null,
+  };
+}
+
+function resolvedThreadFrom(response) {
+  return response?.resolveReviewThread?.thread
+    ?? response?.data?.resolveReviewThread?.thread
+    ?? response?.thread
+    ?? response;
+}
+
+async function invokeThreadResolution(github, threadId) {
+  if (typeof github?.resolveReviewThread === 'function') {
+    return github.resolveReviewThread({ threadId });
+  }
+  if (typeof github?.graphql === 'function') {
+    return github.graphql(RESOLVE_REVIEW_THREAD_MUTATION, { threadId });
+  }
+  throw new PrCloseoutError(
+    PR_CLOSEOUT_ERROR_CODES.THREAD_RESOLUTION_UNAVAILABLE,
+    'GitHub client does not support resolveReviewThread or graphql',
+  );
+}
+
+// Resolve only the original GitHub node identity carried by a confirmed-fixed
+// finding. File, line and body are never accepted as fallback identities.
+export async function resolveGithubReviewThread({
+  github,
+  finding,
+  maxAttempts = DEFAULT_THREAD_RESOLUTION_MAX_ATTEMPTS,
+  retryDelayMs = DEFAULT_THREAD_RESOLUTION_RETRY_MS,
+  clock = {},
+} = {}) {
+  const original = finding && typeof finding === 'object' ? { ...finding } : {};
+  const threadId = String(original.threadNodeId ?? original.threadId ?? '').trim();
+
+  if (original.lifecycle === FINDING_LIFECYCLE.RESOLVED
+    || original.threadResolutionStatus === THREAD_RESOLUTION_STATUS.RESOLVED) {
+    return { ok: true, idempotent: true, attempts: 0, finding: original, evidence: {
+      threadId: threadId || null,
+      resolvedAt: original.resolvedAt ?? null,
+      resolvedBy: original.resolvedBy ?? 'supergpt',
+      resolvedOnHead: original.resolvedOnHead ?? null,
+      verificationReviewId: original.verificationReviewId ?? null,
+    } };
+  }
+
+  if (original.lifecycle !== FINDING_LIFECYCLE.FIXED || !hasReliableThreadIdentity(original)) {
+    const open = { ...original, lifecycle: FINDING_LIFECYCLE.OPEN,
+      threadResolutionStatus: THREAD_RESOLUTION_STATUS.NOT_ATTEMPTED };
+    return { ok: false, idempotent: false, attempts: 0, finding: open,
+      error: { code: 'UNRELIABLE_THREAD_IDENTITY', message: 'finding lacks reliable original thread identity', status: null } };
+  }
+
+  const attemptsLimit = positiveInteger(maxAttempts, DEFAULT_THREAD_RESOLUTION_MAX_ATTEMPTS);
+  const sleep = typeof clock.sleep === 'function'
+    ? (ms) => clock.sleep(ms)
+    : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const now = typeof clock.now === 'function' ? () => clock.now() : () => Date.now();
+  let lastError;
+
+  for (let attempt = 1; attempt <= attemptsLimit; attempt += 1) {
+    try {
+      const response = await invokeThreadResolution(github, threadId);
+      const thread = resolvedThreadFrom(response);
+      const returnedId = String(thread?.id ?? threadId).trim();
+      if (returnedId !== threadId || thread?.isResolved === false) {
+        throw Object.assign(new Error('GitHub returned an unresolved or different review thread'), {
+          code: 'THREAD_IDENTITY_MISMATCH',
+        });
+      }
+      const resolvedAt = new Date(now()).toISOString();
+      const updated = recordThreadResolution(original, { success: true, threadId, resolvedAt });
+      return { ok: true, idempotent: false, attempts: attempt, finding: updated, evidence: {
+        threadId,
+        resolvedAt: updated.resolvedAt,
+        resolvedBy: 'supergpt',
+        resolvedOnHead: updated.resolvedOnHead,
+        verificationReviewId: updated.verificationReviewId,
+      } };
+    } catch (error) {
+      lastError = resolutionError(error);
+      if (attempt < attemptsLimit) await sleep(Math.max(0, Number(retryDelayMs) || 0));
+    }
+  }
+
+  return {
+    ok: false,
+    idempotent: false,
+    attempts: attemptsLimit,
+    finding: recordThreadResolution(original, { success: false }),
+    error: lastError,
+  };
+}
 
 function clampInterval(ms) {
   const n = Number.isFinite(ms) ? Math.round(ms) : DEFAULT_POLL_INTERVAL_MS;
@@ -353,6 +474,12 @@ export function createGithubPrReviewAdapter({
     identity,
     triggerText: PR_REVIEW_TRIGGER_TEXT[reviewerKey] ?? null,
     requestReview,
+    resolveReviewThread: (finding, options = {}) => resolveGithubReviewThread({
+      github,
+      finding,
+      clock,
+      ...options,
+    }),
     get pending() { return snapshot(); },
   };
 }

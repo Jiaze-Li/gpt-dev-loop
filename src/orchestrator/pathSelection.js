@@ -28,6 +28,8 @@
 // `frozenDecision`. Resume never recomputes the path and never weakens the
 // bounded scope.
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { parsePrCloseoutGoal } from './prCloseoutIntent.js';
 
 export const WORKFLOW_PATHS = Object.freeze({
@@ -132,8 +134,8 @@ function isNonEmptyString(v) {
 }
 
 // A concrete file path: a relative path with no glob metacharacters, no parent
-// traversal, not a bare directory, not the repo root.
-function isConcreteFilePath(entry) {
+// traversal, not a bare directory, not the repo root, and not an existing directory on disk.
+function isConcreteFilePath(entry, cwd = null) {
   if (!isNonEmptyString(entry)) return false;
   const p = entry.trim();
   if (p === '.' || p === '/' || p === './') return false;
@@ -143,6 +145,14 @@ function isConcreteFilePath(entry) {
   if (p.endsWith('/')) return false; // bare directory
   const base = p.split('/').pop();
   if (!base) return false;
+  if (cwd && typeof cwd === 'string') {
+    try {
+      const full = path.resolve(cwd, p);
+      if (fs.existsSync(full) && fs.statSync(full).isDirectory()) {
+        return false;
+      }
+    } catch {}
+  }
   return true;
 }
 
@@ -151,7 +161,7 @@ function isConcreteFilePath(entry) {
  * contract. Returns `{ ok: true, contract }` or `{ ok: false, reason, detail }`
  * with a PATH_SELECTION_REASONS value.
  */
-export function buildFastPathTaskContract(boundedTask) {
+export function buildFastPathTaskContract(boundedTask, { cwd = null } = {}) {
   if (Array.isArray(boundedTask)) {
     return { ok: false, reason: PATH_SELECTION_REASONS.FULL_EXPLICIT_MULTI_STEP, detail: 'bounded task input is a list of tasks' };
   }
@@ -175,7 +185,7 @@ export function buildFastPathTaskContract(boundedTask) {
   }
   const allowed_files = [];
   for (const entry of allowedRaw) {
-    if (!isConcreteFilePath(entry)) {
+    if (!isConcreteFilePath(entry, cwd)) {
       return { ok: false, reason: PATH_SELECTION_REASONS.FULL_BROAD_FILE_SCOPE, detail: `allowed_files entry is not a concrete bounded path: ${JSON.stringify(entry)}` };
     }
     allowed_files.push(entry.trim());
@@ -321,7 +331,7 @@ export function selectWorkflowPath({ goal, cwd = process.cwd(), boundedTask, exp
     return fullDecision(PATH_SELECTION_REASONS.FULL_NO_BOUNDED_TASK, 'no bounded single-task contract in trusted input; planning required');
   }
 
-  const built = buildFastPathTaskContract(boundedTask);
+  const built = buildFastPathTaskContract(boundedTask, { cwd });
   if (!built.ok) {
     return fullDecision(built.reason, built.detail);
   }
