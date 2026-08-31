@@ -131,6 +131,8 @@ test('3. API reads RUNNING and DONE workflows accurately without model tokens', 
       executor: { totalTokens: 2500 },
       reviewer: { totalTokens: 0 },
       total: { totalTokens: 3700 },
+      executorInputBreakdownCalls: [{ taskId: 'task-auth', inputTokens: 100, cachedTokens: 20, breakdown: { categories: { taskCard: { tokens: 30 }, repoContext: { tokens: 20 }, history: { tokens: 10 }, evidence: { tokens: 10 }, other: { tokens: 30 } } } }],
+      executorInputBreakdownAggregate: { calls: 1, callsWithBreakdown: 1, providerInputTokens: 100, cachedTokens: 20, categories: { taskCard: { tokens: 30 }, repoContext: { tokens: 20 }, history: { tokens: 10 }, evidence: { tokens: 10 }, other: { tokens: 30 } } },
     },
     taskAttempts: [
       { taskId: 'task-auth', attempt: 1, executorCallId: 'c1' },
@@ -202,6 +204,8 @@ test('3. API reads RUNNING and DONE workflows accurately without model tokens', 
     assert.equal(runDetail.normalAttempts, 1);
     assert.equal(runDetail.escalationActive, false);
     assert.equal(runDetail.usage.total.totalTokens, 3700);
+    assert.equal(runDetail.usage.executorInputBreakdownAggregate.categories.taskCard.tokens, 30);
+    assert.equal(runDetail.usage.executorInputBreakdownCalls[0].cachedTokens, 20);
 
     // Detail for done workflow
     const doneRes = await requestGet(`${url}/api/workflows/${wfDone}`);
@@ -1088,4 +1092,3 @@ test('T. Zombie / stale workflow lifecycle: dead process & expired heartbeat rec
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
-

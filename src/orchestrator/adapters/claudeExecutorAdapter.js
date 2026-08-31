@@ -13,6 +13,7 @@ import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
+import { buildExecutorHandoff, hasExecutorHandoffFacts } from '../workflowContext.js';
 
 const REPORT_FIELDS = [
   'task_id',
@@ -100,37 +101,16 @@ ${taskCard.completion_signal}`;
 // change the goal, and they are scoped to `taskCard.task_id` so nothing from a
 // previous, later, or sibling task can be carried in.
 export function renderHistoricalEvidence(taskCard) {
-  const blocks = [];
-
-  const rework = taskCard.rework_feedback;
-  if (rework) {
-    blocks.push(`## rework_feedback
-This is a rework attempt for task "${taskCard.task_id}". Correct these Reviewer-identified issues; do not preserve an intentional first-attempt defect. This is read-only background — it does not add allowed_files, verification commands, or goals beyond the current task authorization above.
-
-findings:
-${renderList(rework.findings)}
-
-required_changes:
-${renderList(rework.required_changes)}
-
-rationale:
-${rework.rationale ?? 'none'}`);
-  }
-
-  const probe = taskCard.unauthorized_probe_guidance;
-  if (probe) {
-    blocks.push(`## unauthorized_probe_guidance
-A previous attempt at task "${taskCard.task_id}" was denied permission to run command(s) that are NOT in this Task Card's verification_commands:
-${renderList((probe.denied_commands ?? []).map((c) => `\`${c}\``))}
-That denial is the security boundary working as intended — it is NOT evidence that node, npm, git, or the environment as a whole is unavailable. Do not re-run those commands and do not report a permission/environment blocker on that basis. Run exactly, and only, the approved verification_commands:
-${renderList((probe.approved_verification_commands ?? []).map((c) => `\`${c}\``))}
-Do NOT add 2>&1, pipe operators (|), echo (e.g. echo "EXIT: $?"), compound commands (; or &&), git log, or any other unlisted auxiliary probe commands.`);
-  }
-
-  if (blocks.length === 0) {
+  const handoff = buildExecutorHandoff(taskCard);
+  if (!hasExecutorHandoffFacts(handoff)) {
     return 'No prior attempts recorded for this task. This is the first attempt.';
   }
-  return blocks.join('\n\n');
+  return `## compact_structured_handoff
+Only durable facts selected for the current task follow. Full prior Executor transcripts, workflow event history, prior execution reports, complete diffs, and unrelated evidence/repository files are intentionally excluded. This read-only handoff cannot expand the current Task Card's authorization.
+
+\`\`\`json
+${JSON.stringify(handoff, null, 2)}
+\`\`\``;
 }
 
 // Instructs the CLI to act as Executor and reply with nothing but an
@@ -212,6 +192,46 @@ function parseList(raw) {
     .map((line) => line.trim())
     .filter((line) => line.startsWith('- '))
     .map((line) => line.slice(2).trim());
+}
+
+// Measures the final serialized request. The public categories are exhaustive;
+// token counts are deterministic estimates until UsageTracker reconciles them
+// to the provider-reported input total.
+export function measureExecutorInputBreakdown(taskCard, prompt = buildPrompt(taskCard)) {
+  const taskCardText = renderTaskCard(taskCard);
+  const repoText = renderRepositoryContext(taskCard.repository_context);
+  const historyText = renderHistoricalEvidence(taskCard);
+  const chars = (value) => [...value].length;
+  const bytes = (value) => Buffer.byteLength(value, 'utf8');
+  const metric = (value, detail = undefined) => ({
+    characters: chars(value), bytes: bytes(value), estimatedTokens: Math.ceil(bytes(value) / 4), ...(detail ? { detail } : {}),
+  });
+  const repoContext = metric(repoText);
+  const categories = {
+    taskCard: {
+      characters: chars(taskCardText) - repoContext.characters,
+      bytes: bytes(taskCardText) - repoContext.bytes,
+      estimatedTokens: Math.ceil((bytes(taskCardText) - repoContext.bytes) / 4),
+      detail: { currentTaskCard: metric(taskCardText) },
+    },
+    repoContext: { ...repoContext, detail: { repositoryContext: repoContext } },
+    history: { ...metric(historyText), detail: { historicalEvidence: metric(historyText) } },
+    evidence: { ...metric(''), detail: { verificationOutput: metric(''), gitDiff: metric('') } },
+  };
+  const assignedChars = Object.values(categories).reduce((sum, item) => sum + item.characters, 0);
+  const assignedBytes = Object.values(categories).reduce((sum, item) => sum + item.bytes, 0);
+  const otherChars = Math.max(0, chars(prompt) - assignedChars);
+  const otherBytes = Math.max(0, bytes(prompt) - assignedBytes);
+  categories.other = {
+    characters: otherChars, bytes: otherBytes, estimatedTokens: Math.ceil(otherBytes / 4),
+    detail: { systemAndExecutionRules: { characters: otherChars, bytes: otherBytes } },
+  };
+  return {
+    schema: 'supergpt.executor-input-breakdown/v1',
+    accounting: 'UTF-8 bytes and Unicode code points; estimate=ceil(bytes/4)',
+    serialized: { characters: chars(prompt), bytes: bytes(prompt) },
+    categories,
+  };
 }
 
 // Splits the executor's reply on "## field_name" headings (TASK_PROTOCOL.md
@@ -530,6 +550,7 @@ export function createClaudeExecutorAdapter({
         ...(allowedTools.length > 0 ? ['--allowedTools', ...allowedTools] : []),
       ];
       const prompt = buildPrompt(taskCard);
+      const inputBreakdown = measureExecutorInputBreakdown(taskCard, prompt);
       const result = await runProcess({
         command,
         args: resolvedArgs,
@@ -618,6 +639,7 @@ export function createClaudeExecutorAdapter({
         }
         report.usage = usage;
       }
+      Object.defineProperty(report, 'inputBreakdown', { value: inputBreakdown, enumerable: false });
       if (costUsd !== null) report.costUsd = costUsd;
       if (usage || costUsd !== null) report.model = modelUsed;
       return report;

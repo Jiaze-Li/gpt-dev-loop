@@ -5,7 +5,7 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
-import { buildPrompt, parseExecutionReport } from './claudeExecutorAdapter.js';
+import { buildPrompt, measureExecutorInputBreakdown, parseExecutionReport } from './claudeExecutorAdapter.js';
 
 function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActivity, onProcessStarted, onProcessExited, signal }) {
   return new Promise((resolve, reject) => {
@@ -146,6 +146,7 @@ export function createCodexExecutorAdapter({
     model,
     async execute(taskCard, { signal } = {}) {
       const prompt = buildPrompt(taskCard);
+      const inputBreakdown = measureExecutorInputBreakdown(taskCard, prompt);
       const result = await runProcess({
         command,
         args,
@@ -205,51 +206,10 @@ export function createCodexExecutorAdapter({
         usage.callId = callId;
         report.usage = usage;
       }
+      Object.defineProperty(report, 'inputBreakdown', { value: inputBreakdown, enumerable: false });
       if (model) report.model = model;
       return report;
     },
-  };
-}
-
-function runGit(args, { cwd, spawn }) {
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
-    } catch {
-      resolve('');
-      return;
-    }
-    const chunks = [];
-    child.stdout?.on('data', (chunk) => chunks.push(chunk));
-    child.on('error', () => resolve(''));
-    child.on('close', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
-  });
-}
-
-async function currentRepositoryState({ cwd, spawn }) {
-  const [commit, status] = await Promise.all([
-    runGit(['rev-parse', 'HEAD'], { cwd, spawn }),
-    runGit(['status', '--short'], { cwd, spawn }),
-  ]);
-  return `commit: ${commit || 'unknown'}\nchanges:\n${status || '(clean)'}`;
-}
-
-function buildReworkTaskCard(taskCard, { sessionNumber, feedback, repositoryState }) {
-  return {
-    ...taskCard,
-    context: `${taskCard.context}
-
-## Rework — Codex session #${sessionNumber}
-This is a new Codex session. The previous session's conversation is not
-available to you — treat this as a fresh start informed only by what
-follows.
-
-### Review / gate feedback from the previous attempt
-${feedback}
-
-### Current repository state
-${repositoryState}`,
   };
 }
 
@@ -273,15 +233,6 @@ export function createCodexSessionManager({
       if (signal?.aborted) throw new ProviderCancelledError('executor cancelled');
       sessionCount += 1;
       const sessionNumber = sessionCount;
-
-      let feedback = 'none recorded';
-      let taskCardForSession = taskCard;
-      if (sessionNumber > 1) {
-        const state = await persistence?.readState?.(workflowId, taskId);
-        feedback = state?.last_error ?? 'none recorded';
-        const repositoryState = await currentRepositoryState({ cwd, spawn });
-        taskCardForSession = buildReworkTaskCard(taskCard, { sessionNumber, feedback, repositoryState });
-      }
 
       const routing = {
         model: model || 'codex:default',
@@ -321,7 +272,11 @@ export function createCodexSessionManager({
         onProcessStarted: (pid) => onProcessStarted?.({ ...processContext, pid }),
         onProcessExited: (details) => onProcessExited?.({ ...processContext, ...details }),
       });
-      const report = await executor.execute(taskCardForSession, { signal });
+      // Every retry is an ephemeral provider session. Cross-attempt facts are
+      // supplied only through the task-scoped structured handoff assembled by
+      // automatedLoop; do not replay persisted errors, repository status, or
+      // any previous provider conversation here.
+      const report = await executor.execute(taskCard, { signal });
       if (signal?.aborted) throw new ProviderCancelledError('executor cancelled');
 
       try {

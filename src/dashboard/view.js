@@ -417,6 +417,12 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
             </div>
           </div>
 
+          <div>
+            <div style="font-weight: 600; margin-bottom: 6px; font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Executor Input Breakdown</div>
+            <div id="tok-executor-input-breakdown" style="font-size: 12px;"><span style="color: var(--text-secondary);">Unavailable (legacy usage)</span></div>
+            <div id="tok-executor-input-calls" style="font-size: 12px; margin-top: 8px;"></div>
+          </div>
+
           <!-- Col 3: PR Reviewer (External) vs Internal Reviewer -->
           <div>
             <div style="font-weight: 600; margin-bottom: 6px; font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Reviewers (PR vs Internal)</div>
@@ -754,6 +760,26 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
           execModelsContainer.innerHTML = \`<div class="prop-row"><span class="prop-key">\${escapeHtml(providerStr)}</span><span class="prop-val">\${eTok > 0 ? \`\${eTok.toLocaleString()} tok\` : '-'}</span></div>\`;
         } else {
           execModelsContainer.innerHTML = '<span style="color: var(--text-secondary);">-</span>';
+        }
+
+        const categoryLabels = { taskCard: 'Task Card', repoContext: 'Repo Context', history: 'History', evidence: 'Evidence', other: 'Other' };
+        const inputAggregate = usage.executorInputBreakdownAggregate;
+        const inputCalls = Array.isArray(usage.executorInputBreakdownCalls) ? usage.executorInputBreakdownCalls : [];
+        const inputBreakdownContainer = document.getElementById('tok-executor-input-breakdown');
+        const inputCallsContainer = document.getElementById('tok-executor-input-calls');
+        if (inputAggregate && inputAggregate.callsWithBreakdown > 0) {
+          inputBreakdownContainer.innerHTML = Object.keys(categoryLabels).map(k => {
+            const item = inputAggregate.categories?.[k] || {};
+            return \`<div class="prop-row"><span class="prop-key">\${categoryLabels[k]}</span><span class="prop-val">\${(item.tokens || 0).toLocaleString()} input tok</span></div>\`;
+          }).join('') + \`<div class="prop-row"><span class="prop-key">Provider totals</span><span class="prop-val">\${(inputAggregate.providerInputTokens || 0).toLocaleString()} input · \${(inputAggregate.cachedTokens || 0).toLocaleString()} cached (subset)</span></div>\`;
+          inputCallsContainer.innerHTML = inputCalls.map((call, index) => {
+            if (!call.breakdown) return \`<div class="prop-row"><span class="prop-key">Call \${index + 1}</span><span class="prop-val">Unavailable (legacy)</span></div>\`;
+            const composition = Object.keys(categoryLabels).map(k => \`\${categoryLabels[k]} \${(call.breakdown.categories?.[k]?.tokens || 0).toLocaleString()}\`).join(' · ');
+            return \`<div class="prop-row"><span class="prop-key">\${escapeHtml(call.taskId || call.callId || 'Call ' + (index + 1))}</span><span class="prop-val">\${escapeHtml(composition)} · provider \${(call.inputTokens || 0).toLocaleString()} input / \${(call.cachedTokens || 0).toLocaleString()} cached</span></div>\`;
+          }).join('');
+        } else {
+          inputBreakdownContainer.innerHTML = '<span style="color: var(--text-secondary);">Unavailable (legacy usage)</span>';
+          inputCallsContainer.innerHTML = '';
         }
 
         // PR Reviewer (External) vs Internal Reviewer

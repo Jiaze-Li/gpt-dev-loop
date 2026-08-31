@@ -35,6 +35,87 @@ function emptyRoleBucket() {
   };
 }
 
+const INPUT_CATEGORIES = ['taskCard', 'repoContext', 'history', 'evidence', 'other'];
+
+function aggregateExecutorInputBreakdown(records) {
+  const executorRecords = records.filter((record) => record?.role === 'executor');
+  const categories = Object.fromEntries(INPUT_CATEGORIES.map((name) => [name, {
+    bytes: 0, characters: 0, tokens: 0,
+  }]));
+  let callsWithBreakdown = 0;
+  let providerInputTokens = 0;
+  let cachedTokens = 0;
+
+  const perCall = executorRecords.map((record) => {
+    const breakdown = record.inputBreakdown && typeof record.inputBreakdown === 'object'
+      ? record.inputBreakdown : null;
+    if (breakdown) {
+      callsWithBreakdown += 1;
+      for (const name of INPUT_CATEGORIES) {
+        const item = breakdown.categories?.[name] ?? {};
+        categories[name].bytes += Math.max(0, Number(item.bytes) || 0);
+        categories[name].characters += Math.max(0, Number(item.characters ?? item.chars) || 0);
+        categories[name].tokens += Math.max(0, Number(item.tokens) || 0);
+      }
+    }
+    providerInputTokens += Math.max(0, Number(record.inputTokens) || 0);
+    cachedTokens += Math.max(0, Number(record.cachedTokens) || 0);
+    return {
+      callId: record.callId ?? null,
+      taskId: record.taskId ?? null,
+      attempt: record.attempt ?? null,
+      inputTokens: record.inputTokens ?? null,
+      cachedTokens: record.cachedTokens ?? null,
+      outputTokens: record.outputTokens ?? null,
+      breakdown,
+      legacy: !breakdown,
+    };
+  });
+
+  return {
+    perCall,
+    aggregate: {
+      calls: executorRecords.length,
+      callsWithBreakdown,
+      legacyCalls: executorRecords.length - callsWithBreakdown,
+      providerInputTokens,
+      cachedTokens,
+      categories,
+      componentTokens: INPUT_CATEGORIES.reduce((sum, name) => sum + categories[name].tokens, 0),
+      semantics: 'Categories compose provider input tokens; cached tokens are a provider subset and are not added to composition.',
+    },
+  };
+}
+
+function reconcileInputBreakdown(value, providerInputTokens) {
+  if (!value || typeof value !== 'object') return null;
+  const source = value.categories ?? {};
+  const totalBytes = INPUT_CATEGORIES.reduce((sum, name) => sum + Math.max(0, Number(source[name]?.bytes) || 0), 0);
+  const categories = {};
+  let attributed = 0;
+  for (const [index, name] of INPUT_CATEGORIES.entries()) {
+    const item = source[name] ?? {};
+    const tokens = Number.isFinite(providerInputTokens) && totalBytes > 0
+      ? (index === INPUT_CATEGORIES.length - 1
+        ? providerInputTokens - attributed
+        : Math.floor(providerInputTokens * (Math.max(0, Number(item.bytes) || 0) / totalBytes)))
+      : (Number.isFinite(item.estimatedTokens) ? item.estimatedTokens : null);
+    if (tokens !== null) attributed += tokens;
+    categories[name] = {
+      ...item,
+      tokens,
+      tokenAccounting: Number.isFinite(providerInputTokens) ? 'provider-total-proportional-by-utf8-bytes' : 'deterministic-estimate',
+    };
+  }
+  return {
+    ...value,
+    categories,
+    providerInputTokens: Number.isFinite(providerInputTokens) ? providerInputTokens : null,
+    componentTokens: INPUT_CATEGORIES.reduce((sum, name) => sum + (categories[name].tokens ?? 0), 0),
+    unattributedTokens: Number.isFinite(providerInputTokens) ? providerInputTokens - attributed : null,
+  };
+}
+
 export class UsageTracker {
   constructor({ anomalyMonitor = new TokenAnomalyMonitor() } = {}) {
     this.records = [];
@@ -68,6 +149,7 @@ export class UsageTracker {
     durationMs = null,
     startedAt = null,
     completedAt = null,
+    inputBreakdown = null,
   } = {}) {
     if (!role) throw new Error('UsageTracker.record() requires a role');
 
@@ -135,6 +217,7 @@ export class UsageTracker {
       totalTokens,
       costUsd: normalizeNumber(costUsd),
       durationMs: normalizeNumber(durationMs),
+      inputBreakdown: normalizedRole === 'executor' ? reconcileInputBreakdown(inputBreakdown, inputTokens) : null,
     };
 
     this.records.push(rec);
@@ -221,6 +304,7 @@ export class UsageTracker {
       reviewed: Boolean(prCloseout?.reviewedPrHead),
     };
 
+    const executorBreakdown = aggregateExecutorInputBreakdown(this.records);
     const res = {
       workflow: { ...measuredTotal },
       supervisor: rolesSummary.supervisor || emptyRoleBucket(),
@@ -233,6 +317,11 @@ export class UsageTracker {
       externalPrReviewer,
       hasUsageData: measuredTotal.totalTokens > 0 || measuredTotal.calls > 0,
       records: this.records,
+      // Keep the historical array shape while exposing stable, presentation-ready
+      // per-call metadata and aggregate totals alongside it.
+      executorInputBreakdown: executorBreakdown.perCall.map((call) => call.breakdown),
+      executorInputBreakdownCalls: executorBreakdown.perCall,
+      executorInputBreakdownAggregate: executorBreakdown.aggregate,
     };
 
     if (checkAnomalies) {
@@ -273,6 +362,19 @@ export class UsageTracker {
     if (t.cachedTokens > 0) totLine += `   ${fmt(t.cachedTokens).padStart(7)} cached`;
     if (t.costUsd > 0) totLine += `   $${t.costUsd.toFixed(4)}`;
     lines.push(totLine);
+
+    const breakdown = sum.executorInputBreakdownAggregate;
+    if (breakdown.calls > 0) {
+      lines.push('Executor Input Breakdown:');
+      if (breakdown.callsWithBreakdown === 0) {
+        lines.push(`  Unavailable for ${breakdown.legacyCalls} legacy call${breakdown.legacyCalls === 1 ? '' : 's'}`);
+      } else {
+        for (const name of INPUT_CATEGORIES) {
+          lines.push(`  ${name.padEnd(11)} ${fmt(breakdown.categories[name].tokens).padStart(7)} input tokens`);
+        }
+        lines.push(`  Provider     ${fmt(breakdown.providerInputTokens).padStart(7)} input   ${fmt(breakdown.cachedTokens).padStart(7)} cached (subset)`);
+      }
+    }
 
     return lines.join('\n');
   }

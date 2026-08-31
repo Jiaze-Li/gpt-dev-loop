@@ -5,6 +5,8 @@ import { runAutomatedWorkflow } from '../src/orchestrator/automatedLoop.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
 import { createProductionRoleRuntime } from '../src/orchestrator/productionRoleRuntime.js';
 import { QuotaPoolRegistry, ProviderHealthRegistry } from '../src/orchestrator/roleRouting.js';
+import { buildPrompt, measureExecutorInputBreakdown } from '../src/orchestrator/adapters/claudeExecutorAdapter.js';
+import { UsageTracker } from '../src/orchestrator/usageTracker.js';
 
 function demoTaskCard(overrides = {}) {
   return {
@@ -3177,3 +3179,119 @@ test('REVIEW_PENDING checkpoint: mismatched task_id does not restore as pending 
   assert.deepEqual(createClaudeSessionManager.managers.map((m) => m.taskId), ['fresh-task']);
 });
 
+test('regression: multi-task Executor requests stay compact and isolated while rework handoff and usage totals survive', async () => {
+  const priorTranscript = 'PRIOR_FULL_TRANSCRIPT_SHOULD_NOT_LEAK_'.repeat(2_000);
+  const unrelatedEvidence = 'UNRELATED_DIFF_AND_EVIDENCE_SHOULD_NOT_LEAK_'.repeat(2_000);
+  const firstTask = demoTaskCard({
+    task_id: 'compact-task-1',
+    goal: 'change the first file',
+    allowed_files: ['src/first.js'],
+  });
+  const secondTask = demoTaskCard({
+    task_id: 'compact-task-2',
+    goal: 'change the second file',
+    allowed_files: ['src/second.js'],
+    history: [{ task_id: firstTask.task_id, transcript: priorTranscript }],
+    previous_executor_transcript: priorTranscript,
+    evidence: { diff: unrelatedEvidence, files: ['src/first.js'] },
+    auxiliary_snapshots: [
+      { original_path: 'src/second.js', snapshot_path: '.aux/second.js', sha256: 'current', read_only: true },
+      { original_path: 'src/first.js', snapshot_path: '.aux/first.js', sha256: 'prior', read_only: true },
+    ],
+  });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: firstTask },
+    { action: 'NEXT_TASK', task_card: secondTask },
+    { action: 'CONTINUE_REWORK' },
+    { action: 'WORKFLOW_DONE', summary: 'autonomous multi-task completion' },
+  ]);
+  const withUsage = (result, callId) => ({
+    ...result,
+    callId,
+    usage: { input_tokens: 40, output_tokens: 5, total_tokens: 45, callId },
+  });
+  const createReviewerSession = makeFakeReviewerFactory({
+    [firstTask.task_id]: [withUsage(passResult(firstTask.task_id), 'review-1')],
+    [secondTask.task_id]: [
+      withUsage({
+        task_id: secondTask.task_id,
+        decision: 'REWORK',
+        findings: ['second-file edge case'],
+        required_changes: ['handle the second-file edge case'],
+        rationale: 'current task review only',
+      }, 'review-2a'),
+      withUsage(passResult(secondTask.task_id), 'review-2b'),
+    ],
+  });
+  const managers = [];
+  const prompts = [];
+  const createClaudeSessionManager = ({ taskId }) => {
+    const manager = {
+      taskId,
+      executions: [],
+      async execute(taskCard) {
+        const prompt = buildPrompt(taskCard);
+        prompts.push({ taskId, prompt, taskCard });
+        manager.executions.push({ taskCard });
+        return demoExecutionReport(taskId, {
+          callId: `execute-${taskId}-${manager.executions.length}`,
+          model: 'sonnet',
+          usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 },
+          inputBreakdown: measureExecutorInputBreakdown(taskCard, prompt),
+        });
+      },
+    };
+    managers.push(manager);
+    return manager;
+  };
+  createClaudeSessionManager.managers = managers;
+  const gateRunner = makeFakeGateRunner();
+  const usageTracker = new UsageTracker();
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-compact-multi-task',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession: makeFakeWindowSession(),
+    usageTracker,
+    workflowGoal: 'complete both tasks autonomously',
+    repositoryContext: firstTask.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.deepEqual(result.history, [
+    { task_id: firstTask.task_id, decision: 'PASS', attempts: 1 },
+    { task_id: secondTask.task_id, decision: 'PASS', attempts: 2 },
+  ]);
+  assert.equal(gateRunner.runs.length, 3, 'every Executor attempt passes through the gate');
+  assert.equal(createReviewerSession.created.length, 2, 'review state is isolated by task');
+  assert.equal(createReviewerSession.created[0].reviewCalls, 1);
+  assert.equal(createReviewerSession.created[1].reviewCalls, 2, 'rework reuses only the current task reviewer');
+
+  const secondPrompts = prompts.filter((entry) => entry.taskId === secondTask.task_id);
+  assert.equal(secondPrompts.length, 2);
+  for (const { prompt } of secondPrompts) {
+    assert.doesNotMatch(prompt, /PRIOR_FULL_TRANSCRIPT_SHOULD_NOT_LEAK_/);
+    assert.doesNotMatch(prompt, /UNRELATED_DIFF_AND_EVIDENCE_SHOULD_NOT_LEAK_/);
+    assert.doesNotMatch(prompt, /\.aux\/first\.js/);
+    assert.match(prompt, /\.aux\/second\.js/);
+    assert.ok(Buffer.byteLength(prompt) < 20_000, 'later request remains compact');
+  }
+  assert.doesNotMatch(secondPrompts[0].prompt, /handle the second-file edge case/);
+  assert.match(secondPrompts[1].prompt, /handle the second-file edge case/);
+  assert.match(secondPrompts[1].prompt, /current task review only/);
+
+  const usage = usageTracker.summary();
+  assert.equal(usage.executor.calls, 3);
+  assert.equal(usage.executor.inputTokens, 300);
+  assert.equal(usage.executor.outputTokens, 30);
+  assert.equal(usage.internalReviewer.calls, 3);
+  assert.equal(usage.internalReviewer.inputTokens, 120);
+  assert.equal(usage.internalReviewer.outputTokens, 15);
+  assert.equal(usage.total.inputTokens, 420);
+  assert.equal(usage.total.outputTokens, 45);
+  assert.equal(usage.total.totalTokens, 465);
+  assert.equal(usage.executorInputBreakdownAggregate.callsWithBreakdown, 3);
+});

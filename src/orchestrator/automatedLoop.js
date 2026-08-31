@@ -703,6 +703,7 @@ export async function runAutomatedWorkflow({
         provider: executionReport?.provider ?? (executionReport?.model?.startsWith('claude') ? 'claude' : (executionReport?.model?.startsWith('codex') ? 'codex' : 'claude')),
         model: executionReport?.model || 'sonnet',
         usage: executionReport?.usage ?? null,
+        inputBreakdown: executionReport?.inputBreakdown ?? null,
         costUsd: executionReport?.costUsd ?? null,
       });
     }

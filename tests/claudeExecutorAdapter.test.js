@@ -465,10 +465,11 @@ test('executor contract: renders unauthorized_probe_guidance steering the Execut
       approved_verification_commands: ['npm test'],
     },
   }));
-  assert.match(prompt, /## unauthorized_probe_guidance/);
-  assert.match(prompt, /`node --test tests\/other\.test\.js`/);
-  assert.match(prompt, /security boundary working as intended/i);
-  assert.match(prompt, /Run exactly, and only, the approved verification_commands/i);
+  assert.match(prompt, /"verification_guidance": \{/);
+  assert.match(prompt, /"node --test tests\/other\.test\.js"/);
+  assert.match(prompt, /"approved_verification_commands": \[/);
+  assert.match(prompt, /"npm test"/);
+  assert.match(prompt, /compact_structured_handoff/);
 });
 
 test('executor prompt: emits the four scope-isolation layers in order', () => {
@@ -539,8 +540,8 @@ test('executor prompt: prior-attempt evidence renders only in the read-only hist
   }));
   const l3 = prompt.indexOf('LAYER 3 · EXECUTION RULES');
   const l4 = prompt.indexOf('LAYER 4 · HISTORICAL EVIDENCE');
-  const rework = prompt.indexOf('## rework_feedback');
-  const probe = prompt.indexOf('## unauthorized_probe_guidance');
+  const rework = prompt.indexOf('"corrections": {');
+  const probe = prompt.indexOf('"verification_guidance": {');
   assert.ok(rework > l4 && probe > l4, 'evidence sits in layer 4');
   assert.ok(l4 > l3);
   // Layer 4 is explicitly non-authorizing.
@@ -565,5 +566,4 @@ test('executor adapter: allowedTools / permission config is not loosened (no wil
   assert.ok(!args.some((a) => typeof a === 'string' && /Bash\(\*|Bash$|--dangerously/i.test(a)));
   assert.ok(!args.includes('--allowedTools') || args.filter((a) => a === 'Bash(npm test)' || a === 'Bash(node --test tests/a.test.js)').length === 2);
 });
-
 

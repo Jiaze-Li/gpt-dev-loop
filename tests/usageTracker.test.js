@@ -120,6 +120,35 @@ test('usageTracker: tracks callId and propagates to records', () => {
   assert.equal(tracker.records[0].callId, 'call-sup-test-123');
 });
 
+test('usageTracker: reconciles Executor input composition without double-counting cached tokens', () => {
+  const tracker = new UsageTracker();
+  const rec = tracker.record({
+    role: 'executor',
+    usage: { input_tokens: 101, output_tokens: 3, cache_read_tokens: 50 },
+    inputBreakdown: { categories: {
+      taskCard: { bytes: 40, estimatedTokens: 10 }, repoContext: { bytes: 20, estimatedTokens: 5 },
+      history: { bytes: 20, estimatedTokens: 5 }, evidence: { bytes: 10, estimatedTokens: 3 }, other: { bytes: 10, estimatedTokens: 3 },
+    } },
+  });
+  assert.equal(rec.inputBreakdown.componentTokens, 101);
+  assert.equal(rec.inputBreakdown.unattributedTokens, 0);
+  assert.equal(rec.cachedTokens, 50);
+  assert.equal(tracker.summary().executorInputBreakdown.length, 1);
+  const aggregate = tracker.summary().executorInputBreakdownAggregate;
+  assert.equal(aggregate.providerInputTokens, 101);
+  assert.equal(aggregate.cachedTokens, 50);
+  assert.equal(aggregate.componentTokens, 101);
+  assert.match(aggregate.semantics, /not added/);
+});
+
+test('usageTracker: legacy Executor records remain present with unavailable breakdown', () => {
+  const tracker = UsageTracker.fromJSON({ records: [{ role: 'executor', inputTokens: 77, cachedTokens: 12, outputTokens: 4 }] });
+  const summary = tracker.summary();
+  assert.equal(summary.executorInputBreakdownCalls[0].legacy, true);
+  assert.equal(summary.executorInputBreakdownAggregate.legacyCalls, 1);
+  assert.match(tracker.formatSummary(), /Unavailable for 1 legacy call/);
+});
+
 test('usageTracker: tracks provider failover model breakdown and external PR reviewer', () => {
   const tracker = new UsageTracker();
 
@@ -191,4 +220,3 @@ test('usageTracker: tracks provider failover model breakdown and external PR rev
   assert.equal(sum.externalPrReviewer.reviewed, true);
   assert.match(sum.externalPrReviewer.note, /unavailable \/ external/);
 });
-

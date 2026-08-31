@@ -207,6 +207,14 @@ export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } 
   const timelineChronological = deriveWorkflowTimeline(live);
   const timeline = [...timelineChronological].reverse();
   const reviewThreads = projectReviewThreads(live);
+  // Canonical usage intentionally supports old persisted states. Preserve that
+  // normalization, then pass through newer breakdown projections for the UI.
+  const usage = {
+    ...(canonical?.usage ?? {}),
+    executorInputBreakdown: live.tokenUsage?.executorInputBreakdown ?? [],
+    executorInputBreakdownCalls: live.tokenUsage?.executorInputBreakdownCalls ?? [],
+    executorInputBreakdownAggregate: live.tokenUsage?.executorInputBreakdownAggregate ?? null,
+  };
 
   return {
     ...canonical,
@@ -231,6 +239,7 @@ export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } 
     stageStatuses: live.stageStatuses ?? {},
     timeline,
     reviewThreads,
+    usage,
     isAlive: liveness.isAlive,
   };
 }

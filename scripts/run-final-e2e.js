@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, writeFile, readFile, rm } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -18,6 +19,69 @@ import { runSuperGPT, supergptStatus, supergptWait, SUPERGPT_EVENTS } from '../s
 import { UsageTracker } from '../src/orchestrator/usageTracker.js';
 
 const execFileAsync = promisify(execFile);
+
+export const EXECUTOR_INPUT_BASELINE = Object.freeze([358798, 326247, 631654, 744442]);
+export const EXECUTOR_INPUT_BASELINE_TOTAL = 2061141;
+const INPUT_CATEGORIES = ['taskCard', 'repoContext', 'history', 'evidence', 'other'];
+
+export function buildExecutorTokenReport({ workflowId, status, events = [], usage } = {}) {
+  const calls = usage?.executorInputBreakdownCalls ?? [];
+  const humanRequiredCount = events.filter((event) => event?.type === 'human_required' || event?.status === 'HUMAN_REQUIRED').length;
+  const reviews = events.filter((event) => event?.type === 'review_finished');
+  const reviewerResult = reviews.length > 0 && reviews.every((event) => event.decision === 'PASS')
+    ? 'PASS' : (reviews.at(-1)?.decision ?? 'MISSING');
+  const executorCalls = calls.map((call, index) => ({
+    call: index + 1,
+    callId: call.callId ?? null,
+    taskId: call.taskId ?? null,
+    attempt: call.attempt ?? null,
+    inputTokens: call.inputTokens,
+    cachedTokens: call.cachedTokens ?? 0,
+    outputTokens: call.outputTokens,
+    categories: Object.fromEntries(INPUT_CATEGORIES.map((name) => [name, call.breakdown?.categories?.[name]?.tokens ?? null])),
+    baselineInputTokens: EXECUTOR_INPUT_BASELINE[index] ?? null,
+  }));
+  const inputTokens = executorCalls.reduce((sum, call) => sum + (call.inputTokens ?? 0), 0);
+  const absoluteReduction = EXECUTOR_INPUT_BASELINE_TOTAL - inputTokens;
+  return {
+    workflowId, terminalState: status, reviewerResult, humanRequiredCount, executorCalls,
+    totals: {
+      inputTokens,
+      cachedTokens: executorCalls.reduce((sum, call) => sum + call.cachedTokens, 0),
+      outputTokens: executorCalls.reduce((sum, call) => sum + (call.outputTokens ?? 0), 0),
+    },
+    baseline: { calls: [...EXECUTOR_INPUT_BASELINE], totalInputTokens: EXECUTOR_INPUT_BASELINE_TOTAL },
+    comparison: { absoluteReduction, percentageReduction: (absoluteReduction / EXECUTOR_INPUT_BASELINE_TOTAL) * 100 },
+  };
+}
+
+export function assertExecutorTokenAcceptance(report) {
+  if (report.terminalState !== 'WORKFLOW_DONE') throw new Error(`Expected WORKFLOW_DONE, got ${report.terminalState}`);
+  if (report.reviewerResult !== 'PASS') throw new Error(`Expected Reviewer PASS, got ${report.reviewerResult}`);
+  if (report.humanRequiredCount !== 0) throw new Error(`Expected no HUMAN_REQUIRED transitions, got ${report.humanRequiredCount}`);
+  if (report.executorCalls.length < 2) throw new Error('Expected a real multi-task workflow with at least two Executor calls');
+  for (const call of report.executorCalls) {
+    if (!Number.isFinite(call.inputTokens) || !Number.isFinite(call.outputTokens)) throw new Error(`Executor call ${call.call} is missing provider token usage`);
+    if (Object.values(call.categories).some((value) => !Number.isFinite(value))) throw new Error(`Executor call ${call.call} is missing a complete input breakdown`);
+    const componentTotal = Object.values(call.categories).reduce((sum, value) => sum + value, 0);
+    if (componentTotal !== call.inputTokens) throw new Error(`Executor call ${call.call} breakdown (${componentTotal}) does not reconcile with provider input (${call.inputTokens})`);
+  }
+  if (report.comparison.absoluteReduction <= 0) throw new Error('Executor input did not improve on the supplied baseline');
+  return report;
+}
+
+export function formatExecutorTokenReport(report) {
+  const lines = ['EXECUTOR TOKEN REDUCTION — REAL USAGETRACKER EVIDENCE', `Workflow ID: ${report.workflowId}`, `Terminal state: ${report.terminalState}`, `Reviewer: ${report.reviewerResult}`, `HUMAN_REQUIRED transitions: ${report.humanRequiredCount}`];
+  for (const call of report.executorCalls) {
+    const composition = INPUT_CATEGORIES.map((name) => `${name}=${call.categories[name]}`).join(', ');
+    lines.push(`Executor call ${call.call} (${call.taskId ?? 'unknown'}, attempt ${call.attempt ?? 'unknown'}): input=${call.inputTokens}, cached=${call.cachedTokens}, output=${call.outputTokens}; ${composition}; baseline=${call.baselineInputTokens ?? 'n/a'}`);
+  }
+  lines.push(`Optimized Executor total: input=${report.totals.inputTokens}, cached=${report.totals.cachedTokens}, output=${report.totals.outputTokens}`);
+  lines.push(`Supplied baseline: calls=${report.baseline.calls.join(', ')}, total=${report.baseline.totalInputTokens}`);
+  lines.push(`Reduction: ${report.comparison.absoluteReduction} input tokens (${report.comparison.percentageReduction.toFixed(2)}%)`);
+  lines.push('Cached tokens are a subset of provider input and are not added to component composition or totals.');
+  return lines.join('\n');
+}
 
 function sha256(content) {
   return createHash('sha256').update(content).digest('hex');
@@ -327,6 +391,10 @@ test('Task 2: index.js exports all library functions', async () => {
     console.log(`    - Reviewer:   ${usageSummary.reviewer.calls} calls, in=${usageSummary.reviewer.inputTokens}, out=${usageSummary.reviewer.outputTokens}, cached=${usageSummary.reviewer.cachedTokens}`);
   }
 
+  const executorTokenReport = buildExecutorTokenReport({ workflowId: workflowId || runResult.workflowId, status: runResult.status, events: emittedEvents, usage: usageSummary });
+  console.log(`\n${formatExecutorTokenReport(executorTokenReport)}`);
+  assertExecutorTokenAcceptance(executorTokenReport);
+
   console.log('\n========================================================================');
   console.log('✔ E2E ACCEPTANCE COMPLETED SUCCESSFULLY');
   console.log('========================================================================\n');
@@ -341,10 +409,13 @@ test('Task 2: index.js exports all library functions', async () => {
     dirtyHashBefore,
     dirtyHashAfter,
     targetRepo,
+    executorTokenReport,
   };
 }
 
-run().catch((err) => {
-  console.error('\n✖ E2E ACCEPTANCE FAILED:', err);
-  process.exit(1);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  run().catch((err) => {
+    console.error('\n✖ E2E ACCEPTANCE FAILED:', err);
+    process.exit(1);
+  });
+}
