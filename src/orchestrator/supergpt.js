@@ -874,6 +874,36 @@ export function createRealGithubPrCloseoutAdapters({
           }
         }
       } catch {}
+
+      if (sinceId) {
+        try {
+          const reactionsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/issues/comments/${sinceId}/reactions`, {
+            cwd: repoRoot,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          const reactions = JSON.parse(reactionsJson);
+          if (Array.isArray(reactions)) {
+            const thumbsUp = reactions.find((rx) => (rx.content === '+1' || rx.content === 'thumbs_up' || rx.content === 'heart') && /codex/i.test(rx.user?.login || ''));
+            if (thumbsUp) {
+              const headSha = getPrHead();
+              let bucket = results.find((r) => r.headSha === headSha && /codex/i.test(r.author));
+              if (!bucket) {
+                results.push({
+                  id: Number(sinceId) + 1,
+                  reviewer: thumbsUp.user?.login || 'chatgpt-codex-connector[bot]',
+                  author: thumbsUp.user?.login || 'chatgpt-codex-connector[bot]',
+                  headSha,
+                  submittedAt: thumbsUp.created_at,
+                  body: 'Clean review 👍',
+                  findings: [],
+                });
+              }
+            }
+          }
+        } catch {}
+      }
+
       return results;
     },
   };
