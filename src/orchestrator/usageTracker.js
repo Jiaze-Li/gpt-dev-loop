@@ -14,7 +14,8 @@ import { TokenAnomalyMonitor, TINY_WORKFLOW_BASELINE } from './tokenAnomalyMonit
 export const USAGE_ROLES = Object.freeze({
   SUPERVISOR: 'supervisor',
   EXECUTOR: 'executor',
-  REVIEWER: 'reviewer',
+  INTERNAL_REVIEWER: 'internalReviewer',
+  REVIEWER: 'internalReviewer',
   PLANNER: 'planner',
 });
 
@@ -22,36 +23,42 @@ function normalizeNumber(val) {
   return Number.isFinite(val) ? val : null;
 }
 
+function emptyRoleBucket() {
+  return {
+    calls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    byModel: {},
+  };
+}
+
 export class UsageTracker {
   constructor({ anomalyMonitor = new TokenAnomalyMonitor() } = {}) {
     this.records = [];
     this.anomalyMonitor = anomalyMonitor;
     this.byRole = {
-      [USAGE_ROLES.SUPERVISOR]: { calls: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0, costUsd: 0 },
-      [USAGE_ROLES.EXECUTOR]: { calls: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0, costUsd: 0 },
-      [USAGE_ROLES.REVIEWER]: { calls: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0, costUsd: 0 },
-      [USAGE_ROLES.PLANNER]: { calls: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, totalTokens: 0, costUsd: 0 },
+      supervisor: emptyRoleBucket(),
+      executor: emptyRoleBucket(),
+      internalReviewer: emptyRoleBucket(),
+      planner: emptyRoleBucket(),
     };
     this.byTask = {};
   }
 
   /**
    * Record a provider call's usage metadata.
-   *
-   * @param {object} entry
-   * @param {string} entry.role         supervisor | executor | reviewer | planner
-   * @param {string} [entry.taskId]     task id if within a task
-   * @param {number} [entry.attempt]    attempt number if within a task
-   * @param {string} [entry.model]      model id used
-   * @param {object} [entry.usage]      raw usage object from provider (optional)
-   * @param {number} [entry.costUsd]    cost in USD if reported
-   * @param {number} [entry.durationMs] duration in milliseconds
    */
   record({
+    workflowId = null,
     role,
     callId = null,
     taskId = null,
     attempt = null,
+    repairRound = null,
+    provider = null,
     model = null,
     requestedFamily = null,
     resolvedModel = null,
@@ -59,8 +66,22 @@ export class UsageTracker {
     usage = null,
     costUsd = null,
     durationMs = null,
+    startedAt = null,
+    completedAt = null,
   } = {}) {
     if (!role) throw new Error('UsageTracker.record() requires a role');
+
+    let normalizedRole = String(role);
+    const lower = normalizedRole.toLowerCase();
+    if (lower === 'reviewer' || lower === 'internal_reviewer' || lower === 'internalreviewer') {
+      normalizedRole = 'internalReviewer';
+    } else if (lower === 'supervisor') {
+      normalizedRole = 'supervisor';
+    } else if (lower === 'executor') {
+      normalizedRole = 'executor';
+    } else if (lower === 'planner') {
+      normalizedRole = 'planner';
+    }
 
     const effectiveCallId = callId ?? usage?.callId ?? null;
     let inputTokens = null;
@@ -69,8 +90,6 @@ export class UsageTracker {
     let totalTokens = null;
 
     if (usage && typeof usage === 'object') {
-      // agy exposes: input_tokens, output_tokens, thinking_tokens, cache_read_tokens, total_tokens
-      // Claude exposes: input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
       const inTok = usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens;
       const outTok = usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens;
       const cacheRead = usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? usage.cacheReadInputTokens ?? usage.cached_input_tokens ?? 0;
@@ -88,15 +107,27 @@ export class UsageTracker {
       }
     }
 
+    const effectiveProvider = provider ?? (model?.startsWith('claude') ? 'claude' : (model?.startsWith('codex') ? 'codex' : null));
+    const effectiveModel = resolvedModel ?? model ?? 'default';
+    const modelKey = effectiveProvider
+      ? (effectiveModel && !effectiveModel.startsWith(effectiveProvider) ? `${effectiveProvider}:${effectiveModel}` : effectiveModel)
+      : effectiveModel;
+
     const rec = {
       timestamp: new Date().toISOString(),
-      role,
+      startedAt: startedAt ?? new Date().toISOString(),
+      completedAt: completedAt ?? new Date().toISOString(),
+      workflowId,
+      role: normalizedRole,
       callId: effectiveCallId,
       taskId,
       attempt,
-      model,
+      repairRound,
+      provider: effectiveProvider,
+      model: effectiveModel,
+      modelKey,
       requestedFamily,
-      resolvedModel: resolvedModel ?? model,
+      resolvedModel: effectiveModel,
       providerMetadata: providerMetadata && typeof providerMetadata === 'object' ? { ...providerMetadata } : null,
       inputTokens,
       outputTokens,
@@ -108,15 +139,34 @@ export class UsageTracker {
 
     this.records.push(rec);
 
-    if (this.byRole[role]) {
-      const bucket = this.byRole[role];
-      bucket.calls += 1;
-      if (inputTokens !== null) bucket.inputTokens += inputTokens;
-      if (outputTokens !== null) bucket.outputTokens += outputTokens;
-      if (cachedTokens !== null) bucket.cachedTokens += cachedTokens;
-      if (totalTokens !== null) bucket.totalTokens += totalTokens;
-      if (rec.costUsd !== null) bucket.costUsd += rec.costUsd;
+    if (!this.byRole[normalizedRole]) {
+      this.byRole[normalizedRole] = emptyRoleBucket();
     }
+    const bucket = this.byRole[normalizedRole];
+    bucket.calls += 1;
+    if (inputTokens !== null) bucket.inputTokens += inputTokens;
+    if (outputTokens !== null) bucket.outputTokens += outputTokens;
+    if (cachedTokens !== null) bucket.cachedTokens += cachedTokens;
+    if (totalTokens !== null) bucket.totalTokens += totalTokens;
+    if (rec.costUsd !== null) bucket.costUsd += rec.costUsd;
+
+    if (!bucket.byModel[modelKey]) {
+      bucket.byModel[modelKey] = {
+        calls: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedTokens: 0,
+        totalTokens: 0,
+        costUsd: 0,
+      };
+    }
+    const mBucket = bucket.byModel[modelKey];
+    mBucket.calls += 1;
+    if (inputTokens !== null) mBucket.inputTokens += inputTokens;
+    if (outputTokens !== null) mBucket.outputTokens += outputTokens;
+    if (cachedTokens !== null) mBucket.cachedTokens += cachedTokens;
+    if (totalTokens !== null) mBucket.totalTokens += totalTokens;
+    if (rec.costUsd !== null) mBucket.costUsd += rec.costUsd;
 
     if (taskId) {
       if (!this.byTask[taskId]) this.byTask[taskId] = {};
@@ -142,8 +192,8 @@ export class UsageTracker {
   /**
    * Return a structured summary of token usage across all roles.
    */
-  summary({ workflowContext = {}, baseline = null, checkAnomalies = false } = {}) {
-    const total = {
+  summary({ workflowContext = {}, baseline = null, checkAnomalies = false, prCloseout = null } = {}) {
+    const measuredTotal = {
       calls: 0,
       inputTokens: 0,
       outputTokens: 0,
@@ -154,23 +204,35 @@ export class UsageTracker {
 
     const rolesSummary = {};
     for (const [role, data] of Object.entries(this.byRole)) {
-      rolesSummary[role] = { ...data };
-      total.calls += data.calls;
-      total.inputTokens += data.inputTokens;
-      total.outputTokens += data.outputTokens;
-      total.cachedTokens += data.cachedTokens;
-      total.totalTokens += data.totalTokens;
-      total.costUsd += data.costUsd;
+      rolesSummary[role] = { ...data, byModel: { ...data.byModel } };
+      measuredTotal.calls += data.calls;
+      measuredTotal.inputTokens += data.inputTokens;
+      measuredTotal.outputTokens += data.outputTokens;
+      measuredTotal.cachedTokens += data.cachedTokens;
+      measuredTotal.totalTokens += data.totalTokens;
+      measuredTotal.costUsd += data.costUsd;
     }
 
+    const reviewerName = prCloseout?.configuredReviewer || prCloseout?.activeReviewer || null;
+    const externalPrReviewer = {
+      reviewer: reviewerName,
+      usageAvailable: false,
+      note: reviewerName ? 'Token usage: unavailable / external' : 'Not configured',
+      reviewed: Boolean(prCloseout?.reviewedPrHead),
+    };
+
     const res = {
-      workflow: { ...total },
-      supervisor: rolesSummary[USAGE_ROLES.SUPERVISOR],
-      executor: rolesSummary[USAGE_ROLES.EXECUTOR],
-      reviewer: rolesSummary[USAGE_ROLES.REVIEWER],
-      planner: rolesSummary[USAGE_ROLES.PLANNER],
-      total,
-      hasUsageData: total.totalTokens > 0 || total.calls > 0,
+      workflow: { ...measuredTotal },
+      supervisor: rolesSummary.supervisor || emptyRoleBucket(),
+      executor: rolesSummary.executor || emptyRoleBucket(),
+      internalReviewer: rolesSummary.internalReviewer || emptyRoleBucket(),
+      reviewer: rolesSummary.internalReviewer || emptyRoleBucket(), // backwards-compatible alias
+      planner: rolesSummary.planner || emptyRoleBucket(),
+      measuredTotal,
+      total: measuredTotal, // backwards-compatible alias
+      externalPrReviewer,
+      hasUsageData: measuredTotal.totalTokens > 0 || measuredTotal.calls > 0,
+      records: this.records,
     };
 
     if (checkAnomalies) {

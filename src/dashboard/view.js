@@ -394,19 +394,48 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
 
       <!-- 5. Execution & Usage -->
       <div class="card" style="grid-column: 1 / -1;">
-        <div class="card-title">Execution &amp; Token Breakdown</div>
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+        <div class="card-title">Token Breakdown &amp; Execution</div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px;">
+          <!-- Col 1: Local Measured Roles -->
           <div>
-            <div class="prop-row"><span class="prop-key">Provider</span><span class="prop-val" id="val-provider">-</span></div>
-            <div class="prop-row"><span class="prop-key">Model</span><span class="prop-val" id="val-model">-</span></div>
+            <div style="font-weight: 600; margin-bottom: 6px; font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Token Breakdown</div>
+            <div class="prop-row"><span class="prop-key">Planner</span><span class="prop-val" id="tok-planner">0</span></div>
+            <div class="prop-row"><span class="prop-key">Executor</span><span class="prop-val" id="tok-executor">0</span></div>
+            <div class="prop-row"><span class="prop-key">Internal Reviewer</span><span class="prop-val" id="tok-internal-reviewer">0</span></div>
+            <div class="prop-row"><span class="prop-key">Supervisor</span><span class="prop-val" id="tok-supervisor">0</span></div>
+            <div class="prop-row" style="margin-top: 4px; border-top: 1px dashed var(--border); padding-top: 4px;">
+              <span class="prop-key" style="font-weight: 700;">Measured Total</span>
+              <span class="prop-val" style="color: var(--accent); font-weight: 700;" id="tok-measured-total">0</span>
+            </div>
           </div>
+
+          <!-- Col 2: Executor Models Breakdown -->
           <div>
-            <div class="prop-row"><span class="prop-key">Planner Tokens</span><span class="prop-val" id="tok-planner">0</span></div>
-            <div class="prop-row"><span class="prop-key">Supervisor Tokens</span><span class="prop-val" id="tok-supervisor">0</span></div>
+            <div style="font-weight: 600; margin-bottom: 6px; font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Executor Models</div>
+            <div id="tok-executor-models" style="font-size: 12px;">
+              <span style="color: var(--text-secondary);">-</span>
+            </div>
           </div>
+
+          <!-- Col 3: PR Reviewer (External) vs Internal Reviewer -->
           <div>
-            <div class="prop-row"><span class="prop-key">Reviewer Tokens</span><span class="prop-val" id="tok-reviewer">0</span></div>
-            <div class="prop-row"><span class="prop-key">Total Tokens</span><span class="prop-val" style="color: var(--accent); font-weight:700;" id="tok-total">0</span></div>
+            <div style="font-weight: 600; margin-bottom: 6px; font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Reviewers (PR vs Internal)</div>
+            <div class="prop-row">
+              <span class="prop-key">PR Reviewer</span>
+              <span class="prop-val" id="val-pr-reviewer">-</span>
+            </div>
+            <div class="prop-row">
+              <span class="prop-key">PR Reviewer Tokens</span>
+              <span class="prop-val" id="val-pr-reviewer-tokens" style="color: var(--text-secondary); font-style: italic;">External / unavailable</span>
+            </div>
+            <div class="prop-row" style="margin-top: 4px; border-top: 1px dashed var(--border); padding-top: 4px;">
+              <span class="prop-key">Internal Reviewer</span>
+              <span class="prop-val" id="val-internal-reviewer-status">Not invoked</span>
+            </div>
+            <div class="prop-row">
+              <span class="prop-key">Internal Reviewer Tokens</span>
+              <span class="prop-val" id="tok-internal-reviewer-tokens">0</span>
+            </div>
           </div>
         </div>
       </div>
@@ -677,15 +706,64 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
         document.getElementById('val-progress').textContent = formatTime(timing.lastProgressAt);
         document.getElementById('val-activity').textContent = formatTime(timing.lastActivityAt);
 
-        // 7. Execution & Usage
-        document.getElementById('val-provider').textContent = data.executor?.provider || (data.activeProcesses?.[0]?.provider) || 'claude';
-        document.getElementById('val-model').textContent = data.executor?.model || (data.activeProcesses?.[0]?.resolvedModel) || 'sonnet';
-        
+        // 7. Execution & Token Breakdown
         const usage = data.usage || {};
-        document.getElementById('tok-planner').textContent = (usage.planner?.totalTokens || 0).toLocaleString();
-        document.getElementById('tok-supervisor').textContent = (usage.supervisor?.totalTokens || 0).toLocaleString();
-        document.getElementById('tok-reviewer').textContent = (usage.reviewer?.totalTokens || 0).toLocaleString();
-        document.getElementById('tok-total').textContent = (usage.total?.totalTokens || 0).toLocaleString();
+        const isPrCloseout = data.path === 'PR_CLOSEOUT' || Boolean(data.prCloseout);
+
+        // Planner
+        const pTok = usage.planner?.totalTokens || 0;
+        document.getElementById('tok-planner').textContent = pTok > 0 ? pTok.toLocaleString() : (usage.planner?.calls > 0 ? \`\${usage.planner.calls} calls\` : '0');
+
+        // Executor
+        const eTok = usage.executor?.totalTokens || 0;
+        document.getElementById('tok-executor').textContent = eTok > 0 ? eTok.toLocaleString() : (usage.executor?.calls > 0 ? \`\${usage.executor.calls} calls\` : '0');
+
+        // Internal Reviewer
+        const irTok = (usage.internalReviewer?.totalTokens ?? usage.reviewer?.totalTokens) || 0;
+        const irCalls = (usage.internalReviewer?.calls ?? usage.reviewer?.calls) || 0;
+        document.getElementById('tok-internal-reviewer').textContent = irTok > 0 ? irTok.toLocaleString() : (irCalls > 0 ? \`\${irCalls} calls\` : '0');
+        document.getElementById('tok-internal-reviewer-tokens').textContent = irTok > 0 ? irTok.toLocaleString() : (irCalls > 0 ? \`\${irCalls} calls\` : '0');
+
+        // Supervisor
+        const sTok = usage.supervisor?.totalTokens || 0;
+        document.getElementById('tok-supervisor').textContent = sTok > 0 ? sTok.toLocaleString() : (usage.supervisor?.calls > 0 ? \`\${usage.supervisor.calls} calls\` : '0');
+
+        // Measured Total
+        const mTot = (usage.measuredTotal?.totalTokens ?? usage.total?.totalTokens) ?? (pTok + eTok + irTok + sTok);
+        const mCalls = (usage.measuredTotal?.calls ?? usage.total?.calls) ?? ((usage.planner?.calls || 0) + (usage.executor?.calls || 0) + irCalls + (usage.supervisor?.calls || 0));
+        document.getElementById('tok-measured-total').textContent = mTot > 0 ? mTot.toLocaleString() : (mCalls > 0 ? \`\${mCalls} calls\` : '0');
+
+        // Executor models breakdown
+        const execModelsContainer = document.getElementById('tok-executor-models');
+        const execByModel = usage.executor?.byModel || {};
+        const execModelKeys = Object.keys(execByModel);
+        if (execModelKeys.length > 0) {
+          execModelsContainer.innerHTML = execModelKeys.map(k => {
+            const m = execByModel[k];
+            const tokStr = m.totalTokens > 0 ? \`\${m.totalTokens.toLocaleString()} tok\` : \`\${m.calls} calls\`;
+            return \`<div class="prop-row"><span class="prop-key">\${escapeHtml(k)}</span><span class="prop-val">\${escapeHtml(tokStr)}</span></div>\`;
+          }).join('');
+        } else if (data.executor?.model || data.executor?.provider) {
+          const providerStr = \`\${data.executor.provider || 'claude'}:\${data.executor.model || 'sonnet'}\`;
+          execModelsContainer.innerHTML = \`<div class="prop-row"><span class="prop-key">\${escapeHtml(providerStr)}</span><span class="prop-val">\${eTok > 0 ? \`\${eTok.toLocaleString()} tok\` : '-'}</span></div>\`;
+        } else {
+          execModelsContainer.innerHTML = '<span style="color: var(--text-secondary);">-</span>';
+        }
+
+        // PR Reviewer (External) vs Internal Reviewer
+        if (isPrCloseout) {
+          const revName = data.prCloseout?.configuredReviewer || data.prCloseout?.activeReviewer || usage.externalPrReviewer?.reviewer || 'Codex';
+          const isReviewed = Boolean(data.prCloseout?.reviewedPrHead);
+          const prRevStatus = isReviewed ? \`\${revName.toUpperCase()} · REVIEWED\` : \`\${revName.toUpperCase()} · TRIGGERED\`;
+          document.getElementById('val-pr-reviewer').textContent = prRevStatus;
+          document.getElementById('val-pr-reviewer-tokens').textContent = 'External / unavailable';
+          document.getElementById('val-internal-reviewer-status').textContent = 'Not invoked';
+        } else {
+          document.getElementById('val-pr-reviewer').textContent = 'N/A (Standard Path)';
+          document.getElementById('val-pr-reviewer-tokens').textContent = 'N/A';
+          const hasIntRev = irTok > 0 || irCalls > 0;
+          document.getElementById('val-internal-reviewer-status').textContent = hasIntRev ? 'Invoked' : 'Not invoked';
+        }
 
         // 8. Timeline
         const tlContainer = document.getElementById('timeline-container');
@@ -695,12 +773,15 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
         } else {
           tlContainer.innerHTML = events.map(ev => {
             const cls = ev.type.includes('PASS') ? 'pass' : (ev.type.includes('FAIL') || ev.type.includes('REWORK')) ? 'fail' : ev.type.includes('ESCALATION') ? 'escalation' : '';
+            const safeTime = escapeHtml(ev.time || '--:--:--');
+            const safeLabel = escapeHtml(ev.label || '');
+            const safeDetail = ev.detail ? \`<div class="content-detail">\${escapeHtml(ev.detail)}</div>\` : '';
             return \`
               <div class="timeline-item \${cls}">
-                <div class="time-col">\${ev.time || '--:--:--'}</div>
+                <div class="time-col">\${safeTime}</div>
                 <div class="content-col">
-                  <div class="content-label">\${ev.label}</div>
-                  \${ev.detail ? \`<div class="content-detail">\${ev.detail}</div>\` : ''}
+                  <div class="content-label">\${safeLabel}</div>
+                  \${safeDetail}
                 </div>
               </div>
             \`;

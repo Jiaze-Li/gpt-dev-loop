@@ -693,20 +693,21 @@ export async function runAutomatedWorkflow({
     }
     throwIfAborted();
     log(`claude attempt completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
-
-    if (executionReport?.usage && usageTracker) {
+    if (usageTracker) {
       usageTracker.record({
+        workflowId,
         role: 'executor',
-        callId: executionReport.callId ?? executionReport.usage?.callId,
+        callId: executionReport?.callId ?? executionReport?.usage?.callId,
         taskId: currentTaskCard.task_id,
         attempt: attemptCount,
-        model: executionReport.model,
-        usage: executionReport.usage,
-        costUsd: executionReport.costUsd,
+        provider: executionReport?.provider ?? (executionReport?.model?.startsWith('claude') ? 'claude' : (executionReport?.model?.startsWith('codex') ? 'codex' : 'claude')),
+        model: executionReport?.model || 'sonnet',
+        usage: executionReport?.usage ?? null,
+        costUsd: executionReport?.costUsd ?? null,
       });
     }
     if (workflowStateManager) {
-      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
       if (executionReport?.model) {
         workflowStateManager.setRouting({
           model: executionReport.model,
@@ -743,8 +744,43 @@ export async function runAutomatedWorkflow({
           log(
             `executor unauthorized probe denied (not an approved verification command): ` +
               `task=${currentTaskCard.task_id} attempt=${attemptCount} ` +
-              `commands=${JSON.stringify(deniedProbes)} retry=${unauthorizedProbeRetries}`
+              `commands=${JSON.stringify(deniedProbes)} retry=${unauthorizedProbeRetries}/${MAX_UNAUTHORIZED_PROBE_RETRIES}`
           );
+          if (unauthorizedProbeRetries > MAX_UNAUTHORIZED_PROBE_RETRIES) {
+            log(`executor exceeded maximum unauthorized probe retries (${MAX_UNAUTHORIZED_PROBE_RETRIES}): task=${currentTaskCard.task_id}`);
+            const failureCategory = FAILURE_CATEGORIES.IMPLEMENTATION;
+            const reason = `Executor exceeded maximum unauthorized probe retries (${MAX_UNAUTHORIZED_PROBE_RETRIES}) for unapproved commands: ${JSON.stringify(deniedProbes)}.`;
+            const humanEvidence = buildHumanRequiredEvidence({
+              workflowId,
+              taskCard: currentTaskCard,
+              attempt: attemptCount,
+              stage: WORKFLOW_STAGES.EXECUTOR,
+              blockerCategory: failureCategory,
+              rootCause: reason,
+              stderrTail: executionReport?.stderr || reason,
+              history,
+            });
+            if (workflowStateManager) {
+              workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+                reason,
+                question: `Executor repeatedly attempted unauthorized probe commands (${JSON.stringify(deniedProbes)}) instead of executing approved verification commands. How should this be handled?`,
+                evidence: humanEvidence,
+                blockerCategory: failureCategory,
+              });
+            }
+            return {
+              done: true,
+              result: {
+                status: 'HUMAN_REQUIRED',
+                reason,
+                question: `Executor repeatedly attempted unauthorized probe commands (${JSON.stringify(deniedProbes)}) instead of executing approved verification commands. How should this be handled?`,
+                taskId: currentTaskCard.task_id,
+                evidence: humanEvidence,
+                blockerCategory: failureCategory,
+                history,
+              },
+            };
+          }
           // Does NOT consume an implementation retry.
           if (escalationActive) {
             escalationAttempts = Math.max(0, escalationAttempts - 1);
@@ -777,6 +813,41 @@ export async function runAutomatedWorkflow({
       if (isNestedRouteError) {
         log(`executor internal protocol error (nested route attempt): task=${currentTaskCard.task_id} attempt=${attemptCount}`);
         unauthorizedProbeRetries += 1;
+        if (unauthorizedProbeRetries > MAX_UNAUTHORIZED_PROBE_RETRIES) {
+          log(`executor exceeded maximum nested routing retries (${MAX_UNAUTHORIZED_PROBE_RETRIES}): task=${currentTaskCard.task_id}`);
+          const failureCategory = FAILURE_CATEGORIES.IMPLEMENTATION;
+          const reason = `Executor repeatedly confused internal role with front-agent launcher.`;
+          const humanEvidence = buildHumanRequiredEvidence({
+            workflowId,
+            taskCard: currentTaskCard,
+            attempt: attemptCount,
+            stage: WORKFLOW_STAGES.EXECUTOR,
+            blockerCategory: failureCategory,
+            rootCause: reason,
+            stderrTail: reason,
+            history,
+          });
+          if (workflowStateManager) {
+            workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+              reason,
+              question: `Executor repeatedly confused internal role with front-agent launcher. How should this be handled?`,
+              evidence: humanEvidence,
+              blockerCategory: failureCategory,
+            });
+          }
+          return {
+            done: true,
+            result: {
+              status: 'HUMAN_REQUIRED',
+              reason,
+              question: `Executor repeatedly confused internal role with front-agent launcher. How should this be handled?`,
+              taskId: currentTaskCard.task_id,
+              evidence: humanEvidence,
+              blockerCategory: failureCategory,
+              history,
+            },
+          };
+        }
         if (escalationActive) {
           escalationAttempts = Math.max(0, escalationAttempts - 1);
         } else {
@@ -1084,20 +1155,21 @@ export async function runAutomatedWorkflow({
       throw err;
     }
     log(`review completed: task=${currentTaskCard.task_id} attempt=${attemptCount} decision=${reviewResult.decision}`);
-
-    if (reviewResult?.usage && usageTracker) {
+    if (usageTracker) {
       usageTracker.record({
-        role: 'reviewer',
-        callId: reviewResult.callId ?? reviewResult.usage?.callId,
+        workflowId,
+        role: 'internalReviewer',
+        callId: reviewResult?.callId ?? reviewResult?.usage?.callId,
         taskId: currentTaskCard.task_id,
         attempt: attemptCount,
-        model: reviewResult.model,
-        usage: reviewResult.usage,
-        durationMs: reviewResult.durationMs,
+        provider: reviewResult?.provider,
+        model: reviewResult?.model,
+        usage: reviewResult?.usage ?? null,
+        durationMs: reviewResult?.durationMs,
       });
     }
     if (workflowStateManager) {
-      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
       workflowStateManager.state.stageStatuses.reviewer = reviewResult.decision;
       workflowStateManager.setDecision(reviewResult.decision);
       workflowStateManager.recordTaskAttempt({
@@ -1345,17 +1417,19 @@ export async function runAutomatedWorkflow({
 
       log(`supervisor decision: ${decision.action}`);
 
-      if (decision?.usage && usageTracker) {
+      if (usageTracker) {
         usageTracker.record({
+          workflowId,
           role: 'supervisor',
-          callId: decision.callId ?? decision.usage?.callId,
-          model: decision.model,
-          usage: decision.usage,
-          durationMs: decision.durationMs,
+          callId: decision?.callId ?? decision?.usage?.callId,
+          provider: decision?.provider,
+          model: decision?.model,
+          usage: decision?.usage ?? null,
+          durationMs: decision?.durationMs,
         });
       }
       if (workflowStateManager) {
-        if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+        if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
         workflowStateManager.setDecision(decision.action);
       }
 

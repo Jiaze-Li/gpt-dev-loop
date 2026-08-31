@@ -119,3 +119,76 @@ test('usageTracker: tracks callId and propagates to records', () => {
   assert.equal(rec.callId, 'call-sup-test-123');
   assert.equal(tracker.records[0].callId, 'call-sup-test-123');
 });
+
+test('usageTracker: tracks provider failover model breakdown and external PR reviewer', () => {
+  const tracker = new UsageTracker();
+
+  // 1. Planner
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'planner',
+    provider: 'claude',
+    model: 'opus',
+    usage: { input_tokens: 1200, output_tokens: 300, total_tokens: 1500 },
+  });
+
+  // 2. Executor failover sequence: sonnet -> codex -> opus
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'executor',
+    taskId: 'task-1',
+    attempt: 1,
+    provider: 'claude',
+    model: 'sonnet',
+    usage: { input_tokens: 3000, output_tokens: 200, total_tokens: 3200 },
+  });
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'executor',
+    taskId: 'task-1',
+    attempt: 1,
+    provider: 'codex',
+    model: 'default',
+    usage: { input_tokens: 2500, output_tokens: 150, total_tokens: 2650 },
+  });
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'executor',
+    taskId: 'task-1',
+    attempt: 1,
+    provider: 'claude',
+    model: 'opus',
+    usage: { input_tokens: 4000, output_tokens: 600, total_tokens: 4600 },
+  });
+
+  // 3. Summary with PR closeout
+  const sum = tracker.summary({
+    prCloseout: { configuredReviewer: 'codex', reviewedPrHead: 'abc1234' },
+  });
+
+  assert.equal(sum.planner.totalTokens, 1500);
+  assert.equal(sum.executor.calls, 3);
+  assert.equal(sum.executor.totalTokens, 10450);
+  assert.equal(sum.executor.byModel['claude:sonnet'].totalTokens, 3200);
+  assert.equal(sum.executor.byModel['codex:default'].totalTokens, 2650);
+  assert.equal(sum.executor.byModel['claude:opus'].totalTokens, 4600);
+
+  // Supervisor was not called -> 0
+  assert.equal(sum.supervisor.calls, 0);
+  assert.equal(sum.supervisor.totalTokens, 0);
+
+  // Internal Reviewer was not called -> 0
+  assert.equal(sum.internalReviewer.calls, 0);
+  assert.equal(sum.internalReviewer.totalTokens, 0);
+
+  // Measured Total is exact sum: 1500 + 10450 = 11950
+  assert.equal(sum.measuredTotal.totalTokens, 11950);
+  assert.equal(sum.total.totalTokens, 11950);
+
+  // External PR Reviewer
+  assert.equal(sum.externalPrReviewer.reviewer, 'codex');
+  assert.equal(sum.externalPrReviewer.usageAvailable, false);
+  assert.equal(sum.externalPrReviewer.reviewed, true);
+  assert.match(sum.externalPrReviewer.note, /unavailable \/ external/);
+});
+

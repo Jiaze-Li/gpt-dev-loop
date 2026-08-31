@@ -37,6 +37,11 @@ export const PR_REVIEW_TRIGGER_TEXT = Object.freeze({
 
 // Default mapping from PR reviewer key -> the GitHub author login that its
 // review/comment is expected to come from. Injectable for tests / real bots.
+export const PR_REVIEWER_IDENTITIES = Object.freeze({
+  codex: Object.freeze(['codex', 'chatgpt-codex-connector[bot]', 'chatgpt-codex-connector', 'codex[bot]', 'codex-bot']),
+  claude: Object.freeze(['claude', 'claude[bot]', 'claude-code-review[bot]']),
+});
+
 export const PR_REVIEWER_IDENTITY = Object.freeze({
   codex: 'codex',
   claude: 'claude',
@@ -100,6 +105,31 @@ function authorOf(result) {
   return String(result?.reviewer ?? result?.author ?? result?.user?.login ?? '').trim().toLowerCase();
 }
 
+function authorMatchesReviewer(author, identity, reviewerKey, identitiesOverride = {}) {
+  const normAuthor = String(author ?? '').trim().toLowerCase();
+  if (!normAuthor) return false;
+
+  // Exact configured identity match
+  if (normAuthor === String(identity).trim().toLowerCase()) return true;
+
+  // Injected / configured identities override
+  const customList = identitiesOverride?.[reviewerKey];
+  if (Array.isArray(customList) && customList.some((id) => String(id).trim().toLowerCase() === normAuthor)) {
+    return true;
+  }
+  if (typeof customList === 'string' && customList.trim().toLowerCase() === normAuthor) {
+    return true;
+  }
+
+  // Canonical well-known bot identities
+  const canonicalList = PR_REVIEWER_IDENTITIES[reviewerKey];
+  if (Array.isArray(canonicalList) && canonicalList.some((id) => id.toLowerCase() === normAuthor)) {
+    return true;
+  }
+
+  return false;
+}
+
 // A monotonic ">"; prefer numeric id ordering, fall back to ISO timestamp.
 function isAfterTrigger(result, trigger) {
   const rid = Number(result?.id);
@@ -149,7 +179,7 @@ export function createGithubPrReviewAdapter({
   const now = typeof clock.now === 'function' ? () => clock.now() : () => Date.now();
   const sleep = typeof clock.sleep === 'function'
     ? (ms) => clock.sleep(ms)
-    : () => Promise.resolve();
+    : (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const identity = String(
     reviewerIdentities[reviewerKey] ?? PR_REVIEWER_IDENTITY[reviewerKey] ?? reviewerKey,
   ).trim().toLowerCase();
@@ -218,7 +248,7 @@ export function createGithubPrReviewAdapter({
   function matchResult(results, trigger, head) {
     if (!Array.isArray(results)) return null;
     for (const result of results) {
-      if (authorOf(result) !== identity) continue;
+      if (!authorMatchesReviewer(authorOf(result), identity, reviewerKey, reviewerIdentities)) continue;
       if (headShaOf(result) !== head) continue; // provably bound to current head
       if (!isAfterTrigger(result, trigger)) continue; // ignore stale reviews
       return result;

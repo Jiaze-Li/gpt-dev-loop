@@ -729,6 +729,54 @@ export function formatTransitionEvent(event) {
   }
 }
 
+export function formatCanonicalUsage(rawUsage, prCloseout = null) {
+  const emptyRole = () => ({
+    calls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    byModel: {},
+  });
+
+  const u = rawUsage && typeof rawUsage === 'object' ? rawUsage : {};
+  const planner = u.planner ? { ...emptyRole(), ...u.planner } : emptyRole();
+  const executor = u.executor ? { ...emptyRole(), ...u.executor } : emptyRole();
+  const supervisor = u.supervisor ? { ...emptyRole(), ...u.supervisor } : emptyRole();
+  const internalReviewer = u.internalReviewer ?? u.reviewer ? { ...emptyRole(), ...(u.internalReviewer ?? u.reviewer) } : emptyRole();
+
+  const measuredTotal = u.measuredTotal ?? u.total ?? {
+    calls: planner.calls + executor.calls + supervisor.calls + internalReviewer.calls,
+    inputTokens: planner.inputTokens + executor.inputTokens + supervisor.inputTokens + internalReviewer.inputTokens,
+    outputTokens: planner.outputTokens + executor.outputTokens + supervisor.outputTokens + internalReviewer.outputTokens,
+    cachedTokens: planner.cachedTokens + executor.cachedTokens + supervisor.cachedTokens + internalReviewer.cachedTokens,
+    totalTokens: planner.totalTokens + executor.totalTokens + supervisor.totalTokens + internalReviewer.totalTokens,
+    costUsd: planner.costUsd + executor.costUsd + supervisor.costUsd + internalReviewer.costUsd,
+  };
+
+  const reviewerName = prCloseout?.configuredReviewer || prCloseout?.activeReviewer || u.externalPrReviewer?.reviewer || null;
+  const externalPrReviewer = {
+    reviewer: reviewerName,
+    usageAvailable: false,
+    note: reviewerName ? 'Token usage: unavailable / external' : 'Not configured',
+    reviewed: Boolean(prCloseout?.reviewedPrHead),
+  };
+
+  return {
+    planner,
+    executor,
+    supervisor,
+    internalReviewer,
+    reviewer: internalReviewer, // alias
+    measuredTotal,
+    total: measuredTotal, // alias
+    externalPrReviewer,
+    hasUsageData: measuredTotal.totalTokens > 0 || measuredTotal.calls > 0,
+    records: Array.isArray(u.records) ? u.records : [],
+  };
+}
+
 /**
  * Convert any live or persisted workflow state object into canonical progress format (PART 2).
  * Consumes zero model tokens.
@@ -788,7 +836,7 @@ export function toCanonicalProgress(rawState, now = Date.now()) {
       lastProgressAt: rawState.lastProgressAt ?? null,
       lastActivityAt: rawState.lastActivityAt ?? null,
     },
-    usage: rawState.tokenUsage ?? null,
+    usage: formatCanonicalUsage(rawState.tokenUsage, rawState.prCloseout),
     routing: rawState.routing ?? { planner: null, supervisor: null, executor: null, reviewer: null, quotaPools: [] },
     terminal: [
       WORKFLOW_STATUSES.HUMAN_REQUIRED,

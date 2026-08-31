@@ -808,6 +808,7 @@ export function createRealGithubPrCloseoutAdapters({
               author: r.user?.login || 'unknown',
               headSha: r.commit_id,
               submittedAt: r.submitted_at,
+              body: r.body || '',
               findings: [],
             });
           }
@@ -826,21 +827,44 @@ export function createRealGithubPrCloseoutAdapters({
             const author = c.user?.login || 'unknown';
             const headSha = c.commit_id;
             const body = c.body || '';
+
+            let severity = 'OTHER';
+            if (/P1 Badge|badge\/P1|\[P1\]|\bP1\b|critical|blocker/i.test(body)) {
+              severity = 'P1';
+            } else if (/P2 Badge|badge\/P2|\[P2\]|\bP2\b|major/i.test(body)) {
+              severity = 'P2';
+            }
+
+            let title = '';
+            const headerMatch = body.match(/\*\*([^*]+)\*\*/);
+            if (headerMatch) {
+              title = headerMatch[1].replace(/!\[.*?\]\(.*?\)/g, '').trim();
+            } else {
+              title = body.split('\n')[0].slice(0, 120).trim();
+            }
+
             const finding = {
               id: String(c.id),
               file: c.path,
-              line: c.line || c.original_line,
-              severity: /P1[:\s]/i.test(body) ? 'P1' : (/P2[:\s]/i.test(body) ? 'P2' : 'OTHER'),
-              title: body.slice(0, 100),
+              line: c.line || c.original_line || c.start_line,
+              severity,
+              title: title || 'Review finding',
               description: body,
             };
-            let bucket = results.find((r) => r.author === author && r.headSha === headSha);
+
+            let bucket = null;
+            if (c.pull_request_review_id) {
+              bucket = results.find((r) => String(r.id) === String(c.pull_request_review_id));
+            }
+            if (!bucket) {
+              bucket = results.find((r) => r.author === author && r.headSha === headSha);
+            }
             if (!bucket) {
               bucket = {
                 id: c.pull_request_review_id || c.id,
                 reviewer: author,
-                author: author,
-                headSha: headSha,
+                author,
+                headSha,
                 submittedAt: c.created_at,
                 findings: [],
               };
@@ -869,13 +893,49 @@ export function createRealGithubPrCloseoutAdapters({
       return res;
     },
     runRepairTask: async (card) => {
-      return { status: 'COMPLETE', gateResult: 'PASS' };
+      let executionReport = null;
+      try {
+        const executorManager = typeof selection?.createExecutorSessionManager === 'function'
+          ? selection.createExecutorSessionManager({ taskId: card.task_id || 'pr-closeout-repair', cwd: repoRoot })
+          : createClaudeSessionManager({ taskId: card.task_id || 'pr-closeout-repair', cwd: repoRoot });
+        executionReport = await executorManager.execute(card, { signal });
+      } catch (err) {
+        return { status: 'FAILED', gateResult: 'FAIL', error: err.message };
+      }
+
+      const runner = (createGateRunner || _createGateRunner)({
+        cwd: repoRoot,
+        signal,
+        baseline,
+      });
+      const gateResult = await runner.runGate(card);
+      const isComplete = executionReport?.status === 'COMPLETE' && gateResult?.pass;
+      return {
+        status: isComplete ? 'COMPLETE' : (executionReport?.status || 'FAILED'),
+        gateResult: gateResult?.pass ? 'PASS' : 'FAIL',
+        executionReport,
+        gateEvidence: gateResult,
+      };
     },
     pushRepair: async ({ prNumber: p, expectedHead, force, forcePush }) => {
       if (force === true || forcePush === true) {
         throw new Error('Force push is strictly forbidden in PR Closeout');
       }
-      nodeExecSync('git push origin HEAD', { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      let headRefName = null;
+      try {
+        const prViewOut = nodeExecSync(`gh pr view ${p} --json headRefName`, {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        headRefName = JSON.parse(prViewOut).headRefName;
+      } catch {}
+
+      if (headRefName) {
+        nodeExecSync(`git push origin HEAD:${headRefName}`, { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      } else {
+        nodeExecSync('git push origin HEAD', { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      }
       return nodeExecSync('git rev-parse HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
     },
     escalateSupervisor: async (payload) => {
@@ -1310,20 +1370,26 @@ async function defaultPipeline({
 
     if (outcome.status === PR_CLOSEOUT_LOOP_STATUS.DONE) {
       const summary = `PR #${pathDecision.prNumber} closeout loop succeeded: review is clean (${outcome.rounds} repair rounds).`;
+      if (usageTracker && workflowStateManager) {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      }
       workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {
         summary,
         deliveredFiles: [],
       });
       emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'DONE', summary });
-      return { ...EMPTY_RESULT(), status: 'WORKFLOW_DONE', summary, conversations: null, tokenUsage: usageTracker?.summary() ?? null };
+      return { ...EMPTY_RESULT(), status: 'WORKFLOW_DONE', summary, conversations: null, tokenUsage: usageTracker?.summary({ prCloseout: workflowStateManager?.getState()?.prCloseout }) ?? null };
     } else {
       const reason = `PR closeout loop stopped: ${outcome.reason}`;
+      if (usageTracker && workflowStateManager) {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      }
       workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
         reason,
         question: reason,
       });
       emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question: reason });
-      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations: null, tokenUsage: usageTracker?.summary() ?? null };
+      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations: null, tokenUsage: usageTracker?.summary({ prCloseout: workflowStateManager?.getState()?.prCloseout }) ?? null };
     }
   }
 
@@ -1345,6 +1411,9 @@ async function defaultPipeline({
     resolved = (await selection.runtime.invoke('planner', {
       resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
     }, { operationId: workflowId })).value;
+    if (usageTracker && workflowStateManager) {
+      workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+    }
   }
   if (resolved.status === 'AMBIGUOUS') {
     emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason: 'plan_ambiguous', question: resolved.question });

@@ -1922,7 +1922,7 @@ test('P1-1. Gate FAIL routes to REWORK with zero Reviewer calls; PASS after fix 
   assert.deepEqual(result.history, [{ task_id: taskCard.task_id, decision: 'PASS', attempts: 2 }]);
 
   // Usage accounting contains no Reviewer call for attempt 1.
-  const reviewerUsage = usageRecords.filter((r) => r.role === 'reviewer');
+  const reviewerUsage = usageRecords.filter((r) => r.role === 'reviewer' || r.role === 'internal_reviewer' || r.role === 'internalReviewer');
   assert.equal(reviewerUsage.length, 1);
   assert.equal(reviewerUsage[0].attempt, 2);
   assert.ok(!reviewerUsage.some((r) => r.attempt === 1), 'no Reviewer usage recorded for the failed Gate attempt');
