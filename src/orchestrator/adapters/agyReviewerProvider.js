@@ -36,6 +36,11 @@ import {
 import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../../agy/agyJson.js';
 import { AGY_REVIEWER_DEFAULT_MODEL } from '../../agy/agyConfig.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
+import {
+  compactEvidence,
+  enforcePromptBudget,
+  REVIEWER_PROMPT_HARD_LIMIT,
+} from './reviewerEvidence.js';
 
 const DECISIONS = new Set(['PASS', 'REWORK', 'HUMAN_REQUIRED', 'OUT_OF_SCOPE']);
 
@@ -185,7 +190,24 @@ export function createAgyReviewerProvider({
     // id agy actually used — so the caller can capture it on the first
     // review() and reuse it for every rework of the same task.
     async review(taskCard, executionReport, evidence, { attempt, conversationId, checkpoint } = {}) {
-      const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
+      // ── Compact evidence projection (deterministic, zero model calls) ──
+      const {
+        evidence: compactEv,
+        fullEvidenceRef,
+        truncated: evidenceTruncated,
+      } = compactEvidence(evidence, taskCard, executionReport);
+
+      const rawPrompt = buildAgyReviewPrompt(taskCard, executionReport, compactEv, { attempt, checkpoint });
+
+      // ── Hard budget guard ─────────────────────────────────────────────
+      const { prompt, budgetExceeded, originalLength } = enforcePromptBudget(rawPrompt);
+      if (budgetExceeded) {
+        throw new AdapterError(
+          ADAPTER_ERROR_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED,
+          `Reviewer prompt exceeds hard limit: ${originalLength} chars > ${REVIEWER_PROMPT_HARD_LIMIT} char budget (after compact projection)`,
+          { originalLength, limit: REVIEWER_PROMPT_HARD_LIMIT, fullEvidenceRef },
+        );
+      }
 
       let result;
       try {
@@ -213,6 +235,8 @@ export function createAgyReviewerProvider({
           callId: { value: callId, writable: true, configurable: true, enumerable: false },
           usage: { value: usageWithCallId, writable: true, configurable: true, enumerable: false },
           durationMs: { value: result.durationMs ?? null, writable: true, configurable: true, enumerable: false },
+          fullEvidenceRef: { value: fullEvidenceRef, writable: true, configurable: true, enumerable: false },
+          evidenceTruncated: { value: evidenceTruncated, writable: true, configurable: true, enumerable: false },
         });
       } catch {
         /* best effort */
