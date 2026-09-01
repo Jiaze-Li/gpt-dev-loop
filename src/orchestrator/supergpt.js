@@ -33,7 +33,19 @@ import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
 import { loadWorkspaceConfig, resolveApprovedExternalRoots, loadAndValidateExternalRoots, ExternalReadRootConfigError } from './workspaceConfig.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from './runtimeIdentity.js';
-import { supergptVerify, hashCommandSet, computeWorktreeFingerprint, isValidWorktreeFingerprint, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
+import {
+  supergptVerify,
+  hashCommandSet,
+  computeWorktreeFingerprint,
+  isValidWorktreeFingerprint,
+  CLOSEOUT_VERIFICATION_ID,
+  CONTROLLED_ACCEPTANCE_APPROVERS,
+  buildControlledHostAcceptance,
+  persistControlledHostAcceptance,
+  readControlledHostAcceptance,
+  readWorktreeHead,
+  validateControlledHostAcceptance,
+} from './hostVerification.js';
 import {
   WorkflowStateManager,
   readLiveWorkflowState,
@@ -116,6 +128,7 @@ export const SUPERGPT_EVENTS = Object.freeze({
   REVIEW_FINISHED: 'review_finished',
   REWORK_REQUESTED: 'rework_requested',
   HUMAN_REQUIRED: 'human_required',
+  CONTROLLED_ACCEPTANCE_RECORDED: 'controlled_acceptance_recorded',
   DELIVERY_STARTED: 'delivery_started',
   DELIVERY_SUCCEEDED: 'delivery_succeeded',
   DELIVERY_FAILED: 'delivery_failed',
@@ -1133,6 +1146,50 @@ async function defaultPipeline({
     } catch { return []; }
   };
 
+  // Active acceptance versions as persisted by the automated loop's immutable
+  // acceptance chains. `version` is the workflow-wide binding recorded in the
+  // controlled acceptance bundle: any later AMEND/SUPERSEDE moves it and so
+  // invalidates evidence cut against the previous version.
+  const readActiveAcceptanceVersions = () => {
+    const fallback = { version: 1, byTask: null };
+    try {
+      const workflowJson = path.join(workflowRuntimeDirectory(workflowId), workflowId, 'workflow.json');
+      if (!existsSync(workflowJson)) return fallback;
+      const parsed = JSON.parse(readFileSync(workflowJson, 'utf8'));
+      const byTask = {};
+      for (const [taskId, chain] of Object.entries(parsed?.acceptanceChains ?? {})) {
+        if (Number.isInteger(chain?.activeVersion)) byTask[taskId] = chain.activeVersion;
+      }
+      const taskVersions = Object.values(byTask);
+      const version = Number.isInteger(parsed?.acceptanceChain?.activeVersion)
+        ? parsed.acceptanceChain.activeVersion
+        : (taskVersions.length > 0 ? Math.max(...taskVersions) : 1);
+      return { version, byTask: taskVersions.length > 0 ? byTask : null };
+    } catch {
+      return fallback;
+    }
+  };
+
+  // Reviewer outcome for the acceptance bundle. Reaching the delivery tail
+  // already implies every task was accepted, so an absent attempt record is
+  // not evidence of a failure; a RECORDED non-PASS final decision is, and it
+  // blocks the bundle from being minted at all.
+  const latestReviewerOutcome = (state) => {
+    const attempts = Array.isArray(state?.taskAttempts) ? state.taskAttempts : [];
+    const finalByTask = new Map();
+    for (const att of attempts) {
+      if (!att?.taskId || !att.reviewerDecision) continue;
+      const prior = finalByTask.get(att.taskId);
+      if (!prior || (att.attempt ?? 1) >= (prior.attempt ?? 1)) finalByTask.set(att.taskId, att);
+    }
+    const decisions = [...finalByTask.values()];
+    if (decisions.length === 0) return { pass: true, decision: 'PASS' };
+    const failing = decisions.find((d) => String(d.reviewerDecision).toUpperCase() !== 'PASS');
+    return failing
+      ? { pass: false, decision: String(failing.reviewerDecision).toUpperCase(), attempt: failing.attempt ?? 1 }
+      : { pass: true, decision: 'PASS', attempt: Math.max(...decisions.map((d) => d.attempt ?? 1)) };
+  };
+
   // Shared delivery tail — used by both the normal end-of-loop path and the
   // delivery-ready resume fast path below. Defined here so it closes over the
   // restored `worktree`.
@@ -1227,11 +1284,90 @@ async function defaultPipeline({
       }
     }
 
+    // ---- Controlled Host Acceptance ------------------------------------
+    // Bind the delivery decision to one immutable evidence bundle: the
+    // workflow identity, the exact worktree HEAD + content fingerprint the
+    // proof was cut from, the frozen closeout verification commands, the Gate
+    // result, the Reviewer result, and the approved active acceptance version.
+    // The bundle is minted here (after closeout verification and any PR
+    // closeout repair rounds, so it describes the bytes that will actually be
+    // delivered) and re-validated inside deliverWorkflowResult against the live
+    // context. On a resume the persisted bundle must still match, otherwise
+    // delivery fails closed.
+    const deliveryHead = readWorktreeHead(worktree.worktree_path, _execSync);
+    const deliveryFingerprint = getFingerprint(worktree.worktree_path);
+    const acceptanceVersions = readActiveAcceptanceVersions();
+    const reviewerOutcome = latestReviewerOutcome(workflowStateManager?.getState?.() ?? null);
+    const acceptanceContext = {
+      workflowId,
+      head: deliveryHead,
+      worktreeFingerprint: deliveryFingerprint,
+      acceptanceVersion: acceptanceVersions.version,
+      verificationCommands: commands,
+    };
+
+    let controlledAcceptance = null;
+    let acceptanceBlockReason = null;
+    const persisted = readControlledHostAcceptance({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+    if (persisted) {
+      // Never re-mint over a persisted decision: an existing bundle that no
+      // longer matches the live worktree/acceptance is drift, and drift may
+      // only be cleared by a controlled re-approval, never by this process
+      // quietly issuing itself fresh evidence.
+      const revalidated = validateControlledHostAcceptance({ bundle: persisted, ...acceptanceContext });
+      if (revalidated.valid) controlledAcceptance = persisted;
+      else acceptanceBlockReason = revalidated.reason;
+    } else {
+      try {
+        controlledAcceptance = persistControlledHostAcceptance({
+          root: SUPERGPT_WORKTREE_ROOT,
+          workflowId,
+          bundle: buildControlledHostAcceptance({
+            workflowId,
+            worktree: worktree.worktree_path,
+            head: deliveryHead,
+            worktreeFingerprint: deliveryFingerprint,
+            verificationCommands: commands,
+            gate: { pass: true, decision: 'PASS' },
+            reviewer: reviewerOutcome,
+            acceptanceVersion: acceptanceVersions.version,
+            acceptanceVersions: acceptanceVersions.byTask,
+            approvedBy: CONTROLLED_ACCEPTANCE_APPROVERS.CONTROLLED_ORCHESTRATOR,
+            reason: 'Closeout host verification passed on the delivered worktree bytes.',
+          }),
+        });
+      } catch (err) {
+        acceptanceBlockReason = err?.code ?? err?.message ?? 'CONTROLLED_ACCEPTANCE_UNAVAILABLE';
+      }
+    }
+
+    if (!controlledAcceptance) {
+      const reason = `CONTROLLED_ACCEPTANCE_INVALID: ${acceptanceBlockReason}. SuperGPT will not deliver without valid host acceptance evidence.`;
+      emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: acceptanceBlockReason });
+      await lifecycleManager?.onWorkflowSuspended('controlled_acceptance_invalid');
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason,
+        question: reason,
+        actionCode: 'CONTROLLED_ACCEPTANCE_INVALID',
+      });
+      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
+    }
+
+    workflowStateManager?.recordControlledAcceptance?.(controlledAcceptance);
+    emit(SUPERGPT_EVENTS.CONTROLLED_ACCEPTANCE_RECORDED, {
+      acceptanceId: controlledAcceptance.acceptanceId,
+      status: controlledAcceptance.status,
+      acceptanceVersion: controlledAcceptance.acceptanceVersion,
+    });
+
     let delivery;
     try {
       throwIfAborted(signal);
       delivery = await deliverWorkflowResult({
         worktree,
+        controlledAcceptance,
+        expectedAcceptanceContext: acceptanceContext,
+        requireControlledAcceptance: true,
         // Persisted BEFORE worktree cleanup: once the source workspace is
         // mutated, a later cleanup failure must never re-run delivery (P2-2).
         onDelivered: ({ changed_files }) => recordDeliveryCompleted({
@@ -1243,6 +1379,19 @@ async function defaultPipeline({
       await lifecycleManager?.onWorkflowSuspended('delivery_failed');
       workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: `delivery failed: ${err.message}` });
       throw err;
+    }
+    if (delivery.status === 'HUMAN_REQUIRED' && delivery.blocked_reason) {
+      // Evidence went stale between minting and applying (a concurrent worktree
+      // mutation). Nothing was written to the invocation workspace.
+      const reason = `CONTROLLED_ACCEPTANCE_INVALID: ${delivery.blocked_reason}. SuperGPT will not deliver without valid host acceptance evidence.`;
+      emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: delivery.blocked_reason });
+      await lifecycleManager?.onWorkflowSuspended('controlled_acceptance_invalid');
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason,
+        question: reason,
+        actionCode: 'CONTROLLED_ACCEPTANCE_INVALID',
+      });
+      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
     }
     if (delivery.status === 'HUMAN_REQUIRED') {
       emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: 'conflict', conflicts: delivery.conflicts });

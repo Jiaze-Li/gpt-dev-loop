@@ -80,6 +80,38 @@ export class Persistence {
     }
   }
 
+  // Immutable acceptance version chain (src/orchestrator/taskCard.js). Stored
+  // inside the workflow-scoped snapshot so every consumer on resume reads the
+  // same current active acceptance version. The chain itself is append-only;
+  // this only ever replaces the pointer/history wholesale with a superset.
+  // `taskId` (optional) namespaces the chain per task inside the same workflow
+  // snapshot (`acceptanceChains[taskId]`), so a multi-task workflow keeps one
+  // independent, append-only chain per Task Card. Omitting it keeps the legacy
+  // single workflow-scoped `acceptanceChain` pointer.
+  async writeAcceptanceChain(workflowId, chain, taskId = null) {
+    if (!chain || !Array.isArray(chain.versions) || chain.versions.length === 0) {
+      throw new Error('writeAcceptanceChain requires a non-empty acceptance chain');
+    }
+    const current = await this.readAcceptanceChain(workflowId, taskId);
+    if (current && chain.versions.length < current.versions.length) {
+      throw new Error('writeAcceptanceChain refused: acceptance history must not shrink');
+    }
+    if (taskId) {
+      const state = (await this.readWorkflowState(workflowId)) ?? {};
+      const chains = { ...(state.acceptanceChains ?? {}), [taskId]: chain };
+      await this.updateWorkflowState(workflowId, { acceptanceChains: chains });
+    } else {
+      await this.updateWorkflowState(workflowId, { acceptanceChain: chain });
+    }
+    return chain;
+  }
+
+  async readAcceptanceChain(workflowId, taskId = null) {
+    const state = await this.readWorkflowState(workflowId);
+    if (taskId) return state?.acceptanceChains?.[taskId] ?? null;
+    return state?.acceptanceChain ?? null;
+  }
+
   // PERSISTENCE.md §2 — append-only event log, one JSON object per line.
   async appendEvent(event) {
     const dir = await this.ensureTaskDir(event.workflow_id, event.task_id);

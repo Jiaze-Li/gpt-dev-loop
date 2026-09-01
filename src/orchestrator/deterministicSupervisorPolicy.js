@@ -2,6 +2,13 @@
 // The deterministic Core owns obvious transitions; the model Supervisor is reserved
 // for genuine ambiguity / non-convergence.
 
+// A deterministic decision is computed by the orchestrator Core without any
+// model call. It must be accounted as exactly zero provider calls and zero
+// tokens; UsageTracker enforces this by refusing to aggregate a supervisor
+// record that carries neither an immutable provider callId nor provider usage
+// metadata (see isDeterministicSupervisorRecord in usageTracker.js).
+export const DETERMINISTIC_SUPERVISOR_DECISION_TOKEN_COST = 0;
+
 function asList(value) {
   if (Array.isArray(value)) return value.map(String).map((v) => v.trim()).filter(Boolean);
   if (value === null || value === undefined || value === 'none') return [];

@@ -47,7 +47,7 @@ function renderContext(ctx = {}) {
   return `repository_name: ${ctx.repository_name}\nrepository_url: ${ctx.repository_url ?? 'none'}\nbranch: ${ctx.branch}\ncommit_sha: ${ctx.commit_sha}`;
 }
 function renderTaskCard(card) {
-  return `## task_id\n${card.task_id}\n\n## repository_context\n${renderContext(card.repository_context)}\n\n## goal\n${card.goal}\n\n## context\n${card.context}\n\n## scope\n${card.scope}\n\n## allowed_files\n${renderList(card.allowed_files)}\n\n## forbidden_files\n${renderList(card.forbidden_files)}\n\n## acceptance_criteria\n${renderList(card.acceptance_criteria)}\n\n## verification_commands\n${renderList((card.verification_commands ?? []).map((command) => `\`${command}\``))}\n\n## completion_signal\n${card.completion_signal}`;
+  return `## task_id\n${card.task_id}\n\n## repository_context\n${renderContext(card.repository_context)}\n\n## goal\n${card.goal}\n\n## context\n${card.context}\n\n## scope\n${card.scope}\n\n## allowed_files\n${renderList(card.allowed_files)}\n\n## forbidden_files\n${renderList(card.forbidden_files)}\n\n## acceptance_criteria\n${renderList(card.acceptance_criteria)}\n\n## acceptance_version\n${card.acceptance_version ?? 1}\n\n## verification_commands\n${renderList((card.verification_commands ?? []).map((command) => `\`${command}\``))}\n\n## completion_signal\n${card.completion_signal}`;
 }
 function renderExecutionReport(report) {
   const issues = Array.isArray(report.issues) ? renderList(report.issues) : report.issues ?? 'none';

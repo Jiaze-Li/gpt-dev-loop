@@ -128,6 +128,9 @@ export class WorkflowStateManager {
       // V2-C durable PR closeout loop state (round count, reviewed head,
       // finding signatures, last action) — null until the closeout loop runs.
       prCloseout: null,
+      // Controlled Host Acceptance evidence bundle (sanitized projection) —
+      // null until host verification supersedes local acceptance for delivery.
+      controlledAcceptance: null,
     };
   }
 
@@ -298,6 +301,31 @@ export class WorkflowStateManager {
   recordCloseoutState(closeoutState) {
     this.state.prCloseout = closeoutState
       ? JSON.parse(JSON.stringify(closeoutState))
+      : null;
+    this.state.lastProgressAt = new Date().toISOString();
+    this.notify();
+    this.persist();
+  }
+
+  // Records the controlled Host Acceptance milestone. Only the auditable,
+  // non-sensitive fields of the evidence bundle are projected into live state;
+  // the authoritative bundle stays in the host evidence store.
+  recordControlledAcceptance(bundle) {
+    this.state.controlledAcceptance = bundle
+      ? {
+        status: bundle.status ?? null,
+        acceptanceId: bundle.acceptanceId ?? null,
+        acceptanceVersion: bundle.acceptanceVersion ?? null,
+        head: bundle.head ?? null,
+        worktreeFingerprint: bundle.worktreeFingerprint ?? null,
+        commandsHash: bundle.commandsHash ?? null,
+        verificationCommands: Array.isArray(bundle.verificationCommands) ? [...bundle.verificationCommands] : [],
+        gate: bundle.gate ?? null,
+        reviewer: bundle.reviewer ?? null,
+        approvedBy: bundle.approvedBy ?? null,
+        approvedAt: bundle.approvedAt ?? null,
+        reason: bundle.reason ?? null,
+      }
       : null;
     this.state.lastProgressAt = new Date().toISOString();
     this.notify();
@@ -998,13 +1026,51 @@ export function captureTerminalSnapshot({
 }
 
 /**
+ * Resolves the controlled Host Acceptance evidence for a terminal judgement.
+ *
+ * `controlledAcceptance` is either a validation result ({ valid, reason }) or a
+ * resolver function evaluated lazily. Returns a normalized
+ * { present, valid, reason, bundle } view; `present: false` means the workflow
+ * never used controlled acceptance and is judged on its own attempt evidence.
+ */
+export function resolveControlledAcceptanceEvidence(controlledAcceptance) {
+  if (controlledAcceptance === null || controlledAcceptance === undefined) {
+    return { present: false, valid: false, reason: null, bundle: null };
+  }
+  let resolved = controlledAcceptance;
+  if (typeof controlledAcceptance === 'function') {
+    try {
+      resolved = controlledAcceptance();
+    } catch (err) {
+      return { present: true, valid: false, reason: err?.message ?? 'CONTROLLED_ACCEPTANCE_UNREADABLE', bundle: null };
+    }
+  }
+  if (!resolved || typeof resolved !== 'object') {
+    return { present: true, valid: false, reason: 'CONTROLLED_ACCEPTANCE_MALFORMED', bundle: null };
+  }
+  return {
+    present: true,
+    valid: resolved.valid === true,
+    reason: resolved.valid === true ? null : (resolved.reason ?? 'CONTROLLED_ACCEPTANCE_MALFORMED'),
+    bundle: resolved.bundle ?? null,
+  };
+}
+
+/**
  * Generate a validated acceptance report strictly from an immutable terminal snapshot.
+ *
+ * When controlled Host Acceptance evidence is supplied it becomes part of the
+ * terminal judgement and fails closed: drifted, tampered, or missing evidence
+ * yields ACCEPTANCE_EVIDENCE_INCONSISTENT (never a PASS), while valid evidence
+ * reports ACCEPTANCE_SUPERSEDED_BY_HOST_VERIFICATION on an otherwise accepted
+ * workflow.
  */
 export function generateTerminalAcceptanceReport({
   workflowId,
   root = SUPERGPT_WORKTREE_ROOT,
   state = null,
   usageTracker = null,
+  controlledAcceptance = null,
 } = {}) {
   const result = captureTerminalSnapshot({ workflowId, root, state, usageTracker });
   if (result.status === 'ACCEPTANCE_NOT_TERMINAL') {
@@ -1029,10 +1095,33 @@ export function generateTerminalAcceptanceReport({
   const attempts = Array.isArray(s.taskAttempts) ? s.taskAttempts : [];
   const usage = s.tokenUsage ?? {};
 
+  const evidence = resolveControlledAcceptanceEvidence(controlledAcceptance);
+  if (evidence.present && !evidence.valid) {
+    return {
+      acceptance: 'ACCEPTANCE_EVIDENCE_INCONSISTENT',
+      valid: false,
+      violations: [`Controlled Host Acceptance evidence is not valid: ${evidence.reason}`],
+      controlledAcceptance: { valid: false, reason: evidence.reason },
+      report: null,
+    };
+  }
+
   const accepted = s.workflowStatus === WORKFLOW_STATUSES.DONE;
   return {
-    acceptance: accepted ? 'PASS' : 'NOT_ACCEPTED',
+    acceptance: evidence.present && accepted
+      ? 'ACCEPTANCE_SUPERSEDED_BY_HOST_VERIFICATION'
+      : (accepted ? 'PASS' : 'NOT_ACCEPTED'),
     valid: accepted,
+    ...(evidence.present
+      ? {
+        controlledAcceptance: {
+          valid: true,
+          reason: null,
+          acceptanceId: evidence.bundle?.acceptanceId ?? null,
+          acceptanceVersion: evidence.bundle?.acceptanceVersion ?? null,
+        },
+      }
+      : {}),
     workflowId: s.workflowId,
     workflowStatus: s.workflowStatus,
     summary: s.summary,

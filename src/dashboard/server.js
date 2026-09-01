@@ -237,6 +237,10 @@ export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } 
     superseded: Boolean(live.superseded),
     supersededBy: live.supersededBy || null,
     stageStatuses: live.stageStatuses ?? {},
+    // Controlled Host Acceptance projection: the delivery-authorising evidence
+    // summary (status, acceptance version, worktree binding), or null when the
+    // workflow never reached a controlled acceptance decision.
+    controlledAcceptance: live.controlledAcceptance ?? null,
     timeline,
     reviewThreads,
     usage,

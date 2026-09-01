@@ -23,6 +23,61 @@ function normalizeNumber(val) {
   return Number.isFinite(val) ? val : null;
 }
 
+/**
+ * Stable identity of a physical provider invocation, used for exactly-once
+ * aggregation. The immutable provider callId is authoritative; when a legacy or
+ * externally injected record carries no callId we fall back to a deterministic
+ * identity derived from the invocation coordinates and the reported token
+ * counts. Event replays, checkpoint resumes and cross-process reads of the same
+ * invocation therefore collapse to a single accounted call.
+ */
+export function invocationIdentity(rec) {
+  if (!rec) return null;
+  if (rec.callId) return `callId:${rec.callId}`;
+  // No callId: fall back to a stable identity only when the invocation
+  // coordinates are specific enough to name a single logical call slot
+  // (workflow + role + task + attempt). Byte-identical replays of that slot —
+  // e.g. a checkpoint reload of the persisted record — then collapse, while two
+  // genuinely distinct calls (different token counts / start time) stay apart.
+  if (rec.role && rec.taskId != null && rec.attempt != null) {
+    return [
+      'slot',
+      rec.workflowId ?? '',
+      rec.role,
+      rec.taskId,
+      rec.attempt,
+      rec.repairRound ?? '',
+      rec.startedAt ?? '',
+      rec.inputTokens ?? '',
+      rec.outputTokens ?? '',
+    ].join('|');
+  }
+  // Not determinable: treat every occurrence as a distinct physical call.
+  return null;
+}
+
+/**
+ * A deterministic Supervisor decision is computed by the orchestrator Core with
+ * no model call at all. Every real Supervisor provider adapter attaches an
+ * immutable callId, a concrete model and (when the provider exposes it) usage
+ * metadata; a deterministic decision carries none of those coordinates. Such a
+ * record must be accounted as exactly zero provider calls and zero tokens and
+ * must never be treated as a fabricated provider call.
+ *
+ * Note: a real call to a provider that simply does not expose usage still
+ * carries a callId and/or a model, so it is NOT classified here.
+ */
+function isDeterministicSupervisorDecision({ role, callId, usage, model, resolvedModel, provider, durationMs, costUsd }) {
+  return role === 'supervisor'
+    && !callId
+    && (usage === null || usage === undefined)
+    && !model
+    && !resolvedModel
+    && !provider
+    && (durationMs === null || durationMs === undefined)
+    && (costUsd === null || costUsd === undefined);
+}
+
 function emptyRoleBucket() {
   return {
     calls: 0,
@@ -38,7 +93,7 @@ function emptyRoleBucket() {
 const INPUT_CATEGORIES = ['taskCard', 'repoContext', 'history', 'evidence', 'other'];
 
 function aggregateExecutorInputBreakdown(records) {
-  const executorRecords = records.filter((record) => record?.role === 'executor');
+  const executorRecords = records.filter((record) => record?.role === 'executor' && !record.duplicate && !record.deterministic);
   const categories = Object.fromEntries(INPUT_CATEGORIES.map((name) => [name, {
     bytes: 0, characters: 0, tokens: 0,
   }]));
@@ -120,6 +175,10 @@ export class UsageTracker {
   constructor({ anomalyMonitor = new TokenAnomalyMonitor() } = {}) {
     this.records = [];
     this.anomalyMonitor = anomalyMonitor;
+    // Exactly-once aggregation bookkeeping.
+    this._seenIdentities = new Map();
+    this._duplicateRecords = [];
+    this.deterministicDecisions = 0;
     this.byRole = {
       supervisor: emptyRoleBucket(),
       executor: emptyRoleBucket(),
@@ -220,18 +279,50 @@ export class UsageTracker {
       inputBreakdown: normalizedRole === 'executor' ? reconcileInputBreakdown(inputBreakdown, inputTokens) : null,
     };
 
-    this.records.push(rec);
-
-    if (!this.byRole[normalizedRole]) {
-      this.byRole[normalizedRole] = emptyRoleBucket();
+    // Deterministic Supervisor decisions never touch a model. Record them for
+    // audit visibility but keep them out of provider-call accounting entirely.
+    if (isDeterministicSupervisorDecision({
+      role: normalizedRole, callId: effectiveCallId, usage, model, resolvedModel, provider, durationMs, costUsd,
+    })) {
+      rec.deterministic = true;
+      rec.countsTowardAggregates = false;
+      this.deterministicDecisions += 1;
+      this.records.push(rec);
+      return rec;
     }
-    const bucket = this.byRole[normalizedRole];
+
+    // Exactly-once aggregation: a physical invocation is aggregated the first
+    // time it is seen and never again, regardless of how many times the same
+    // event is replayed, resumed or read back.
+    const identity = invocationIdentity(rec);
+    if (identity !== null && this._seenIdentities.has(identity)) {
+      rec.duplicate = true;
+      rec.duplicateOf = identity;
+      rec.countsTowardAggregates = false;
+      this.records.push(rec);
+      this._duplicateRecords.push(rec);
+      return rec;
+    }
+    if (identity !== null) this._seenIdentities.set(identity, rec);
+    this.records.push(rec);
+    this._aggregate(rec);
+    return rec;
+  }
+
+  /**
+   * Fold a deduplicated record into the role / model / task aggregates.
+   */
+  _aggregate(rec) {
+    const role = rec.role;
+    const modelKey = rec.modelKey;
+    if (!this.byRole[role]) this.byRole[role] = emptyRoleBucket();
+    const bucket = this.byRole[role];
     bucket.calls += 1;
-    if (inputTokens !== null) bucket.inputTokens += inputTokens;
-    if (outputTokens !== null) bucket.outputTokens += outputTokens;
-    if (cachedTokens !== null) bucket.cachedTokens += cachedTokens;
-    if (totalTokens !== null) bucket.totalTokens += totalTokens;
-    if (rec.costUsd !== null) bucket.costUsd += rec.costUsd;
+    if (rec.inputTokens != null) bucket.inputTokens += rec.inputTokens;
+    if (rec.outputTokens != null) bucket.outputTokens += rec.outputTokens;
+    if (rec.cachedTokens != null) bucket.cachedTokens += rec.cachedTokens;
+    if (rec.totalTokens != null) bucket.totalTokens += rec.totalTokens;
+    if (rec.costUsd != null) bucket.costUsd += rec.costUsd;
 
     if (!bucket.byModel[modelKey]) {
       bucket.byModel[modelKey] = {
@@ -245,19 +336,58 @@ export class UsageTracker {
     }
     const mBucket = bucket.byModel[modelKey];
     mBucket.calls += 1;
-    if (inputTokens !== null) mBucket.inputTokens += inputTokens;
-    if (outputTokens !== null) mBucket.outputTokens += outputTokens;
-    if (cachedTokens !== null) mBucket.cachedTokens += cachedTokens;
-    if (totalTokens !== null) mBucket.totalTokens += totalTokens;
-    if (rec.costUsd !== null) mBucket.costUsd += rec.costUsd;
+    if (rec.inputTokens != null) mBucket.inputTokens += rec.inputTokens;
+    if (rec.outputTokens != null) mBucket.outputTokens += rec.outputTokens;
+    if (rec.cachedTokens != null) mBucket.cachedTokens += rec.cachedTokens;
+    if (rec.totalTokens != null) mBucket.totalTokens += rec.totalTokens;
+    if (rec.costUsd != null) mBucket.costUsd += rec.costUsd;
 
-    if (taskId) {
-      if (!this.byTask[taskId]) this.byTask[taskId] = {};
-      const attKey = attempt !== null ? String(attempt) : '1';
-      if (!this.byTask[taskId][attKey]) this.byTask[taskId][attKey] = [];
-      this.byTask[taskId][attKey].push(rec);
+    if (rec.taskId) {
+      if (!this.byTask[rec.taskId]) this.byTask[rec.taskId] = {};
+      const attKey = rec.attempt != null ? String(rec.attempt) : '1';
+      if (!this.byTask[rec.taskId][attKey]) this.byTask[rec.taskId][attKey] = [];
+      this.byTask[rec.taskId][attKey].push(rec);
     }
+  }
 
+  /**
+   * Idempotently fold another tracker (or its serialized form) into this one.
+   * Overlapping physical invocations — e.g. a cross-workflow UsageTracker read —
+   * are matched by invocation identity and never double-counted.
+   */
+  merge(other) {
+    const data = other instanceof UsageTracker ? other.toJSON() : other;
+    if (!data || !Array.isArray(data.records)) return this;
+    for (const raw of data.records) {
+      if (!raw || typeof raw !== 'object') continue;
+      this._ingestPersisted(raw);
+    }
+    return this;
+  }
+
+  _ingestPersisted(raw) {
+    const rec = { ...raw };
+    delete rec.duplicate;
+    delete rec.duplicateOf;
+    delete rec.countsTowardAggregates;
+    if (rec.deterministic) {
+      rec.countsTowardAggregates = false;
+      this.deterministicDecisions += 1;
+      this.records.push(rec);
+      return rec;
+    }
+    const identity = invocationIdentity(rec);
+    if (identity !== null && this._seenIdentities.has(identity)) {
+      rec.duplicate = true;
+      rec.duplicateOf = identity;
+      rec.countsTowardAggregates = false;
+      this.records.push(rec);
+      this._duplicateRecords.push(rec);
+      return rec;
+    }
+    if (identity !== null) this._seenIdentities.set(identity, rec);
+    this.records.push(rec);
+    this._aggregate(rec);
     return rec;
   }
 
@@ -390,14 +520,14 @@ export class UsageTracker {
   static fromJSON(data) {
     const tracker = new UsageTracker();
     if (!data || typeof data !== 'object') return tracker;
-    if (Array.isArray(data.records)) tracker.records = [...data.records];
-    if (data.byRole && typeof data.byRole === 'object') {
-      for (const [r, bucket] of Object.entries(data.byRole)) {
-        if (tracker.byRole[r]) tracker.byRole[r] = { ...bucket };
+    // Rebuild aggregates from the (deduplicated) record log rather than trusting
+    // a persisted byRole/byTask snapshot: a checkpoint resume or a merged
+    // cross-process log must not re-apply usage that was already accounted.
+    if (Array.isArray(data.records)) {
+      for (const raw of data.records) {
+        if (!raw || typeof raw !== 'object') continue;
+        tracker._ingestPersisted(raw);
       }
-    }
-    if (data.byTask && typeof data.byTask === 'object') {
-      tracker.byTask = JSON.parse(JSON.stringify(data.byTask));
     }
     return tracker;
   }

@@ -40,6 +40,12 @@ import {
 import { getValidHostEvidence, markHostEvidenceConsumed, hashCommandSet, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { decideDeterministically } from './deterministicSupervisorPolicy.js';
+import {
+  createAcceptanceChain,
+  serializeAcceptanceChain,
+  deserializeAcceptanceChain,
+  stampActiveAcceptance,
+} from './taskCard.js';
 
 function defaultLog(line) {
   console.log(`gpt-loop: ${line}`);
@@ -483,6 +489,46 @@ export async function runAutomatedWorkflow({
       reviewerCreated = false;
       reviewerTabId = null;
     }
+  }
+
+  // Resolve — and, when persistence is available, persist — the immutable
+  // acceptance version chain for a freshly selected task, then stamp the
+  // current active acceptance onto the card. Every consumer downstream
+  // (Executor prompt, Gate verification, Reviewer payload) then reads that
+  // exact active version rather than a raw, Executor-mutable criteria array.
+  async function bindActiveAcceptance(card) {
+    // A Supervisor-issued Task Card is not structurally required to carry
+    // acceptance_criteria (the older NEXT_TASK contract omits it entirely).
+    // Only build and stamp an immutable acceptance version chain when the
+    // card actually declares non-empty criteria; otherwise pass it through
+    // untouched so verification still runs off verification_commands.
+    const declaredCriteria = Array.isArray(card.acceptance_criteria)
+      ? card.acceptance_criteria.filter((item) => String(item).trim().length > 0)
+      : [];
+    if (declaredCriteria.length === 0) {
+      return card;
+    }
+    let chain = null;
+    const hasStore = persistence && typeof persistence.writeAcceptanceChain === 'function';
+    if (hasStore) {
+      try {
+        const stored = await persistence.readAcceptanceChain(workflowId, card.task_id);
+        if (stored) chain = deserializeAcceptanceChain(stored);
+      } catch {
+        /* unreadable stored chain — fall back to a fresh version-1 chain */
+      }
+    }
+    if (!chain) {
+      chain = createAcceptanceChain(card.acceptance_criteria);
+      if (hasStore) {
+        try {
+          await persistence.writeAcceptanceChain(workflowId, serializeAcceptanceChain(chain), card.task_id);
+        } catch {
+          /* non-fatal: the in-memory chain still stamps the card for this run */
+        }
+      }
+    }
+    return stampActiveAcceptance(card, chain);
   }
 
   // Runs exactly one Claude execute() -> gate.run() -> (lazy Reviewer
@@ -1691,8 +1737,8 @@ export async function runAutomatedWorkflow({
 
       // decision.action === 'NEXT_TASK'
       await closeReviewer(); // closes the PREVIOUS task's reviewer tab, if any — conversation itself is left in the account, not deleted
-      currentTaskCard = { ...decision.task_card };
-      log(`task selected: ${currentTaskCard.task_id}`);
+      currentTaskCard = await bindActiveAcceptance({ ...decision.task_card });
+      log(`task selected: ${currentTaskCard.task_id} (acceptance v${currentTaskCard.acceptance_version})`);
       // reviewerSession is instantiated now but its create(taskId) — the
       // call that actually opens the background ChatGPT tab, INSIDE the
       // same automation window — is deferred to runAttempt(), right before

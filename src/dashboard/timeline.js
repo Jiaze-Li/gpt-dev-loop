@@ -20,6 +20,7 @@ function formatTimestamp(isoString) {
 const EVENT_ORDER = {
   START: 10,
   PLANNER: 20,
+  ACCEPTANCE_AMENDED: 25,
   TASK_START: 30,
   RETRY: 35,
   EXECUTOR_DONE: 40,
@@ -29,6 +30,7 @@ const EVENT_ORDER = {
   REVIEWER_REWORK: 60,
   REWORK: 65,
   ESCALATION: 70,
+  CONTROLLED_ACCEPTANCE: 75,
   TERMINAL_DONE: 80,
   TERMINAL_HUMAN_REQUIRED: 80,
   TERMINAL_FAILED: 80,
@@ -60,6 +62,36 @@ export function deriveWorkflowTimeline(rawState) {
       type: 'START',
       label: 'Workflow started',
       detail: rawState.workflowPath ? `Path: ${rawState.workflowPath}` : null,
+    });
+  }
+
+  // Acceptance version-chain audit trail: every AMEND/SUPERSEDE beyond the
+  // initial version 1 surfaces as a sanitized milestone carrying the reason and
+  // the approving authority.
+  const acceptanceChain = rawState.acceptanceChain;
+  if (acceptanceChain && Array.isArray(acceptanceChain.versions)) {
+    for (const v of acceptanceChain.versions) {
+      if (!v || v.version === 1) continue;
+      rawEvents.push({
+        iso: v.approvedAt || rawState.lastProgressAt || startIso,
+        type: 'ACCEPTANCE_AMENDED',
+        label: `Acceptance ${v.command} → v${v.version} (active v${acceptanceChain.activeVersion})`,
+        detail: `${v.reason || 'no reason recorded'} [approved by ${v.approvedBy || 'unknown'}]`,
+      });
+    }
+  }
+
+  // Controlled Host Acceptance: the auditable milestone where passing host
+  // verification evidence — bound to the worktree fingerprint and the approved
+  // acceptance version — supersedes local acceptance for delivery.
+  const controlled = rawState.controlledAcceptance;
+  if (controlled && controlled.status) {
+    const fingerprint = controlled.worktreeFingerprint ? String(controlled.worktreeFingerprint).slice(0, 12) : 'unknown';
+    rawEvents.push({
+      iso: controlled.approvedAt || rawState.lastProgressAt || startIso,
+      type: 'CONTROLLED_ACCEPTANCE',
+      label: `${controlled.status} (acceptance v${controlled.acceptanceVersion ?? '?'})`,
+      detail: `Gate ${controlled.gate?.decision ?? 'unknown'}, Reviewer ${controlled.reviewer?.decision ?? 'unknown'}, worktree ${fingerprint} [approved by ${controlled.approvedBy || 'unknown'}]`,
     });
   }
 

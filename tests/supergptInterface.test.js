@@ -44,6 +44,7 @@ test('SUPERGPT_EVENTS carries the documented event types', () => {
       'review_finished',
       'rework_requested',
       'human_required',
+      'controlled_acceptance_recorded',
       'delivery_started',
       'delivery_succeeded',
       'delivery_failed',

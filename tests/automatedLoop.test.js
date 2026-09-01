@@ -203,10 +203,19 @@ function makeFakeGateRunner(order) {
 
 function makeFakePersistence() {
   const writes = [];
+  const acceptanceChains = {};
   return {
     writes,
+    acceptanceChains,
     async writeState(state) {
       writes.push(state);
+    },
+    async writeAcceptanceChain(_workflowId, chain, taskId) {
+      acceptanceChains[taskId ?? '_'] = chain;
+      return chain;
+    },
+    async readAcceptanceChain(_workflowId, taskId) {
+      return acceptanceChains[taskId ?? '_'] ?? null;
     },
   };
 }
@@ -3294,4 +3303,58 @@ test('regression: multi-task Executor requests stay compact and isolated while r
   assert.equal(usage.total.outputTokens, 45);
   assert.equal(usage.total.totalTokens, 465);
   assert.equal(usage.executorInputBreakdownAggregate.callsWithBreakdown, 3);
+});
+
+test('active acceptance version chain is created, persisted and stamped onto the card every consumer sees', async () => {
+  const taskCard = demoTaskCard({ acceptance_criteria: ['ship the demo', 'tests pass'] });
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done' },
+  ]);
+
+  const reviewedCards = [];
+  const baseFactory = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const createReviewerSession = () => {
+    const session = baseFactory();
+    const origReview = session.review.bind(session);
+    session.review = async (taskId, card, report, evidence, opts) => {
+      reviewedCards.push(card);
+      return origReview(taskId, card, report, evidence, opts);
+    };
+    return session;
+  };
+  createReviewerSession.created = baseFactory.created;
+
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+  const gateRunner = makeFakeGateRunner();
+  const windowSession = makeFakeWindowSession();
+  const persistence = makeFakePersistence();
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-acc',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession,
+    persistence,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+
+  // persisted per-task chain, version 1 from the card's own criteria
+  const chain = persistence.acceptanceChains[taskCard.task_id];
+  assert.ok(chain, 'acceptance chain persisted for the task');
+  assert.equal(chain.activeVersion, 1);
+  assert.deepEqual(chain.versions[0].acceptance, ['ship the demo', 'tests pass']);
+
+  // Executor and Reviewer both received the stamped active acceptance
+  const execCard = createClaudeSessionManager.managers[0].executions[0].taskCard;
+  assert.equal(execCard.acceptance_version, 1);
+  assert.deepEqual(execCard.acceptance_criteria, ['ship the demo', 'tests pass']);
+  assert.equal(reviewedCards.length, 1);
+  assert.equal(reviewedCards[0].acceptance_version, 1);
+  assert.deepEqual(reviewedCards[0].acceptance_criteria, ['ship the demo', 'tests pass']);
 });
