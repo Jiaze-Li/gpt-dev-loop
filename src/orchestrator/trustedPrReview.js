@@ -107,10 +107,15 @@ export function classifyFindings(findings, { reviewId = null } = {}) {
 // Trust only the exact configured reviewer identity. Any mismatch, or an
 // unconfigured expectation, fails closed.
 export function isTrustedReviewer(review, configuredReviewer) {
-  const expected = String(configuredReviewer ?? '').trim().toLowerCase();
-  if (!expected) return false;
+  if (!configuredReviewer) return false;
   const actual = String(review?.reviewer ?? review?.reviewerId ?? '').trim().toLowerCase();
-  return Boolean(actual) && actual === expected;
+  if (!actual) return false;
+  if (Array.isArray(configuredReviewer) || configuredReviewer instanceof Set) {
+    const list = Array.from(configuredReviewer).map((r) => String(r).trim().toLowerCase()).filter(Boolean);
+    return list.includes(actual);
+  }
+  const expected = String(configuredReviewer).trim().toLowerCase();
+  return actual === expected;
 }
 
 // A review is only usable while the head it examined is still the PR head.

@@ -57,7 +57,7 @@ import {
   WORKFLOW_STATUSES,
 } from './workflowState.js';
 import { runPrCloseoutLoop, PR_CLOSEOUT_LOOP_STATUS } from './prCloseoutLoop.js';
-import { initialCloseoutState, DEFAULT_MAX_REPAIR_ROUNDS } from './prCloseoutPolicy.js';
+import { initialCloseoutState, DEFAULT_MAX_REPAIR_ROUNDS, resolveReviewerFallbackOrder } from './prCloseoutPolicy.js';
 import { createGithubPrReviewAdapter } from './adapters/githubPrReviewAdapter.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import {
@@ -934,8 +934,8 @@ export function createRealGithubPrCloseoutAdapters({
       const codexAdapter = createGithubPrReviewAdapter({
         github: githubClient,
         reviewer: 'codex',
-        pollIntervalMs: 15_000,
-        maxWaitMs: 5 * 60_000,
+        pollIntervalMs: 5_000,
+        maxWaitMs: 30_000,
       });
       const res = await codexAdapter.requestReview({ prNumber: p, prHead });
       if (res.ok) return res.review;
@@ -943,8 +943,8 @@ export function createRealGithubPrCloseoutAdapters({
       const claudeAdapter = createGithubPrReviewAdapter({
         github: githubClient,
         reviewer: 'claude',
-        pollIntervalMs: 15_000,
-        maxWaitMs: 3 * 60_000,
+        pollIntervalMs: 5_000,
+        maxWaitMs: 30_000,
       });
       const claudeRes = await claudeAdapter.requestReview({ prNumber: p, prHead });
       if (claudeRes.ok) return claudeRes.review;
@@ -1266,7 +1266,7 @@ async function defaultPipeline({
           },
           adapters: prCloseoutAdapters,
           config: {
-            configuredReviewer: closeoutCfg.configuredReviewer ?? null,
+            configuredReviewer: resolveReviewerFallbackOrder(closeoutCfg.configuredReviewer ?? 'codex'),
             allowMerge: closeoutCfg.allowMerge === true,
             repositoryContext: closeoutCfg.repositoryContext ?? {},
             verificationCommands: commands,
@@ -1561,7 +1561,7 @@ async function defaultPipeline({
       init: closeoutInit,
       adapters: effectiveAdapters,
       config: {
-        configuredReviewer: 'codex',
+        configuredReviewer: resolveReviewerFallbackOrder('codex'),
         allowMerge: false,
         verificationCommands: readFrozenCloseoutCommands(),
       },
