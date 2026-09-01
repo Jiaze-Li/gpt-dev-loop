@@ -84,6 +84,9 @@ function emptyRoleBucket() {
     inputTokens: 0,
     outputTokens: 0,
     cachedTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    usageVolume: 0,
     totalTokens: 0,
     costUsd: 0,
     byModel: {},
@@ -121,6 +124,10 @@ function aggregateExecutorInputBreakdown(records) {
       attempt: record.attempt ?? null,
       inputTokens: record.inputTokens ?? null,
       cachedTokens: record.cachedTokens ?? null,
+      cacheReadTokens: record.cacheReadTokens ?? null,
+      cacheCreationTokens: record.cacheCreationTokens ?? null,
+      usageVolume: record.usageVolume ?? null,
+      physicalCallReason: record.physicalCallReason ?? null,
       outputTokens: record.outputTokens ?? null,
       breakdown,
       legacy: !breakdown,
@@ -209,6 +216,7 @@ export class UsageTracker {
     startedAt = null,
     completedAt = null,
     inputBreakdown = null,
+    physicalCallReason = null,
   } = {}) {
     if (!role) throw new Error('UsageTracker.record() requires a role');
 
@@ -228,19 +236,23 @@ export class UsageTracker {
     let inputTokens = null;
     let outputTokens = null;
     let cachedTokens = null;
+    let cacheReadTokens = null;
+    let cacheCreationTokens = null;
     let totalTokens = null;
 
     if (usage && typeof usage === 'object') {
       const inTok = usage.input_tokens ?? usage.inputTokens ?? usage.prompt_tokens;
       const outTok = usage.output_tokens ?? usage.outputTokens ?? usage.completion_tokens;
       const cacheRead = usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? usage.cacheReadInputTokens ?? usage.cached_input_tokens ?? 0;
-      const cacheCreate = usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens ?? 0;
+      const cacheCreate = usage.cache_creation_input_tokens ?? usage.cache_creation_tokens ?? usage.cacheCreationInputTokens ?? 0;
       const cached = cacheRead + cacheCreate;
       const totTok = usage.total_tokens ?? usage.totalTokens;
 
       if (Number.isFinite(inTok)) inputTokens = inTok;
       if (Number.isFinite(outTok)) outputTokens = outTok;
       if (cached > 0) cachedTokens = cached;
+      if (cacheRead > 0) cacheReadTokens = cacheRead;
+      if (cacheCreate > 0) cacheCreationTokens = cacheCreate;
       if (Number.isFinite(totTok)) {
         totalTokens = totTok;
       } else if (inputTokens !== null || outputTokens !== null) {
@@ -273,6 +285,13 @@ export class UsageTracker {
       inputTokens,
       outputTokens,
       cachedTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      // Provider-reported model processing volume. It is intentionally not
+      // labelled billable: membership plans do not expose a billing formula.
+      usageVolume: (inputTokens ?? 0) + (outputTokens ?? 0) + (cacheReadTokens ?? 0) + (cacheCreationTokens ?? 0),
+      membershipUsageAvailable: false,
+      physicalCallReason,
       totalTokens,
       costUsd: normalizeNumber(costUsd),
       durationMs: normalizeNumber(durationMs),
@@ -321,6 +340,9 @@ export class UsageTracker {
     if (rec.inputTokens != null) bucket.inputTokens += rec.inputTokens;
     if (rec.outputTokens != null) bucket.outputTokens += rec.outputTokens;
     if (rec.cachedTokens != null) bucket.cachedTokens += rec.cachedTokens;
+    if (rec.cacheReadTokens != null) bucket.cacheReadTokens += rec.cacheReadTokens;
+    if (rec.cacheCreationTokens != null) bucket.cacheCreationTokens += rec.cacheCreationTokens;
+    if (rec.usageVolume != null) bucket.usageVolume += rec.usageVolume;
     if (rec.totalTokens != null) bucket.totalTokens += rec.totalTokens;
     if (rec.costUsd != null) bucket.costUsd += rec.costUsd;
 
@@ -330,6 +352,9 @@ export class UsageTracker {
         inputTokens: 0,
         outputTokens: 0,
         cachedTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        usageVolume: 0,
         totalTokens: 0,
         costUsd: 0,
       };
@@ -339,6 +364,9 @@ export class UsageTracker {
     if (rec.inputTokens != null) mBucket.inputTokens += rec.inputTokens;
     if (rec.outputTokens != null) mBucket.outputTokens += rec.outputTokens;
     if (rec.cachedTokens != null) mBucket.cachedTokens += rec.cachedTokens;
+    if (rec.cacheReadTokens != null) mBucket.cacheReadTokens += rec.cacheReadTokens;
+    if (rec.cacheCreationTokens != null) mBucket.cacheCreationTokens += rec.cacheCreationTokens;
+    if (rec.usageVolume != null) mBucket.usageVolume += rec.usageVolume;
     if (rec.totalTokens != null) mBucket.totalTokens += rec.totalTokens;
     if (rec.costUsd != null) mBucket.costUsd += rec.costUsd;
 
@@ -411,6 +439,9 @@ export class UsageTracker {
       inputTokens: 0,
       outputTokens: 0,
       cachedTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      usageVolume: 0,
       totalTokens: 0,
       costUsd: 0,
     };
@@ -422,6 +453,9 @@ export class UsageTracker {
       measuredTotal.inputTokens += data.inputTokens;
       measuredTotal.outputTokens += data.outputTokens;
       measuredTotal.cachedTokens += data.cachedTokens;
+      measuredTotal.cacheReadTokens += data.cacheReadTokens;
+      measuredTotal.cacheCreationTokens += data.cacheCreationTokens;
+      measuredTotal.usageVolume += data.usageVolume;
       measuredTotal.totalTokens += data.totalTokens;
       measuredTotal.costUsd += data.costUsd;
     }
@@ -502,8 +536,12 @@ export class UsageTracker {
         for (const name of INPUT_CATEGORIES) {
           lines.push(`  ${name.padEnd(11)} ${fmt(breakdown.categories[name].tokens).padStart(7)} input tokens`);
         }
-        lines.push(`  Provider     ${fmt(breakdown.providerInputTokens).padStart(7)} input   ${fmt(breakdown.cachedTokens).padStart(7)} cached (subset)`);
+        lines.push(`  Provider     ${fmt(breakdown.providerInputTokens).padStart(7)} input   ${fmt(sum.executor.cacheReadTokens).padStart(7)} cache read   ${fmt(sum.executor.cacheCreationTokens).padStart(7)} cache creation`);
       }
+    }
+    if (sum.executor.calls > 0) {
+      lines.push(`  Executor volume ${fmt(sum.executor.usageVolume)} processed tokens (provider-reported volume; not asserted billable).`);
+      lines.push('  Claude membership usage: unavailable (provider does not report remaining quota or membership deduction).');
     }
 
     return lines.join('\n');

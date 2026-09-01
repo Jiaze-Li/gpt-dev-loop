@@ -12,6 +12,11 @@ const RETRYABLE = new Set([
 
 export function providerFailure(error) {
   const code = error?.details?.providerFailure ?? error?.providerFailure ?? error?.code;
+  // Executor correctness/protocol/budget errors are post-send outcomes. They
+  // must become REWORK/new attempt, never a hidden full rerun on another model.
+  if (code === 'EXECUTOR_BUDGET_EXCEEDED' || code === 'EXECUTOR_DUPLICATE_CALL_REJECTED' || code === 'EXECUTOR_INVALID_OUTPUT') {
+    return { code: 'EXECUTOR_IMPLEMENTATION_FAILURE' };
+  }
   if (code === 'EXECUTOR_TIMEOUT') {
     return { code: 'PROVIDER_TIMEOUT', resetAt: error?.details?.resetAt ?? error?.resetAt ?? null, retryAfter: error?.details?.retryAfter ?? error?.retryAfter ?? null };
   }

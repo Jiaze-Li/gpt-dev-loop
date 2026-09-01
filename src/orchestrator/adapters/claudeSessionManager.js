@@ -23,6 +23,7 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createClaudeExecutorAdapter } from './claudeExecutorAdapter.js';
+import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
 
 function runGit(args, { cwd, spawn }) {
   return new Promise((resolve) => {
@@ -158,10 +159,28 @@ export function createClaudeSessionManager({
   onProcessExited,
 } = {}) {
   let sessionCount = 0;
+  const physicalCalls = new Map();
 
   return {
-    async execute(taskCard, { signal } = {}) {
+    async execute(taskCard, { signal, attempt = null, physicalCallReason = 'PRIMARY' } = {}) {
       if (signal?.aborted) throw new Error('executor cancelled');
+      if (taskCard?.task_id !== taskId) {
+        throw new Error(`Claude session manager for "${taskId}" cannot execute task "${taskCard?.task_id}"`);
+      }
+      const effectiveAttempt = Number.isFinite(attempt) ? attempt : sessionCount + 1;
+      const slot = `${taskId}:${effectiveAttempt}`;
+      // The Claude adapter owns one provider only. A second full invocation in
+      // the same task/attempt is never a continuation and is therefore unsafe.
+      if (physicalCalls.has(slot)) {
+        throw new AdapterError(
+          ADAPTER_ERROR_CODES.EXECUTOR_DUPLICATE_CALL_REJECTED,
+          `duplicate executor physical call rejected for task=${taskId} attempt=${effectiveAttempt}; first reason=${physicalCalls.get(slot)}, requested reason=${physicalCallReason}`
+        );
+      }
+      if (physicalCallReason !== 'PRIMARY') {
+        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_DUPLICATE_CALL_REJECTED, `unsupported executor physical call reason: ${physicalCallReason}`);
+      }
+      physicalCalls.set(slot, physicalCallReason);
       sessionCount += 1;
       const sessionNumber = sessionCount;
 
@@ -206,7 +225,7 @@ export function createClaudeSessionManager({
       // A fresh executor per call: starts a new Claude session, waits for
       // it to finish, and collects its Execution Report. Never reuses a
       // previous call's executor/process.
-      const processContext = { role: 'executor', taskId, attempt: sessionNumber, provider: 'claude', requestedFamily: 'claude:default', resolvedModel: routing.model };
+      const processContext = { role: 'executor', taskId, attempt: effectiveAttempt, physicalCallReason, provider: 'claude', requestedFamily: 'claude:default', resolvedModel: routing.model };
       const executor = createExecutor({
         cwd, model: routing.model,
         onProcessStarted: (pid) => onProcessStarted?.({ ...processContext, pid }),
@@ -221,6 +240,7 @@ export function createClaudeSessionManager({
           model: { value: report.model || routing.model, writable: true, configurable: true, enumerable: false },
           modelEscalated: { value: routing.escalated, writable: true, configurable: true, enumerable: false },
           escalationReason: { value: routing.escalationReason, writable: true, configurable: true, enumerable: false },
+          physicalCallReason: { value: physicalCallReason, writable: false, configurable: false, enumerable: false },
         });
       } catch {
         /* best effort */

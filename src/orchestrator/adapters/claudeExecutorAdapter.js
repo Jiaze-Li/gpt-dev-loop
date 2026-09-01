@@ -389,7 +389,11 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
           });
           if (timedOut) {
             reject(
-              new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`)
+              new AdapterError(
+                ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+                `executor runtime exceeded mechanical limit of ${timeoutMs}ms`,
+                { budget: { maxRuntimeMs: timeoutMs, kind: 'local-wall-clock' }, processTreeTerminated: true }
+              )
             );
             return;
           }
@@ -525,12 +529,20 @@ export function createClaudeExecutorAdapter({
   model = 'sonnet',
   cwd = process.cwd(),
   env = process.env,
-  // The `claude` CLI exposes no supported per-Bash-command / per-tool timeout
-  // flag (verified against `claude --help`), so we do not pass one. A single
-  // hung tool call inside the Executor is bounded only by this whole-process
-  // timeoutMs, after which the provider candidate is failed over
-  // (sonnet -> codex -> opus) without consuming an implementation retry.
-  timeoutMs = 10 * 60 * 1000,
+  // The CLI exposes no supported per-tool/turn limit or real-time usage
+  // telemetry in this JSON print-mode transport. Bound the entire local
+  // process instead, so a hung invocation is stopped even when final usage
+  // telemetry never arrives. This is a terminal budget brake, not a provider
+  // transport timeout: retrying it on Opus would start another full execution.
+  timeoutMs = Number(env?.EXECUTOR_MAX_RUNTIME_MS ?? 5 * 60 * 1000),
+  // The installed CLI's print mode also supports a hard agentic-turn cap.
+  // Sixty turns leaves ordinary edit + test tasks ample room while containing
+  // accidental tool/agent loops. Set <=0 to leave the CLI default unbounded.
+  maxTurns = Number(env?.EXECUTOR_MAX_TURNS ?? 60),
+  // Claude Code's print-mode budget is the only supported in-process hard
+  // stop exposed by the installed CLI. Keep it deliberately small; callers
+  // may tune it per deployment without changing a Task Card.
+  maxBudgetUsd = Number(env?.EXECUTOR_MAX_BUDGET_USD ?? 0.50),
   spawn = nodeSpawn,
   onActivity,
   onProcessStarted,
@@ -544,9 +556,14 @@ export function createClaudeExecutorAdapter({
         '-p',
         '--output-format',
         'json',
+        // Each Task Card is a disposable process/session. This prevents a
+        // later CLI invocation from being resumed accidentally from disk.
+        '--no-session-persistence',
         '--permission-mode',
         'acceptEdits',
         ...(model ? ['--model', model] : []),
+        ...(Number.isFinite(maxTurns) && maxTurns > 0 ? ['--max-turns', String(Math.floor(maxTurns))] : []),
+        ...(Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0 ? ['--max-budget-usd', String(maxBudgetUsd)] : []),
         ...(allowedTools.length > 0 ? ['--allowedTools', ...allowedTools] : []),
       ];
       const prompt = buildPrompt(taskCard);
@@ -566,9 +583,18 @@ export function createClaudeExecutorAdapter({
       });
 
       if (result.code !== 0) {
+        const diagnostic = (result.stderr || result.stdout).trim();
+        if (/budget|spend limit|max[- ]budget/i.test(diagnostic)) {
+          throw new AdapterError(
+            ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+            `executor budget exceeded (${maxBudgetUsd} USD): ${diagnostic}`,
+            { budget: { maxBudgetUsd, kind: 'provider-reported-cost' } }
+          );
+        }
         throw new AdapterError(
           ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE,
-          `executor "${command}" exited with code ${result.code}: ${(result.stderr || result.stdout).trim()}`
+          `executor "${command}" exited with code ${result.code}: ${diagnostic}`,
+          { providerFailure: 'PROVIDER_UNAVAILABLE' }
         );
       }
 
@@ -609,6 +635,19 @@ export function createClaudeExecutorAdapter({
       }
 
       const report = parseExecutionReport(taskCard.task_id, reportText);
+      const maxCacheReadTokens = Number(env?.EXECUTOR_MAX_CACHE_READ_TOKENS ?? 250_000);
+      const maxOutputTokens = Number(env?.EXECUTOR_MAX_OUTPUT_TOKENS ?? 20_000);
+      if ((Number.isFinite(maxCacheReadTokens) && maxCacheReadTokens > 0 && (usage?.cache_read_tokens ?? 0) > maxCacheReadTokens)
+        || (Number.isFinite(maxOutputTokens) && maxOutputTokens > 0 && (usage?.output_tokens ?? 0) > maxOutputTokens)) {
+        throw new AdapterError(
+          ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+          `executor usage exceeded hard budget (cacheRead=${usage?.cache_read_tokens ?? 0}/${maxCacheReadTokens}, output=${usage?.output_tokens ?? 0}/${maxOutputTokens})`,
+          {
+            budget: { maxBudgetUsd, maxCacheReadTokens, maxOutputTokens },
+            usage,
+          }
+        );
+      }
       Object.defineProperty(report, 'permissionDenials', {
         value: permissionDenials,
         writable: false,

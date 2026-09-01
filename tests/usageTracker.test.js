@@ -141,6 +141,24 @@ test('usageTracker: reconciles Executor input composition without double-countin
   assert.match(aggregate.semantics, /not added/);
 });
 
+test('usageTracker: exposes cache read, cache creation and non-billable usage volume separately', () => {
+  const tracker = new UsageTracker();
+  const rec = tracker.record({
+    role: 'executor',
+    taskId: 'small-task',
+    attempt: 1,
+    physicalCallReason: 'PRIMARY',
+    usage: { input_tokens: 100, output_tokens: 25, cache_read_tokens: 3_500_000, cache_creation_tokens: 10 },
+  });
+  const executor = tracker.summary().executor;
+  assert.equal(rec.physicalCallReason, 'PRIMARY');
+  assert.equal(executor.cacheReadTokens, 3_500_000);
+  assert.equal(executor.cacheCreationTokens, 10);
+  assert.equal(executor.usageVolume, 3_500_135);
+  assert.equal(executor.totalTokens, 125, 'legacy total remains input + output, not a billing claim');
+  assert.equal(rec.membershipUsageAvailable, false);
+});
+
 test('usageTracker: legacy Executor records remain present with unavailable breakdown', () => {
   const tracker = UsageTracker.fromJSON({ records: [{ role: 'executor', inputTokens: 77, cachedTokens: 12, outputTokens: 4 }] });
   const summary = tracker.summary();

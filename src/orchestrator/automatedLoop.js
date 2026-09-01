@@ -700,7 +700,7 @@ export async function runAutomatedWorkflow({
 
     let executionReport;
     try {
-      executionReport = await claudeManager.execute(executorTaskCard, { signal });
+      executionReport = await claudeManager.execute(executorTaskCard, { signal, attempt: attemptCount, physicalCallReason: 'PRIMARY' });
     } catch (err) {
       if (isCancellation(err, signal)) throw err;
       log(`executor infrastructure failure: task=${currentTaskCard.task_id} attempt=${attemptCount} error=${err.message}`);
@@ -744,6 +744,7 @@ export async function runAutomatedWorkflow({
         workflowId,
         role: 'executor',
         callId: executionReport?.callId ?? executionReport?.usage?.callId,
+        physicalCallReason: executionReport?.physicalCallReason ?? 'PRIMARY',
         taskId: currentTaskCard.task_id,
         attempt: attemptCount,
         provider: executionReport?.provider ?? (executionReport?.model?.startsWith('claude') ? 'claude' : (executionReport?.model?.startsWith('codex') ? 'codex' : 'claude')),

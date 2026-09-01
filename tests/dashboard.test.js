@@ -391,6 +391,10 @@ test('C. Workflow selector badge is identical to the header badge (single canoni
     taskId: 'task-x',
     taskName: 'Review stage in progress',
     startedAt: '2026-08-31T04:00:00.000Z',
+    // Keep this active fixture within the liveness grace window. The historic
+    // startedAt is intentionally stale now and would otherwise be reconciled
+    // to STOPPED before the selector projection is built.
+    heartbeatAt: new Date().toISOString(),
   };
   fs.writeFileSync(path.join(root, `${wf}.state.json`), JSON.stringify(state, null, 2));
 

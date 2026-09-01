@@ -2045,6 +2045,30 @@ test('regression: an Executor provider timeout fails over sonnet -> codex -> opu
   assert.equal(events.filter((e) => e.type === 'ROLE_INVOCATION_SUCCEEDED').length, 1);
 });
 
+test('executor mechanical budget breaker is not silently failed over into a second full provider run', async () => {
+  const attempted = [];
+  const runtime = createProductionRoleRuntime({
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }, { family: 'claude:opus' }] },
+    quotaRegistry: new QuotaPoolRegistry({ filePath: null }),
+    providerHealth: new ProviderHealthRegistry(),
+    resolveFamily: (family) => ({ requestedFamily: family, resolvedModel: family, provider: 'claude', capabilities: { roles: ['executor'] } }),
+    adapters: {
+      executor: {
+        'claude:sonnet': async () => {
+          attempted.push('sonnet');
+          throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED, 'executor runtime exceeded mechanical limit');
+        },
+        'claude:opus': async () => {
+          attempted.push('opus');
+          return demoExecutionReport('task-1');
+        },
+      },
+    },
+  });
+  await assert.rejects(() => runtime.invoke('executor', { taskCard: demoTaskCard() }), (err) => err.code === ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED);
+  assert.deepEqual(attempted, ['sonnet']);
+});
+
 // --- Executor unauthorized-probe attribution & Escalation Budget Tests ---
 
 function makeScriptedClaudeManagerFactory(reportsByTaskId) {

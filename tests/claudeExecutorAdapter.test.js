@@ -79,7 +79,9 @@ function makeFakeSpawn({ stdout = '', stderr = '', code = 0, spawnError = null, 
       write: (chunk) => written.push(chunk),
       end: () => {},
     };
-    child.kill = () => {
+    child.killSignals = [];
+    child.kill = (signal) => {
+      child.killSignals.push(signal);
       queueMicrotask(() => child.emit('close', null));
     };
     child.written = written;
@@ -255,14 +257,30 @@ test('claude executor adapter: non-zero exit code throws EXECUTOR_UNAVAILABLE', 
   });
 });
 
-test('claude executor adapter: a hung process throws EXECUTOR_TIMEOUT', async () => {
+test('claude executor adapter: a hung process is mechanically killed and throws EXECUTOR_BUDGET_EXCEEDED', async () => {
   const { spawn } = makeFakeSpawn({ hang: true });
-  const adapter = createClaudeExecutorAdapter({ spawn, timeoutMs: 20 });
+  let child;
+  const adapter = createClaudeExecutorAdapter({
+    spawn: (...args) => {
+      child = spawn(...args);
+      return child;
+    },
+    env: { EXECUTOR_MAX_RUNTIME_MS: '20' },
+  });
 
   await assert.rejects(() => adapter.execute(demoTaskCard()), (err) => {
-    assert.equal(err.code, ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT);
+    assert.equal(err.code, ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED);
+    assert.equal(err.details.budget.maxRuntimeMs, 20);
+    assert.equal(err.details.processTreeTerminated, true);
     return true;
   });
+  assert.deepEqual(child.killSignals, ['SIGTERM']);
+});
+
+test('claude executor adapter: a normal short process completes before its mechanical runtime limit', async () => {
+  const { spawn } = makeFakeSpawn({ stdout: reportText() });
+  const report = await createClaudeExecutorAdapter({ spawn, env: { EXECUTOR_MAX_RUNTIME_MS: '20' } }).execute(demoTaskCard());
+  assert.equal(report.status, 'DONE');
 });
 
 test('claude executor adapter: extracts usage and cost from json output and triggers process hooks', async () => {
@@ -312,6 +330,8 @@ test('claude executor adapter: extracts usage and cost from json output and trig
   assert.ok(activityEvents.length > 0);
   assert.ok(calls[0].args.includes('--model'));
   assert.ok(calls[0].args.includes('sonnet'));
+  assert.ok(calls[0].args.includes('--max-turns'));
+  assert.ok(calls[0].args.includes('60'));
   assert.ok(calls[0].args.includes('--output-format'));
   assert.ok(calls[0].args.includes('json'));
 });
@@ -326,6 +346,33 @@ test('claude executor adapter: exposes provider permission denial telemetry', as
   assert.deepEqual(report.permissionDenials, [
     { tool_name: 'Bash', tool_input: { command: 'node -e 1' } },
   ]);
+});
+
+test('claude executor adapter: fixture cache growth trips EXECUTOR_BUDGET_EXCEEDED and preserves fresh-session flags', async () => {
+  const payload = JSON.stringify({
+    result: reportText(),
+    usage: {
+      input_tokens: 100,
+      output_tokens: 12,
+      cache_read_input_tokens: 3_500_000,
+      cache_creation_input_tokens: 0,
+    },
+  });
+  const { spawn, calls } = makeFakeSpawn({ stdout: payload });
+  const adapter = createClaudeExecutorAdapter({
+    spawn,
+    env: { EXECUTOR_MAX_CACHE_READ_TOKENS: '250000', EXECUTOR_MAX_OUTPUT_TOKENS: '20000' },
+  });
+
+  await assert.rejects(() => adapter.execute(demoTaskCard()), (err) => {
+    assert.equal(err.code, ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED);
+    assert.match(err.message, /3500000\/250000/);
+    return true;
+  });
+  assert.ok(calls[0].args.includes('--no-session-persistence'));
+  assert.ok(calls[0].args.includes('--max-budget-usd'));
+  assert.ok(!calls[0].args.includes('--resume'));
+  assert.ok(!calls[0].args.includes('--continue'));
 });
 
 test('claude executor adapter: builds only exact allowed tools for approved node and npm commands', () => {
@@ -566,4 +613,3 @@ test('executor adapter: allowedTools / permission config is not loosened (no wil
   assert.ok(!args.some((a) => typeof a === 'string' && /Bash\(\*|Bash$|--dangerously/i.test(a)));
   assert.ok(!args.includes('--allowedTools') || args.filter((a) => a === 'Bash(npm test)' || a === 'Bash(node --test tests/a.test.js)').length === 2);
 });
-

@@ -401,6 +401,8 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
             <div style="font-weight: 600; margin-bottom: 6px; font-size: 12px; color: var(--text-secondary); text-transform: uppercase;">Token Breakdown</div>
             <div class="prop-row"><span class="prop-key">Planner</span><span class="prop-val" id="tok-planner">0</span></div>
             <div class="prop-row"><span class="prop-key">Executor</span><span class="prop-val" id="tok-executor">0</span></div>
+            <div class="prop-row"><span class="prop-key">Executor model volume</span><span class="prop-val" id="tok-executor-volume">0</span></div>
+            <div class="prop-row"><span class="prop-key">Membership usage</span><span class="prop-val" id="tok-membership-usage">Unavailable</span></div>
             <div class="prop-row"><span class="prop-key">Internal Reviewer</span><span class="prop-val" id="tok-internal-reviewer">0</span></div>
             <div class="prop-row"><span class="prop-key">Supervisor</span><span class="prop-val" id="tok-supervisor">0</span></div>
             <div class="prop-row" style="margin-top: 4px; border-top: 1px dashed var(--border); padding-top: 4px;">
@@ -729,6 +731,9 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
         // Executor
         const eTok = usage.executor?.totalTokens || 0;
         document.getElementById('tok-executor').textContent = eTok > 0 ? eTok.toLocaleString() : (usage.executor?.calls > 0 ? \`\${usage.executor.calls} calls\` : '0');
+        const eVolume = usage.executor?.usageVolume || 0;
+        document.getElementById('tok-executor-volume').textContent = eVolume > 0 ? \`\${eVolume.toLocaleString()} processed (not billing)\` : '0';
+        document.getElementById('tok-membership-usage').textContent = usage.executor?.membershipUsageAvailable === true ? 'Available' : 'Unavailable (provider does not report quota)';
 
         // Internal Reviewer
         const irTok = (usage.internalReviewer?.totalTokens ?? usage.reviewer?.totalTokens) || 0;
@@ -771,7 +776,7 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
           inputBreakdownContainer.innerHTML = Object.keys(categoryLabels).map(k => {
             const item = inputAggregate.categories?.[k] || {};
             return \`<div class="prop-row"><span class="prop-key">\${categoryLabels[k]}</span><span class="prop-val">\${(item.tokens || 0).toLocaleString()} input tok</span></div>\`;
-          }).join('') + \`<div class="prop-row"><span class="prop-key">Provider totals</span><span class="prop-val">\${(inputAggregate.providerInputTokens || 0).toLocaleString()} input · \${(inputAggregate.cachedTokens || 0).toLocaleString()} cached (subset)</span></div>\`;
+          }).join('') + \`<div class="prop-row"><span class="prop-key">Provider totals</span><span class="prop-val">\${(inputAggregate.providerInputTokens || 0).toLocaleString()} input · \${(usage.executor?.cacheReadTokens || 0).toLocaleString()} cache read · \${(usage.executor?.cacheCreationTokens || 0).toLocaleString()} cache creation</span></div>\`;
           inputCallsContainer.innerHTML = inputCalls.map((call, index) => {
             if (!call.breakdown) return \`<div class="prop-row"><span class="prop-key">Call \${index + 1}</span><span class="prop-val">Unavailable (legacy)</span></div>\`;
             const composition = Object.keys(categoryLabels).map(k => \`\${categoryLabels[k]} \${(call.breakdown.categories?.[k]?.tokens || 0).toLocaleString()}\`).join(' · ');
