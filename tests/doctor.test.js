@@ -103,7 +103,7 @@ test('runDoctor requires AGY, Claude, and Codex symmetrically', async () => {
       policyOptions,
     });
     assert.equal(report.ok, true);
-    assert.deepEqual(Object.keys(report.results).sort(), ['agy', 'claude', 'codex', 'git', 'global_policy', 'node']);
+    assert.deepEqual(Object.keys(report.results).sort(), ['agy', 'claude', 'codex', 'front_agent_contract', 'git', 'global_policy', 'node']);
     assert.ok(lines.includes('doctor: all prerequisites satisfied'));
   } finally {
     await rm(home, { recursive: true, force: true });

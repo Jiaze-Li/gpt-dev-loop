@@ -97,6 +97,58 @@ export function checkGlobalPolicy({
   return { name: 'global_policy', ok, frontends, agyMcp, agySkill, issues };
 }
 
+// Zero-model-token mechanical check that the unified Front-Agent local-wait
+// contract is in effect and the retired auto-watch contract is gone. Verifies:
+//   - COMMON declares a contract version >= 2,
+//   - COMMON routes autonomous launches through `supergpt_start_and_wait`,
+//   - COMMON no longer instructs an automatic `supergpt_watch` attach/loop,
+//   - the MCP server actually registers `supergpt_start_and_wait`.
+// COMMON is byte-identical across Claude / Codex / AGY (enforced by
+// checkGlobalPolicy), so a single source check covers all three frontends.
+export function checkFrontAgentContract({
+  policyFile = DEFAULT_POLICY_FILE,
+  serverFile = fileURLToPath(new URL('../src/mcp/supergptMcpServer.js', import.meta.url)),
+} = {}) {
+  const issues = [];
+  let contractVersion = null;
+  let common;
+  try {
+    common = readFileSync(policyFile, 'utf8');
+  } catch (err) {
+    return { name: 'front_agent_contract', ok: false, contractVersion: null, issues: [`unreadable COMMON policy: ${err.message}`] };
+  }
+
+  const versionMatch = common.match(/Contract version:\s*(\d+)/i);
+  if (!versionMatch) {
+    issues.push('COMMON policy has no "Contract version:" declaration');
+  } else {
+    contractVersion = Number(versionMatch[1]);
+    if (contractVersion < 2) issues.push(`COMMON contract version ${contractVersion} predates the unified local-wait entrypoint (need >= 2)`);
+  }
+
+  if (!/supergpt_start_and_wait/.test(common)) {
+    issues.push('COMMON policy does not route autonomous launches through supergpt_start_and_wait');
+  }
+  if (/Attach\s+`?supergpt_watch/i.test(common)) {
+    issues.push('COMMON policy still instructs an automatic supergpt_watch attach (retired auto-watch contract)');
+  }
+  if (!/do not (?:use|loop)[\s\S]{0,120}supergpt_watch/i.test(common) && !/must not loop on watch/i.test(common)) {
+    issues.push('COMMON policy does not explicitly forbid an automatic watch/wait polling loop');
+  }
+
+  let serverSource = null;
+  try {
+    serverSource = readFileSync(serverFile, 'utf8');
+  } catch (err) {
+    issues.push(`unreadable MCP server source: ${err.message}`);
+  }
+  if (serverSource !== null && !/registerTool\(\s*['"]supergpt_start_and_wait['"]/.test(serverSource)) {
+    issues.push('MCP server does not register the supergpt_start_and_wait tool');
+  }
+
+  return { name: 'front_agent_contract', ok: issues.length === 0, contractVersion, issues };
+}
+
 function probe(execSync, command) {
   return String(execSync(command, { stdio: ['ignore', 'pipe', 'ignore'] })).trim();
 }
@@ -159,19 +211,29 @@ export function runDoctor({ execSync, log, env, policyOptions } = {}) {
   const environment = env || process.env;
 
   const policy = checkGlobalPolicy({ env: environment, ...(policyOptions || {}) });
+  const contract = checkFrontAgentContract(policyOptions?.contractOptions || {});
   // Core local runtime prerequisites. global_policy is reported as diagnostic
   // info/warning only — a missing or stale global install never fails runDoctor.
+  // front_agent_contract IS fatal: it is a repo invariant, not an install state,
+  // and its whole purpose is to fail loudly if the retired auto-watch contract
+  // creeps back in.
   const coreResults = [
     checkGit({ execSync: exec }),
     checkNode({ env: environment }),
     checkAgy({ execSync: exec }),
     checkClaude({ execSync: exec }),
     checkCodex({ execSync: exec }),
+    contract,
   ];
   const results = [...coreResults, policy];
   const ok = coreResults.every((r) => r.ok);
 
   for (const r of coreResults) {
+    if (r.name === 'front_agent_contract') {
+      if (r.ok) write(`  ok    front_agent_contract (v${r.contractVersion}, unified supergpt_start_and_wait, no auto-watch loop)`);
+      else for (const issue of r.issues) write(`  FAIL  front_agent_contract: ${issue}`);
+      continue;
+    }
     if (r.ok) write(`  ok    ${r.name}${r.version ? ` (${r.version})` : ''}`);
     else write(`  FAIL  ${r.name}: ${r.error || 'not found'}`);
   }
