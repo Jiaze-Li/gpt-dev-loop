@@ -271,7 +271,7 @@ const DERIVE_CONVENTIONAL_ROOT_RE = /^(?:src|lib|app|pkg|internal|cmd|scripts?|c
 const DERIVE_VERIFY_CMD_RE = /^(?:npm|npx|pnpm|yarn|bun|deno|node|python3?|py|pytest|tox|unittest|cargo|go|make|just|jest|vitest|mocha|ava|tap|rspec|rake|bundle\s+exec|phpunit|composer|dotnet|gradle|\.\/gradlew|mvn|ctest|cmake|swift|dart|flutter|elixir|mix|rustc|tsc|eslint|ruff|pyright|mypy)\b/i;
 const DERIVE_CMD_UNSAFE_RE = /[;&|<>`$\n]|\|\||&&/;
 
-function deriveVerificationCommands(goal) {
+function deriveExplicitVerificationCommands(goal) {
   const text = String(goal ?? '');
   const candidates = [];
   // 1. backtick-quoted spans
@@ -297,6 +297,102 @@ function deriveVerificationCommands(goal) {
     out.push(c);
   }
   return out;
+}
+
+function readJsonFile(full) {
+  try {
+    return JSON.parse(fs.readFileSync(full, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function readTextFile(full) {
+  try {
+    return fs.readFileSync(full, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+// Conservative, evidence-gated fallback: when the request itself carries no
+// explicit verification command, derive the ONE canonical test command the
+// workspace mechanically implies. No guessing from a file extension — every
+// branch below requires a concrete on-disk marker. No usable cwd, or no
+// marker, returns [] (-> FULL_NO_BOUNDED_TASK unchanged).
+function deriveWorkspaceVerificationCommands(cwd, namedFiles) {
+  if (!cwd || typeof cwd !== 'string') return [];
+  let cwdIsDir = false;
+  try { cwdIsDir = fs.existsSync(cwd) && fs.statSync(cwd).isDirectory(); } catch { cwdIsDir = false; }
+  if (!cwdIsDir) return [];
+
+  const pkg = readJsonFile(path.join(cwd, 'package.json'));
+
+  // A. package.json defines a standard `test` script -> `npm test`.
+  //    This is the repository's own declared verification entrypoint and is
+  //    preferred over any more specific command. We deliberately do NOT infer
+  //    a non-npm package manager here — expanding that is out of scope.
+  if (pkg && typeof pkg === 'object') {
+    const testScript = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts.test : null;
+    if (isNonEmptyString(testScript)) {
+      return ['npm test'];
+    }
+  }
+
+  const testTargets = (Array.isArray(namedFiles) ? namedFiles : [])
+    .filter((f) => DERIVE_TEST_FILE_RE.test(f))
+    .map((f) => f.trim())
+    .filter(Boolean)
+    .sort();
+
+  // B. node:test — only when the request names concrete test file(s) AND the
+  //    package config shows explicit `node --test` evidence (another script
+  //    invokes it). Built-in runner, no dependency needed, but we still demand
+  //    a marker so a bare `.test.js` name never alone selects a runner.
+  if (testTargets.length > 0 && pkg && pkg.scripts && typeof pkg.scripts === 'object') {
+    const usesNodeTest = Object.values(pkg.scripts).some(
+      (v) => typeof v === 'string' && /\bnode\s+(?:--test|--experimental-test-runner)\b/.test(v),
+    );
+    if (usesNodeTest) {
+      const cmd = `node --test ${testTargets.join(' ')}`;
+      if (cmd.length <= 160 && !DERIVE_CMD_UNSAFE_RE.test(cmd)) return [cmd];
+      return ['node --test'];
+    }
+  }
+
+  // C. pytest — only with an explicit pytest project marker on disk.
+  const pytestMarkers = [
+    () => fs.existsSync(path.join(cwd, 'pytest.ini')),
+    () => fs.existsSync(path.join(cwd, 'conftest.py')),
+    () => {
+      const t = readTextFile(path.join(cwd, 'pyproject.toml'));
+      return !!t && /\[tool\.pytest(?:\.ini_options)?\]/.test(t);
+    },
+    () => {
+      const t = readTextFile(path.join(cwd, 'setup.cfg'));
+      return !!t && /\[tool:pytest\]/.test(t);
+    },
+    () => {
+      const t = readTextFile(path.join(cwd, 'tox.ini'));
+      return !!t && /\bpytest\b/.test(t);
+    },
+  ];
+  if (pytestMarkers.some((probe) => { try { return probe(); } catch { return false; } })) {
+    const pyTargets = testTargets.filter((f) => /\.py$/i.test(f));
+    const cmd = pyTargets.length > 0 ? `pytest ${pyTargets.join(' ')}` : 'pytest';
+    if (cmd.length <= 160 && !DERIVE_CMD_UNSAFE_RE.test(cmd)) return [cmd];
+    return ['pytest'];
+  }
+
+  return [];
+}
+
+// Explicit request-supplied commands always win; the workspace fallback only
+// runs when the request carries none.
+function deriveVerificationCommands(goal, { cwd = null, namedFiles = [] } = {}) {
+  const explicit = deriveExplicitVerificationCommands(goal);
+  if (explicit.length > 0) return explicit;
+  return deriveWorkspaceVerificationCommands(cwd, namedFiles);
 }
 
 function deriveAllowedFiles(goal, cwd) {
@@ -402,7 +498,7 @@ export function deriveBoundedTaskFromGoal(goal, { cwd = null } = {}) {
   if (allowed_files.length === 0) return null;
   if (allowed_files.length > FAST_PATH_MAX_FILES) return null;
 
-  const verification_commands = deriveVerificationCommands(goal);
+  const verification_commands = deriveVerificationCommands(goal, { cwd, namedFiles: named });
   if (verification_commands.length === 0) return null;
 
   return {

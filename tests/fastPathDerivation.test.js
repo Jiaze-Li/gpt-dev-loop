@@ -248,6 +248,105 @@ test('regression: explicitFullPath overrides a derivable goal', () => {
 });
 
 // ============================================================
+// WORKSPACE-DERIVED VERIFICATION FALLBACK (recommendation B)
+//
+// A natural-language goal that names an impl file + a test file but carries
+// NO explicit "Verify with ..." clause must still reach Fast Path when the
+// workspace itself mechanically implies the canonical test command.
+// ============================================================
+
+test('fallback positive 1: impl + test named, no verify clause, package.json scripts.test -> FAST via `npm test` (Section-I class)', () => {
+  const cwd = repo({
+    'src/kebabCase.js': 'export function kebabCase(){ throw new Error("not implemented"); }\n',
+    'tests/kebabCase.test.js': 'import { kebabCase } from "../src/kebabCase.js";\n',
+    'package.json': '{"scripts":{"test":"node --test"}}\n',
+  });
+  const goal = 'Add a single function kebabCase(str) to src/kebabCase.js that converts camelCase, spaces and hyphens to kebab-case, with 6 node:test cases in tests/kebabCase.test.js';
+
+  const d = selectWorkflowPath({ goal, cwd });
+  assert.equal(d.path, WORKFLOW_PATHS.FAST);
+  assert.equal(d.reason, PATH_SELECTION_REASONS.FAST_DERIVED_BOUNDED_TASK);
+  assert.deepEqual(d.taskContract.allowed_files, ['src/kebabCase.js']);
+  assert.deepEqual(d.taskContract.forbidden_files, ['tests/kebabCase.test.js']);
+  assert.deepEqual(d.taskContract.verification_commands, ['npm test']);
+});
+
+test('fallback positive 2: same goal through the real selectWorkflowPath entry with a worktree-style isolated cwd -> FAST', () => {
+  // Mimic the isolated worktree the real workflow passes as `cwd`: the target
+  // impl/test files and package.json actually exist inside that root.
+  const isolatedFixtureRoot = repo({
+    'src/snakeCase.js': 'export function snakeCase(){ throw new Error("nyi"); }\n',
+    'tests/snakeCase.test.js': '// acceptance spec\n',
+    'package.json': '{"name":"wt","scripts":{"test":"node --test"}}\n',
+    'README.md': '# wt\n',
+  });
+  const goal = 'Add a single function snakeCase(str) to src/snakeCase.js that converts camelCase, spaces, and hyphens to snake_case, with 6 node:test cases in tests/snakeCase.test.js';
+
+  const d = selectWorkflowPath({ goal, cwd: isolatedFixtureRoot });
+  assert.equal(d.path, WORKFLOW_PATHS.FAST);
+  assert.equal(d.reason, PATH_SELECTION_REASONS.FAST_DERIVED_BOUNDED_TASK);
+  assert.deepEqual(d.taskContract.verification_commands, ['npm test']);
+});
+
+test('fallback positive 3: no scripts.test but another script invokes `node --test` + named test files -> FAST via `node --test <files>`', () => {
+  const cwd = repo({
+    'src/pad.js': '\n',
+    'tests/pad.test.js': '\n',
+    'package.json': '{"scripts":{"ci":"node --test tests/"}}\n',
+  });
+  const goal = 'Implement src/pad.js with 4 node:test cases in tests/pad.test.js';
+  const d = selectWorkflowPath({ goal, cwd });
+  assert.equal(d.path, WORKFLOW_PATHS.FAST);
+  assert.equal(d.reason, PATH_SELECTION_REASONS.FAST_DERIVED_BOUNDED_TASK);
+  assert.deepEqual(d.taskContract.verification_commands, ['node --test tests/pad.test.js']);
+});
+
+test('fallback negative 3: impl + test named but no mechanically-determinable runner -> FULL_NO_BOUNDED_TASK', () => {
+  const cwd = repo({ 'src/kebabCase.js': '\n', 'tests/kebabCase.test.js': '\n' });
+  const goal = 'Implement src/kebabCase.js with 6 node:test cases in tests/kebabCase.test.js';
+  const d = selectWorkflowPath({ goal, cwd });
+  assert.equal(d.path, WORKFLOW_PATHS.FULL);
+  assert.equal(d.reason, PATH_SELECTION_REASONS.FULL_NO_BOUNDED_TASK);
+});
+
+test('fallback negative 4: package.json present but no scripts.test and no other runner evidence -> FULL', () => {
+  const cwd = repo({
+    'src/kebabCase.js': '\n',
+    'tests/kebabCase.test.js': '\n',
+    'package.json': '{"name":"x","scripts":{"build":"tsc"}}\n',
+  });
+  const goal = 'Implement src/kebabCase.js with 6 node:test cases in tests/kebabCase.test.js';
+  const d = selectWorkflowPath({ goal, cwd });
+  assert.equal(d.path, WORKFLOW_PATHS.FULL);
+  assert.equal(d.reason, PATH_SELECTION_REASONS.FULL_NO_BOUNDED_TASK);
+});
+
+test('fallback negative 5: multi-step goal still FULL even though `npm test` is discoverable', () => {
+  const cwd = repo({
+    'src/a.js': '\n',
+    'src/b.js': '\n',
+    'tests/a.test.js': '\n',
+    'package.json': '{"scripts":{"test":"node --test"}}\n',
+  });
+  const goal = 'Implement the handler in src/a.js, then wire it into src/b.js, with tests in tests/a.test.js';
+  const d = selectWorkflowPath({ goal, cwd });
+  assert.equal(d.path, WORKFLOW_PATHS.FULL);
+  assert.equal(d.reason, PATH_SELECTION_REASONS.FULL_EXPLICIT_MULTI_STEP);
+});
+
+test('fallback negative 6: an explicit verification command wins and is not overridden by the workspace fallback', () => {
+  const cwd = repo({
+    'src/a.js': '\n',
+    'tests/a.test.js': '\n',
+    'package.json': '{"scripts":{"test":"node --test"}}\n',
+  });
+  const goal = 'Implement src/a.js against tests/a.test.js. Verify with `node --test tests/a.test.js`.';
+  const d = selectWorkflowPath({ goal, cwd });
+  assert.equal(d.path, WORKFLOW_PATHS.FAST);
+  assert.deepEqual(d.taskContract.verification_commands, ['node --test tests/a.test.js']);
+});
+
+// ============================================================
 // UNIT — deriveBoundedTaskFromGoal directly
 // ============================================================
 
