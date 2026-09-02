@@ -1737,6 +1737,14 @@ async function defaultPipeline({
       return evidence;
     },
   };
+  // BASELINE-DIFF GATE: the pre-Executor baseline verification uses the same
+  // deterministic command runner against the (still clean) isolated worktree,
+  // but is not a "verification finished" milestone for the user-facing stream.
+  const baselineGateRunner = {
+    async run(commands) {
+      return baseGate.run(commands);
+    },
+  };
 
   const frozenCloseoutCommands = readFrozenCloseoutCommands();
 
@@ -1751,6 +1759,7 @@ async function defaultPipeline({
       onProcessExited: (details) => workflowStateManager?.recordProviderProcessExit(details),
     }),
     gateRunner,
+    baselineGateRunner,
     windowSession,
     persistence,
     workflowGoal: plan,

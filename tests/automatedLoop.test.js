@@ -3599,3 +3599,294 @@ test('no-new-information: identical dashboard Gate failure + unchanged diff stop
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── BASELINE-DIFF GATE ──────────────────────────────────────────────────
+// Pre-existing / out-of-scope verification failures are attributed to the
+// repository baseline, never to the current task, and never drive REWORK.
+
+// A gate runner that returns a fixed evidence object (optionally a different
+// one after the first call), and counts its calls.
+function fixedGateRunner(evidence, evidenceAfterFirst) {
+  const runs = [];
+  return {
+    runs,
+    async run(commands) {
+      runs.push(commands);
+      const ev = (runs.length > 1 && evidenceAfterFirst) ? evidenceAfterFirst : evidence;
+      return JSON.parse(JSON.stringify(ev));
+    },
+  };
+}
+function failEvidence(failLines) {
+  return {
+    pass: false,
+    results: [{ command: 'npm test', pass: false, exitCode: 1, output: failLines.join('\n') }],
+    changed_files: ['src/x.js'],
+    diff: 'diff --git a/src/x.js b/src/x.js\n+// change\n',
+  };
+}
+const DASHBOARD_3 = ['✖ dashboard A (1ms)', '✖ dashboard B (2ms)', '✖ dashboard C (3ms)'];
+
+test('baseline-diff A: identical pre-existing failures -> task Gate PASSes, no REWORK, 1 Executor call, WARNING event', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-bdg-a-'));
+  try {
+    const taskCard = demoTaskCard({ task_id: 'add-feature', verification_commands: ['npm test'] });
+    const supervisor = makeFakeSupervisor([
+      { action: 'NEXT_TASK', task_card: taskCard },
+      { action: 'WORKFLOW_DONE', summary: 'done — baseline failures are not mine' },
+    ]);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+    const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+    const baselineGateRunner = fixedGateRunner(failEvidence(DASHBOARD_3));
+    const gateRunner = fixedGateRunner(failEvidence(DASHBOARD_3));
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-bdg-a', kind: 'INTERNAL_TEST', root });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-bdg-a',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      baselineGateRunner,
+      windowSession: makeFakeWindowSession(),
+      workflowStateManager,
+      workflowGoal: 'add a feature',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'WORKFLOW_DONE');
+    assert.equal(baselineGateRunner.runs.length, 1, 'baseline verification ran exactly once (pre-Executor)');
+    assert.equal(createClaudeSessionManager.managers[0].executions.length, 1, 'no REWORK — a single Executor call');
+    assert.equal(createReviewerSession.created[0].reviewCalls, 1, 'the task reached the Reviewer (treated as Gate PASS)');
+
+    const projection = summarizeSafetyEvents(workflowStateManager.getSafetyEvents());
+    assert.equal(projection.hasBlocking, false, 'ignoring baseline failures is not BLOCKING');
+    const warn = projection.warningSafetyEvents.find((e) => e.code === 'PREEXISTING_VERIFICATION_FAILURES');
+    assert.ok(warn, 'a PREEXISTING_VERIFICATION_FAILURES warning is recorded');
+    assert.match(warn.reason, /dashboard A/);
+    assert.equal(warn.taskId, taskCard.task_id);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('baseline-diff B: current adds a NEW failure -> Gate FAIL, required_changes scoped to the new failure only', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-bdg-b-'));
+  try {
+    const taskCard = demoTaskCard({ task_id: 'graph-algorithms', verification_commands: ['npm test'] });
+    const supervisor = makeFakeSupervisor([
+      { action: 'NEXT_TASK', task_card: taskCard },
+      { action: 'CONTINUE_REWORK' },
+      { action: 'CONTINUE_REWORK' },
+      { action: 'CONTINUE_REWORK' },
+      { action: 'CONTINUE_REWORK' },
+    ]);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [] });
+    const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+    const baselineGateRunner = fixedGateRunner(failEvidence(DASHBOARD_3));
+    // Every post-Executor gate run: the 3 pre-existing + 1 genuinely new failure.
+    const gateRunner = fixedGateRunner(failEvidence([...DASHBOARD_3, '✖ graph vertexCount is correct (4ms)']));
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-bdg-b', kind: 'INTERNAL_TEST', root });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-bdg-b',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      baselineGateRunner,
+      windowSession: makeFakeWindowSession(),
+      workflowStateManager,
+      workflowGoal: 'implement graph algorithms',
+      repositoryContext: taskCard.repository_context,
+      maxAttemptsPerTask: 2,
+      maxEscalationAttempts: 1,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED', 'the NEW failure keeps driving REWORK until the guard trips');
+    const attempts = workflowStateManager.getState().taskAttempts.filter((a) => a.gateResult === 'FAIL');
+    assert.ok(attempts.length >= 1);
+    for (const a of attempts) {
+      const joined = (a.requiredChanges || []).join(' | ');
+      assert.match(joined, /graph vertexCount is correct/, 'required_changes cite the new failure');
+      assert.doesNotMatch(joined, /dashboard/, 'required_changes never cite a pre-existing baseline failure');
+    }
+    // The pre-existing failures are not silently dropped — they are still in
+    // the Gate evidence's baselineDiff.
+    assert.ok(result.history !== undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('baseline-diff F: on resume the persisted baseline is reused — baseline verification never re-runs on the modified worktree', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-bdg-f-'));
+  try {
+    const taskCard = demoTaskCard({ task_id: 'resume-task', verification_commands: ['npm test'] });
+
+    // A hand-built live-rework checkpoint that already carries a persisted
+    // pre-Executor baseline (3 pre-existing dashboard failures).
+    const checkpoint = {
+      history: [],
+      currentTaskCard: taskCard,
+      currentTaskId: taskCard.task_id,
+      attempt: 1,
+      normalAttempts: 1,
+      escalationAttempts: 0,
+      escalationActive: false,
+      reviewRound: 1,
+      latestReviewResult: {
+        task_id: taskCard.task_id,
+        decision: 'REWORK',
+        round: 1,
+        source: 'GATE',
+        required_changes: ['Fix newly failing test/assertion introduced by this task: graph test D'],
+        findings: 'x',
+        rationale: 'y',
+      },
+      taskBaseline: {
+        taskId: taskCard.task_id,
+        commandsHash: 'deadbeef',
+        evidence: {
+          pass: false,
+          results: [{ command: 'npm test', pass: false, exitCode: 1, output: DASHBOARD_3.join('\n') }],
+        },
+      },
+    };
+
+    const supervisor = makeFakeSupervisor([
+      { action: 'CONTINUE_REWORK' },
+      { action: 'WORKFLOW_DONE', summary: 'resumed and passed' },
+    ]);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+    const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+    // Post-Executor gate: the Executor fixed the new failure, only the 3
+    // pre-existing dashboard failures remain.
+    const gateRunner = fixedGateRunner(failEvidence(DASHBOARD_3));
+    let baselineReran = false;
+    const baselineGateRunner = {
+      runs: [],
+      async run() {
+        baselineReran = true;
+        throw new Error('baseline verification must NOT re-run on a resumed (already-modified) worktree');
+      },
+    };
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-bdg-f', kind: 'INTERNAL_TEST', root });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-bdg-f',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      baselineGateRunner,
+      windowSession: makeFakeWindowSession(),
+      workflowStateManager,
+      workflowGoal: 'resume with a persisted baseline',
+      repositoryContext: taskCard.repository_context,
+      checkpoint,
+      maxAttemptsPerTask: 5,
+    });
+
+    assert.equal(baselineReran, false, 'baseline verification was not re-run on resume');
+    assert.equal(result.status, 'WORKFLOW_DONE');
+    // The restored baseline let the Gate suppress the 3 pre-existing failures.
+    const projection = summarizeSafetyEvents(workflowStateManager.getSafetyEvents());
+    assert.ok(projection.warningSafetyEvents.some((e) => e.code === 'PREEXISTING_VERIFICATION_FAILURES'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('baseline-diff G: wf-agy-9a3583e5 replay — 7 pre-existing dashboard failures, correct impl -> 1 Executor call, task PASS', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-bdg-g-'));
+  try {
+    const taskCard = demoTaskCard({
+      task_id: 'add-vertex-count',
+      allowed_files: ['src/utils/graph-algorithms.js', 'tests/graph-algorithms.test.js'],
+      verification_commands: ['npm test'],
+    });
+    const plannedTasks = [{
+      task_id: taskCard.task_id,
+      goal: taskCard.goal,
+      scope: taskCard.scope,
+      allowed_files: taskCard.allowed_files,
+      verification_commands: taskCard.verification_commands,
+    }];
+    const DASHBOARD_7 = [
+      '✖ D. Timeline shows newest-first (1.9ms)',
+      '✖ M. /api/workflows returns Attention workflows by default (12ms)',
+      '✖ M2. Default selector shows ONLY active/unresolved workflows (2.2ms)',
+      '✖ Scenario A: Starting unrelated USER workflow C does NOT supersede (47ms)',
+      '✖ Scenario B: Explicit replacement B marks A as SUPERSEDED (20ms)',
+      '✖ Scenario D: Workflow A in HUMAN_REQUIRED resume transitions (1.1ms)',
+      '✖ Q. API /api/focus and /api/workflows return active focus (9.8ms)',
+    ];
+    const supervisor = {
+      async create() { return { tabId: 501, conversationId: null }; },
+      async decide(context) {
+        if (context.latestReviewResult && context.latestReviewResult.decision !== 'PASS') {
+          throw new Error('Supervisor must NOT be consulted — the task PASSes on baseline-diff');
+        }
+        return { action: 'NEXT_TASK', task_card: taskCard };
+      },
+      async close() {},
+      getIdentity() { return { tabId: 501, conversationId: null }; },
+    };
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+    const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+    const baselineGateRunner = fixedGateRunner(failEvidence(DASHBOARD_7));
+    const gateRunner = fixedGateRunner(failEvidence(DASHBOARD_7));
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-bdg-g', kind: 'INTERNAL_TEST', root });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-bdg-g',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      baselineGateRunner,
+      windowSession: makeFakeWindowSession(),
+      workflowStateManager,
+      workflowGoal: 'add vertexCount',
+      repositoryContext: taskCard.repository_context,
+      plannedTasks,
+      planSummary: 'one bounded task',
+      maxAttemptsPerTask: 3,
+      maxEscalationAttempts: 2,
+    });
+
+    assert.equal(result.status, 'WORKFLOW_DONE');
+    assert.equal(
+      createClaudeSessionManager.managers[0].executions.length,
+      1,
+      'baseline-diff drops the Executor call count from ~2 (no-new-information) to 1',
+    );
+    const projection = summarizeSafetyEvents(workflowStateManager.getSafetyEvents());
+    const warn = projection.warningSafetyEvents.find((e) => e.code === 'PREEXISTING_VERIFICATION_FAILURES');
+    assert.ok(warn, 'user is told the repository still has pre-existing verification failures');
+    assert.match(warn.reason, /Timeline shows newest-first/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -42,6 +42,11 @@ import { getValidHostEvidence, markHostEvidenceConsumed, hashCommandSet, CLOSEOU
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { decideDeterministically } from './deterministicSupervisorPolicy.js';
 import {
+  diffBaselineFailures,
+  summarizeBaselineEvidence,
+  BASELINE_DIFF_VERDICTS,
+} from './baselineDiffGate.js';
+import {
   createAcceptanceChain,
   serializeAcceptanceChain,
   deserializeAcceptanceChain,
@@ -224,6 +229,14 @@ export async function runAutomatedWorkflow({
   usageTracker = null,
   onTaskCompleted = null,
   signal = null,
+  // BASELINE-DIFF GATE. When a runner is supplied, each task's
+  // verification_commands are run once BEFORE the Executor's first edit (in
+  // the isolated workspace, baseline fixed) and the pre-existing failing-test
+  // identities are recorded. The post-Executor Gate then attributes only
+  // NEW failures to the task; pre-existing repository red tests do not
+  // trigger REWORK. Local deterministic commands only — zero model calls.
+  // Feature is OFF when null (every existing caller/test is unaffected).
+  baselineGateRunner = null,
   closeoutVerificationCommands = [],
   onCloseoutPass = null,
   taskTotal = null,
@@ -253,6 +266,16 @@ export async function runAutomatedWorkflow({
   const history = [];
   let latestReviewResult = null;
   let latestGateEvidence = null;
+
+  // BASELINE-DIFF GATE state. `taskBaselineEvidence` is the trimmed, persisted
+  // pre-Executor verification result for `taskBaselineTaskId`. It is captured
+  // exactly once per task (in the NEXT_TASK branch, before the first Executor
+  // call) or rehydrated from a checkpoint — NEVER re-captured on a worktree
+  // the Executor has already modified.
+  const baselineDiffEnabled = Boolean(baselineGateRunner);
+  let taskBaselineEvidence = null;
+  let taskBaselineTaskId = null;
+  let taskBaselineCommandsHash = null;
   const seenBlockers = new Map();
   let currentTaskCard = null;
   const loopReworkMemory = new Map();
@@ -308,14 +331,80 @@ export async function runAutomatedWorkflow({
       executionReport: null,
       gateEvidence: null,
       worktreeFingerprint: null,
+      // BASELINE-DIFF GATE: the pre-Executor verification snapshot survives a
+      // resume so the baseline is never re-taken on an already-modified tree.
+      taskBaseline: (baselineDiffEnabled && taskBaselineTaskId)
+        ? {
+          taskId: taskBaselineTaskId,
+          commandsHash: taskBaselineCommandsHash,
+          evidence: taskBaselineEvidence,
+        }
+        : null,
       ...extra,
     });
   };
+
+  // BASELINE-DIFF GATE: run the current task's verification_commands ONCE,
+  // before the Executor has touched anything, and remember which failures
+  // were already there. Local deterministic commands only — zero model calls.
+  // A baseline that could not be captured leaves the feature inert for this
+  // task (the original Gate FAIL behaviour stands); it is never fatal.
+  async function captureTaskBaseline() {
+    taskBaselineEvidence = null;
+    taskBaselineTaskId = null;
+    taskBaselineCommandsHash = null;
+    if (!baselineDiffEnabled || !currentTaskCard) return;
+    const commands = Array.isArray(currentTaskCard.verification_commands)
+      ? currentTaskCard.verification_commands.map((c) => String(c))
+      : [];
+    if (commands.length === 0) return;
+    try {
+      log(`baseline verification started: task=${currentTaskCard.task_id} (pre-Executor)`);
+      const raw = await baselineGateRunner.run(commands);
+      throwIfAborted();
+      taskBaselineEvidence = summarizeBaselineEvidence(raw);
+      taskBaselineTaskId = currentTaskCard.task_id;
+      taskBaselineCommandsHash = hashCommandSet(commands);
+      const failing = (taskBaselineEvidence.results || []).filter((r) => !r.pass).length;
+      log(
+        `baseline verification completed: task=${currentTaskCard.task_id} `
+        + `pass=${taskBaselineEvidence.pass} preexistingFailingCommands=${failing}`
+      );
+      workflowStateManager?.recordProgress({
+        taskBaseline: {
+          taskId: taskBaselineTaskId,
+          commandsHash: taskBaselineCommandsHash,
+          pass: taskBaselineEvidence.pass,
+          capturedAt: new Date().toISOString(),
+          evidence: taskBaselineEvidence,
+        },
+      });
+    } catch (err) {
+      if (isCancellation(err, signal)) throw err;
+      log(
+        `baseline verification could not run (${err.message}) — baseline-diff gate `
+        + `disabled for task=${currentTaskCard?.task_id}; original Gate FAIL behaviour stands`
+      );
+      taskBaselineEvidence = null;
+      taskBaselineTaskId = null;
+      taskBaselineCommandsHash = null;
+    }
+  }
 
   if (checkpoint && typeof checkpoint === 'object') {
     if (Array.isArray(checkpoint.history)) history.push(...checkpoint.history);
     reviewRound = Number.isFinite(checkpoint.reviewRound) ? checkpoint.reviewRound : 0;
     supervisorGuidance = checkpoint.supervisorGuidance ?? null;
+
+    // BASELINE-DIFF GATE: restore the pre-Executor baseline captured before
+    // suspension. Never re-run baseline verification on resume — the worktree
+    // now carries the Executor's edits and is no longer a valid baseline.
+    if (baselineDiffEnabled && checkpoint.taskBaseline && checkpoint.taskBaseline.evidence) {
+      taskBaselineEvidence = checkpoint.taskBaseline.evidence;
+      taskBaselineTaskId = checkpoint.taskBaseline.taskId ?? null;
+      taskBaselineCommandsHash = checkpoint.taskBaseline.commandsHash ?? null;
+      log(`baseline verification restored from checkpoint: task=${taskBaselineTaskId}`);
+    }
 
     // Stale-REWORK isolation. A persisted Review Result is a LIVE rework
     // trigger only when it (a) is not a terminal decision (PASS / OUT_OF_SCOPE
@@ -1135,6 +1224,59 @@ export async function runAutomatedWorkflow({
       };
     }
 
+    // BASELINE-DIFF GATE. Compare this attempt's failing-test identities
+    // against the pre-Executor baseline for this task. Pre-existing repository
+    // red tests are NOT this task's responsibility and must not drive REWORK.
+    const baselineDiff = (
+      baselineDiffEnabled
+      && taskBaselineTaskId === currentTaskCard.task_id
+    )
+      ? diffBaselineFailures(taskBaselineEvidence, evidence)
+      : null;
+    if (baselineDiff) {
+      evidence.baselineDiff = baselineDiff;
+      log(
+        `baseline-diff gate: task=${currentTaskCard.task_id} attempt=${attemptCount} verdict=${baselineDiff.verdict} `
+        + `baseline=${baselineDiff.baselineFailures.length} current=${baselineDiff.currentFailures.length} `
+        + `new=${baselineDiff.newFailures.length} ignored=${baselineDiff.ignoredBaselineFailures.length}`
+      );
+    }
+
+    // PASS_WITH_BASELINE_FAILURES: the Gate found failures, but every one was
+    // already failing before this task ran. Treat as PASS for this task —
+    // route to the Reviewer, not to REWORK — while keeping the pre-existing
+    // repository failures visible as a WARNING and in the Gate evidence.
+    if (baselineDiff && baselineDiff.verdict === BASELINE_DIFF_VERDICTS.PASS_WITH_BASELINE_FAILURES) {
+      log(
+        `gate PASS (baseline-diff): task=${currentTaskCard.task_id} attempt=${attemptCount} — `
+        + `${baselineDiff.ignoredBaselineFailures.length} pre-existing verification failure(s) ignored, `
+        + `0 introduced by this task`
+      );
+      if (workflowStateManager) {
+        try {
+          workflowStateManager.recordSafetyEvent({
+            code: SAFETY_EVENT_CODES.PREEXISTING_VERIFICATION_FAILURES,
+            severity: SAFETY_SEVERITY.WARNING,
+            role: 'gate',
+            taskId: currentTaskCard.task_id,
+            attempt: attemptCount,
+            reason:
+              `${baselineDiff.ignoredBaselineFailures.length} verification failure(s) were already failing `
+              + `before task "${currentTaskCard.task_id}" ran and were not introduced by it: `
+              + `${baselineDiff.ignoredBaselineFailures.slice(0, 10).join('; ')}`,
+            actionTaken:
+              'task PASSed on baseline-diff (introduced no new failure); pre-existing repository failures left intact',
+          });
+        } catch (seErr) {
+          log(`preexisting-verification-failures safety event record failed: ${seErr.message}`);
+        }
+      }
+      return runReviewStep({
+        executionReport,
+        evidence: { ...evidence, pass: true, baselineDiff },
+      });
+    }
+
     // STATE_MACHINE.md §2: VERIFYING FAIL -> REWORK (never REVIEWING).
     // A non-environment Gate failure routes deterministically back to a fresh
     // Executor attempt and consumes ZERO Reviewer calls — a Reviewer PASS
@@ -1142,22 +1284,35 @@ export async function runAutomatedWorkflow({
     // are carried forward as actionable Executor rework feedback.
     if (evidence.pass !== true) {
       const failingResults = (evidence.results || []).filter((r) => !r.pass);
+      // NEW_FAILURES: only the failures this task actually introduced are its
+      // responsibility. Everything else keeps the original per-command shape.
+      const attributeToNewFailures = baselineDiff
+        && baselineDiff.verdict === BASELINE_DIFF_VERDICTS.NEW_FAILURES
+        && baselineDiff.newFailures.length > 0;
       const failureSummary =
-        failingResults.map((r) => `${r.command}: ${r.output || 'failed'}`).join('; ') ||
+        (attributeToNewFailures
+          ? `new failures introduced by this task: ${baselineDiff.newFailures.join('; ')}`
+          : failingResults.map((r) => `${r.command}: ${r.output || 'failed'}`).join('; ')) ||
         'Gate verification did not pass';
       log(
         `gate FAIL (non-environment): routing task=${currentTaskCard.task_id} attempt=${attemptCount} ` +
-          `to REWORK without invoking the Reviewer`
+          `to REWORK without invoking the Reviewer` +
+          (attributeToNewFailures ? ` (baseline-diff: ${baselineDiff.newFailures.length} new failure(s))` : '')
       );
 
       latestReviewResult = {
         task_id: currentTaskCard.task_id,
         decision: 'REWORK',
-        findings: failingResults.map((r) => `Gate command failed: ${r.command}`),
-        required_changes: failingResults.map((r) => `Fix failing verification command: ${r.command}`),
+        findings: attributeToNewFailures
+          ? baselineDiff.newFailures.map((id) => `New verification failure introduced by this task: ${id}`)
+          : failingResults.map((r) => `Gate command failed: ${r.command}`),
+        required_changes: attributeToNewFailures
+          ? baselineDiff.newFailures.map((id) => `Fix newly failing test/assertion introduced by this task: ${id}`)
+          : failingResults.map((r) => `Fix failing verification command: ${r.command}`),
         rationale: `Gate verification failed on this attempt: ${failureSummary}`,
         source: 'GATE',
         round: reviewRound,
+        ...(baselineDiff ? { baselineDiff } : {}),
       };
 
       if (workflowStateManager) {
@@ -1857,6 +2012,11 @@ export async function runAutomatedWorkflow({
       unauthorizedProbeGuidance = null;
       attemptCount = 0;
       latestReviewResult = null;
+
+      // BASELINE-DIFF GATE: capture the pre-existing verification failures now,
+      // before the Executor's first edit, while this is still a clean baseline.
+      await captureTaskBaseline();
+
       await persistCheckpoint();
 
       const outcome = await runAttempt();

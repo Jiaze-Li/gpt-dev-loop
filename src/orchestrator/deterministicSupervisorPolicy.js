@@ -2,6 +2,8 @@
 // The deterministic Core owns obvious transitions; the model Supervisor is reserved
 // for genuine ambiguity / non-convergence.
 
+import { sha256, extractFailingTestIds, normalizeGateOutput } from './gateFailureIdentity.js';
+
 // A deterministic decision is computed by the orchestrator Core without any
 // model call. It must be accounted as exactly zero provider calls and zero
 // tokens; UsageTracker enforces this by refusing to aggregate a supervisor
@@ -21,51 +23,6 @@ function reworkSignature(review) {
     .map((item) => item.toLowerCase().replace(/\s+/g, ' ').trim())
     .sort()
     .join('\n');
-}
-
-import { createHash } from 'node:crypto';
-
-function sha256(value) {
-  return createHash('sha256').update(String(value)).digest('hex');
-}
-
-// Pull the individual failing test / assertion identifiers out of a Gate
-// command's captured output. Supports node:test's spec reporter (`✖ name`)
-// and TAP (`not ok N - name`). Durations, absolute worktree paths, and
-// stack-trace line:col are stripped so the identifier is stable across runs.
-function extractFailingTestIds(output) {
-  const text = String(output || '');
-  const ids = new Set();
-  const patterns = [
-    /^\s*[✖✗✘]\s+(.+?)\s*$/gm, // ✖ ✗ ✘  (node:test)
-    /^\s*not ok \d+\s*(?:-\s*)?(.+?)\s*$/gm, // TAP
-  ];
-  for (const re of patterns) {
-    let m;
-    while ((m = re.exec(text)) !== null) {
-      const name = m[1]
-        .replace(/\s*\(\d+(?:\.\d+)?\s*(?:ms|s)\)\s*$/i, '') // trailing duration
-        .replace(/\s+/g, ' ')
-        .trim();
-      if (!name) continue;
-      if (/^failing tests:?$/i.test(name)) continue; // TAP/spec summary header
-      ids.add(name);
-    }
-  }
-  return [...ids].sort();
-}
-
-// Volatile-bit-stripped digest of a Gate output, used only when no structured
-// failing-test identifiers could be extracted.
-function normalizeGateOutput(output) {
-  return String(output || '')
-    .replace(/\(\d+(?:\.\d+)?\s*(?:ms|s)\)/g, '(t)') // durations
-    .replace(/\/[^\s:'"]*\/(?:gpt-dev-loop|\.supergpt)[^\s:'"]*/g, '<path>') // worktree paths
-    .replace(/:\d+:\d+/g, ':L:C') // stack-trace line:col
-    .replace(/\b[0-9a-f]{7,40}\b/g, '<hex>') // commit / blob ids
-    .replace(/\bpid[=: ]\d+/gi, 'pid=<n>')
-    .replace(/[ \t]+$/gm, '')
-    .trim();
 }
 
 // Deterministic fingerprint of a Gate FAIL. Two Gate failures with the same

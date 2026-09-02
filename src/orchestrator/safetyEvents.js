@@ -18,6 +18,12 @@ export const SAFETY_EVENT_CODES = Object.freeze({
   // so dispatching another Executor call cannot help. The loop stops instead
   // of burning another expensive model call.
   NO_NEW_INFORMATION_RETRY_BLOCKED: 'NO_NEW_INFORMATION_RETRY_BLOCKED',
+  // The baseline-diff Gate ignored one or more verification failures that
+  // were already failing BEFORE this task ran (pre-existing / out-of-scope
+  // repository red tests). The task itself introduced no new failure, so it
+  // is PASSed — but the user must still learn the repository has N baseline
+  // failures. WARNING severity: the workflow keeps running.
+  PREEXISTING_VERIFICATION_FAILURES: 'PREEXISTING_VERIFICATION_FAILURES',
 });
 
 export const SAFETY_SEVERITY = Object.freeze({
