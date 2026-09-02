@@ -8,7 +8,7 @@
 // executor in is the caller's job.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
@@ -517,6 +517,144 @@ export function buildAllowedVerificationTools(taskCard, { cwd = process.cwd() } 
   return [...allowedTools];
 }
 
+// ---------------------------------------------------------------------------
+// Executor budget guard
+//
+// The Claude CLI's final `usage.cache_read_input_tokens` is the CUMULATIVE
+// sum across every API request (turn) in one invocation. It grows ~linearly
+// with turn count even for a trivial task, so a fixed cumulative-cacheRead
+// hard-stop mis-fires on ordinary multi-turn executions. The real mechanical
+// signals are:
+//   - cacheCreation  : the one-time unique base-context volume for the invocation
+//   - cacheRead/turn : per-turn context size (catches a single blown-up turn)
+//   - num_turns      : agent-loop runaway
+//   - output_tokens  : reply runaway
+//   - total_cost_usd : provider-reported spend
+// Cumulative cacheRead stays as telemetry only; it is enforced ONLY when a
+// deployment explicitly sets EXECUTOR_MAX_CACHE_READ_TOKENS > 0.
+// ---------------------------------------------------------------------------
+export function resolveExecutorBudgetLimits(env = {}, { maxBudgetUsd = 0.5, maxTurns = 60 } = {}) {
+  const num = (value, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  return {
+    // One-time unique base context (system prompt + tool schemas + policy +
+    // Task Card). Real trivial smoke ~24k; historical explosions ~50k-75k.
+    maxCacheCreationTokens: num(env.EXECUTOR_MAX_CACHE_CREATION_TOKENS, 200_000),
+    // Per-turn cached context. Real trivial smoke ~36k/turn; 150k leaves ~4x
+    // headroom while still catching a single turn that drags a huge context.
+    maxCacheReadPerTurn: num(env.EXECUTOR_MAX_CACHE_READ_PER_TURN, 150_000),
+    maxOutputTokens: num(env.EXECUTOR_MAX_OUTPUT_TOKENS, 20_000),
+    maxTurns: num(env.EXECUTOR_MAX_TURNS, maxTurns),
+    maxCostUsd: num(env.EXECUTOR_MAX_COST_USD, maxBudgetUsd),
+    // Telemetry-only by default (0 = disabled). Honoured if explicitly set > 0.
+    maxCacheReadTokens: num(env.EXECUTOR_MAX_CACHE_READ_TOKENS, 0),
+  };
+}
+
+// Pure post-run budget evaluation. `usage` is the adapter-normalised usage
+// object; `costUsd` the provider-reported total. Returns every tripped metric
+// so the failure record can name exactly what happened.
+export function evaluateExecutorBudget({ usage = null, costUsd = null, limits = {} } = {}) {
+  const cacheRead = Number(usage?.cache_read_tokens ?? 0) || 0;
+  const cacheCreation = Number(usage?.cache_creation_tokens ?? 0) || 0;
+  const output = Number(usage?.output_tokens ?? 0) || 0;
+  const numTurns = Number.isFinite(usage?.num_turns) ? usage.num_turns : null;
+  const cacheReadPerTurn = Number.isFinite(numTurns) && numTurns > 0
+    ? Math.round(cacheRead / numTurns)
+    : cacheRead;
+  const cost = Number.isFinite(costUsd) ? costUsd : null;
+
+  const active = (value) => Number.isFinite(value) && value > 0;
+  const checks = [];
+  if (active(limits.maxCacheCreationTokens) && cacheCreation > limits.maxCacheCreationTokens) {
+    checks.push({ metric: 'cacheCreation', value: cacheCreation, limit: limits.maxCacheCreationTokens });
+  }
+  if (active(limits.maxCacheReadPerTurn) && cacheReadPerTurn > limits.maxCacheReadPerTurn) {
+    checks.push({ metric: 'cacheReadPerTurn', value: cacheReadPerTurn, limit: limits.maxCacheReadPerTurn });
+  }
+  if (active(limits.maxTurns) && Number.isFinite(numTurns) && numTurns > limits.maxTurns) {
+    checks.push({ metric: 'numTurns', value: numTurns, limit: limits.maxTurns });
+  }
+  if (active(limits.maxOutputTokens) && output > limits.maxOutputTokens) {
+    checks.push({ metric: 'outputTokens', value: output, limit: limits.maxOutputTokens });
+  }
+  if (active(limits.maxCostUsd) && cost !== null && cost > limits.maxCostUsd) {
+    checks.push({ metric: 'costUsd', value: cost, limit: limits.maxCostUsd });
+  }
+  if (active(limits.maxCacheReadTokens) && cacheRead > limits.maxCacheReadTokens) {
+    checks.push({ metric: 'cumulativeCacheRead', value: cacheRead, limit: limits.maxCacheReadTokens });
+  }
+
+  return {
+    exceeded: checks.length > 0,
+    reason: checks.length ? checks.map((c) => `${c.metric}=${c.value}/${c.limit}`).join(', ') : null,
+    checks,
+    observed: { cacheRead, cacheCreation, output, numTurns, cacheReadPerTurn, costUsd: cost },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Permission-denial de-duplication
+//
+// From outside the CLI the adapter cannot intercept an in-session permission
+// prompt, but the final JSON's `permission_denials` array does expose when the
+// model burned turns re-requesting the SAME command after it was already
+// denied. Collapse those to one structured entry with a repeatCount and a
+// deterministic fingerprint, and flag a verification-blocked state when a
+// single command was denied repeatedly.
+// ---------------------------------------------------------------------------
+export const DENIAL_REPEAT_THRESHOLD = 2;
+
+export function normalizeDeniedCommand(command) {
+  if (typeof command !== 'string') return '';
+  return command.trim().replace(/\s+/g, ' ');
+}
+
+export function denialFingerprint(denial, cwd = '') {
+  const tool = typeof denial?.tool_name === 'string' ? denial.tool_name : 'unknown';
+  const rawCommand = denial?.tool_input && typeof denial.tool_input.command === 'string'
+    ? denial.tool_input.command
+    : (typeof denial?.tool_input === 'string' ? denial.tool_input : JSON.stringify(denial?.tool_input ?? null));
+  const normalized = normalizeDeniedCommand(rawCommand);
+  const basis = `${tool} ${cwd ?? ''} ${normalized}`;
+  return createHash('sha256').update(basis).digest('hex').slice(0, 16);
+}
+
+export function dedupePermissionDenials(denials, cwd = '') {
+  const list = Array.isArray(denials) ? denials : [];
+  const byFingerprint = new Map();
+  const order = [];
+  for (const denial of list) {
+    const fingerprint = denialFingerprint(denial, cwd);
+    if (!byFingerprint.has(fingerprint)) {
+      byFingerprint.set(fingerprint, { ...denial, fingerprint, repeatCount: 1 });
+      order.push(fingerprint);
+    } else {
+      byFingerprint.get(fingerprint).repeatCount += 1;
+    }
+  }
+  const deduped = order.map((fp) => byFingerprint.get(fp));
+  const repeated = deduped.filter((d) => d.repeatCount >= DENIAL_REPEAT_THRESHOLD);
+  const maxRepeat = deduped.reduce((max, d) => Math.max(max, d.repeatCount), 0);
+  return {
+    deduped,
+    maxRepeat,
+    repeatedFingerprints: repeated.map((d) => d.fingerprint),
+    threshold: DENIAL_REPEAT_THRESHOLD,
+    verificationBlocked: repeated.length > 0
+      ? {
+          fingerprint: repeated[0].fingerprint,
+          tool: repeated[0].tool_name ?? null,
+          command: repeated[0].tool_input?.command ?? null,
+          cwd: cwd ?? null,
+          repeatCount: repeated[0].repeatCount,
+        }
+      : null,
+  };
+}
+
 export function createClaudeExecutorAdapter({
   command = 'claude',
   // Runs non-interactively with no TTY to approve prompts, so file edits
@@ -611,12 +749,14 @@ export function createClaudeExecutorAdapter({
             reportText = parsed.result;
           }
           if (parsed.usage && typeof parsed.usage === 'object') {
+            const rawTurns = Number(parsed.num_turns ?? parsed.usage.num_turns);
             usage = {
               input_tokens: parsed.usage.input_tokens ?? 0,
               output_tokens: parsed.usage.output_tokens ?? 0,
               cache_read_tokens: parsed.usage.cache_read_input_tokens ?? 0,
               cache_creation_tokens: parsed.usage.cache_creation_input_tokens ?? 0,
               total_tokens: (parsed.usage.input_tokens ?? 0) + (parsed.usage.output_tokens ?? 0),
+              num_turns: Number.isFinite(rawTurns) ? rawTurns : null,
             };
           }
           if (Number.isFinite(parsed.total_cost_usd)) {
@@ -635,26 +775,62 @@ export function createClaudeExecutorAdapter({
       }
 
       const report = parseExecutionReport(taskCard.task_id, reportText);
-      const maxCacheReadTokens = Number(env?.EXECUTOR_MAX_CACHE_READ_TOKENS ?? 250_000);
-      const maxOutputTokens = Number(env?.EXECUTOR_MAX_OUTPUT_TOKENS ?? 20_000);
-      if ((Number.isFinite(maxCacheReadTokens) && maxCacheReadTokens > 0 && (usage?.cache_read_tokens ?? 0) > maxCacheReadTokens)
-        || (Number.isFinite(maxOutputTokens) && maxOutputTokens > 0 && (usage?.output_tokens ?? 0) > maxOutputTokens)) {
+
+      // Stable id first: a post-run budget failure still consumed a real
+      // provider call, and its usage record must carry the same callId the
+      // successful path would have used.
+      const callId = `call-claude-exe-${randomUUID()}`;
+      if (usage) {
+        try {
+          Object.defineProperty(usage, 'callId', {
+            value: callId, writable: true, configurable: true, enumerable: false,
+          });
+        } catch {
+          usage.callId = callId;
+        }
+      }
+
+      const denialAnalysis = dedupePermissionDenials(permissionDenials, cwd);
+      const budgetLimits = resolveExecutorBudgetLimits(env ?? {}, { maxBudgetUsd, maxTurns });
+      const budget = evaluateExecutorBudget({ usage, costUsd, limits: budgetLimits });
+      if (budget.exceeded) {
         throw new AdapterError(
           ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
-          `executor usage exceeded hard budget (cacheRead=${usage?.cache_read_tokens ?? 0}/${maxCacheReadTokens}, output=${usage?.output_tokens ?? 0}/${maxOutputTokens})`,
+          `executor usage exceeded hard budget (${budget.reason})`,
           {
-            budget: { maxBudgetUsd, maxCacheReadTokens, maxOutputTokens },
+            budget: budgetLimits,
+            budgetExceededReason: budget.reason,
+            budgetChecks: budget.checks,
+            budgetObserved: budget.observed,
             usage,
+            costUsd,
+            numTurns: usage?.num_turns ?? null,
+            model: modelUsed,
+            callId,
+            permissionDenials: denialAnalysis.deduped,
           }
         );
       }
       Object.defineProperty(report, 'permissionDenials', {
-        value: permissionDenials,
+        value: denialAnalysis.deduped,
         writable: false,
         configurable: false,
         enumerable: false,
       });
-      const callId = `call-claude-exe-${randomUUID()}`;
+      Object.defineProperty(report, 'permissionDenialAnalysis', {
+        value: {
+          maxRepeat: denialAnalysis.maxRepeat,
+          repeatedFingerprints: denialAnalysis.repeatedFingerprints,
+          threshold: denialAnalysis.threshold,
+        },
+        enumerable: false,
+      });
+      if (denialAnalysis.verificationBlocked) {
+        Object.defineProperty(report, 'verificationBlocked', {
+          value: denialAnalysis.verificationBlocked,
+          enumerable: false,
+        });
+      }
       try {
         Object.defineProperty(report, 'callId', {
           value: callId,
@@ -666,16 +842,6 @@ export function createClaudeExecutorAdapter({
         report.callId = callId;
       }
       if (usage) {
-        try {
-          Object.defineProperty(usage, 'callId', {
-            value: callId,
-            writable: true,
-            configurable: true,
-            enumerable: false,
-          });
-        } catch {
-          usage.callId = callId;
-        }
         report.usage = usage;
       }
       Object.defineProperty(report, 'inputBreakdown', { value: inputBreakdown, enumerable: false });

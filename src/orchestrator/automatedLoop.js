@@ -703,6 +703,35 @@ export async function runAutomatedWorkflow({
       executionReport = await claudeManager.execute(executorTaskCard, { signal, attempt: attemptCount, physicalCallReason: 'PRIMARY' });
     } catch (err) {
       if (isCancellation(err, signal)) throw err;
+      // A post-send budget / duplicate-call failure still consumed a real
+      // provider call. Record its usage before surfacing the blocker so the
+      // dashboard never shows executor.calls = 0 for a call that happened.
+      if (usageTracker && err?.details?.usage) {
+        try {
+          usageTracker.record({
+            workflowId,
+            role: 'executor',
+            callId: err.details.callId ?? err.details.usage?.callId ?? null,
+            physicalCallReason: err.details.physicalCallReason ?? 'PRIMARY',
+            taskId: err.details.taskId ?? currentTaskCard.task_id,
+            attempt: err.details.attempt ?? attemptCount,
+            provider: 'claude',
+            model: err.details.model || 'sonnet',
+            usage: err.details.usage,
+            costUsd: err.details.costUsd ?? null,
+            providerMetadata: err.details.budgetExceededReason
+              ? { budgetExceededReason: err.details.budgetExceededReason, numTurns: err.details.numTurns ?? null }
+              : null,
+          });
+          if (workflowStateManager) {
+            workflowStateManager.setTokenUsage(
+              usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout })
+            );
+          }
+        } catch (recordErr) {
+          log(`executor budget-failure usage recording failed: ${recordErr.message}`);
+        }
+      }
       log(`executor infrastructure failure: task=${currentTaskCard.task_id} attempt=${attemptCount} error=${err.message}`);
       const failureCategory = FAILURE_CATEGORIES.INFRASTRUCTURE;
       const reason = `Executor failed: ${err.message}`;

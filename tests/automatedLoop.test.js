@@ -3382,3 +3382,53 @@ test('active acceptance version chain is created, persisted and stamped onto the
   assert.equal(reviewedCards[0].acceptance_version, 1);
   assert.deepEqual(reviewedCards[0].acceptance_criteria, ['ship the demo', 'tests pass']);
 });
+
+test('executor budget-exceeded still records the real provider call in the UsageTracker', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([{ action: 'NEXT_TASK', task_card: taskCard }]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [] });
+  const gateRunner = makeFakeGateRunner();
+  const usageTracker = new UsageTracker();
+
+  const budgetError = new AdapterError(
+    ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+    'executor usage exceeded hard budget (cacheCreation=900000/200000)',
+    {
+      budgetExceededReason: 'cacheCreation=900000/200000',
+      callId: 'call-claude-exe-budget-1',
+      model: 'sonnet',
+      physicalCallReason: 'PRIMARY',
+      attempt: 1,
+      numTurns: 8,
+      costUsd: 0.18,
+      usage: {
+        input_tokens: 16,
+        output_tokens: 2010,
+        cache_read_tokens: 287895,
+        cache_creation_tokens: 900000,
+        num_turns: 8,
+        callId: 'call-claude-exe-budget-1',
+      },
+    }
+  );
+  const createClaudeSessionManager = makeFakeClaudeManagerFactory(null, () => { throw budgetError; });
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-budget-usage',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession: makeFakeWindowSession(),
+    usageTracker,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'HUMAN_REQUIRED');
+  const usage = usageTracker.summary();
+  assert.equal(usage.executor.calls, 1, 'the consumed provider call must be recorded, not dropped');
+  assert.equal(usage.executor.outputTokens, 2010);
+  assert.equal(usage.executor.cacheCreationTokens, 900000);
+  assert.equal(usage.executor.cacheReadTokens, 287895);
+});

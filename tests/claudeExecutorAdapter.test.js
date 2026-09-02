@@ -7,6 +7,12 @@ import {
   buildAllowedVerificationTools,
   buildPrompt,
   isDangerousVerificationCommand,
+  resolveExecutorBudgetLimits,
+  evaluateExecutorBudget,
+  dedupePermissionDenials,
+  denialFingerprint,
+  normalizeDeniedCommand,
+  DENIAL_REPEAT_THRESHOLD,
 } from '../src/orchestrator/adapters/claudeExecutorAdapter.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
 
@@ -325,6 +331,7 @@ test('claude executor adapter: extracts usage and cost from json output and trig
     cache_read_tokens: 1500,
     cache_creation_tokens: 500,
     total_tokens: 4550,
+    num_turns: null,
   });
   assert.equal(startedPid, 9999);
   assert.ok(activityEvents.length > 0);
@@ -343,9 +350,13 @@ test('claude executor adapter: exposes provider permission denial telemetry', as
   });
   const { spawn } = makeFakeSpawn({ stdout: payload });
   const report = await createClaudeExecutorAdapter({ spawn }).execute(demoTaskCard());
-  assert.deepEqual(report.permissionDenials, [
-    { tool_name: 'Bash', tool_input: { command: 'node -e 1' } },
-  ]);
+  assert.equal(report.permissionDenials.length, 1);
+  assert.equal(report.permissionDenials[0].tool_name, 'Bash');
+  assert.equal(report.permissionDenials[0].tool_input.command, 'node -e 1');
+  assert.equal(report.permissionDenials[0].repeatCount, 1);
+  assert.match(report.permissionDenials[0].fingerprint, /^[0-9a-f]{16}$/);
+  assert.equal(report.permissionDenialAnalysis.maxRepeat, 1);
+  assert.equal(report.verificationBlocked, undefined);
 });
 
 test('claude executor adapter: fixture cache growth trips EXECUTOR_BUDGET_EXCEEDED and preserves fresh-session flags', async () => {
@@ -373,6 +384,202 @@ test('claude executor adapter: fixture cache growth trips EXECUTOR_BUDGET_EXCEED
   assert.ok(calls[0].args.includes('--max-budget-usd'));
   assert.ok(!calls[0].args.includes('--resume'));
   assert.ok(!calls[0].args.includes('--continue'));
+});
+
+// --- Executor budget guard: metric selection (Fix A) ---------------------
+
+test('budget guard: 8-turn trivial smoke (cacheRead 288k / creation 24k) is NOT killed by cumulative cacheRead', () => {
+  const limits = resolveExecutorBudgetLimits({});
+  const result = evaluateExecutorBudget({
+    usage: {
+      output_tokens: 2010,
+      cache_read_tokens: 287895,
+      cache_creation_tokens: 23569,
+      num_turns: 8,
+    },
+    costUsd: 0.172,
+    limits,
+  });
+  assert.equal(result.exceeded, false, result.reason ?? 'expected within budget');
+  assert.equal(result.observed.cacheReadPerTurn, Math.round(287895 / 8));
+});
+
+test('budget guard: abnormally large cacheCreation is a hard stop', () => {
+  const limits = resolveExecutorBudgetLimits({});
+  const result = evaluateExecutorBudget({
+    usage: { output_tokens: 10, cache_read_tokens: 400_000, cache_creation_tokens: 900_000, num_turns: 3 },
+    limits,
+  });
+  assert.equal(result.exceeded, true);
+  assert.match(result.reason, /cacheCreation=900000\/200000/);
+});
+
+test('budget guard: abnormally large cacheRead-per-turn is a hard stop', () => {
+  const limits = resolveExecutorBudgetLimits({});
+  const result = evaluateExecutorBudget({
+    usage: { output_tokens: 10, cache_read_tokens: 1_200_000, cache_creation_tokens: 30_000, num_turns: 4 },
+    limits,
+  });
+  assert.equal(result.exceeded, true);
+  assert.match(result.reason, /cacheReadPerTurn=300000\/150000/);
+});
+
+test('budget guard: num_turns over the cap is a hard stop', () => {
+  const limits = resolveExecutorBudgetLimits({}, { maxTurns: 60 });
+  const result = evaluateExecutorBudget({
+    usage: { output_tokens: 10, cache_read_tokens: 100_000, cache_creation_tokens: 10_000, num_turns: 90 },
+    limits,
+  });
+  assert.equal(result.exceeded, true);
+  assert.match(result.reason, /numTurns=90\/60/);
+});
+
+test('budget guard: provider-reported cost over the cap is a hard stop', () => {
+  const limits = resolveExecutorBudgetLimits({}, { maxBudgetUsd: 0.5 });
+  const result = evaluateExecutorBudget({
+    usage: { output_tokens: 100, cache_read_tokens: 50_000, cache_creation_tokens: 5_000, num_turns: 5 },
+    costUsd: 7.05,
+    limits,
+  });
+  assert.equal(result.exceeded, true);
+  assert.match(result.reason, /costUsd=7.05\/0.5/);
+});
+
+test('budget guard: historical multi-million cacheRead is still caught via per-turn / turns / cost', () => {
+  const limits = resolveExecutorBudgetLimits({});
+  const result = evaluateExecutorBudget({
+    usage: { output_tokens: 25_916, cache_read_tokens: 3_519_194, cache_creation_tokens: 73_357, num_turns: 49 },
+    costUsd: 7.05,
+    limits,
+  });
+  assert.equal(result.exceeded, true);
+  // caught by output + cost, not by a fixed cumulative cacheRead threshold
+  assert.match(result.reason, /outputTokens=25916\/20000/);
+  assert.match(result.reason, /costUsd=7.05\/0.5/);
+  assert.doesNotMatch(result.reason, /cumulativeCacheRead/);
+});
+
+test('budget guard: a single blown-up turn in an otherwise short run trips per-turn', () => {
+  const limits = resolveExecutorBudgetLimits({});
+  const result = evaluateExecutorBudget({
+    usage: { output_tokens: 500, cache_read_tokens: 1_709_521, cache_creation_tokens: 40_000, num_turns: 7 },
+    costUsd: 0.3,
+    limits,
+  });
+  assert.equal(result.exceeded, true);
+  assert.match(result.reason, /cacheReadPerTurn=244217\/150000/);
+});
+
+test('budget guard: cumulative cacheRead only enforced when explicitly configured > 0', () => {
+  const off = evaluateExecutorBudget({
+    usage: { cache_read_tokens: 5_000_000, cache_creation_tokens: 1000, output_tokens: 1, num_turns: 200 },
+    limits: { maxCacheReadTokens: 0, maxCacheCreationTokens: 0, maxCacheReadPerTurn: 0, maxOutputTokens: 0, maxTurns: 0, maxCostUsd: 0 },
+  });
+  assert.equal(off.exceeded, false);
+  const on = evaluateExecutorBudget({
+    usage: { cache_read_tokens: 5_000_000, cache_creation_tokens: 1000, output_tokens: 1, num_turns: 200 },
+    limits: { maxCacheReadTokens: 250_000 },
+  });
+  assert.equal(on.exceeded, true);
+  assert.match(on.reason, /cumulativeCacheRead=5000000\/250000/);
+});
+
+test('budget guard: env overrides are honoured', () => {
+  const limits = resolveExecutorBudgetLimits({
+    EXECUTOR_MAX_CACHE_CREATION_TOKENS: '50000',
+    EXECUTOR_MAX_CACHE_READ_PER_TURN: '40000',
+    EXECUTOR_MAX_OUTPUT_TOKENS: '5000',
+    EXECUTOR_MAX_COST_USD: '0.10',
+  });
+  assert.equal(limits.maxCacheCreationTokens, 50000);
+  assert.equal(limits.maxCacheReadPerTurn, 40000);
+  assert.equal(limits.maxOutputTokens, 5000);
+  assert.equal(limits.maxCostUsd, 0.10);
+});
+
+test('budget guard: a normal small task stays within budget', () => {
+  const limits = resolveExecutorBudgetLimits({});
+  const result = evaluateExecutorBudget({
+    usage: { output_tokens: 800, cache_read_tokens: 60_000, cache_creation_tokens: 22_000, num_turns: 3 },
+    costUsd: 0.04,
+    limits,
+  });
+  assert.equal(result.exceeded, false, result.reason ?? '');
+});
+
+test('budget guard: adapter records usage-with-callId in the thrown error on a hard stop', async () => {
+  const payload = JSON.stringify({
+    result: reportText(),
+    total_cost_usd: 0.18,
+    num_turns: 8,
+    usage: {
+      input_tokens: 16,
+      output_tokens: 2010,
+      cache_read_input_tokens: 287895,
+      cache_creation_input_tokens: 900_000,
+    },
+  });
+  const { spawn } = makeFakeSpawn({ stdout: payload });
+  const adapter = createClaudeExecutorAdapter({ spawn });
+  await assert.rejects(() => adapter.execute(demoTaskCard()), (err) => {
+    assert.equal(err.code, ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED);
+    assert.ok(err.details.usage, 'usage must be attached to the error');
+    assert.equal(err.details.usage.num_turns, 8);
+    assert.equal(err.details.usage.output_tokens, 2010);
+    assert.equal(err.details.usage.cache_read_tokens, 287895);
+    assert.equal(err.details.costUsd, 0.18);
+    assert.equal(err.details.numTurns, 8);
+    assert.ok(String(err.details.callId).startsWith('call-claude-exe-'));
+    assert.equal(err.details.usage.callId, err.details.callId);
+    assert.match(err.details.budgetExceededReason, /cacheCreation=900000\/200000/);
+    return true;
+  });
+});
+
+// --- Permission-denial de-duplication (Fix B) ----------------------------
+
+test('denial dedup: identical denied commands collapse to one entry with a repeatCount', () => {
+  const denial = { tool_name: 'Bash', tool_input: { command: 'node -e "read(p)"' } };
+  const spaced = { tool_name: 'Bash', tool_input: { command: '  node   -e   "read(p)"  ' } };
+  const analysis = dedupePermissionDenials([denial, spaced, denial, denial], '/repo');
+  assert.equal(analysis.deduped.length, 1);
+  assert.equal(analysis.deduped[0].repeatCount, 4);
+  assert.equal(analysis.maxRepeat, 4);
+  assert.ok(analysis.verificationBlocked);
+  assert.equal(analysis.verificationBlocked.repeatCount, 4);
+  assert.equal(analysis.verificationBlocked.tool, 'Bash');
+});
+
+test('denial dedup: genuinely different commands are NOT merged', () => {
+  const analysis = dedupePermissionDenials([
+    { tool_name: 'Bash', tool_input: { command: 'node a.js' } },
+    { tool_name: 'Bash', tool_input: { command: 'node b.js' } },
+  ], '/repo');
+  assert.equal(analysis.deduped.length, 2);
+  assert.equal(analysis.maxRepeat, 1);
+  assert.equal(analysis.verificationBlocked, null);
+});
+
+test('denial dedup: same command in a different cwd fingerprints differently', () => {
+  const d = { tool_name: 'Bash', tool_input: { command: 'node t.js' } };
+  assert.notEqual(denialFingerprint(d, '/repo-a'), denialFingerprint(d, '/repo-b'));
+});
+
+test('denial dedup: threshold constant and normalizer are stable', () => {
+  assert.equal(DENIAL_REPEAT_THRESHOLD, 2);
+  assert.equal(normalizeDeniedCommand('  a   b\tc\n'), 'a b c');
+});
+
+test('denial dedup: adapter flags verificationBlocked when one command is denied repeatedly', async () => {
+  const d = { tool_name: 'Bash', tool_input: { command: 'node verify.js' } };
+  const payload = JSON.stringify({ result: reportText({ status: 'BLOCKED' }), permission_denials: [d, d, d] });
+  const { spawn } = makeFakeSpawn({ stdout: payload });
+  const report = await createClaudeExecutorAdapter({ spawn }).execute(demoTaskCard());
+  assert.equal(report.permissionDenials.length, 1);
+  assert.equal(report.permissionDenials[0].repeatCount, 3);
+  assert.ok(report.verificationBlocked);
+  assert.equal(report.verificationBlocked.command, 'node verify.js');
+  assert.equal(report.permissionDenialAnalysis.maxRepeat, 3);
 });
 
 test('claude executor adapter: builds only exact allowed tools for approved node and npm commands', () => {

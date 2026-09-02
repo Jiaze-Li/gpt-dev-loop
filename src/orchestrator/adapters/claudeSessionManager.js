@@ -231,7 +231,23 @@ export function createClaudeSessionManager({
         onProcessStarted: (pid) => onProcessStarted?.({ ...processContext, pid }),
         onProcessExited: (details) => onProcessExited?.({ ...processContext, ...details }),
       });
-      const report = await executor.execute(taskCardForSession, { signal });
+      let report;
+      try {
+        report = await executor.execute(taskCardForSession, { signal });
+      } catch (error) {
+        // A post-send budget failure still consumed a real provider call.
+        // Stamp the routing context onto the error so the caller can record
+        // its usage before surfacing the blocker.
+        if (error instanceof AdapterError && error.details && error.details.usage) {
+          error.details.physicalCallReason = error.details.physicalCallReason ?? physicalCallReason;
+          error.details.attempt = error.details.attempt ?? effectiveAttempt;
+          error.details.taskId = error.details.taskId ?? taskId;
+          if (!error.details.model) error.details.model = routing.model;
+          error.details.modelEscalated = routing.escalated;
+          error.details.escalationReason = routing.escalationReason;
+        }
+        throw error;
+      }
       if (signal?.aborted) throw new Error('executor cancelled');
 
       // Ensure report has routing metadata attached
