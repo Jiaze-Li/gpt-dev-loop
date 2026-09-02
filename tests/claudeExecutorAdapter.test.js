@@ -338,9 +338,13 @@ test('claude executor adapter: extracts usage and cost from json output and trig
   assert.ok(calls[0].args.includes('--model'));
   assert.ok(calls[0].args.includes('sonnet'));
   assert.ok(calls[0].args.includes('--max-turns'));
-  assert.ok(calls[0].args.includes('60'));
+  assert.ok(calls[0].args.includes('30'));
   assert.ok(calls[0].args.includes('--output-format'));
   assert.ok(calls[0].args.includes('json'));
+  // Scoped Executor loads zero MCP servers: --strict-mcp-config present,
+  // no --mcp-config passed, so the user's SuperGPT MCP schemas never inject.
+  assert.ok(calls[0].args.includes('--strict-mcp-config'));
+  assert.ok(!calls[0].args.includes('--mcp-config'));
 });
 
 test('claude executor adapter: exposes provider permission denial telemetry', async () => {
@@ -425,13 +429,40 @@ test('budget guard: abnormally large cacheRead-per-turn is a hard stop', () => {
 });
 
 test('budget guard: num_turns over the cap is a hard stop', () => {
-  const limits = resolveExecutorBudgetLimits({}, { maxTurns: 60 });
+  const limits = resolveExecutorBudgetLimits({});
   const result = evaluateExecutorBudget({
     usage: { output_tokens: 10, cache_read_tokens: 100_000, cache_creation_tokens: 10_000, num_turns: 90 },
     limits,
   });
   assert.equal(result.exceeded, true);
-  assert.match(result.reason, /numTurns=90\/60/);
+  assert.match(result.reason, /numTurns=90\/30/);
+});
+
+test('budget guard: default turn cap is 30 — 30 turns PASS, 31 turns BLOCK', () => {
+  const limits = resolveExecutorBudgetLimits({});
+  assert.equal(limits.maxTurns, 30);
+
+  const at = evaluateExecutorBudget({
+    usage: { output_tokens: 10, cache_read_tokens: 30_000, cache_creation_tokens: 10_000, num_turns: 30 },
+    costUsd: 0.01,
+    limits,
+  });
+  assert.equal(at.exceeded, false, '30 turns is within the cap');
+
+  const over = evaluateExecutorBudget({
+    usage: { output_tokens: 10, cache_read_tokens: 31_000, cache_creation_tokens: 10_000, num_turns: 31 },
+    costUsd: 0.01,
+    limits,
+  });
+  assert.equal(over.exceeded, true, '31 turns trips the cap');
+  assert.ok(over.checks.some((c) => c.metric === 'numTurns' && c.limit === 30 && c.value === 31));
+});
+
+test('budget guard: turn cap remains configurable via EXECUTOR_MAX_TURNS / override', () => {
+  const overridden = resolveExecutorBudgetLimits({ EXECUTOR_MAX_TURNS: '45' });
+  assert.equal(overridden.maxTurns, 45);
+  const injected = resolveExecutorBudgetLimits({}, { maxTurns: 12 });
+  assert.equal(injected.maxTurns, 12);
 });
 
 test('budget guard: provider-reported cost over the cap is a hard stop', () => {

@@ -270,7 +270,10 @@ async function makeWorkflowDir(root, wfId, { status, withMetadata = true } = {})
   await mkdir(dir, { recursive: true });
   if (status) {
     await writeFile(path.join(root, `${wfId}.state.json`),
-      JSON.stringify({ workflowId: wfId, workflowStatus: status, activeProcesses: [] }));
+      // tokenUsage.records: [] — a reconstructable "zero prior spend"
+      // representation; keeps the resume cost-state gate satisfied so these
+      // tests exercise their own invariant.
+      JSON.stringify({ workflowId: wfId, workflowStatus: status, activeProcesses: [], tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }));
   }
   if (withMetadata) {
     await writeFile(path.join(root, `${wfId}.workspace.json`), JSON.stringify({ workflow_id: wfId }));
@@ -445,6 +448,12 @@ test('P1-1: resume sets the per-task Gate baseline to the persisted advanced com
     baseline_head: originalHead,
     closeout_verification_commands: ['echo closeout-ok'],
   }));
+  // A real mid-workflow resume state always carries a token-usage snapshot;
+  // this fixture predates cost tracking, so add a reconstructable one.
+  fs.writeFileSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`), JSON.stringify({
+    workflowId, workflowStatus: 'HUMAN_REQUIRED',
+    tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } },
+  }));
 
   // Durable control: task A in history, task B mid-flight (REWORK), advanced baseline persisted.
   saveCheckpoint({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, {
@@ -533,6 +542,10 @@ test('P1-1 fail-closed: an advanced baseline recorded in control that is not a v
     source_branch: 'main',
     baseline_head: originalHead,
     closeout_verification_commands: ['echo ok'],
+  }));
+  fs.writeFileSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`), JSON.stringify({
+    workflowId, workflowStatus: 'HUMAN_REQUIRED',
+    tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } },
   }));
   saveCheckpoint({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, { history: [{ task_id: 'a', decision: 'PASS', attempts: 1 }] });
   recordAdvancedBaselineHead({ root: SUPERGPT_WORKTREE_ROOT, workflowId, head: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' });

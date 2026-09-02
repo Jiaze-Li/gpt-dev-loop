@@ -253,6 +253,34 @@ export function enforcePromptBudget(prompt, limit = HARD_LIMIT) {
 }
 
 
+// ── Central prompt assembly + hard budget enforcement ───────────────
+//
+// The single enforcement point for the Supervisor 25k-char context hard
+// limit. EVERY Supervisor provider (agy, codex, claude) MUST build its
+// prompt through this function so the limit and its
+// SUPERVISOR_CONTEXT_BUDGET_EXCEEDED classification are identical on every
+// provider and an oversized prompt can never reach a physical model call.
+// Compaction still happens inside buildAgySupervisorPrompt; this is the
+// last-resort backstop after compaction.
+export function assembleSupervisorPrompt(context = {}) {
+  const rawPrompt = buildAgySupervisorPrompt(context);
+  const budget = enforcePromptBudget(rawPrompt);
+  if (budget.budgetExceeded) {
+    throw new AdapterError(
+      ADAPTER_ERROR_CODES.SUPERVISOR_CONTEXT_BUDGET_EXCEEDED,
+      `Supervisor prompt exceeded hard limit: ${budget.originalLength} chars > ${budget.limit} char budget. ` +
+      `Context must be compacted further before calling the model.`,
+      {
+        role: 'supervisor',
+        originalLength: budget.originalLength,
+        limit: budget.limit,
+      },
+    );
+  }
+  return { prompt: budget.prompt, originalLength: budget.originalLength, limit: budget.limit };
+}
+
+
 // ── Main prompt builder ─────────────────────────────────────────────
 
 export function buildAgySupervisorPrompt(context = {}) {
@@ -464,22 +492,7 @@ export function createAgySupervisorProvider({
     // (newly created on the first call, echoed back on every resume) — so
     // the caller can capture it once and reuse it thereafter.
     async decide(context = {}, { conversationId, effort } = {}) {
-      const prompt = buildAgySupervisorPrompt(context);
-
-      // ── Budget enforcement ──────────────────────────────────────────
-      const budget = enforcePromptBudget(prompt);
-      if (budget.budgetExceeded) {
-        throw new AdapterError(
-          ADAPTER_ERROR_CODES.SUPERVISOR_CONTEXT_BUDGET_EXCEEDED,
-          `Supervisor prompt exceeded hard limit: ${budget.originalLength} chars > ${budget.limit} char budget. ` +
-          `Context must be compacted further before calling the model.`,
-          {
-            role: 'supervisor',
-            originalLength: budget.originalLength,
-            limit: budget.limit,
-          },
-        );
-      }
+      const { prompt } = assembleSupervisorPrompt(context);
 
       let result;
       try {

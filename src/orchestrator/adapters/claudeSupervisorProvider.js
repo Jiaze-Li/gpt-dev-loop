@@ -8,7 +8,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawn as nodeSpawn } from "node:child_process";
-import { buildAgySupervisorPrompt, parseSupervisorJson } from "./agySupervisorProvider.js";
+import { assembleSupervisorPrompt, parseSupervisorJson } from "./agySupervisorProvider.js";
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from "../errors.js";
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from "../processTree.js";
 
@@ -165,7 +165,8 @@ export function createClaudeSupervisorProvider({ call = callClaude, model = "opu
     provider: "claude",
     model,
     async decide(context = {}, { effort } = {}) {
-      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort, signal });
+      const { prompt } = assembleSupervisorPrompt(context);
+      const result = await call({ prompt, model, timeoutMs, executable, spawn, effort, signal });
       let raw;
       try {
         const trimmed = result.text.trim().replace(/^\`\`\`(?:json)?\s*/i, "").replace(/\s*\`\`\`$/, "");

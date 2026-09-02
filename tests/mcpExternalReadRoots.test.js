@@ -240,6 +240,14 @@ test("3. Resume preserves approved root policy from workflow state automatically
       metaFile,
       JSON.stringify(runtimeMeta, null, 2)
     );
+    // A real resume state always carries a token-usage snapshot; add a
+    // reconstructable (empty) one so the resume cost-state gate is satisfied
+    // and this test exercises its own approved-root policy invariant.
+    const stateFile = path.join(metadataDir, workflowId + ".state.json");
+    fs.writeFileSync(stateFile, JSON.stringify({
+      workflowId, workflowStatus: "HUMAN_REQUIRED",
+      tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } },
+    }));
 
     // Call supergptResume without passing any explicit externalReadRoots
     const result = await supergptResume({
@@ -253,6 +261,7 @@ test("3. Resume preserves approved root policy from workflow state automatically
 
     // Clean up metadata
     fs.rmSync(metaFile, { force: true });
+    fs.rmSync(stateFile, { force: true });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

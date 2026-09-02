@@ -5,7 +5,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { buildAgySupervisorPrompt, parseSupervisorJson } from './agySupervisorProvider.js';
+import { assembleSupervisorPrompt, parseSupervisorJson } from './agySupervisorProvider.js';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
 
@@ -104,7 +104,8 @@ export function createCodexSupervisorProvider({ call = callCodex, model = null, 
   return {
     provider: 'codex', model,
     async decide(context = {}, { effort = null, conversationId = null } = {}) {
-      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort, conversationId, signal });
+      const { prompt } = assembleSupervisorPrompt(context);
+      const result = await call({ prompt, model, timeoutMs, executable, spawn, effort, conversationId, signal });
       let raw;
       try { raw = JSON.parse(result.text.trim()); } catch {
         throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT, 'Codex Supervisor did not return a JSON decision', { providerFailure: 'PROVIDER_PROTOCOL_ERROR', model });

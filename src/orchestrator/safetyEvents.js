@@ -12,6 +12,22 @@ export const SAFETY_EVENT_CODES = Object.freeze({
   VERIFICATION_PERMISSION_BLOCKED: 'VERIFICATION_PERMISSION_BLOCKED',
   REVIEWER_CONTEXT_BUDGET_EXCEEDED: 'REVIEWER_CONTEXT_BUDGET_EXCEEDED',
   SUPERVISOR_CONTEXT_BUDGET_EXCEEDED: 'SUPERVISOR_CONTEXT_BUDGET_EXCEEDED',
+  WORKFLOW_COST_BUDGET_EXCEEDED: 'WORKFLOW_COST_BUDGET_EXCEEDED',
+  // Resume could not reconstruct prior cumulative spend while the cost
+  // ceiling is enabled — refuse to resume with a fresh $0 budget.
+  WORKFLOW_COST_STATE_UNAVAILABLE: 'WORKFLOW_COST_STATE_UNAVAILABLE',
+  // ── Mechanical token ceilings (the last-resort fuse) ─────────────────
+  // These fire independently of every heuristic (baseline-diff, no-new-info,
+  // per-call budget). They are pure aggregate token/call counters read off the
+  // deduplicated UsageTracker log, so an unknown bug that slips past every
+  // other guard still hits a hard wall.
+  // One Task's Executor physical calls reached the cumulative usage-volume cap.
+  TASK_EXECUTOR_USAGE_VOLUME_EXCEEDED: 'TASK_EXECUTOR_USAGE_VOLUME_EXCEEDED',
+  // One Task reached the maximum number of real Executor physical calls.
+  EXECUTOR_CALL_CEILING_EXCEEDED: 'EXECUTOR_CALL_CEILING_EXCEEDED',
+  // The whole workflow reached the cumulative usage-volume cap (cost-source
+  // independent: a provider that never reports costUsd is still counted).
+  WORKFLOW_USAGE_VOLUME_EXCEEDED: 'WORKFLOW_USAGE_VOLUME_EXCEEDED',
   FRONT_AGENT_POLLING_REGRESSION: 'FRONT_AGENT_POLLING_REGRESSION',
   // A Gate-sourced REWORK repeated with the SAME failure fingerprint AND the
   // SAME task diff — the previous Executor attempt produced no new information,
@@ -55,6 +71,9 @@ export function makeSafetyEvent({
   actionTaken = null,
   fingerprint = null,
   diffHash = null,
+  physicalCalls = null,
+  usageVolume = null,
+  limit = null,
 } = {}) {
   if (!VALID_CODES.has(code)) {
     throw new Error(`makeSafetyEvent: unknown safety event code "${code}"`);
@@ -76,6 +95,10 @@ export function makeSafetyEvent({
     // byte-identical.
     ...(fingerprint == null ? {} : { fingerprint: String(fingerprint) }),
     ...(diffHash == null ? {} : { diffHash: String(diffHash) }),
+    // Mechanical-ceiling evidence — only the token-fuse codes carry these.
+    ...(Number.isFinite(physicalCalls) ? { physicalCalls } : {}),
+    ...(Number.isFinite(usageVolume) ? { usageVolume } : {}),
+    ...(Number.isFinite(limit) ? { limit } : {}),
     at: new Date().toISOString(),
   };
 }

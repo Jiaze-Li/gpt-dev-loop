@@ -3600,6 +3600,687 @@ test('no-new-information: identical dashboard Gate failure + unchanged diff stop
   }
 });
 
+// ── Workflow-level cumulative cost circuit breaker ───────────────────
+
+import {
+  resolveWorkflowCostCeilingUsd,
+  workflowCostExceeded,
+  DEFAULT_WORKFLOW_MAX_COST_USD,
+} from '../src/orchestrator/workflowCostGuard.js';
+
+function costingExecutorManagerFactory({ costUsd, usage }) {
+  const managers = [];
+  function createClaudeSessionManager({ taskId }) {
+    const executions = [];
+    const manager = {
+      taskId,
+      executions,
+      async execute(taskCard) {
+        executions.push({ taskCard });
+        const report = demoExecutionReport(taskCard.task_id);
+        Object.defineProperty(report, 'usage', { value: { ...usage }, enumerable: false });
+        Object.defineProperty(report, 'callId', { value: usage.callId, enumerable: false });
+        report.costUsd = costUsd;
+        report.model = 'sonnet';
+        return report;
+      },
+    };
+    managers.push(manager);
+    return manager;
+  }
+  createClaudeSessionManager.managers = managers;
+  return createClaudeSessionManager;
+}
+
+test('workflow cost breaker: threshold-crossing call is recorded, then no further model call runs', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-cost-'));
+  try {
+    const taskCard = demoTaskCard();
+    const supervisor = makeFakeSupervisor([
+      { action: 'NEXT_TASK', task_card: taskCard },
+      { action: 'WORKFLOW_DONE', summary: 'should never be reached' },
+    ]);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+    const gateRunner = makeFakeGateRunner();
+    const usageTracker = new UsageTracker();
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-agy-test-costbreak', kind: 'INTERNAL_TEST', root });
+
+    // One valid Executor call that costs $0.12 — individually fine, but it
+    // crosses the $0.10 aggregate ceiling.
+    const createClaudeSessionManager = costingExecutorManagerFactory({
+      costUsd: 0.12,
+      usage: { input_tokens: 1000, output_tokens: 200, num_turns: 4, callId: 'call-claude-exe-cost-1' },
+    });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-agy-test-costbreak',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      workflowCostCeilingUsd: 0.10,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    // C2: the crossing call's usage is recorded.
+    const usage = usageTracker.summary();
+    assert.equal(usage.executor.calls, 1);
+    assert.equal(usage.executor.costUsd, 0.12);
+    // C5: no subsequent model call — the Reviewer is never invoked (its tab
+    // is never opened, review() never runs), and the supervisor is only
+    // consulted once (before the executor), never again.
+    const reviewerSessions = createReviewerSession.created;
+    assert.ok(reviewerSessions.every((s) => s.created === false && s.reviewCalls === 0));
+    assert.equal(supervisor.calls.length, 1);
+    // C3 + C4: a BLOCKING safety event on the existing safety path.
+    const events = workflowStateManager.getSafetyEvents();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].code, 'WORKFLOW_COST_BUDGET_EXCEEDED');
+    assert.equal(events[0].severity, 'BLOCKING');
+    assert.match(events[0].reason, /exceeded the hard ceiling/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('workflow cost breaker: a run that stays under the ceiling completes normally', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done under budget' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const gateRunner = makeFakeGateRunner();
+  const usageTracker = new UsageTracker();
+  const createClaudeSessionManager = costingExecutorManagerFactory({
+    costUsd: 0.12,
+    usage: { input_tokens: 1000, output_tokens: 200, num_turns: 4, callId: 'call-claude-exe-cost-ok' },
+  });
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-cost-ok',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner,
+    windowSession: makeFakeWindowSession(),
+    usageTracker,
+    workflowCostCeilingUsd: 1.00,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.equal(createReviewerSession.created.length, 1);
+  assert.equal(usageTracker.summary().executor.costUsd, 0.12);
+});
+
+test('workflow cost guard: config resolution + dedupe-safe aggregate', () => {
+  assert.equal(resolveWorkflowCostCeilingUsd({}), DEFAULT_WORKFLOW_MAX_COST_USD);
+  assert.equal(resolveWorkflowCostCeilingUsd({ WORKFLOW_MAX_COST_USD: '2.5' }), 2.5);
+  assert.equal(resolveWorkflowCostCeilingUsd({ WORKFLOW_MAX_COST_USD: '0' }), 0, 'non-positive disables the breaker');
+  assert.equal(resolveWorkflowCostCeilingUsd({ WORKFLOW_MAX_COST_USD: 'nonsense' }), 0);
+
+  const tracker = new UsageTracker();
+  const rec = { workflowId: 'w', role: 'executor', callId: 'dup-1', taskId: 't', attempt: 1,
+    model: 'sonnet', usage: { input_tokens: 10, output_tokens: 5, callId: 'dup-1' }, costUsd: 4.0 };
+  tracker.record(rec);
+  tracker.record(rec); // identical physical call — must not double-count
+  assert.equal(tracker.summary().measuredTotal.costUsd, 4.0);
+  assert.equal(workflowCostExceeded(tracker, 5.0), null);
+  assert.deepEqual(
+    { ...workflowCostExceeded(tracker, 3.0) },
+    { totalCostUsd: 4.0, limitUsd: 3.0 },
+  );
+  assert.equal(workflowCostExceeded(tracker, 0), null, 'disabled ceiling never trips');
+});
+
+// ── Workflow cost breaker survives resume (whole-workflow, not per-process) ──
+
+import { rehydrateUsageFromState } from '../src/orchestrator/workflowCostGuard.js';
+
+// Build a UsageTracker holding ~$totalUsd of recorded model calls, then return
+// the persisted-state shape (`{ tokenUsage: tracker.summary() }`) a prior
+// process would have written to <workflowId>.state.json.
+function persistedStateWithCost(perCall) {
+  const tracker = new UsageTracker();
+  perCall.forEach((costUsd, i) => {
+    tracker.record({
+      workflowId: 'wf-resume', role: i % 2 === 0 ? 'executor' : 'supervisor',
+      callId: `prior-call-${i}`, taskId: `t${i}`, attempt: 1, model: 'sonnet',
+      usage: { input_tokens: 100, output_tokens: 20, callId: `prior-call-${i}` },
+      costUsd,
+    });
+  });
+  return { tokenUsage: tracker.summary() };
+}
+
+test('resume: rehydrateUsageFromState restores the exact prior aggregate and is replay-safe', () => {
+  const priorState = persistedStateWithCost([2.0, 1.5, 0.5]); // $4.00 total
+
+  const fresh = new UsageTracker();
+  const folded = rehydrateUsageFromState(fresh, priorState);
+  assert.equal(folded, 3);
+  assert.equal(fresh.summary().measuredTotal.costUsd, 4.0);
+
+  // Replaying the same snapshot (e.g. a second resume) must not inflate it.
+  rehydrateUsageFromState(fresh, priorState);
+  assert.equal(fresh.summary().measuredTotal.costUsd, 4.0);
+
+  // A genuinely new call in this process adds on top of the restored total.
+  fresh.record({ workflowId: 'wf-resume', role: 'executor', callId: 'new-1', taskId: 'tN', attempt: 1,
+    model: 'sonnet', usage: { input_tokens: 10, output_tokens: 5, callId: 'new-1' }, costUsd: 0.3 });
+  assert.equal(fresh.summary().measuredTotal.costUsd, 4.3);
+
+  // No prior snapshot → no-op.
+  assert.equal(rehydrateUsageFromState(new UsageTracker(), null), 0);
+  assert.equal(rehydrateUsageFromState(new UsageTracker(), { tokenUsage: { records: [] } }), 0);
+});
+
+test('resume: restored $4.00 + a new $1.20 call crosses the $5 ceiling — recorded, BLOCKING, HUMAN_REQUIRED, no later call', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-resume-cost-'));
+  try {
+    const taskCard = demoTaskCard();
+
+    // ── prior process: accumulate $4.00, persist ──────────────────────
+    const priorState = persistedStateWithCost([2.5, 1.0, 0.5]);
+    assert.equal(new UsageTracker().summary().measuredTotal.costUsd, 0);
+
+    // ── restart: fresh tracker, rehydrated from the persisted snapshot ─
+    const usageTracker = new UsageTracker();
+    rehydrateUsageFromState(usageTracker, priorState);
+    assert.equal(usageTracker.summary().measuredTotal.costUsd, 4.0, 'restored aggregate is $4.00, not $0');
+
+    const supervisor = makeFakeSupervisor([
+      { action: 'NEXT_TASK', task_card: taskCard },
+      { action: 'WORKFLOW_DONE', summary: 'never reached' },
+    ]);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-agy-test-resumecost', kind: 'INTERNAL_TEST', root });
+    const createClaudeSessionManager = costingExecutorManagerFactory({
+      costUsd: 1.20,
+      usage: { input_tokens: 1000, output_tokens: 200, num_turns: 4, callId: 'call-claude-exe-resume-cross' },
+    });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-agy-test-resumecost',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner: makeFakeGateRunner(),
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      workflowCostCeilingUsd: 5.0,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    const usage = usageTracker.summary();
+    // the crossing call itself is recorded exactly once...
+    assert.equal(usage.records.filter((r) => r.callId === 'call-claude-exe-resume-cross').length, 1);
+    // ...on top of the 2 restored executor calls (indices 0 + 2), 3 total.
+    assert.equal(usage.executor.calls, 3);
+    // restored ($4.00) + new ($1.20) = $5.20
+    assert.equal(Number(usage.measuredTotal.costUsd.toFixed(2)), 5.20);
+    // no later model call
+    const reviewerSessions = createReviewerSession.created;
+    assert.ok(reviewerSessions.every((s) => s.created === false && s.reviewCalls === 0));
+    assert.equal(supervisor.calls.length, 1);
+    // BLOCKING safety event on the existing path
+    const events = workflowStateManager.getSafetyEvents();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].code, 'WORKFLOW_COST_BUDGET_EXCEEDED');
+    assert.equal(events[0].severity, 'BLOCKING');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('resume: restored cost + new cost still under the ceiling continues normally', async () => {
+  const taskCard = demoTaskCard();
+  const priorState = persistedStateWithCost([2.0, 1.0, 0.5]); // $3.50
+  const usageTracker = new UsageTracker();
+  rehydrateUsageFromState(usageTracker, priorState);
+  assert.equal(usageTracker.summary().measuredTotal.costUsd, 3.5);
+
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done under budget after resume' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const createClaudeSessionManager = costingExecutorManagerFactory({
+    costUsd: 0.50,
+    usage: { input_tokens: 1000, output_tokens: 200, num_turns: 4, callId: 'call-claude-exe-resume-ok' },
+  });
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-resume-ok',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    usageTracker,
+    workflowCostCeilingUsd: 5.0,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.equal(createReviewerSession.created[0].reviewCalls, 1);
+  assert.equal(Number(usageTracker.summary().measuredTotal.costUsd.toFixed(2)), 4.0);
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  MECHANICAL TOKEN CEILINGS — the last-resort fuse
+//  (1) per-Task Executor cumulative usageVolume
+//  (2) per-Task Executor physical-call count
+//  (3) whole-workflow cumulative usageVolume
+//  + resume continuity for all three.
+// ════════════════════════════════════════════════════════════════════
+
+import {
+  executorTaskUsage,
+  taskExecutorCeilingExceeded,
+  workflowUsageVolumeExceeded,
+} from '../src/orchestrator/workflowCostGuard.js';
+
+// Executor manager whose every execute() is a distinct physical call
+// (unique callId) contributing `perCallVolume` processed tokens. costUsd is
+// left null by default so the volume guards are exercised in isolation from
+// the dollar cost breaker.
+function volumeExecutorManagerFactory({ perCallVolume = 100_000, costUsd = null } = {}) {
+  let n = 0;
+  const managers = [];
+  function createClaudeSessionManager({ taskId }) {
+    const executions = [];
+    const manager = {
+      taskId,
+      executions,
+      async execute(taskCard) {
+        n += 1;
+        executions.push({ taskCard, n });
+        const callId = `call-vol-${taskCard.task_id}-${n}`;
+        const report = demoExecutionReport(taskCard.task_id);
+        Object.defineProperty(report, 'usage', {
+          value: { input_tokens: perCallVolume, output_tokens: 0, callId },
+          enumerable: false,
+        });
+        Object.defineProperty(report, 'callId', { value: callId, enumerable: false });
+        report.costUsd = costUsd;
+        report.model = 'sonnet';
+        return report;
+      },
+    };
+    managers.push(manager);
+    return manager;
+  }
+  createClaudeSessionManager.managers = managers;
+  return createClaudeSessionManager;
+}
+
+function reworkForever(taskCard, rounds = 30) {
+  const decisions = [{ action: 'NEXT_TASK', task_card: taskCard }];
+  for (let i = 0; i < rounds; i += 1) decisions.push({ action: 'CONTINUE_REWORK' });
+  decisions.push({ action: 'WORKFLOW_DONE', summary: 'never reached' });
+  const reworkQueue = [];
+  for (let i = 0; i < rounds; i += 1) reworkQueue.push(reworkResult(taskCard.task_id));
+  return { decisions, reworkQueue };
+}
+
+function persistedStateWithExecutorVolume(perCallVolumes, { taskId = 't-prior', workflowId = 'wf-resume-vol' } = {}) {
+  const tracker = new UsageTracker();
+  perCallVolumes.forEach((vol, i) => tracker.record({
+    workflowId, role: 'executor', callId: `prior-vol-${i}`, taskId, attempt: 1, model: 'sonnet',
+    usage: { input_tokens: vol, output_tokens: 0, callId: `prior-vol-${i}` },
+  }));
+  return { tokenUsage: tracker.summary() };
+}
+
+// ── unit: the pure counters ─────────────────────────────────────────
+
+test('token fuse unit: executorTaskUsage counts every physical-call reason, ignores dup/deterministic/other-task', () => {
+  const t = new UsageTracker();
+  for (const [i, reason] of ['PRIMARY', 'RETRY', 'FAILOVER', 'PROBE'].entries()) {
+    t.record({
+      workflowId: 'w', role: 'executor', callId: `c${i}`, taskId: 'task-1', attempt: i + 1, model: 'sonnet',
+      physicalCallReason: reason,
+      usage: { input_tokens: 100_000, output_tokens: 10_000, callId: `c${i}` },
+    });
+  }
+  // a byte-identical replay of c0 — must NOT add a call
+  t.record({
+    workflowId: 'w', role: 'executor', callId: 'c0', taskId: 'task-1', attempt: 1, model: 'sonnet',
+    usage: { input_tokens: 100_000, output_tokens: 10_000, callId: 'c0' },
+  });
+  // a different task, and a supervisor call — neither counts for task-1
+  t.record({ workflowId: 'w', role: 'executor', callId: 'other', taskId: 'task-2', attempt: 1, model: 'sonnet', usage: { input_tokens: 500_000, output_tokens: 0, callId: 'other' } });
+  t.record({ workflowId: 'w', role: 'supervisor', callId: 'sup', taskId: 'task-1', attempt: 1, model: 'sonnet', usage: { input_tokens: 999_999, output_tokens: 0, callId: 'sup' } });
+
+  const u = executorTaskUsage(t, 'task-1');
+  assert.equal(u.physicalCalls, 4, 'PRIMARY + RETRY + FAILOVER + PROBE all count; the replay does not');
+  assert.equal(u.usageVolume, 4 * 110_000);
+
+  // call ceiling checked before volume; >= semantics
+  assert.equal(taskExecutorCeilingExceeded(t, 'task-1', { callLimit: 5, volumeLimit: 0 }), null);
+  assert.deepEqual(
+    { ...taskExecutorCeilingExceeded(t, 'task-1', { callLimit: 4, volumeLimit: 0 }) },
+    { kind: 'CALLS', physicalCalls: 4, usageVolume: 440_000, limit: 4 },
+  );
+  assert.equal(taskExecutorCeilingExceeded(t, 'task-1', { callLimit: 0, volumeLimit: 440_001 }), null, '439,999 < limit passes');
+  assert.equal(taskExecutorCeilingExceeded(t, 'task-1', { callLimit: 0, volumeLimit: 440_000 }).kind, 'VOLUME', 'reaching the limit trips');
+});
+
+test('token fuse unit: workflowUsageVolumeExceeded uses >= on the deduplicated measuredTotal', () => {
+  const t = new UsageTracker();
+  t.record({ workflowId: 'w', role: 'executor', callId: 'a', taskId: 't', attempt: 1, model: 'sonnet', usage: { input_tokens: 1_490_000, output_tokens: 0, callId: 'a' } });
+  assert.equal(workflowUsageVolumeExceeded(t, 1_500_000), null, '1.49M < 1.5M');
+  assert.equal(workflowUsageVolumeExceeded(t, 0), null, 'disabled ceiling never trips');
+  t.record({ workflowId: 'w', role: 'executor', callId: 'b', taskId: 't', attempt: 2, model: 'sonnet', usage: { input_tokens: 10_000, output_tokens: 0, callId: 'b' } });
+  assert.deepEqual(
+    { ...workflowUsageVolumeExceeded(t, 1_500_000) },
+    { totalUsageVolume: 1_500_000, limit: 1_500_000 },
+  );
+});
+
+// ── integration: per-Task Executor physical-call ceiling ────────────
+
+test('token fuse: a Task is stopped BEFORE the 5th real Executor call (MAX_EXECUTOR_PHYSICAL_CALLS_PER_TASK=4)', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-callceil-'));
+  try {
+    const taskCard = demoTaskCard();
+    const { decisions, reworkQueue } = reworkForever(taskCard);
+    const supervisor = makeFakeSupervisor(decisions);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: reworkQueue });
+    const usageTracker = new UsageTracker();
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-callceil', kind: 'INTERNAL_TEST', root });
+    const createClaudeSessionManager = volumeExecutorManagerFactory({ perCallVolume: 10_000 });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-callceil',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner: makeFakeGateRunner(),
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      // the heuristic bounds are set high so it is the mechanical fuse that fires
+      maxAttemptsPerTask: 20,
+      maxEscalationAttempts: 20,
+      executorPhysicalCallCeiling: 4,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.equal(createClaudeSessionManager.managers[0].executions.length, 4, 'exactly 4 physical Executor calls, never a 5th');
+    assert.equal(usageTracker.summary().executor.calls, 4);
+    // the Reviewer ran once per COMPLETED round (4), never for the blocked 5th
+    assert.equal(createReviewerSession.created[0].reviewCalls, 4);
+    const events = workflowStateManager.getSafetyEvents();
+    const blocking = events.filter((e) => e.severity === 'BLOCKING');
+    assert.equal(blocking.length, 1);
+    assert.equal(blocking[0].code, 'EXECUTOR_CALL_CEILING_EXCEEDED');
+    assert.equal(blocking[0].role, 'executor');
+    assert.equal(blocking[0].taskId, taskCard.task_id);
+    assert.equal(blocking[0].physicalCalls, 4);
+    assert.equal(blocking[0].limit, 4);
+    assert.match(blocking[0].reason, /physical-call ceiling/);
+    // terminal projection carries it to the Front Agent
+    const proj = summarizeSafetyEvents(events);
+    assert.equal(proj.blockingSafetyEvent.code, 'EXECUTOR_CALL_CEILING_EXCEEDED');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── integration: per-Task Executor cumulative usageVolume ceiling ───
+
+test('token fuse: a Task is stopped once its Executor cumulative usageVolume reaches TASK_MAX_EXECUTOR_USAGE_VOLUME', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-taskvol-'));
+  try {
+    const taskCard = demoTaskCard();
+    const { decisions, reworkQueue } = reworkForever(taskCard);
+    const supervisor = makeFakeSupervisor(decisions);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: reworkQueue });
+    const usageTracker = new UsageTracker();
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-taskvol', kind: 'INTERNAL_TEST', root });
+    // 300k per call: after call 2 the task sits at exactly 600k -> call 3 blocked.
+    const createClaudeSessionManager = volumeExecutorManagerFactory({ perCallVolume: 300_000 });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-taskvol',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner: makeFakeGateRunner(),
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      maxAttemptsPerTask: 20,
+      maxEscalationAttempts: 20,
+      taskExecutorUsageVolumeCeiling: 600_000,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.equal(createClaudeSessionManager.managers[0].executions.length, 2, '590k would pass; 600k blocks the next call');
+    const blocking = workflowStateManager.getSafetyEvents().filter((e) => e.severity === 'BLOCKING');
+    assert.equal(blocking.length, 1);
+    assert.equal(blocking[0].code, 'TASK_EXECUTOR_USAGE_VOLUME_EXCEEDED');
+    assert.equal(blocking[0].usageVolume, 600_000);
+    assert.equal(blocking[0].limit, 600_000);
+    assert.equal(blocking[0].physicalCalls, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── integration: whole-workflow cumulative usageVolume ceiling ──────
+
+test('token fuse: the whole workflow is stopped once measuredTotal.usageVolume reaches WORKFLOW_MAX_USAGE_VOLUME (cost-source independent)', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-wfvol-'));
+  try {
+    const taskCard = demoTaskCard();
+    const { decisions, reworkQueue } = reworkForever(taskCard);
+    const supervisor = makeFakeSupervisor(decisions);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: reworkQueue });
+    const usageTracker = new UsageTracker();
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-wfvol', kind: 'INTERNAL_TEST', root });
+    // 800k per call, NO costUsd reported at all.
+    const createClaudeSessionManager = volumeExecutorManagerFactory({ perCallVolume: 800_000, costUsd: null });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-wfvol',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner: makeFakeGateRunner(),
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      maxAttemptsPerTask: 20,
+      maxEscalationAttempts: 20,
+      // dollar ceiling ON but useless here: the provider reports no cost
+      workflowCostCeilingUsd: 5.0,
+      workflowUsageVolumeCeiling: 1_500_000,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.equal(createClaudeSessionManager.managers[0].executions.length, 2, '800k then 1.6M — the 3rd call is blocked');
+    const summary = usageTracker.summary();
+    assert.equal(summary.measuredTotal.costUsd, 0, 'no cost was ever reported');
+    assert.equal(summary.measuredTotal.usageVolume, 1_600_000);
+    const blocking = workflowStateManager.getSafetyEvents().filter((e) => e.severity === 'BLOCKING');
+    assert.equal(blocking.length, 1);
+    assert.equal(blocking[0].code, 'WORKFLOW_USAGE_VOLUME_EXCEEDED');
+    assert.equal(blocking[0].role, 'workflow');
+    assert.equal(blocking[0].limit, 1_500_000);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('token fuse: a workflow that stays under every ceiling completes normally', async () => {
+  const taskCard = demoTaskCard();
+  const supervisor = makeFakeSupervisor([
+    { action: 'NEXT_TASK', task_card: taskCard },
+    { action: 'WORKFLOW_DONE', summary: 'done under every ceiling' },
+  ]);
+  const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [passResult(taskCard.task_id)] });
+  const usageTracker = new UsageTracker();
+  const createClaudeSessionManager = volumeExecutorManagerFactory({ perCallVolume: 200_000, costUsd: 0.1 });
+
+  const result = await runAutomatedWorkflow({
+    workflowId: 'wf-underceil',
+    supervisorSession: supervisor,
+    createReviewerSession,
+    createClaudeSessionManager,
+    gateRunner: makeFakeGateRunner(),
+    windowSession: makeFakeWindowSession(),
+    usageTracker,
+    workflowCostCeilingUsd: 5.0,
+    workflowUsageVolumeCeiling: 1_500_000,
+    taskExecutorUsageVolumeCeiling: 600_000,
+    executorPhysicalCallCeiling: 4,
+    workflowGoal: 'ship it',
+    repositoryContext: taskCard.repository_context,
+  });
+
+  assert.equal(result.status, 'WORKFLOW_DONE');
+  assert.equal(createClaudeSessionManager.managers[0].executions.length, 1);
+  assert.equal(usageTracker.summary().executor.calls, 1);
+});
+
+// ── resume continuity ──────────────────────────────────────────────
+
+test('token fuse resume: 1.4M persisted volume + a new 150k call crosses the 1.5M workflow ceiling', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-resume-vol-'));
+  try {
+    const taskCard = demoTaskCard();
+    const priorState = persistedStateWithExecutorVolume([700_000, 700_000]); // 1.4M
+    const usageTracker = new UsageTracker();
+    rehydrateUsageFromState(usageTracker, priorState);
+    assert.equal(usageTracker.summary().measuredTotal.usageVolume, 1_400_000, 'restored 1.4M, not 0');
+
+    const { decisions, reworkQueue } = reworkForever(taskCard);
+    const supervisor = makeFakeSupervisor(decisions);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: reworkQueue });
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-resume-vol-loop', kind: 'INTERNAL_TEST', root });
+    const createClaudeSessionManager = volumeExecutorManagerFactory({ perCallVolume: 150_000 });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-resume-vol-loop',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner: makeFakeGateRunner(),
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      maxAttemptsPerTask: 20,
+      maxEscalationAttempts: 20,
+      workflowUsageVolumeCeiling: 1_500_000,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.equal(createClaudeSessionManager.managers[0].executions.length, 1, 'one new call (1.4M -> 1.55M), then blocked — not reset to 0');
+    assert.equal(usageTracker.summary().measuredTotal.usageVolume, 1_550_000);
+    assert.equal(workflowStateManager.getSafetyEvents().filter((e) => e.severity === 'BLOCKING')[0].code, 'WORKFLOW_USAGE_VOLUME_EXCEEDED');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('token fuse resume: a Task with 4 persisted Executor physical calls gets no 5th after restart', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-resume-calls-'));
+  try {
+    const taskCard = demoTaskCard(); // task_id: 'task-1'
+    const priorState = persistedStateWithExecutorVolume([50_000, 50_000, 50_000, 50_000], { taskId: 'task-1' });
+    const usageTracker = new UsageTracker();
+    rehydrateUsageFromState(usageTracker, priorState);
+    assert.equal(executorTaskUsage(usageTracker, 'task-1').physicalCalls, 4);
+
+    const { decisions, reworkQueue } = reworkForever(taskCard);
+    const supervisor = makeFakeSupervisor(decisions);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: reworkQueue });
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-resume-calls-loop', kind: 'INTERNAL_TEST', root });
+    const createClaudeSessionManager = volumeExecutorManagerFactory({ perCallVolume: 10_000 });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-resume-calls-loop',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner: makeFakeGateRunner(),
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      maxAttemptsPerTask: 20,
+      maxEscalationAttempts: 20,
+      executorPhysicalCallCeiling: 4,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.equal(createClaudeSessionManager.managers[0].executions.length, 0, 'the ceiling was already reached before restart — zero new physical calls');
+    assert.ok(createReviewerSession.created.every((s) => s.reviewCalls === 0), 'no Reviewer dispatch after the block');
+    assert.equal(supervisor.calls.length, 1, 'Supervisor consulted once to pick the task, never again after the block');
+    assert.equal(workflowStateManager.getSafetyEvents().filter((e) => e.severity === 'BLOCKING')[0].code, 'EXECUTOR_CALL_CEILING_EXCEEDED');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── BASELINE-DIFF GATE ──────────────────────────────────────────────────
 // Pre-existing / out-of-scope verification failures are attributed to the
 // repository baseline, never to the current task, and never drive REWORK.

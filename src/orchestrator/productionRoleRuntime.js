@@ -17,6 +17,14 @@ export function providerFailure(error) {
   if (code === 'EXECUTOR_BUDGET_EXCEEDED' || code === 'EXECUTOR_DUPLICATE_CALL_REJECTED' || code === 'EXECUTOR_INVALID_OUTPUT') {
     return { code: 'EXECUTOR_IMPLEMENTATION_FAILURE' };
   }
+  // A context-budget overflow is deterministic: every provider builds the
+  // Supervisor / Reviewer prompt through the same assembler, so failing over
+  // to the next provider would overflow identically and burn another call.
+  // Classify it non-retryable so the invocation surfaces the guard
+  // immediately, exactly like the Executor budget brake.
+  if (code === 'SUPERVISOR_CONTEXT_BUDGET_EXCEEDED' || code === 'REVIEWER_CONTEXT_BUDGET_EXCEEDED') {
+    return { code };
+  }
   if (code === 'EXECUTOR_TIMEOUT') {
     return { code: 'PROVIDER_TIMEOUT', resetAt: error?.details?.resetAt ?? error?.resetAt ?? null, retryAfter: error?.details?.retryAfter ?? error?.retryAfter ?? null };
   }

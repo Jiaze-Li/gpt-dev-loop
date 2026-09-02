@@ -533,7 +533,7 @@ export function buildAllowedVerificationTools(taskCard, { cwd = process.cwd() } 
 // Cumulative cacheRead stays as telemetry only; it is enforced ONLY when a
 // deployment explicitly sets EXECUTOR_MAX_CACHE_READ_TOKENS > 0.
 // ---------------------------------------------------------------------------
-export function resolveExecutorBudgetLimits(env = {}, { maxBudgetUsd = 0.5, maxTurns = 60 } = {}) {
+export function resolveExecutorBudgetLimits(env = {}, { maxBudgetUsd = 0.5, maxTurns = 30 } = {}) {
   const num = (value, fallback) => {
     const n = Number(value);
     return Number.isFinite(n) ? n : fallback;
@@ -674,9 +674,11 @@ export function createClaudeExecutorAdapter({
   // transport timeout: retrying it on Opus would start another full execution.
   timeoutMs = Number(env?.EXECUTOR_MAX_RUNTIME_MS ?? 5 * 60 * 1000),
   // The installed CLI's print mode also supports a hard agentic-turn cap.
-  // Sixty turns leaves ordinary edit + test tasks ample room while containing
-  // accidental tool/agent loops. Set <=0 to leave the CLI default unbounded.
-  maxTurns = Number(env?.EXECUTOR_MAX_TURNS ?? 60),
+  // Thirty turns leaves ordinary edit + test tasks ample room (a realistic
+  // scoped task lands well under 25) while containing accidental tool/agent
+  // loops far sooner than the old 60. Set <=0 to leave the CLI default
+  // unbounded.
+  maxTurns = Number(env?.EXECUTOR_MAX_TURNS ?? 30),
   // Claude Code's print-mode budget is the only supported in-process hard
   // stop exposed by the installed CLI. Keep it deliberately small; callers
   // may tune it per deployment without changing a Task Card.
@@ -697,6 +699,14 @@ export function createClaudeExecutorAdapter({
         // Each Task Card is a disposable process/session. This prevents a
         // later CLI invocation from being resumed accidentally from disk.
         '--no-session-persistence',
+        // Scoped Executor: load ONLY MCP servers passed via --mcp-config
+        // (none are), so the user's global SuperGPT MCP server and its ~14
+        // tool schemas are never injected into this session. The Executor is
+        // already forbidden from every supergpt_* tool; this stops paying to
+        // serialize their schemas on every turn. Built-in CLI tools (Bash,
+        // Edit, Read, Write, Glob, Grep, ...) are unaffected — they are not
+        // MCP — and --allowedTools restrictions below still apply.
+        '--strict-mcp-config',
         '--permission-mode',
         'acceptEdits',
         ...(model ? ['--model', model] : []),

@@ -1344,6 +1344,14 @@ test('Hardening G & H (Real). supergptResume runs defaultPipeline without _pipel
       closeout_verification_commands: ['swift test'],
     })
   );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
+  );
 
   // 2. Before resume: workspace config/docs change to ["npm test"]
   fs.mkdirSync(path.join(sourceRepo, '.supergpt'), { recursive: true });
@@ -1590,6 +1598,14 @@ test('Fingerprint Fail-Closed C: Core closeout Gate PASS + fingerprint unavailab
       closeout_verification_commands: ['swift test'],
     })
   );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
+  );
 
   const fakePlanner = async () => ({
     status: 'READY',
@@ -1697,6 +1713,14 @@ test('Fingerprint Fail-Closed D: Prior closeout evidence has null fingerprint + 
       closeout_verification_commands: ['swift test'],
     })
   );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
+  );
 
   // Directly set control file with delivery_ready and null worktree_fingerprint in evidence
   writeControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, {
@@ -1785,6 +1809,14 @@ test('Fingerprint Fail-Closed E: Delivery-ready resume with fingerprint failure 
       closeout_verification_commands: ['swift test'],
     })
   );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
+  );
 
   // Set control file to delivery_ready with a valid prior fingerprint
   writeControl({ root: SUPERGPT_WORKTREE_ROOT, workflowId }, {
@@ -1871,6 +1903,14 @@ test('Fingerprint Fail-Closed F: Once fingerprinting works again, fresh closeout
       baseline_head: headSha,
       closeout_verification_commands: ['swift test'],
     })
+  );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
   );
 
   // delivery_ready state with stale/missing evidence

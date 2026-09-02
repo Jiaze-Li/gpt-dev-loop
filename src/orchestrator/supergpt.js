@@ -32,6 +32,21 @@ import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/r
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
 import {
+  resolveWorkflowCostCeilingUsd,
+  workflowCostExceeded,
+  formatWorkflowCostReason,
+  rehydrateUsageFromState,
+  assertResumeCostStateReconstructable,
+  resolveWorkflowUsageVolumeCeiling,
+  resolveTaskExecutorUsageVolumeCeiling,
+  resolveExecutorPhysicalCallCeiling,
+  anyTokenCeilingActive,
+  workflowUsageVolumeExceeded,
+  formatWorkflowUsageVolumeReason,
+  taskExecutorCeilingExceeded,
+  formatTaskExecutorCeilingReason,
+} from './workflowCostGuard.js';
+import {
   summarizeSafetyEvents,
   formatBlockingSafetyReason,
   safetyCodeForAdapterError,
@@ -343,6 +358,7 @@ export async function runSuperGPT({
   _execSync,
   _computeWorktreeFingerprint,
   _afterOwnershipAcquired,
+  _readLiveWorkflowState = readLiveWorkflowState,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   validateWorkflowId(workflowId);
@@ -459,6 +475,15 @@ export async function runSuperGPT({
     workflowStateManager.startHeartbeat(1000);
     lifecycleManager = new WorkflowLifecycleManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd });
     usageTracker = new UsageTracker();
+
+    if (!isResume) {
+      // Authoritative zero-spend snapshot from the very first moment of a
+      // fresh run: a later resume must be able to tell "this workflow
+      // genuinely made zero prior model calls" (tokenUsage.records === [])
+      // apart from "the prior cost state was lost". See the resume fail-closed
+      // check below and workflowCostGuard.assertResumeCostStateReconstructable.
+      try { workflowStateManager.setTokenUsage(usageTracker.summary()); } catch { /* best effort */ }
+    }
   } catch (initErr) {
     releaseOwnershipIfHeld('pre-pipeline-init');
     if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
@@ -487,6 +512,67 @@ export async function runSuperGPT({
     cwd,
     isResume,
   });
+
+  // ── Resume: restore whole-workflow cumulative model cost ──────────────
+  // The cost ceiling (workflowCostGuard.js) is a WHOLE-WORKFLOW limit, not a
+  // per-process one. A resumed run gets a fresh UsageTracker, so it must fold
+  // in the usage snapshot the prior process persisted into
+  // <workflowId>.state.json. UsageTracker.merge() dedupes by immutable callId
+  // / invocation identity, so replaying persisted records never inflates the
+  // restored total, and genuinely new calls this process makes add on top.
+  //
+  // FAIL CLOSED: when the ceiling is enabled (WORKFLOW_MAX_COST_USD > 0) and
+  // the prior cost cannot be reconstructed (state missing / unreadable /
+  // malformed / no tokenUsage.records), do NOT resume with a fresh $0 budget
+  // — halt through the existing HUMAN_REQUIRED + BLOCKING safety path,
+  // dispatching zero model calls and doing no provider failover.
+  if (isResume) {
+    let priorState = null;
+    let priorReadFailed = false;
+    try {
+      priorState = _readLiveWorkflowState({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
+    } catch {
+      priorReadFailed = true;
+    }
+    const resumeCeilingUsd = resolveWorkflowCostCeilingUsd(env ?? process.env);
+    const resumeCeilingsActive = anyTokenCeilingActive(env ?? process.env);
+    const reconstructable = assertResumeCostStateReconstructable(
+      priorReadFailed ? null : priorState,
+      { ceilingUsd: resumeCeilingUsd, guardActive: resumeCeilingsActive },
+    );
+    if (!reconstructable.ok) {
+      const reason = `A workflow token ceiling (cost $${resumeCeilingUsd.toFixed(2)} and/or a cumulative usage-volume / Executor-call ceiling) is enabled but prior spend cannot be reconstructed on resume: ${reconstructable.reason}. Refusing to resume with a fresh zero budget.`;
+      const question = `${reason} Restore ${workflowId}.state.json from a backup, or start a new workflow.`;
+      try {
+        workflowStateManager.recordSafetyEvent({
+          code: SAFETY_EVENT_CODES.WORKFLOW_COST_STATE_UNAVAILABLE,
+          severity: 'BLOCKING',
+          role: 'workflow',
+          reason,
+          actionTaken: 'workflow halted — HUMAN_REQUIRED; no Planner/Supervisor/Executor/Reviewer/PR-closeout model call made',
+        });
+      } catch { /* never let safety-event recording mask the stop */ }
+      workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+      workflowStateManager.stopHeartbeat();
+      emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+      emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'HUMAN_REQUIRED', reason });
+      releaseOwnershipIfHeld('resume-cost-state-unavailable');
+      if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
+      result.status = 'HUMAN_REQUIRED';
+      result.reason = reason;
+      result.question = question;
+      try {
+        const projection = summarizeSafetyEvents(workflowStateManager.getSafetyEvents());
+        result.safetyEvents = projection.safetyEvents;
+        result.blockingSafetyEvent = projection.blockingSafetyEvent;
+      } catch { /* best effort projection */ }
+      return result;
+    }
+    // Reconstructable (records array present — possibly empty === proven zero
+    // prior spend) OR the ceiling is disabled (best-effort). Either way,
+    // fold in whatever prior records exist.
+    try { rehydrateUsageFromState(usageTracker, priorState); } catch { /* best effort */ }
+  }
 
   internalAbort = new AbortController();
   let onAbort;
@@ -793,6 +879,11 @@ export function createRealGithubPrCloseoutAdapters({
   signal,
   workflowId,
   workflowStateManager,
+  usageTracker = null,
+  workflowCostCeilingUsd = 0,
+  workflowUsageVolumeCeiling = 0,
+  taskExecutorUsageVolumeCeiling = 0,
+  executorPhysicalCallCeiling = 0,
 } = {}) {
   const prNum = Number(prNumber);
 
@@ -993,15 +1084,132 @@ export function createRealGithubPrCloseoutAdapters({
       };
     },
     runRepairTask: async (card) => {
+      const repairTaskId = card.task_id || 'pr-closeout-repair';
+      const persistTokenUsage = () => {
+        if (usageTracker && workflowStateManager) {
+          workflowStateManager.setTokenUsage(
+            usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }),
+          );
+        }
+      };
+      const recordRepairExecutorUsage = ({ usage, callId, model, costUsd, inputBreakdown, physicalCallReason }) => {
+        if (!usageTracker || !usage) return;
+        try {
+          usageTracker.record({
+            workflowId,
+            role: 'executor',
+            callId: callId ?? usage?.callId ?? null,
+            physicalCallReason: physicalCallReason ?? 'PRIMARY',
+            taskId: repairTaskId,
+            provider: model?.startsWith?.('codex') ? 'codex' : 'claude',
+            model: model || 'sonnet',
+            usage,
+            inputBreakdown: inputBreakdown ?? null,
+            costUsd: costUsd ?? null,
+          });
+          persistTokenUsage();
+        } catch (recErr) {
+          // Never let accounting failure mask the repair outcome.
+        }
+      };
+
+      // Mechanical token ceilings: stop before spending another repair
+      // Executor call. Cost, then whole-workflow usage volume, then this
+      // Task's Executor call-count / cumulative usage volume.
+      const preCost = workflowCostExceeded(usageTracker, workflowCostCeilingUsd);
+      const preVol = preCost ? null : workflowUsageVolumeExceeded(usageTracker, workflowUsageVolumeCeiling);
+      const preTask = (preCost || preVol) ? null : taskExecutorCeilingExceeded(usageTracker, repairTaskId, {
+        volumeLimit: taskExecutorUsageVolumeCeiling,
+        callLimit: executorPhysicalCallCeiling,
+      });
+      if (preCost || preVol || preTask) {
+        let code;
+        let reason;
+        let evidence = {};
+        if (preCost) {
+          code = SAFETY_EVENT_CODES.WORKFLOW_COST_BUDGET_EXCEEDED;
+          reason = formatWorkflowCostReason(preCost);
+          evidence = { limit: preCost.limitUsd };
+        } else if (preVol) {
+          code = SAFETY_EVENT_CODES.WORKFLOW_USAGE_VOLUME_EXCEEDED;
+          reason = formatWorkflowUsageVolumeReason(preVol);
+          evidence = { usageVolume: preVol.totalUsageVolume, limit: preVol.limit };
+        } else {
+          code = preTask.kind === 'CALLS'
+            ? SAFETY_EVENT_CODES.EXECUTOR_CALL_CEILING_EXCEEDED
+            : SAFETY_EVENT_CODES.TASK_EXECUTOR_USAGE_VOLUME_EXCEEDED;
+          reason = formatTaskExecutorCeilingReason(repairTaskId, preTask);
+          evidence = { physicalCalls: preTask.physicalCalls, usageVolume: preTask.usageVolume, limit: preTask.limit };
+        }
+        try {
+          workflowStateManager?.recordSafetyEvent({
+            code,
+            severity: 'BLOCKING',
+            role: preTask ? 'executor' : 'workflow',
+            taskId: repairTaskId,
+            reason,
+            ...evidence,
+            actionTaken: 'PR Closeout repair halted — no further Executor call made',
+          });
+        } catch { /* best effort */ }
+        return { status: 'FAILED', gateResult: 'FAIL', error: reason, safetyCode: code, safetyBlocking: true };
+      }
+
       let executionReport = null;
       try {
         const executorManager = typeof selection?.createExecutorSessionManager === 'function'
-          ? selection.createExecutorSessionManager({ taskId: card.task_id || 'pr-closeout-repair', cwd: repoRoot })
-          : createClaudeSessionManager({ taskId: card.task_id || 'pr-closeout-repair', cwd: repoRoot });
+          ? selection.createExecutorSessionManager({ taskId: repairTaskId, cwd: repoRoot })
+          : createClaudeSessionManager({ taskId: repairTaskId, cwd: repoRoot });
         executionReport = await executorManager.execute(card, { signal });
       } catch (err) {
-        return { status: 'FAILED', gateResult: 'FAIL', error: err.message };
+        // A post-send token-safety guard (budget / duplicate call) still
+        // consumed a real provider call: record its usage, surface a
+        // user-visible BLOCKING safety event, and return a STRUCTURED
+        // failure — never a bare generic FAILED. No retry / failover: the
+        // repair round simply ends here.
+        const safetyCode = safetyCodeForAdapterError(err);
+        if (err?.details?.usage) {
+          recordRepairExecutorUsage({
+            usage: err.details.usage,
+            callId: err.details.callId ?? err.details.usage?.callId ?? null,
+            model: err.details.model || 'sonnet',
+            costUsd: err.details.costUsd ?? null,
+            inputBreakdown: err.details.inputBreakdown ?? null,
+            physicalCallReason: err.details.physicalCallReason ?? 'PRIMARY',
+          });
+        }
+        if (safetyCode) {
+          try {
+            workflowStateManager?.recordSafetyEvent({
+              code: safetyCode,
+              severity: 'BLOCKING',
+              role: 'executor',
+              taskId: err?.details?.taskId ?? repairTaskId,
+              attempt: err?.details?.attempt ?? null,
+              reason: err?.details?.budgetExceededReason ?? err.message,
+              actionTaken: 'PR Closeout repair halted — no further Executor call made',
+            });
+          } catch { /* best effort */ }
+        }
+        return {
+          status: 'FAILED',
+          gateResult: 'FAIL',
+          error: err.message,
+          ...(safetyCode ? { safetyCode, safetyBlocking: true } : {}),
+          usage: err?.details?.usage ?? null,
+        };
       }
+
+      // Successful repair Executor call — meter it exactly like the primary
+      // Executor path does.
+      recordRepairExecutorUsage({
+        usage: executionReport?.usage ?? null,
+        callId: executionReport?.callId ?? executionReport?.usage?.callId ?? null,
+        model: executionReport?.model || 'sonnet',
+        costUsd: executionReport?.costUsd ?? null,
+        inputBreakdown: executionReport?.inputBreakdown ?? null,
+        physicalCallReason: executionReport?.physicalCallReason ?? 'PRIMARY',
+      });
 
       const runner = (createGateRunner || _createGateRunner)({
         cwd: repoRoot,
@@ -1073,6 +1281,46 @@ async function defaultPipeline({
 }) {
   workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
+
+  // Hard aggregate workflow ceilings (0 = disabled for each). Every metered
+  // internal AI call — Planner, Supervisor, Executor, internal Reviewer, and
+  // the PR Closeout repair Executor — is checked against these before the next
+  // dispatch. See workflowCostGuard.js.
+  const workflowCostCeilingUsd = resolveWorkflowCostCeilingUsd(env ?? process.env);
+  const workflowUsageVolumeCeiling = resolveWorkflowUsageVolumeCeiling(env ?? process.env);
+  const taskExecutorUsageVolumeCeiling = resolveTaskExecutorUsageVolumeCeiling(env ?? process.env);
+  const executorPhysicalCallCeiling = resolveExecutorPhysicalCallCeiling(env ?? process.env);
+  // Route a crossed workflow ceiling (cost OR cumulative usage volume) through
+  // the existing HUMAN_REQUIRED + BLOCKING safety path. Returns a terminal
+  // result to `return`, or null. Used at the Planner boundary (before AND
+  // after the Planner call) — the state-machine roles have their own copy of
+  // this guard inside automatedLoop.js.
+  const guardWorkflowCeilings = ({ taskId = null } = {}) => {
+    const costHit = workflowCostExceeded(usageTracker, workflowCostCeilingUsd);
+    const volHit = costHit ? null : workflowUsageVolumeExceeded(usageTracker, workflowUsageVolumeCeiling);
+    if (!costHit && !volHit) return null;
+    const code = costHit
+      ? SAFETY_EVENT_CODES.WORKFLOW_COST_BUDGET_EXCEEDED
+      : SAFETY_EVENT_CODES.WORKFLOW_USAGE_VOLUME_EXCEEDED;
+    const reason = costHit ? formatWorkflowCostReason(costHit) : formatWorkflowUsageVolumeReason(volHit);
+    const question = `${reason}. No further model call will be made. Review the task scope / budget, then resume the workflow.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code,
+        severity: 'BLOCKING',
+        role: 'workflow',
+        taskId,
+        reason,
+        ...(volHit ? { usageVolume: volHit.totalUsageVolume, limit: volHit.limit } : { limit: costHit.limitUsd }),
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further model call made',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    if (usageTracker && workflowStateManager) {
+      workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question };
+  };
 
   validateWorkflowId(workflowId);
   const metadataPath = assertPathWithinRoot(SUPERGPT_WORKTREE_ROOT, path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), 'workspace metadata');
@@ -1590,6 +1838,11 @@ async function defaultPipeline({
       signal,
       workflowId,
       workflowStateManager,
+      usageTracker,
+      workflowCostCeilingUsd,
+      workflowUsageVolumeCeiling,
+      taskExecutorUsageVolumeCeiling,
+      executorPhysicalCallCeiling,
     });
 
     const outcome = await runPrCloseoutLoop({
@@ -1643,6 +1896,12 @@ async function defaultPipeline({
     if (answer && !planPath) {
       planArg = `${planArg}\n\n[User Clarification / Answer]:\n${answer}`;
     }
+    // PRE-Planner check: a resume rehydrates prior spend BEFORE this point, so a
+    // workflow that is already over a ceiling must not get to run the Planner
+    // (an expensive model call) at all. Fresh runs sit at zero and pass.
+    const prePlannerStop = guardWorkflowCeilings();
+    if (prePlannerStop) return prePlannerStop;
+
     const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
     resolved = (await selection.runtime.invoke('planner', {
       resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
@@ -1650,6 +1909,10 @@ async function defaultPipeline({
     if (usageTracker && workflowStateManager) {
       workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
     }
+    // POST-Planner check: the Planner call itself may have crossed a ceiling.
+    // Stop before dispatching Supervisor / Executor.
+    const plannerCostStop = guardWorkflowCeilings();
+    if (plannerCostStop) return plannerCostStop;
   }
   if (resolved.status === 'AMBIGUOUS') {
     emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason: 'plan_ambiguous', question: resolved.question });
@@ -1776,6 +2039,10 @@ async function defaultPipeline({
     maxEscalationAttempts: Number(env.AGY_MAX_ESCALATION_ATTEMPTS) || 2,
     humanAnswer: answer,
     closeoutVerificationCommands: frozenCloseoutCommands,
+    workflowCostCeilingUsd,
+    workflowUsageVolumeCeiling,
+    taskExecutorUsageVolumeCeiling,
+    executorPhysicalCallCeiling,
     onCloseoutPass: async (proof) => {
       const fingerprint = getFingerprint(worktree.worktree_path);
       if (isValidWorktreeFingerprint(fingerprint)) {
@@ -2266,6 +2533,7 @@ export async function supergptResume({
   _createGateRunner,
   _execSync,
   _computeWorktreeFingerprint,
+  _readLiveWorkflowState,
 } = {}) {
   validateWorkflowId(workflowId);
 
@@ -2336,6 +2604,7 @@ export async function supergptResume({
     _createGateRunner,
     _execSync,
     _computeWorktreeFingerprint,
+    ...(_readLiveWorkflowState ? { _readLiveWorkflowState } : {}),
   });
 }
 

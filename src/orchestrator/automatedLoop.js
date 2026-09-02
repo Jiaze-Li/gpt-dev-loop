@@ -31,6 +31,14 @@
 import { AdapterError, ADAPTER_ERROR_CODES, isCancellation } from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
 import { classifyVerificationPermissionBlocked, SAFETY_EVENT_CODES, SAFETY_SEVERITY } from './safetyEvents.js';
+import {
+  workflowCostExceeded,
+  formatWorkflowCostReason,
+  workflowUsageVolumeExceeded,
+  formatWorkflowUsageVolumeReason,
+  taskExecutorCeilingExceeded,
+  formatTaskExecutorCeilingReason,
+} from './workflowCostGuard.js';
 import { defaultOrganicReworkRecorder } from './organicReworkRecorder.js';
 import { nullWindowSession } from './agyProviderSessions.js';
 import {
@@ -227,6 +235,17 @@ export async function runAutomatedWorkflow({
   log = defaultLog,
   workflowStateManager = null,
   usageTracker = null,
+  // Hard aggregate workflow model-cost ceiling in USD. 0 disables it. The
+  // caller (supergpt.js) resolves this from WORKFLOW_MAX_COST_USD; tests
+  // inject a low value rather than spending real money.
+  workflowCostCeilingUsd = 0,
+  // ── Mechanical token ceilings (the last-resort fuse). 0 disables each. ──
+  // Whole-workflow cumulative usageVolume (all metered roles).
+  workflowUsageVolumeCeiling = 0,
+  // One Task's cumulative Executor usageVolume across its physical calls.
+  taskExecutorUsageVolumeCeiling = 0,
+  // One Task's maximum real Executor physical calls.
+  executorPhysicalCallCeiling = 0,
   onTaskCompleted = null,
   signal = null,
   // BASELINE-DIFF GATE. When a runner is supplied, each task's
@@ -276,6 +295,99 @@ export async function runAutomatedWorkflow({
   let taskBaselineEvidence = null;
   let taskBaselineTaskId = null;
   let taskBaselineCommandsHash = null;
+
+  // ── Mechanical token ceilings — the last-resort fuse ───────────────
+  // Checked BEFORE every expensive model dispatch (Supervisor / Executor /
+  // Reviewer). The call that crossed a ceiling has already been recorded into
+  // usageTracker; this stops the NEXT one. Fires exactly once, then routes
+  // through the existing HUMAN_REQUIRED terminal + BLOCKING safety-event path
+  // with no provider failover or retry. These are pure aggregate counters (no
+  // heuristics), so a bug that slips past every other guard still hits a wall.
+  let tokenCeilingTripped = false;
+  let tokenCeilingTerminalResult = null;
+  const tripTokenCeiling = ({ code, role, reason, taskId = null, attempt = null, physicalCalls = null, usageVolume = null, limit = null }) => {
+    tokenCeilingTripped = true;
+    const question = `${reason}. No further model call will be made. Review the task scope / budget, then resume the workflow.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code,
+        severity: 'BLOCKING',
+        role,
+        taskId: taskId ?? currentTaskCard?.task_id ?? null,
+        attempt,
+        reason,
+        physicalCalls,
+        usageVolume,
+        limit,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further Planner/Supervisor/Executor/Reviewer/repair model call made',
+      });
+    } catch (seErr) {
+      log(`token-ceiling safety event record failed: ${seErr.message}`);
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+      reason,
+      question,
+      blockerCategory: FAILURE_CATEGORIES.INFRASTRUCTURE,
+    });
+    tokenCeilingTerminalResult = {
+      status: 'HUMAN_REQUIRED',
+      reason,
+      question,
+      history,
+      ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
+    };
+    return { done: true, result: tokenCeilingTerminalResult };
+  };
+
+  // Workflow-wide guards: cumulative $ cost, then cumulative usage volume.
+  // Applied before EVERY expensive dispatch (Supervisor / Executor / Reviewer /
+  // — in supergpt.js — Planner and the PR-closeout repair Executor).
+  const enforceWorkflowCost = () => {
+    if (tokenCeilingTripped) return { done: true, result: tokenCeilingTerminalResult };
+    const costHit = workflowCostExceeded(usageTracker, workflowCostCeilingUsd);
+    if (costHit) {
+      return tripTokenCeiling({
+        code: SAFETY_EVENT_CODES.WORKFLOW_COST_BUDGET_EXCEEDED,
+        role: 'workflow',
+        reason: formatWorkflowCostReason(costHit),
+        limit: costHit.limitUsd,
+      });
+    }
+    const volHit = workflowUsageVolumeExceeded(usageTracker, workflowUsageVolumeCeiling);
+    if (volHit) {
+      return tripTokenCeiling({
+        code: SAFETY_EVENT_CODES.WORKFLOW_USAGE_VOLUME_EXCEEDED,
+        role: 'workflow',
+        reason: formatWorkflowUsageVolumeReason(volHit),
+        usageVolume: volHit.totalUsageVolume,
+        limit: volHit.limit,
+      });
+    }
+    return null;
+  };
+
+  // Per-Task Executor guards: physical-call count, then cumulative usage
+  // volume. Applied only immediately before a real Executor dispatch.
+  const enforceExecutorTaskCeilings = (taskId, attempt) => {
+    if (tokenCeilingTripped) return { done: true, result: tokenCeilingTerminalResult };
+    const hit = taskExecutorCeilingExceeded(usageTracker, taskId, {
+      volumeLimit: taskExecutorUsageVolumeCeiling,
+      callLimit: executorPhysicalCallCeiling,
+    });
+    if (!hit) return null;
+    return tripTokenCeiling({
+      code: hit.kind === 'CALLS'
+        ? SAFETY_EVENT_CODES.EXECUTOR_CALL_CEILING_EXCEEDED
+        : SAFETY_EVENT_CODES.TASK_EXECUTOR_USAGE_VOLUME_EXCEEDED,
+      role: 'executor',
+      taskId,
+      attempt: Number.isFinite(attempt) ? attempt : null,
+      reason: formatTaskExecutorCeilingReason(taskId, hit),
+      physicalCalls: hit.physicalCalls,
+      usageVolume: hit.usageVolume,
+      limit: hit.limit,
+    });
+  };
   const seenBlockers = new Map();
   let currentTaskCard = null;
   const loopReworkMemory = new Map();
@@ -629,6 +741,10 @@ export async function runAutomatedWorkflow({
   async function runAttempt() {
     throwIfAborted();
 
+    // Workflow cost ceiling: stop before spending another Executor call.
+    const costGate = enforceWorkflowCost();
+    if (costGate) return costGate;
+
     // 1. DETERMINISTIC PREFLIGHT CHECK (Zero model tokens)
     log(`preflight started: task=${currentTaskCard.task_id}`);
     workflowStateManager?.startStage(WORKFLOW_STAGES.PREFLIGHT, {
@@ -787,6 +903,13 @@ export async function runAutomatedWorkflow({
     // One-shot: the guidance is baked into this attempt's payload; a later
     // clean attempt must not keep re-sending it.
     unauthorizedProbeGuidance = null;
+
+    // Mechanical fuse: stop BEFORE this Executor dispatch if the Task has
+    // already reached its physical-call ceiling or its cumulative
+    // usage-volume ceiling. Counted from the deduplicated UsageTracker log,
+    // so attemptCount / normalAttempts bookkeeping cannot bypass it.
+    const executorTaskGate = enforceExecutorTaskCeilings(currentTaskCard.task_id, attemptCount);
+    if (executorTaskGate) return executorTaskGate;
 
     let executionReport;
     try {
@@ -1380,6 +1503,10 @@ export async function runAutomatedWorkflow({
   async function runReviewStep({ executionReport, evidence }) {
     latestGateEvidence = evidence;
 
+    // Workflow cost ceiling: stop before spending another Reviewer call.
+    const costGate = enforceWorkflowCost();
+    if (costGate) return costGate;
+
     if (!reviewerCreated) {
       const reviewerIdentity = await reviewerSession.create(currentTaskCard.task_id, { windowId });
       reviewerTabId = reviewerIdentity?.tabId ?? null;
@@ -1631,6 +1758,10 @@ export async function runAutomatedWorkflow({
     }
 
     for (;;) {
+      // Workflow cost ceiling: stop before spending another Supervisor call.
+      const costGate = enforceWorkflowCost();
+      if (costGate) return costGate.result;
+
       const decisionContext = {
         workflowGoal,
         repositoryContext,

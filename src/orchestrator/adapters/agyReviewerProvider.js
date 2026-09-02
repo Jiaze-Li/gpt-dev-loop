@@ -77,6 +77,33 @@ function invalid(message) {
   return new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT, message);
 }
 
+// ── Central prompt assembly + hard budget enforcement ───────────────
+//
+// The single enforcement point for the Reviewer 40k-char context hard
+// limit. EVERY Reviewer provider (agy, codex, claude) MUST build its
+// prompt through this function so compaction, the limit, and its
+// REVIEWER_CONTEXT_BUDGET_EXCEEDED classification are identical on every
+// provider and an oversized prompt can never reach a physical model call.
+export function assembleReviewerPrompt(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
+  const {
+    evidence: compactEv,
+    fullEvidenceRef,
+    truncated: evidenceTruncated,
+  } = compactEvidence(evidence, taskCard, executionReport);
+
+  const rawPrompt = buildAgyReviewPrompt(taskCard, executionReport, compactEv, { attempt, checkpoint });
+
+  const { prompt, budgetExceeded, originalLength } = enforcePromptBudget(rawPrompt);
+  if (budgetExceeded) {
+    throw new AdapterError(
+      ADAPTER_ERROR_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED,
+      `Reviewer prompt exceeds hard limit: ${originalLength} chars > ${REVIEWER_PROMPT_HARD_LIMIT} char budget (after compact projection)`,
+      { role: 'reviewer', originalLength, limit: REVIEWER_PROMPT_HARD_LIMIT, fullEvidenceRef },
+    );
+  }
+  return { prompt, fullEvidenceRef, evidenceTruncated };
+}
+
 export function buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
   const checkpointBlock = checkpoint && Array.isArray(checkpoint.prior_required_changes)
     ? `\n## Structured Prior Finding (continuity only)
@@ -190,24 +217,11 @@ export function createAgyReviewerProvider({
     // id agy actually used — so the caller can capture it on the first
     // review() and reuse it for every rework of the same task.
     async review(taskCard, executionReport, evidence, { attempt, conversationId, checkpoint } = {}) {
-      // ── Compact evidence projection (deterministic, zero model calls) ──
-      const {
-        evidence: compactEv,
-        fullEvidenceRef,
-        truncated: evidenceTruncated,
-      } = compactEvidence(evidence, taskCard, executionReport);
-
-      const rawPrompt = buildAgyReviewPrompt(taskCard, executionReport, compactEv, { attempt, checkpoint });
-
-      // ── Hard budget guard ─────────────────────────────────────────────
-      const { prompt, budgetExceeded, originalLength } = enforcePromptBudget(rawPrompt);
-      if (budgetExceeded) {
-        throw new AdapterError(
-          ADAPTER_ERROR_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED,
-          `Reviewer prompt exceeds hard limit: ${originalLength} chars > ${REVIEWER_PROMPT_HARD_LIMIT} char budget (after compact projection)`,
-          { originalLength, limit: REVIEWER_PROMPT_HARD_LIMIT, fullEvidenceRef },
-        );
-      }
+      // ── Compact projection + hard budget guard (deterministic, zero
+      //    model calls) — shared by every Reviewer provider ──────────────
+      const { prompt, fullEvidenceRef, evidenceTruncated } = assembleReviewerPrompt(
+        taskCard, executionReport, evidence, { attempt, checkpoint },
+      );
 
       let result;
       try {
