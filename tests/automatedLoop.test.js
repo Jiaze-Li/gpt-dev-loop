@@ -3432,3 +3432,58 @@ test('executor budget-exceeded still records the real provider call in the Usage
   assert.equal(usage.executor.cacheCreationTokens, 900000);
   assert.equal(usage.executor.cacheReadTokens, 287895);
 });
+
+test('executor budget-exceeded records a BLOCKING safety event on the workflow state', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-safety-'));
+  try {
+    const taskCard = demoTaskCard();
+    const supervisor = makeFakeSupervisor([{ action: 'NEXT_TASK', task_card: taskCard }]);
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [] });
+    const gateRunner = makeFakeGateRunner();
+    const usageTracker = new UsageTracker();
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-agy-test-loopsafety', kind: 'INTERNAL_TEST', root });
+
+    const budgetError = new AdapterError(
+      ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+      'executor usage exceeded hard budget (cacheCreation=900000/200000)',
+      {
+        budgetExceededReason: 'cacheCreation=900000/200000',
+        callId: 'call-claude-exe-budget-2',
+        model: 'sonnet',
+        physicalCallReason: 'PRIMARY',
+        attempt: 1,
+        numTurns: 8,
+        usage: { output_tokens: 2010, cache_read_tokens: 287895, cache_creation_tokens: 900000, num_turns: 8, callId: 'call-claude-exe-budget-2' },
+      }
+    );
+    const createClaudeSessionManager = makeFakeClaudeManagerFactory(null, () => { throw budgetError; });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-agy-test-loopsafety',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      workflowGoal: 'ship it',
+      repositoryContext: taskCard.repository_context,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    const events = workflowStateManager.getSafetyEvents();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].code, 'EXECUTOR_BUDGET_EXCEEDED');
+    assert.equal(events[0].severity, 'BLOCKING');
+    assert.equal(events[0].role, 'executor');
+    assert.match(events[0].reason, /cacheCreation=900000\/200000/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -26,7 +26,7 @@ const COMMON = fileURLToPath(new URL('../agent-policy/COMMON.md', import.meta.ur
 // `runningPolls` internal polls, then settles on `terminalStatus`. Models a
 // long workflow whose local state is polled hundreds of times while the
 // front-agent model is never re-invoked.
-function fakeLoop({ runningPolls, terminalStatus, workflowId = 'wf-agy-test-000000' }) {
+function fakeLoop({ runningPolls, terminalStatus, workflowId = 'wf-agy-test-000000', stateOverrides = {} }) {
   const calls = { start: 0, wait: 0 };
   let polls = 0;
   return {
@@ -52,6 +52,7 @@ function fakeLoop({ runningPolls, terminalStatus, workflowId = 'wf-agy-test-0000
         question: terminalStatus === 'HUMAN_REQUIRED' ? 'pick A or B?' : null,
         workflowPath: 'FAST',
         deliveredFiles: terminalStatus === 'DONE' ? ['a.js'] : [],
+        ...stateOverrides,
       };
       assert.equal(predicate(state), true, 'terminal state must satisfy the predicate');
       return state;
@@ -141,6 +142,89 @@ test('start_and_wait: HUMAN_REQUIRED returns the pending question, one external 
   assert.equal(res.structuredContent.question, 'pick A or B?');
   assert.equal(fake.calls.start, 1);
   assert.equal(server._frontAgentCounters.startAndWaitCount, 1);
+  await client.close();
+});
+
+// --- user-visible safety event projection ------------------------------
+
+const WARNING_EVENT = {
+  code: 'VERIFICATION_PERMISSION_BLOCKED',
+  severity: 'WARNING',
+  role: 'executor',
+  taskId: 't-1',
+  attempt: 1,
+  repeatCount: 3,
+  reason: 'node verify.js repeatedly denied',
+  actionTaken: 'other approved verification path still available; workflow continues',
+  at: new Date().toISOString(),
+};
+const BLOCKING_EVENT = {
+  code: 'EXECUTOR_BUDGET_EXCEEDED',
+  severity: 'BLOCKING',
+  role: 'executor',
+  taskId: 't-1',
+  attempt: 1,
+  repeatCount: null,
+  reason: 'cacheCreation=900000/200000',
+  actionTaken: 'workflow halted — HUMAN_REQUIRED',
+  at: new Date().toISOString(),
+};
+
+test('start_and_wait: WARNING safety event + DONE — terminal result carries the warning, no blocking event', async () => {
+  const fake = fakeLoop({ runningPolls: 2, terminalStatus: 'DONE', stateOverrides: { safetyEvents: [WARNING_EVENT] } });
+  const { client } = await connect(fake);
+  const out = (await client.callTool({ name: 'supergpt_start_and_wait', arguments: { goal: 'x', keepaliveMs: 1000 } })).structuredContent;
+  assert.equal(out.status, 'DONE');
+  assert.equal(out.safetyEvents.length, 1);
+  assert.equal(out.safetyEvents[0].code, 'VERIFICATION_PERMISSION_BLOCKED');
+  assert.equal(out.safetyEvents[0].severity, 'WARNING');
+  assert.equal(out.blockingSafetyEvent, null);
+  await client.close();
+});
+
+test('start_and_wait: BLOCKING safety event + HUMAN_REQUIRED — Front Agent reads the reason straight off the result', async () => {
+  const fake = fakeLoop({ runningPolls: 2, terminalStatus: 'HUMAN_REQUIRED', stateOverrides: { safetyEvents: [BLOCKING_EVENT], reason: null } });
+  const { client } = await connect(fake);
+  const out = (await client.callTool({ name: 'supergpt_start_and_wait', arguments: { goal: 'x', keepaliveMs: 1000 } })).structuredContent;
+  assert.equal(out.status, 'HUMAN_REQUIRED');
+  assert.ok(out.blockingSafetyEvent, 'blockingSafetyEvent must be set');
+  assert.equal(out.blockingSafetyEvent.code, 'EXECUTOR_BUDGET_EXCEEDED');
+  // A Front Agent that only reads `reason` still sees the blocking cause.
+  assert.match(out.reason, /EXECUTOR_BUDGET_EXCEEDED/);
+  assert.match(out.reason, /cacheCreation=900000\/200000/);
+  await client.close();
+});
+
+test('start_and_wait: an internal safety event is NEVER left invisible to the terminal result', async () => {
+  const fake = fakeLoop({ runningPolls: 1, terminalStatus: 'DONE', stateOverrides: { safetyEvents: [WARNING_EVENT, BLOCKING_EVENT] } });
+  const { client } = await connect(fake);
+  const out = (await client.callTool({ name: 'supergpt_start_and_wait', arguments: { goal: 'x', keepaliveMs: 1000 } })).structuredContent;
+  // Both internally recorded events surface; the blocking one is singled out.
+  assert.equal(out.safetyEvents.length, 2);
+  assert.equal(out.blockingSafetyEvent.code, 'EXECUTOR_BUDGET_EXCEEDED');
+  await client.close();
+});
+
+test('start_and_wait: backward compatible — no safety events yields [] and null', async () => {
+  const fake = fakeLoop({ runningPolls: 1, terminalStatus: 'DONE' });
+  const { client } = await connect(fake);
+  const out = (await client.callTool({ name: 'supergpt_start_and_wait', arguments: { goal: 'x', keepaliveMs: 1000 } })).structuredContent;
+  assert.deepEqual(out.safetyEvents, []);
+  assert.equal(out.blockingSafetyEvent, null);
+  await client.close();
+});
+
+test('start_and_wait: a front-agent polling regression is projected as a WARNING safety event', async () => {
+  const fake = fakeLoop({ runningPolls: 1, terminalStatus: 'DONE' });
+  const { client, server } = await connect(fake);
+  // Simulate a front agent that looped on watch before/while waiting.
+  server._frontAgentCounters.watchCount = 3;
+  const out = (await client.callTool({ name: 'supergpt_start_and_wait', arguments: { goal: 'x', keepaliveMs: 1000 } })).structuredContent;
+  const polling = out.safetyEvents.filter((e) => e.code === 'FRONT_AGENT_POLLING_REGRESSION');
+  assert.equal(polling.length, 1);
+  assert.equal(polling[0].severity, 'WARNING');
+  assert.equal(out.blockingSafetyEvent, null);
+  assert.equal(out.status, 'DONE');
   await client.close();
 });
 

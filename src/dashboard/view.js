@@ -449,6 +449,12 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
       </div>
     </div>
 
+    <!-- Cost / Safety Events (minimal; primary channel is the terminal result) -->
+    <div class="timeline-card" id="safety-events-card" style="display: none;">
+      <div class="card-title">Cost / Safety Events</div>
+      <div id="safety-events-list" style="margin-top: 8px; font-size: 13px;"></div>
+    </div>
+
     <!-- Timeline -->
     <div class="timeline-card" id="review-threads-card" style="display: none;">
       <div class="card-title">Review Threads</div>
@@ -816,6 +822,21 @@ export function renderDashboardHtml({ initialWorkflowId = '' } = {}) {
           const location = finding.file ? finding.file + (finding.line == null ? '' : ':' + finding.line) : (finding.title || 'Review finding');
           const failed = finding.threadResolutionStatus === 'FAILED' ? ' · Resolution Failed' : '';
           return \`<div class="prop-row"><span class="prop-key">\${escapeHtml(location)}</span><span class="prop-val"><span class="tag tag-\${tagClass}">\${escapeHtml(status)}</span>\${escapeHtml(failed)}</span></div>\`;
+        }).join('');
+
+        // 8b. Cost / Safety Events
+        const safetyEvents = Array.isArray(data.safetyEvents) ? data.safetyEvents : [];
+        const safetyCard = document.getElementById('safety-events-card');
+        safetyCard.style.display = safetyEvents.length > 0 ? 'block' : 'none';
+        document.getElementById('safety-events-list').innerHTML = safetyEvents.map(ev => {
+          const sev = ev.severity === 'BLOCKING' ? 'BLOCKING' : 'WARNING';
+          const tagClass = sev === 'BLOCKING' ? 'failed' : 'waiting';
+          const meta = [ev.role, ev.taskId, ev.attempt != null ? 'attempt ' + ev.attempt : null,
+            ev.repeatCount != null ? 'x' + ev.repeatCount : null].filter(Boolean).join(' · ');
+          return \`<div class="prop-row"><span class="prop-key"><span class="tag tag-\${tagClass}">\${escapeHtml(sev)}</span> \${escapeHtml(ev.code || '')}</span>\` +
+            \`<span class="prop-val">\${escapeHtml(meta)}</span></div>\` +
+            \`<div style="color: var(--text-secondary); margin: 0 0 8px 2px;">\${escapeHtml(ev.reason || '')}\` +
+            (ev.actionTaken ? \` — <em>\${escapeHtml(ev.actionTaken)}</em>\` : '') + \`</div>\`;
         }).join('');
 
         // 9. Timeline

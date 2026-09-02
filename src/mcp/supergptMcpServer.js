@@ -43,6 +43,7 @@ import {
   SUPERGPT_WATCH_TIMEOUT_MS,
 } from '../orchestrator/supergpt.js';
 import { SUPERGPT_WORKTREE_ROOT } from '../orchestrator/workflowWorktree.js';
+import { summarizeSafetyEvents, formatBlockingSafetyReason } from '../orchestrator/safetyEvents.js';
 import { validateWorkflowId } from '../orchestrator/workflowId.js';
 import { resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
@@ -438,6 +439,11 @@ export function createSuperGptMcpServer({
         localPollCount: z.number(),
         frontAgentWaitCount: z.number(),
         frontAgentWatchCount: z.number(),
+        // User-visible cost / safety events projected from workflow state,
+        // plus any front-agent polling regression detected locally. Additive
+        // and backward compatible.
+        safetyEvents: z.array(z.record(z.string(), z.any())).optional(),
+        blockingSafetyEvent: z.record(z.string(), z.any()).nullable().optional(),
       },
     },
     async ({ goal, planPath, supersedesWorkflowId, cwd: runCwd, keepaliveMs = 30000, maxWaitMs = 6 * 60 * 60 * 1000 }, extra) => {
@@ -497,12 +503,43 @@ export function createSuperGptMcpServer({
       }
 
       const canonical = state ? toCanonicalProgress(state) || state : null;
+
+      // Project the workflow's own safety events, then fold in any local
+      // front-agent polling regression (workflow-independent, WARNING —
+      // the workflow itself is unaffected but the pattern must not be silent).
+      const collectedSafetyEvents = Array.isArray(state?.safetyEvents) ? [...state.safetyEvents] : [];
+      const pollingVerdict = checkPollingRegression(frontAgentCounters);
+      if (pollingVerdict.regression) {
+        for (const issue of pollingVerdict.issues) {
+          collectedSafetyEvents.push({
+            code: 'FRONT_AGENT_POLLING_REGRESSION',
+            severity: 'WARNING',
+            role: 'frontAgent',
+            taskId: null,
+            attempt: null,
+            reason: issue.detail,
+            repeatCount: null,
+            actionTaken: 'workflow result unaffected; front-agent polling pattern flagged for the user',
+            at: new Date().toISOString(),
+          });
+        }
+      }
+      const safetyProjection = summarizeSafetyEvents(collectedSafetyEvents);
+
+      let reason = state?.reason ?? state?.error ?? null;
+      if (safetyProjection.blockingSafetyEvent) {
+        const line = formatBlockingSafetyReason(safetyProjection.blockingSafetyEvent);
+        if (line && !(reason ?? '').includes(safetyProjection.blockingSafetyEvent.code)) {
+          reason = reason ? `${reason} | ${line}` : line;
+        }
+      }
+
       const structured = {
         status: state?.workflowStatus ?? (extra?.signal?.aborted ? 'CANCELLED' : 'TIMEOUT'),
         stage: state?.stage ?? null,
         workflowId,
         summary: state?.summary ?? null,
-        reason: state?.reason ?? state?.error ?? null,
+        reason,
         question: state?.question ?? null,
         path: state?.workflowPath ?? null,
         evidence: state?.evidence ?? null,
@@ -511,6 +548,8 @@ export function createSuperGptMcpServer({
         localPollCount: localPolls,
         frontAgentWaitCount: frontAgentCounters.waitCount,
         frontAgentWatchCount: frontAgentCounters.watchCount,
+        safetyEvents: safetyProjection.safetyEvents,
+        blockingSafetyEvent: safetyProjection.blockingSafetyEvent,
       };
       return {
         content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],

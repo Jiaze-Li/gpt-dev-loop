@@ -244,6 +244,10 @@ export function getWorkflowDetail({ workflowId, root = SUPERGPT_WORKTREE_ROOT } 
     timeline,
     reviewThreads,
     usage,
+    // Minimal user-visible cost / safety events projection. The dashboard is
+    // a secondary channel — the primary one is the terminal result — but the
+    // events must still be visible here.
+    safetyEvents: Array.isArray(live.safetyEvents) ? live.safetyEvents : [],
     isAlive: liveness.isAlive,
   };
 }

@@ -31,6 +31,12 @@ import { validateWorkflowId, assertPathWithinRoot, isTestWorkflowId } from './wo
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
+import {
+  summarizeSafetyEvents,
+  formatBlockingSafetyReason,
+  safetyCodeForAdapterError,
+  SAFETY_EVENT_CODES,
+} from './safetyEvents.js';
 import { loadWorkspaceConfig, resolveApprovedExternalRoots, loadAndValidateExternalRoots, ExternalReadRootConfigError } from './workspaceConfig.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from './runtimeIdentity.js';
 import {
@@ -676,6 +682,22 @@ export async function runSuperGPT({
     }
     result.status = 'FAILED';
     result.reason = err?.message ?? String(err);
+    // A reviewer / supervisor context-budget guard that fails the run is a
+    // user-visible BLOCKING safety event — record it before the terminal
+    // transition so it is projected into the returned result.
+    const safetyCode = safetyCodeForAdapterError(err);
+    if (safetyCode === SAFETY_EVENT_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED
+      || safetyCode === SAFETY_EVENT_CODES.SUPERVISOR_CONTEXT_BUDGET_EXCEEDED) {
+      try {
+        workflowStateManager.recordSafetyEvent({
+          code: safetyCode,
+          severity: 'BLOCKING',
+          role: safetyCode === SAFETY_EVENT_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED ? 'reviewer' : 'supervisor',
+          reason: result.reason,
+          actionTaken: 'workflow halted — FAILED; no further model call made',
+        });
+      } catch { /* never let safety-event recording mask the original failure */ }
+    }
     workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: result.reason });
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, reason: result.reason });
     return result;
@@ -690,6 +712,20 @@ export async function runSuperGPT({
     if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
     // Expose the selected path consistently on every terminal result.
     result.path = result.path ?? workflowStateManager?.state?.workflowPath ?? null;
+    // Project accumulated user-visible safety events onto every terminal
+    // result (success, FAILED, CANCELLED alike). The blocking event is the
+    // one a Front Agent must surface.
+    try {
+      const projection = summarizeSafetyEvents(workflowStateManager?.getSafetyEvents?.() ?? []);
+      result.safetyEvents = projection.safetyEvents;
+      result.blockingSafetyEvent = projection.blockingSafetyEvent;
+      if (projection.blockingSafetyEvent) {
+        const line = formatBlockingSafetyReason(projection.blockingSafetyEvent);
+        if (line && !(result.reason ?? '').includes(projection.blockingSafetyEvent.code)) {
+          result.reason = result.reason ? `${result.reason} | ${line}` : line;
+        }
+      }
+    } catch { /* best effort projection */ }
   }
 
   // A fully delivered workflow needs no durable control record any more.

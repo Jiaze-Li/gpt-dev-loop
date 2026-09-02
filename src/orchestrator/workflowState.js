@@ -17,6 +17,7 @@ import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
 import { readOwnerLease, isLeaseOwnerAlive } from './workflowOwnership.js';
 import { appendProviderProcessDiagnostic } from './providerProcessTelemetry.js';
 import { validateWorkflowId, assertPathWithinRoot, isTestWorkflowId } from './workflowId.js';
+import { makeSafetyEvent } from './safetyEvents.js';
 
 export const WORKFLOW_KINDS = Object.freeze({
   USER: 'USER',
@@ -125,6 +126,10 @@ export class WorkflowStateManager {
       summary: null,
       evidence: null,
       blockers: [],
+      // User-visible cost / safety events (see safetyEvents.js). Accumulated
+      // live; projected verbatim into every terminal channel so an anomaly is
+      // never left only in internal logs.
+      safetyEvents: [],
       // V2-C durable PR closeout loop state (round count, reviewed head,
       // finding signatures, last action) — null until the closeout loop runs.
       prCloseout: null,
@@ -330,6 +335,23 @@ export class WorkflowStateManager {
     this.state.lastProgressAt = new Date().toISOString();
     this.notify();
     this.persist();
+  }
+
+  // Append a user-visible cost / safety event. Zero model tokens. The event
+  // is persisted immediately so it survives a crash between here and the
+  // terminal transition.
+  recordSafetyEvent(event) {
+    const normalized = makeSafetyEvent(event);
+    if (!Array.isArray(this.state.safetyEvents)) this.state.safetyEvents = [];
+    this.state.safetyEvents.push(normalized);
+    this.state.lastProgressAt = new Date().toISOString();
+    this.notify();
+    this.persist();
+    return normalized;
+  }
+
+  getSafetyEvents() {
+    return Array.isArray(this.state.safetyEvents) ? [...this.state.safetyEvents] : [];
   }
 
   setDecision(decision) {

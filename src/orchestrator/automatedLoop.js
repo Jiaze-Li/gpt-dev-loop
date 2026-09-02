@@ -30,6 +30,7 @@
 
 import { AdapterError, ADAPTER_ERROR_CODES, isCancellation } from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
+import { classifyVerificationPermissionBlocked } from './safetyEvents.js';
 import { defaultOrganicReworkRecorder } from './organicReworkRecorder.js';
 import { nullWindowSession } from './agyProviderSessions.js';
 import {
@@ -732,6 +733,26 @@ export async function runAutomatedWorkflow({
           log(`executor budget-failure usage recording failed: ${recordErr.message}`);
         }
       }
+      // User-visible safety event: a token/duplicate guard tripped and the
+      // workflow cannot safely continue (it ends HUMAN_REQUIRED below). This
+      // MUST reach the terminal result, not just the log.
+      if (workflowStateManager
+        && (err?.code === ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED
+          || err?.code === ADAPTER_ERROR_CODES.EXECUTOR_DUPLICATE_CALL_REJECTED)) {
+        try {
+          workflowStateManager.recordSafetyEvent({
+            code: err.code,
+            severity: 'BLOCKING',
+            role: 'executor',
+            taskId: err?.details?.taskId ?? currentTaskCard.task_id,
+            attempt: err?.details?.attempt ?? attemptCount,
+            reason: err?.details?.budgetExceededReason ?? err.message,
+            actionTaken: 'workflow halted — HUMAN_REQUIRED; no further executor call made',
+          });
+        } catch (seErr) {
+          log(`safety event record failed: ${seErr.message}`);
+        }
+      }
       log(`executor infrastructure failure: task=${currentTaskCard.task_id} attempt=${attemptCount} error=${err.message}`);
       const failureCategory = FAILURE_CATEGORIES.INFRASTRUCTURE;
       const reason = `Executor failed: ${err.message}`;
@@ -815,6 +836,34 @@ export async function runAutomatedWorkflow({
         // Exact verbatim match only — no prefix, substring, glob, or trim expansion.
         const deniedApproved = deniedCommands.filter((c) => approvedCommands.has(c));
         const deniedProbes = deniedCommands.filter((c) => !approvedCommands.has(c));
+
+        // The adapter flags `verificationBlocked` when the same command was
+        // denied >= 2 times in one invocation (turn burn). Project it as a
+        // user-visible safety event: WARNING when another approved
+        // verification path is still open, BLOCKING when every approved
+        // verification command is denied.
+        if (workflowStateManager && executionReport.verificationBlocked) {
+          const { severity, hasAltPath, remainingApprovedCommands } = classifyVerificationPermissionBlocked({
+            approvedCommands: [...approvedCommands],
+            deniedCommands,
+          });
+          try {
+            workflowStateManager.recordSafetyEvent({
+              code: 'VERIFICATION_PERMISSION_BLOCKED',
+              severity,
+              role: 'executor',
+              taskId: currentTaskCard.task_id,
+              attempt: attemptCount,
+              repeatCount: executionReport.verificationBlocked.repeatCount ?? null,
+              reason: `verification command repeatedly permission-denied: ${executionReport.verificationBlocked.command ?? '(unknown)'}`,
+              actionTaken: hasAltPath
+                ? `other approved verification path still available (${remainingApprovedCommands.length}); workflow continues`
+                : 'no approved verification path remains; workflow halts for human input',
+            });
+          } catch (seErr) {
+            log(`safety event record failed: ${seErr.message}`);
+          }
+        }
 
         if (deniedApproved.length === 0 && deniedProbes.length > 0) {
           unauthorizedProbeRetries += 1;
