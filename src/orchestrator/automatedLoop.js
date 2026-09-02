@@ -30,7 +30,7 @@
 
 import { AdapterError, ADAPTER_ERROR_CODES, isCancellation } from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
-import { classifyVerificationPermissionBlocked } from './safetyEvents.js';
+import { classifyVerificationPermissionBlocked, SAFETY_EVENT_CODES, SAFETY_SEVERITY } from './safetyEvents.js';
 import { defaultOrganicReworkRecorder } from './organicReworkRecorder.js';
 import { nullWindowSession } from './agyProviderSessions.js';
 import {
@@ -1568,6 +1568,29 @@ export async function runAutomatedWorkflow({
       assertLegalTransition(decision, hasPendingRework);
 
       if (decision.action === 'HUMAN_REQUIRED') {
+        // NO NEW INFORMATION -> NO NEW MODEL CALL: the deterministic policy
+        // stopped a Gate-rework loop because the same failure repeated against
+        // an unchanged diff. Project it as a BLOCKING safety event so it
+        // survives to the terminal result the Front Agent shows the user.
+        if (decision.noNewInformation && workflowStateManager) {
+          try {
+            workflowStateManager.recordSafetyEvent({
+              code: SAFETY_EVENT_CODES.NO_NEW_INFORMATION_RETRY_BLOCKED,
+              severity: SAFETY_SEVERITY.BLOCKING,
+              role: 'supervisor',
+              taskId: decision.noNewInformation.taskId ?? currentTaskCard?.task_id ?? null,
+              attempt: attemptCount,
+              fingerprint: decision.noNewInformation.gateFingerprint ?? null,
+              diffHash: decision.noNewInformation.diffHash ?? null,
+              reason: decision.reason,
+              actionTaken:
+                'workflow halted — HUMAN_REQUIRED; no further Executor call dispatched '
+                + '(identical Gate failure + unchanged task diff on two consecutive attempts)',
+            });
+          } catch (seErr) {
+            log(`no-new-information safety event record failed: ${seErr.message}`);
+          }
+        }
         // Deliberately does not close anything: HUMAN_REQUIRED means "stop
         // and preserve enough state to continue later", and the whole point
         // of these being persistent conversations (inside a window that is

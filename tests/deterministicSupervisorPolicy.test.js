@@ -83,21 +83,120 @@ test('Reviewer PASS advances directly to next task then DONE', () => {
   assert.deepEqual(done.decision, { action: 'WORKFLOW_DONE', summary: 'ship both' });
 });
 
-test('Gate REWORK always returns directly to Executor', () => {
+test('first Gate REWORK returns directly to Executor; identical repeat is blocked (no new information)', () => {
   const memory = new Map();
-  for (let i = 0; i < 3; i += 1) {
-    const result = decideDeterministically({
-      context: ctx({
-        latestReviewResult: {
-          task_id: 'one', decision: 'REWORK', source: 'GATE', required_changes: ['Fix npm test'],
-        },
-      }),
-      plannedTasks: tasks,
-      reworkMemory: memory,
-    });
-    assert.equal(result.handled, true);
-    assert.equal(result.decision.action, 'CONTINUE_REWORK');
-  }
+  const review = {
+    task_id: 'one', decision: 'REWORK', source: 'GATE', required_changes: ['Fix failing verification command: npm test'],
+  };
+  const gate = {
+    results: [{ command: 'npm test', pass: false, output: '✖ D. Timeline shows newest-first (1.2ms)\n✖ Q. API /api/focus (3ms)' }],
+    diff: 'diff --git a/src/one.js b/src/one.js\n+export const x = 1;\n',
+    changed_files: ['src/one.js'],
+  };
+  const first = decideDeterministically({
+    context: ctx({ latestReviewResult: review, latestGateEvidence: gate }),
+    plannedTasks: tasks,
+    reworkMemory: memory,
+  });
+  assert.equal(first.handled, true);
+  assert.equal(first.decision.action, 'CONTINUE_REWORK');
+  assert.equal(first.reason, 'gate_rework');
+
+  const second = decideDeterministically({
+    context: ctx({ latestReviewResult: review, latestGateEvidence: gate }),
+    plannedTasks: tasks,
+    reworkMemory: memory,
+  });
+  assert.equal(second.handled, true);
+  assert.equal(second.decision.action, 'HUMAN_REQUIRED');
+  assert.equal(second.reason, 'gate_rework_no_new_information');
+  assert.ok(second.decision.noNewInformation.gateFingerprint);
+  assert.ok(second.decision.noNewInformation.diffHash);
+});
+
+// ── NO NEW INFORMATION -> NO NEW MODEL CALL (Gate-source REWORK) ──────────
+function gateReview(overrides = {}) {
+  return {
+    task_id: 'one',
+    decision: 'REWORK',
+    source: 'GATE',
+    required_changes: ['Fix failing verification command: npm test'],
+    ...overrides,
+  };
+}
+function gateEvidence({ output = '✖ Scenario D: resume transitions\n✖ Q. API /api/focus', diff = '+export const x = 1;', files = ['src/one.js'] } = {}) {
+  return {
+    results: [{ command: 'npm test', pass: false, exitCode: 1, output }],
+    diff: `diff --git a/src/one.js b/src/one.js\n${diff}\n`,
+    changed_files: files,
+  };
+}
+
+test('A. same gate fingerprint + same diff hash on the 2nd attempt blocks the 3rd Executor dispatch', () => {
+  const memory = new Map();
+  const ev = gateEvidence();
+  const r1 = decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: ev }), plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(r1.decision.action, 'CONTINUE_REWORK');
+
+  const r2 = decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: ev }), plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(r2.decision.action, 'HUMAN_REQUIRED');
+  assert.equal(r2.reason, 'gate_rework_no_new_information');
+
+  // A 3rd identical decision is still blocked — the loop never dispatches Executor again.
+  const r3 = decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: ev }), plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(r3.decision.action, 'HUMAN_REQUIRED');
+});
+
+test('B. a different gate failure fingerprint is allowed to continue', () => {
+  const memory = new Map();
+  const a = decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: gateEvidence({ output: '✖ test alpha' }) }),
+    plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(a.decision.action, 'CONTINUE_REWORK');
+
+  const b = decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: gateEvidence({ output: '✖ test beta' }) }),
+    plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(b.decision.action, 'CONTINUE_REWORK', 'new failing test set => new information => keep going');
+});
+
+test('C. same gate fingerprint but a changed task diff is allowed to continue', () => {
+  const memory = new Map();
+  const first = decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: gateEvidence({ diff: '+export const x = 1;' }) }),
+    plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(first.decision.action, 'CONTINUE_REWORK');
+
+  const second = decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: gateEvidence({ diff: '+export const x = 2;' }) }),
+    plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(second.decision.action, 'CONTINUE_REWORK', 'the implementation actually changed => not a no-op retry');
+});
+
+test('D. a Reviewer REWORK with a new required change is not blocked by a stale gate fingerprint', () => {
+  const memory = new Map();
+  // Round 1: gate failure recorded.
+  decideDeterministically({
+    context: ctx({ latestReviewResult: gateReview(), latestGateEvidence: gateEvidence() }), plannedTasks: tasks, reworkMemory: memory,
+  });
+  // Round 2: gate now passes, Reviewer asks for a concrete new change.
+  const reviewer = decideDeterministically({
+    context: ctx({ latestReviewResult: { task_id: 'one', decision: 'REWORK', required_changes: ['Add a null check in parse()'] } }),
+    plannedTasks: tasks, reworkMemory: memory,
+  });
+  assert.equal(reviewer.handled, true);
+  assert.equal(reviewer.decision.action, 'CONTINUE_REWORK');
+  assert.equal(reviewer.reason, 'ordinary_reviewer_rework');
 });
 
 test('first Reviewer REWORK is direct; identical non-convergence escalates', () => {

@@ -3487,3 +3487,115 @@ test('executor budget-exceeded records a BLOCKING safety event on the workflow s
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ── NO NEW INFORMATION -> NO NEW MODEL CALL (Gate-rework loop) ────────
+import { summarizeSafetyEvents } from '../src/orchestrator/safetyEvents.js';
+
+test('no-new-information: identical dashboard Gate failure + unchanged diff stops after 2 Executor calls with a BLOCKING safety event', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const nodePath = await import('node:path');
+  const { WorkflowStateManager } = await import('../src/orchestrator/workflowState.js');
+
+  const root = mkdtempSync(nodePath.join(tmpdir(), 'loop-nonewinfo-'));
+  try {
+    const taskCard = demoTaskCard({
+      task_id: 'add-vertex-count',
+      allowed_files: ['src/utils/graph-algorithms.js', 'tests/graph-algorithms.test.js'],
+      verification_commands: ['npm test'],
+    });
+    const plannedTasks = [{
+      task_id: taskCard.task_id,
+      goal: taskCard.goal,
+      scope: taskCard.scope,
+      allowed_files: taskCard.allowed_files,
+      verification_commands: taskCard.verification_commands,
+    }];
+
+    // Replays the real wf-agy-9a3583e5 shape: the SAME 7 pre-existing
+    // dashboard.test.js failures on every attempt, and the Executor's diff
+    // never changes (it was correct from attempt 1).
+    const DASHBOARD_FAIL = [
+      '✖ D. Timeline shows newest-first (1.9ms)',
+      '✖ M. /api/workflows returns Attention workflows by default (12ms)',
+      '✖ M2. Default selector shows ONLY active/unresolved workflows (2.2ms)',
+      '✖ Scenario A: Starting unrelated USER workflow C does NOT supersede (47ms)',
+      '✖ Scenario B: Explicit replacement B marks A as SUPERSEDED (20ms)',
+      '✖ Scenario D: Workflow A in HUMAN_REQUIRED resume transitions (1.1ms)',
+      '✖ Q. API /api/focus and /api/workflows return active focus (9.8ms)',
+    ].join('\n');
+    const gateRunner = {
+      runs: [],
+      async run(cmds) {
+        this.runs.push(cmds);
+        return {
+          pass: false,
+          results: [{ command: 'npm test', pass: false, exitCode: 1, output: DASHBOARD_FAIL }],
+          diff: 'diff --git a/src/utils/graph-algorithms.js b/src/utils/graph-algorithms.js\n+export function vertexCount(graph) {\n+  return collectVertices(graph).size;\n+}\n',
+          changed_files: ['src/utils/graph-algorithms.js', 'tests/graph-algorithms.test.js'],
+        };
+      },
+    };
+
+    let supervisorDecideCalls = 0;
+    const supervisor = {
+      async create() { return { tabId: 501, conversationId: null }; },
+      async decide(context) {
+        // The initial task comes through NEXT_TASK; any decide() call while a
+        // rework is pending would be a model call we are trying to avoid.
+        if (context.latestReviewResult && context.latestReviewResult.decision !== 'PASS') {
+          supervisorDecideCalls += 1;
+          throw new Error('Supervisor model must NOT be called to decide a no-new-information gate rework');
+        }
+        return { action: 'NEXT_TASK', task_card: taskCard };
+      },
+      async close() {},
+      getIdentity() { return { tabId: 501, conversationId: null }; },
+    };
+
+    const createReviewerSession = makeFakeReviewerFactory({ [taskCard.task_id]: [] });
+    const createClaudeSessionManager = makeFakeClaudeManagerFactory();
+    const usageTracker = new UsageTracker();
+    const workflowStateManager = new WorkflowStateManager({ workflowId: 'wf-nonewinfo', kind: 'INTERNAL_TEST', root });
+
+    const result = await runAutomatedWorkflow({
+      workflowId: 'wf-nonewinfo',
+      supervisorSession: supervisor,
+      createReviewerSession,
+      createClaudeSessionManager,
+      gateRunner,
+      windowSession: makeFakeWindowSession(),
+      usageTracker,
+      workflowStateManager,
+      workflowGoal: 'add vertexCount',
+      repositoryContext: taskCard.repository_context,
+      plannedTasks,
+      planSummary: 'one bounded task',
+      maxAttemptsPerTask: 3,
+      maxEscalationAttempts: 2,
+    });
+
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.equal(supervisorDecideCalls, 0, 'no model Supervisor call was made');
+
+    // F: real-fixture blast radius — down from 5-6 Executor calls to at most 2.
+    const executorCalls = createClaudeSessionManager.managers[0].executions.length;
+    assert.ok(executorCalls <= 2, `expected <= 2 Executor calls, got ${executorCalls}`);
+    assert.equal(executorCalls, 2);
+
+    // E: the BLOCKING safety event reaches the projection used by
+    // supergpt_start_and_wait's terminal result.
+    const events = workflowStateManager.getSafetyEvents();
+    const projection = summarizeSafetyEvents(events);
+    assert.ok(projection.blockingSafetyEvent, 'a blocking safety event is projected');
+    assert.equal(projection.blockingSafetyEvent.code, 'NO_NEW_INFORMATION_RETRY_BLOCKED');
+    assert.equal(projection.blockingSafetyEvent.severity, 'BLOCKING');
+    assert.equal(projection.blockingSafetyEvent.taskId, taskCard.task_id);
+    assert.equal(projection.blockingSafetyEvent.attempt, 2);
+    assert.ok(projection.blockingSafetyEvent.fingerprint, 'carries the gate fingerprint');
+    assert.ok(projection.blockingSafetyEvent.diffHash, 'carries the task diff hash');
+    assert.match(projection.blockingSafetyEvent.actionTaken, /no further Executor call/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

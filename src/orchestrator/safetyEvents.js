@@ -13,6 +13,11 @@ export const SAFETY_EVENT_CODES = Object.freeze({
   REVIEWER_CONTEXT_BUDGET_EXCEEDED: 'REVIEWER_CONTEXT_BUDGET_EXCEEDED',
   SUPERVISOR_CONTEXT_BUDGET_EXCEEDED: 'SUPERVISOR_CONTEXT_BUDGET_EXCEEDED',
   FRONT_AGENT_POLLING_REGRESSION: 'FRONT_AGENT_POLLING_REGRESSION',
+  // A Gate-sourced REWORK repeated with the SAME failure fingerprint AND the
+  // SAME task diff — the previous Executor attempt produced no new information,
+  // so dispatching another Executor call cannot help. The loop stops instead
+  // of burning another expensive model call.
+  NO_NEW_INFORMATION_RETRY_BLOCKED: 'NO_NEW_INFORMATION_RETRY_BLOCKED',
 });
 
 export const SAFETY_SEVERITY = Object.freeze({
@@ -42,6 +47,8 @@ export function makeSafetyEvent({
   reason = null,
   repeatCount = null,
   actionTaken = null,
+  fingerprint = null,
+  diffHash = null,
 } = {}) {
   if (!VALID_CODES.has(code)) {
     throw new Error(`makeSafetyEvent: unknown safety event code "${code}"`);
@@ -58,6 +65,11 @@ export function makeSafetyEvent({
     reason: reason == null ? null : String(reason),
     repeatCount: Number.isFinite(repeatCount) ? repeatCount : null,
     actionTaken: actionTaken == null ? null : String(actionTaken),
+    // Optional non-convergence evidence — only some codes carry these, so they
+    // are omitted from the persisted shape when absent to keep older events
+    // byte-identical.
+    ...(fingerprint == null ? {} : { fingerprint: String(fingerprint) }),
+    ...(diffHash == null ? {} : { diffHash: String(diffHash) }),
     at: new Date().toISOString(),
   };
 }

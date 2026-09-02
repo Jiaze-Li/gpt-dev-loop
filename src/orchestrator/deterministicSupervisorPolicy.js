@@ -23,6 +23,118 @@ function reworkSignature(review) {
     .join('\n');
 }
 
+import { createHash } from 'node:crypto';
+
+function sha256(value) {
+  return createHash('sha256').update(String(value)).digest('hex');
+}
+
+// Pull the individual failing test / assertion identifiers out of a Gate
+// command's captured output. Supports node:test's spec reporter (`✖ name`)
+// and TAP (`not ok N - name`). Durations, absolute worktree paths, and
+// stack-trace line:col are stripped so the identifier is stable across runs.
+function extractFailingTestIds(output) {
+  const text = String(output || '');
+  const ids = new Set();
+  const patterns = [
+    /^\s*[✖✗✘]\s+(.+?)\s*$/gm, // ✖ ✗ ✘  (node:test)
+    /^\s*not ok \d+\s*(?:-\s*)?(.+?)\s*$/gm, // TAP
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const name = m[1]
+        .replace(/\s*\(\d+(?:\.\d+)?\s*(?:ms|s)\)\s*$/i, '') // trailing duration
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!name) continue;
+      if (/^failing tests:?$/i.test(name)) continue; // TAP/spec summary header
+      ids.add(name);
+    }
+  }
+  return [...ids].sort();
+}
+
+// Volatile-bit-stripped digest of a Gate output, used only when no structured
+// failing-test identifiers could be extracted.
+function normalizeGateOutput(output) {
+  return String(output || '')
+    .replace(/\(\d+(?:\.\d+)?\s*(?:ms|s)\)/g, '(t)') // durations
+    .replace(/\/[^\s:'"]*\/(?:gpt-dev-loop|\.supergpt)[^\s:'"]*/g, '<path>') // worktree paths
+    .replace(/:\d+:\d+/g, ':L:C') // stack-trace line:col
+    .replace(/\b[0-9a-f]{7,40}\b/g, '<hex>') // commit / blob ids
+    .replace(/\bpid[=: ]\d+/gi, 'pid=<n>')
+    .replace(/[ \t]+$/gm, '')
+    .trim();
+}
+
+// Deterministic fingerprint of a Gate FAIL. Two Gate failures with the same
+// fingerprint are "the same failure". Only stable, semantically-meaningful
+// data is folded in: the failing verification command(s), their exit codes,
+// and the set of failing test / assertion identifiers.
+export function gateFailureFingerprint(review, gateEvidence) {
+  const results = Array.isArray(gateEvidence?.results) ? gateEvidence.results : [];
+  const failing = results.filter((r) => r && r.pass !== true);
+
+  const commands = [];
+  const exitCodes = [];
+  const failingTests = new Set();
+  let sawStructuredIds = false;
+
+  for (const r of failing) {
+    if (typeof r.command === 'string' && r.command.trim()) commands.push(r.command.trim());
+    const code = Number.isFinite(r.exitCode) ? r.exitCode
+      : Number.isFinite(r.exit_code) ? r.exit_code
+        : Number.isFinite(r.code) ? r.code : null;
+    if (code !== null) exitCodes.push(code);
+    const ids = extractFailingTestIds(r.output);
+    if (ids.length) {
+      sawStructuredIds = true;
+      for (const id of ids) failingTests.add(id);
+    }
+  }
+
+  // Fallbacks when the Gate evidence carried no per-result rows or no
+  // structured ids: use the review's required_changes / a stripped digest.
+  if (commands.length === 0) {
+    for (const c of asList(review?.required_changes)) {
+      const m = /verification command:\s*(.+)$/i.exec(c);
+      commands.push(m ? m[1].trim() : c.trim());
+    }
+  }
+
+  const payload = {
+    commands: [...new Set(commands)].sort(),
+    exitCodes: [...new Set(exitCodes)].sort((a, b) => a - b),
+    failingTests: [...failingTests].sort(),
+    outputDigest: sawStructuredIds
+      ? null
+      : sha256(
+        failing.map((r) => normalizeGateOutput(r.output)).sort().join(' :: ')
+          || reworkSignature(review),
+      ),
+  };
+  return sha256(JSON.stringify(payload));
+}
+
+// Deterministic hash of the current task's implementation diff. Identical
+// implementation -> identical hash. Git blob-id lines are stripped so a
+// differing `core.abbrev` cannot make an unchanged diff look changed.
+export function taskDiffHash(gateEvidence, gitChanges) {
+  const raw = (typeof gateEvidence?.diff === 'string' && gateEvidence.diff)
+    || (typeof gateEvidence?.git_diff === 'string' && gateEvidence.git_diff)
+    || (typeof gitChanges === 'string' && gitChanges)
+    || '';
+  const normalized = String(raw)
+    .replace(/^index [0-9a-f]+\.\.[0-9a-f]+.*$/gm, 'index <blob>')
+    .replace(/[ \t]+$/gm, '')
+    .trim();
+  const changedFiles = Array.isArray(gateEvidence?.changed_files)
+    ? [...gateEvidence.changed_files].map(String).sort()
+    : [];
+  return sha256(JSON.stringify({ changedFiles, diff: normalized }));
+}
+
 export function validPlannedTasks(tasks) {
   if (!Array.isArray(tasks) || tasks.length === 0) return false;
   const ids = new Set();
@@ -109,6 +221,42 @@ export function decideDeterministically({
     // Gate failures are mechanical code/test failures. Environment/toolchain
     // failures are already intercepted by automatedLoop as HUMAN_REQUIRED.
     if (review.source === 'GATE') {
+      // NO NEW INFORMATION -> NO NEW MODEL CALL.
+      // The first Gate FAIL for a given (failure fingerprint + task diff) is a
+      // normal REWORK — a model may well fix it after one round. The FIRST
+      // REPEAT of the exact same fingerprint AND the exact same task diff means
+      // the previous Executor attempt produced nothing new, so another Executor
+      // dispatch cannot help: stop through the existing HUMAN_REQUIRED path.
+      const gateTaskId = typeof review.task_id === 'string' ? review.task_id.trim() : '';
+      const gateKey = `gate:${gateTaskId}`;
+      const fingerprint = gateFailureFingerprint(review, context.latestGateEvidence);
+      const diffHash = taskDiffHash(context.latestGateEvidence, context.gitChanges);
+      const prior = reworkMemory.get(gateKey) ?? null;
+
+      if (prior && prior.fingerprint === fingerprint && prior.diffHash === diffHash) {
+        return {
+          handled: true,
+          reason: 'gate_rework_no_new_information',
+          decision: {
+            action: 'HUMAN_REQUIRED',
+            reason:
+              `Gate verification failed identically on two consecutive attempts with an unchanged implementation `
+              + `(failure ${fingerprint.slice(0, 12)}, diff ${diffHash.slice(0, 12)}). No new information — `
+              + `refusing to dispatch another Executor call.`,
+            question:
+              `Task "${gateTaskId || review.task_id}" produced the same Gate failure twice with an unchanged diff. `
+              + `A human decision is required: adjust the task scope / acceptance criteria / verification command, `
+              + `fix the environment, or accept out-of-band, then resume.`,
+            noNewInformation: {
+              taskId: gateTaskId || null,
+              gateFingerprint: fingerprint,
+              diffHash,
+            },
+          },
+        };
+      }
+
+      reworkMemory.set(gateKey, { fingerprint, diffHash });
       return { handled: true, decision: { action: 'CONTINUE_REWORK' }, reason: 'gate_rework' };
     }
 
