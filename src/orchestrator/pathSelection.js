@@ -40,6 +40,7 @@ export const WORKFLOW_PATHS = Object.freeze({
 
 export const PATH_SELECTION_REASONS = Object.freeze({
   FAST_BOUNDED_SINGLE_TASK: 'fast_bounded_single_task',
+  FAST_DERIVED_BOUNDED_TASK: 'fast_derived_bounded_task',
   PR_CLOSEOUT_INTENT: 'pr_closeout_intent',
   FULL_NO_BOUNDED_TASK: 'full_no_bounded_task',
   FULL_EXPLICIT_REQUEST: 'full_explicit_request',
@@ -234,6 +235,185 @@ function classifyGoalText(text) {
   return null;
 }
 
+// ---- Deterministic bounded-task derivation from a plain request goal --------
+//
+// The path selector's Fast Path was previously reachable ONLY when a caller
+// handed in a pre-structured `boundedTask` contract. The MCP entrypoints
+// (`supergpt_start_and_wait` etc.) never construct one, so every plain
+// natural-language request — however small and mechanically bounded — fell to
+// Full Path and paid for a Planner model call.
+//
+// This derivation closes that gap WITHOUT an LLM call and without special-
+// casing any fixture: it keys purely on structural properties of the request
+// text and the workspace. It only produces a candidate when the request
+//   (a) names one or a few concrete, in-repo (or new-in-existing-dir) files,
+//       and
+//   (b) names at least one recognized deterministic verification command.
+// The candidate is then subject to the SAME downstream gating as an explicit
+// contract (`buildFastPathTaskContract` scope/verification checks plus
+// `classifyGoalText` multi-step / ambiguity / high-risk / closeout markers),
+// so decomposable, ambiguous, or risky work still routes to the Planner.
+// Anything it cannot confidently derive returns null -> Full Path unchanged.
+
+// Source-ish file extensions worth treating as a bounded edit target.
+const DERIVE_FILE_EXT = 'js|jsx|ts|tsx|mjs|cjs|py|go|rs|rb|java|kt|kts|swift|scala|clj|cljs|ex|exs|erl|c|h|cc|cpp|hpp|cxx|hxx|m|mm|cs|php|lua|dart|sh|bash|zsh|sql|css|scss|sass|less|html|vue|svelte|json|jsonc|ya?ml|toml|ini|cfg|conf|env|properties|gradle|md|mdx|txt|proto|graphql|gql';
+const DERIVE_FILE_RE = new RegExp(
+  String.raw`(?<![\w@./-])((?:[\w.-]+/)*[\w.-]+\.(?:${DERIVE_FILE_EXT}))(?![\w/])`,
+  'gi',
+);
+
+// Conventional source roots accepted when on-disk existence cannot be checked
+// (no usable cwd). A bare `foo.js` with no directory part is never accepted.
+const DERIVE_CONVENTIONAL_ROOT_RE = /^(?:src|lib|app|pkg|internal|cmd|scripts?|config|test|tests|spec|packages|components?|server|client|api|core)\//i;
+
+// Recognized deterministic verification runners. A candidate command must start
+// with one of these AND carry no shell chaining/redirection/substitution.
+const DERIVE_VERIFY_CMD_RE = /^(?:npm|npx|pnpm|yarn|bun|deno|node|python3?|py|pytest|tox|unittest|cargo|go|make|just|jest|vitest|mocha|ava|tap|rspec|rake|bundle\s+exec|phpunit|composer|dotnet|gradle|\.\/gradlew|mvn|ctest|cmake|swift|dart|flutter|elixir|mix|rustc|tsc|eslint|ruff|pyright|mypy)\b/i;
+const DERIVE_CMD_UNSAFE_RE = /[;&|<>`$\n]|\|\||&&/;
+
+function deriveVerificationCommands(goal) {
+  const text = String(goal ?? '');
+  const candidates = [];
+  // 1. backtick-quoted spans
+  const btRe = /`([^`\n]{1,160})`/g;
+  let m;
+  while ((m = btRe.exec(text)) !== null) candidates.push(m[1]);
+  // 2. "verify with X", "run X to verify", "verification command: X",
+  //    "verify: X", "test command: X", "tests: X" — to end of line.
+  const cueRe = /(?:verify(?:\s+(?:it|this|the\s+change|by\s+running))?\s+with|run\s+|verification\s+command\s*[:=]|verify\s*[:=]|test\s+command\s*[:=]|tests?\s*[:=])\s*`?([^\n`]{1,160})`?/gi;
+  while ((m = cueRe.exec(text)) !== null) candidates.push(m[1]);
+
+  const out = [];
+  const seen = new Set();
+  for (const raw of candidates) {
+    let c = String(raw).trim().replace(/^['"]|['"]$/g, '').trim();
+    // trim a trailing sentence period / clause punctuation
+    c = c.replace(/[.,;:)\s]+$/g, '').trim();
+    if (!c || c.length > 160) continue;
+    if (DERIVE_CMD_UNSAFE_RE.test(c)) continue;
+    if (!DERIVE_VERIFY_CMD_RE.test(c)) continue;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    out.push(c);
+  }
+  return out;
+}
+
+function deriveAllowedFiles(goal, cwd) {
+  const text = String(goal ?? '');
+  let cwdIsDir = false;
+  if (cwd && typeof cwd === 'string') {
+    try { cwdIsDir = fs.existsSync(cwd) && fs.statSync(cwd).isDirectory(); } catch { cwdIsDir = false; }
+  }
+  const out = [];
+  const seen = new Set();
+  let m;
+  DERIVE_FILE_RE.lastIndex = 0;
+  while ((m = DERIVE_FILE_RE.exec(text)) !== null) {
+    const entry = m[1].trim();
+    if (seen.has(entry)) continue;
+    if (!isConcreteFilePath(entry, cwd)) continue;
+    let accept = false;
+    if (cwdIsDir) {
+      try {
+        const full = path.resolve(cwd, entry);
+        if (fs.existsSync(full) && fs.statSync(full).isFile()) {
+          accept = true;
+        } else {
+          // a not-yet-created file is a valid bounded target only when its
+          // immediate parent directory already exists inside the workspace.
+          const parent = path.dirname(full);
+          accept = fs.existsSync(parent) && fs.statSync(parent).isDirectory();
+        }
+      } catch { accept = false; }
+    } else {
+      // No usable cwd: accept only a path that is clearly workspace source,
+      // i.e. has a directory part under a conventional root.
+      accept = entry.includes('/') && DERIVE_CONVENTIONAL_ROOT_RE.test(entry);
+    }
+    if (!accept) continue;
+    seen.add(entry);
+    out.push(entry);
+  }
+  return out;
+}
+
+// A path that names a test/spec file rather than an implementation target.
+const DERIVE_TEST_FILE_RE = /(?:^|\/)(?:__tests__|__specs__|tests?|specs?)\/|\.(?:test|spec)\.[a-z]+$|_(?:test|spec)\.[a-z]+$|(?:^|\/)test_[^/]+\.[a-z]+$/i;
+
+// Explicit intent to edit the test files themselves (direct object), which is
+// the only case a named test/spec file stays a writable Fast Path target.
+const DERIVE_EDIT_TESTS_RE = /(?<!\bnot\s)(?<!\bnever\s)(?<!n['’]t\s)\b(?:modif(?:y|ies)|edit|editing|updat(?:e|ing)|chang(?:e|ing)|rewrit(?:e|ing)|extend(?:ing)?|add(?:ing)?\s+(?:a\s+)?(?:new\s+)?(?:case|assertion|test))\b[^.\n]{0,40}\b(?:test|spec)s?\b|\b(?:test|spec)s?\b[^.\n]{0,40}\b(?:file|suite)\b[^.\n]{0,20}\b(?:modif|edit|updat|chang|rewrit)/i;
+
+// Explicit "do not modify <path>" / "leave <path> unchanged" clauses.
+function deriveForbiddenFiles(goal) {
+  const text = String(goal ?? '');
+  const out = new Set();
+  const ext = `(?:${DERIVE_FILE_EXT})`;
+  const negRe = new RegExp(
+    String.raw`(?:do not|don't|never|without|avoid)\s+(?:modif|edit|chang|touch|alter)\w*[^.\n]{0,80}?((?:[\w.-]+/)*[\w.-]+\.${ext})`,
+    'gi',
+  );
+  const leaveRe = new RegExp(
+    String.raw`leave\s+((?:[\w.-]+/)*[\w.-]+\.${ext})\s+(?:unchanged|as-is|as is|alone|intact|untouched)`,
+    'gi',
+  );
+  let m;
+  while ((m = negRe.exec(text)) !== null) out.add(m[1].trim());
+  while ((m = leaveRe.exec(text)) !== null) out.add(m[1].trim());
+  return [...out];
+}
+
+/**
+ * Deterministically derive a single bounded-task contract candidate from a
+ * plain request goal and the workspace. Returns a `boundedTask`-shaped object
+ * (`{ goal, allowed_files, forbidden_files, verification_commands }`) or null
+ * when the request is not structurally a single mechanically-verifiable task.
+ *
+ * Pure: string inspection plus read-only `fs.existsSync`/`statSync`. No model
+ * call, no network, no writes.
+ */
+export function deriveBoundedTaskFromGoal(goal, { cwd = null } = {}) {
+  if (!isNonEmptyString(goal)) return null;
+
+  const named = deriveAllowedFiles(goal, cwd);
+  if (named.length === 0) return null;
+
+  const explicitForbidden = new Set(deriveForbiddenFiles(goal));
+  const editTests = DERIVE_EDIT_TESTS_RE.test(goal);
+
+  const implFiles = named.filter((f) => !DERIVE_TEST_FILE_RE.test(f) && !explicitForbidden.has(f));
+  const testFiles = named.filter((f) => DERIVE_TEST_FILE_RE.test(f) && !explicitForbidden.has(f));
+
+  const allowed_files = [];
+  const forbidden_files = new Set(explicitForbidden);
+  for (const f of implFiles) allowed_files.push(f);
+  for (const f of testFiles) {
+    // In a bounded "implement X, the tests verify it" task the named test
+    // files are the acceptance spec, not an edit target — protect them unless
+    // the request explicitly asks to edit the tests themselves. A request that
+    // names ONLY test files (no impl target) is not a Fast Path shape.
+    if (editTests && implFiles.length > 0) allowed_files.push(f);
+    else forbidden_files.add(f);
+  }
+
+  // Need at least one concrete implementation target to edit.
+  if (implFiles.length === 0) return null;
+  if (allowed_files.length === 0) return null;
+  if (allowed_files.length > FAST_PATH_MAX_FILES) return null;
+
+  const verification_commands = deriveVerificationCommands(goal);
+  if (verification_commands.length === 0) return null;
+
+  return {
+    goal: goal.trim(),
+    allowed_files,
+    forbidden_files: [...forbidden_files],
+    verification_commands,
+    __derived: true,
+  };
+}
+
 function fullDecision(reason, detail) {
   return Object.freeze({
     path: WORKFLOW_PATHS.FULL,
@@ -327,11 +507,19 @@ export function selectWorkflowPath({ goal, cwd = process.cwd(), boundedTask, exp
     return fullDecision(PATH_SELECTION_REASONS.FULL_EXPLICIT_REQUEST, 'caller explicitly requested the Full Path / planning');
   }
 
-  if (boundedTask === undefined || boundedTask === null) {
-    return fullDecision(PATH_SELECTION_REASONS.FULL_NO_BOUNDED_TASK, 'no bounded single-task contract in trusted input; planning required');
+  let derived = false;
+  let effectiveBoundedTask = boundedTask;
+  if (effectiveBoundedTask === undefined || effectiveBoundedTask === null) {
+    // No caller-supplied contract: try to derive one deterministically from the
+    // request text + workspace. Still fully gated below.
+    effectiveBoundedTask = deriveBoundedTaskFromGoal(goal, { cwd });
+    if (!effectiveBoundedTask) {
+      return fullDecision(PATH_SELECTION_REASONS.FULL_NO_BOUNDED_TASK, 'no bounded single-task contract in trusted input and none derivable from the request; planning required');
+    }
+    derived = true;
   }
 
-  const built = buildFastPathTaskContract(boundedTask, { cwd });
+  const built = buildFastPathTaskContract(effectiveBoundedTask, { cwd });
   if (!built.ok) {
     return fullDecision(built.reason, built.detail);
   }
@@ -345,8 +533,10 @@ export function selectWorkflowPath({ goal, cwd = process.cwd(), boundedTask, exp
 
   return Object.freeze({
     path: WORKFLOW_PATHS.FAST,
-    reason: PATH_SELECTION_REASONS.FAST_BOUNDED_SINGLE_TASK,
-    reasonDetail: `single bounded task, ${built.contract.allowed_files.length} file(s) in scope, ${built.contract.verification_commands.length} verification command(s)`,
+    reason: derived
+      ? PATH_SELECTION_REASONS.FAST_DERIVED_BOUNDED_TASK
+      : PATH_SELECTION_REASONS.FAST_BOUNDED_SINGLE_TASK,
+    reasonDetail: `${derived ? 'derived ' : ''}single bounded task, ${built.contract.allowed_files.length} file(s) in scope, ${built.contract.verification_commands.length} verification command(s)`,
     taskContract: built.contract,
     frozenPlan: null,
     restored: false,
