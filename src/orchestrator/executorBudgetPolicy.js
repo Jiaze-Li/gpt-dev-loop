@@ -17,9 +17,12 @@
 // `${workflowId}:${taskId}` (see providerSelection.js
 // createExecutorSessionManager — the only production constructor of
 // Executor CallIntents through this policy). A missing/malformed
-// operationId fails closed on the per-TASK ceilings only — they are simply
-// not evaluated for that call (workflow-wide ceilings below still are); no
-// taskId is ever guessed.
+// operationId means the per-TASK ceilings CANNOT be evaluated for that
+// call — and an unevaluatable ceiling must fail the call closed (DENY),
+// never fall through as if the ceiling did not apply. No taskId is ever
+// guessed; "undefined" (the literal string, e.g. from a stringified
+// `${undefined}:${undefined}` template) is treated as absent, same as a
+// missing/empty taskId.
 
 import {
   workflowCostExceeded,
@@ -35,7 +38,8 @@ function taskIdFromOperationId(operationId) {
   const sep = operationId.indexOf(':');
   if (sep === -1) return null;
   const taskId = operationId.slice(sep + 1);
-  return taskId || null;
+  if (!taskId || taskId === 'undefined') return null;
+  return taskId;
 }
 
 export function createExecutorBudgetPolicy({
@@ -61,7 +65,13 @@ export function createExecutorBudgetPolicy({
     if (intent.role !== 'executor') return { allow: true };
 
     const taskId = taskIdFromOperationId(intent.operationId);
-    if (!taskId) return { allow: true };
+    if (!taskId) {
+      return {
+        allow: false,
+        reason: `Executor physical call denied: operationId ${JSON.stringify(intent.operationId)} `
+          + 'does not carry a reliable taskId, so the task-level budget ceiling cannot be evaluated',
+      };
+    }
 
     const taskHit = taskExecutorCeilingExceeded(usageTracker, taskId, {
       volumeLimit: taskExecutorUsageVolumeCeiling,

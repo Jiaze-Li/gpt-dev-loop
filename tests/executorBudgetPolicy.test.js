@@ -203,3 +203,42 @@ test('G: budget denial is not classified as provider failure and does not pollut
   assert.equal(dispatched, 0);
   assert.equal(runtimeWithEvents.providerHealth.usable('claude:sonnet', 'claude'), true, 'budget denial must not penalize provider health');
 });
+
+// H. a missing/malformed operationId must fail the task-level ceiling
+// CLOSED (DENY, 0 dispatch) — it must never fall through as if the
+// per-task ceiling simply did not apply.
+test('H: an Executor call whose operationId carries no reliable taskId is denied before dispatch', async () => {
+  const malformedOperationIds = [null, '', 'no-colon', ':', 'workflow:', 'undefined:undefined'];
+  for (const operationId of malformedOperationIds) {
+    const usageTracker = new UsageTracker();
+    let dispatched = 0;
+    const runtime = buildRuntime({
+      usageTracker,
+      ceilings: { taskExecutorUsageVolumeCeiling: 100 },
+      rolePolicy: { executor: [{ family: 'claude:sonnet' }] },
+      adapters: { executor: { 'claude:sonnet': async () => { dispatched += 1; return 'never'; } } },
+    });
+    await assert.rejects(
+      runtime.invoke('executor', {}, { operationId }),
+      (err) => isAuthorizationFailure(err),
+      `operationId ${JSON.stringify(operationId)} must be denied`,
+    );
+    assert.equal(dispatched, 0, `operationId ${JSON.stringify(operationId)} must not dispatch`);
+  }
+});
+
+// I. a well-formed operationId still passes when under the ceiling —
+// the fail-closed fix above must not have collaterally denied valid calls.
+test('I: a well-formed operationId still passes under the ceiling', async () => {
+  const usageTracker = new UsageTracker();
+  let dispatched = 0;
+  const runtime = buildRuntime({
+    usageTracker,
+    ceilings: { taskExecutorUsageVolumeCeiling: 100 },
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }] },
+    adapters: { executor: { 'claude:sonnet': async () => { dispatched += 1; return 'ok'; } } },
+  });
+  const result = await runtime.invoke('executor', {}, { operationId: 'wf-123:task-1' });
+  assert.equal(result.value, 'ok');
+  assert.equal(dispatched, 1);
+});
