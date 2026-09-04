@@ -69,6 +69,36 @@ export const PR_CLOSEOUT_ERROR_CODES = Object.freeze({
   THREAD_RESOLUTION_UNAVAILABLE: 'THREAD_RESOLUTION_UNAVAILABLE',
 });
 
+// Token-Safety authorization boundary. A permit / spend-authorization failure
+// is an ORCHESTRATOR decision, never evidence that a provider is unavailable:
+// the role runtime must propagate it immediately, perform ZERO failover, and
+// must never mutate provider-health or quota state. It is deliberately NOT an
+// AdapterError and is never classified through providerFailure().
+export class AuthorizationError extends Error {
+  constructor(code, message, details) {
+    super(message ?? code);
+    this.name = 'AuthorizationError';
+    this.code = code;
+    this.authorizationFailure = true;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+export const AUTHORIZATION_ERROR_CODES = Object.freeze({
+  // authorize() rejected the CallIntent before any permit was issued
+  SPEND_DENIED: 'SPEND_DENIED',
+  INTENT_INCOMPLETE: 'INTENT_INCOMPLETE',
+  // dispatch() refused to run without / with an invalid permit
+  PERMIT_MISSING: 'PERMIT_MISSING',
+  PERMIT_UNKNOWN: 'PERMIT_UNKNOWN',
+  PERMIT_CONSUMED: 'PERMIT_CONSUMED',
+  PERMIT_INTENT_MISMATCH: 'PERMIT_INTENT_MISMATCH',
+});
+
+export function isAuthorizationFailure(error) {
+  return Boolean(error) && (error instanceof AuthorizationError || error.authorizationFailure === true);
+}
+
 export const ADAPTER_ERROR_CODES = Object.freeze({
   EXECUTOR_UNAVAILABLE: 'EXECUTOR_UNAVAILABLE',
   EXECUTOR_TIMEOUT: 'EXECUTOR_TIMEOUT',

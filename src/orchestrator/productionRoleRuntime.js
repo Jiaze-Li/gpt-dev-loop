@@ -2,7 +2,8 @@
 // physical transports stay in their existing adapters; this module is the
 // only place that selects a provider and retries another family.
 import { RoleRouter, QuotaPoolRegistry, ProviderHealthRegistry } from './roleRouting.js';
-import { isCancellation, ProviderCancelledError } from './errors.js';
+import { isCancellation, isAuthorizationFailure, ProviderCancelledError } from './errors.js';
+import { ModelSpendAuthority } from './modelSpendAuthority.js';
 
 const RETRYABLE = new Set([
   'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_RATE_LIMITED', 'PROVIDER_AUTH_FAILED',
@@ -51,6 +52,9 @@ export function createProductionRoleRuntime({
   adapters = {},
   onEvent,
   signal,
+  // The Token-Safety authorization boundary. Default: an allow-all authority
+  // that still enforces permit issuance / binding / single-use / default-deny.
+  spendAuthority = new ModelSpendAuthority({ onEvent }),
 } = {}) {
   const capabilityResolver = resolveFamily ?? ((family) => ({
     requestedFamily: family,
@@ -83,8 +87,27 @@ export function createProductionRoleRuntime({
         roleRouter.recordFailure(selection, { code: 'PROVIDER_UNAVAILABLE' });
         continue;
       }
+      // One CallIntent per PHYSICAL attempt. `attempted.size` is the 1-based
+      // physical-attempt counter for this invoke(), so provider B on failover
+      // is bound to attempt:2 and cannot reuse provider A's permit.
+      const callIntent = {
+        role,
+        family: selection.requestedFamily,
+        provider: selection.provider,
+        operationId,
+        attempt: attempted.size,
+      };
+      let permit;
       try {
-        const value = await adapter(payload, selection);
+        permit = spendAuthority.authorize(callIntent);
+      } catch (error) {
+        // Authorization failure is an orchestrator decision, NOT provider
+        // failure: no recordFailure, no health/quota mutation, no failover.
+        onEvent?.({ type: 'ROLE_INVOCATION_DENIED', role, operationId, ...selection, reason: error.code });
+        throw error;
+      }
+      try {
+        const value = await spendAuthority.dispatch(permit, callIntent, () => adapter(payload, selection));
         onEvent?.({ type: 'ROLE_INVOCATION_SUCCEEDED', role, operationId, ...selection });
         return { value, selection };
       } catch (error) {
@@ -93,6 +116,13 @@ export function createProductionRoleRuntime({
         // mutation, or failover — and propagate the original error.
         if (isCancellation(error, abortSignal)) {
           onEvent?.({ type: 'ROLE_INVOCATION_CANCELLED', role, operationId, ...selection });
+          throw error;
+        }
+        // A permit / spend-authorization failure is likewise NOT provider
+        // failure. Propagate immediately, before any classification or
+        // provider-health / quota mutation, and never fail over.
+        if (isAuthorizationFailure(error)) {
+          onEvent?.({ type: 'ROLE_INVOCATION_DENIED', role, operationId, ...selection, reason: error.code });
           throw error;
         }
         lastError = error;
@@ -104,5 +134,5 @@ export function createProductionRoleRuntime({
     }
   }
 
-  return { router: roleRouter, quotaRegistry, providerHealth, invoke };
+  return { router: roleRouter, quotaRegistry, providerHealth, spendAuthority, invoke };
 }
