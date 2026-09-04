@@ -105,24 +105,29 @@ PhysicalCallPermit._brand = Symbol('PhysicalCallPermit.brand');
 // Extracts whatever usage evidence a dispatch outcome carries, WITHOUT ever
 // estimating a token amount (UNKNOWN USAGE != ZERO).
 //
-//   - success: the adapter returned a value at all, which by construction
-//     proves the physical call completed and its outcome is known — settle
-//     as SETTLED_KNOWN using whatever `usage` field (possibly none, for a
-//     provider that plainly does not report usage) accompanies it. "The
-//     provider does not expose token counts" and "we do not know whether the
-//     call happened" are different states; only the second is UNRESOLVED.
-//   - failure: settlement is known ONLY when the thrown error itself carries
-//     explicit usage evidence (`error.details.usage` / `error.usage`) — the
-//     shape every adapter that reaches this call already uses when a
-//     post-send guard (budget / duplicate-call / invalid-output) fires with
-//     real provider usage in hand. Any other failure (timeout, killed
-//     process, transport failure, missing usage telemetry, ...) is
-//     conservatively UNRESOLVED: a business/protocol error never implies the
-//     spend was zero.
+// A successful functional result proves the provider responded; it does NOT
+// by itself prove the token spend was reliably accounted for. Settlement is
+// therefore known ONLY when reliable usage evidence is actually present —
+// on success or on failure alike:
+//
+//   - success: known iff the resolved value carries a `usage` field. The
+//     bare existence of a return value (or a callId with no usage) is NOT
+//     sufficient — it proves the call happened, not that its cost is known.
+//   - failure: known ONLY when the thrown error itself carries explicit
+//     usage evidence (`error.details.usage` / `error.usage`) — the shape
+//     every adapter that reaches this call already uses when a post-send
+//     guard (budget / duplicate-call / invalid-output) fires with real
+//     provider usage in hand. Any other failure (timeout, killed process,
+//     transport failure, missing usage telemetry, ...) is conservatively
+//     UNRESOLVED: a business/protocol error never implies the spend was
+//     zero.
+//
+// Neither branch estimates or synthesizes a usage value; both simply report
+// whether one was actually supplied.
 function extractSettlementUsage(outcome) {
   if (outcome.ok) {
     const usage = outcome.value?.usage ?? outcome.value?.value?.usage ?? null;
-    return { known: true, usage, callId: usage?.callId ?? outcome.value?.callId ?? null };
+    return { known: usage !== null && usage !== undefined, usage, callId: usage?.callId ?? outcome.value?.callId ?? null };
   }
   const usage = outcome.error?.details?.usage ?? outcome.error?.usage ?? null;
   return { known: usage !== null && usage !== undefined, usage, callId: usage?.callId ?? null };
@@ -305,36 +310,63 @@ export class ModelSpendAuthority {
     record.consumed = true;
     record.consumedAt = Date.now();
     this._onEvent?.({ type: 'PERMIT_CONSUMED', ...intent });
+
+    // The physical call itself is isolated from settlement bookkeeping below:
+    // `outcome` captures success/failure WITHOUT yet deciding anything about
+    // the reservation, so a settlement-persistence failure is never
+    // misclassified as "the provider call failed" (and vice versa).
+    let outcome;
     try {
-      const value = await dispatchFn();
-      const settlement = extractSettlementUsage({ ok: true, value });
-      await this._reservationLedger.settleKnown({
-        workflowId: intent.workflowId,
-        reservationId: record.reservationId,
-        usageCallId: settlement.callId,
-        usageReference: settlement.usage,
-        reason: 'PROVIDER_CALL_SUCCEEDED',
-      });
-      return value;
+      outcome = { ok: true, value: await dispatchFn() };
     } catch (error) {
-      const settlement = extractSettlementUsage({ ok: false, error });
-      if (settlement.known) {
+      outcome = { ok: false, error };
+    }
+    const settlement = extractSettlementUsage(outcome);
+
+    if (settlement.known) {
+      try {
         await this._reservationLedger.settleKnown({
           workflowId: intent.workflowId,
           reservationId: record.reservationId,
           usageCallId: settlement.callId,
           usageReference: settlement.usage,
-          reason: 'PROVIDER_CALL_FAILED_WITH_KNOWN_USAGE',
+          reason: outcome.ok ? 'PROVIDER_CALL_SUCCEEDED' : 'PROVIDER_CALL_FAILED_WITH_KNOWN_USAGE',
         });
-      } else {
-        await this._reservationLedger.markUnresolved({
-          workflowId: intent.workflowId,
-          reservationId: record.reservationId,
-          reason: error?.code ?? error?.message ?? 'USAGE_UNKNOWN_AFTER_DISPATCH',
-        });
+      } catch (persistError) {
+        // Settlement persistence failure (§ Failure 2). The provider
+        // physically ran and its usage WAS known, but the durable
+        // SETTLED_KNOWN write itself failed — the ledger's own cache is
+        // guaranteed to still read as DISPATCHING (see
+        // ReservationLedger.settleKnown), which already blocks further
+        // spend for this workflow. This is an orchestrator persistence
+        // failure, never provider failure: it must never be classified as
+        // a provider outcome, never trigger failover, and never mark the
+        // provider unhealthy — it is thrown as an AuthorizationError,
+        // exactly like every other Reservation fail-closed path, so the
+        // generic failover mechanism (which only ever failsover on
+        // provider/AdapterError outcomes) does not see it as one.
+        throw new AuthorizationError(
+          AUTHORIZATION_ERROR_CODES.MODEL_SPEND_SETTLEMENT_PERSIST_FAILED,
+          `model spend settlement could not be durably persisted: ${persistError?.message ?? persistError}`,
+          { intent, providerOutcome: outcome.ok ? 'SUCCESS' : 'FAILURE' },
+        );
       }
-      throw error;
+      if (outcome.ok) return outcome.value;
+      throw outcome.error;
     }
+
+    // Usage was not reliably known — UNRESOLVED regardless of whether the
+    // provider call itself succeeded or failed (§ Failure 1). A successful
+    // functional result never implies the token spend was accounted for.
+    await this._reservationLedger.markUnresolved({
+      workflowId: intent.workflowId,
+      reservationId: record.reservationId,
+      reason: outcome.ok
+        ? 'PROVIDER_CALL_SUCCEEDED_NO_RELIABLE_USAGE'
+        : (outcome.error?.code ?? outcome.error?.message ?? 'USAGE_UNKNOWN_AFTER_DISPATCH'),
+    });
+    if (outcome.ok) return outcome.value;
+    throw outcome.error;
   }
 
   // Test / diagnostics only.

@@ -1845,12 +1845,37 @@ async function defaultPipeline({
   // CANCELLED_PRE_DISPATCH. Runs once, before the first invoke() of this
   // process; every ModelSpendAuthority constructed below (primary runtime,
   // PR-closeout fallback) reads the SAME persisted, now-reconciled ledger.
+  // Reconciliation is safety-critical, not best-effort (§ Failure 3): if the
+  // persisted Reservation ledger cannot be reliably read/reconciled, this
+  // process must not assume it is safe to spend. Fail closed through the
+  // existing HUMAN_REQUIRED + BLOCKING safety path — the same one used for
+  // every other unresolved-spend halt — rather than silently continuing with
+  // an unreconciled (and therefore untrustworthy) ledger.
   try {
     await new ReservationLedger({
       store: new ReservationStore(persistence),
       recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
     }).reconcileOnResume(workflowId);
-  } catch { /* best effort — a reconciliation failure must not crash the run */ }
+  } catch (err) {
+    const reason = `Model spend reservation reconciliation failed on resume: ${err?.message ?? err}`;
+    const question = `${reason}. No further model call will be made. Review the workflow's persisted reservation state, then resume.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.MODEL_SPEND_RECONCILIATION_FAILED,
+        severity: 'BLOCKING',
+        role: 'workflow',
+        taskId: null,
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further model call made',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'HUMAN_REQUIRED', reason });
+    return {
+      ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, conversations: null, tokenUsage: usageTracker?.summary() ?? null,
+    };
+  }
   const selection = (_selectProviders || selectProviders)({
     env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal,
     onEvent: (event) => emit(event.type, event),

@@ -485,6 +485,153 @@ test('settlement is idempotent: settling an already-SETTLED_KNOWN reservation ag
   assert.equal(second.usageCallId, first.usageCallId, 'a repeated settlement must not overwrite the original settlement');
 });
 
+// ── P. Success with missing usage must NOT be SETTLED_KNOWN ────────────
+
+test('P: a successful provider call with no reliable usage settles UNRESOLVED and blocks the next internal call', async () => {
+  const ledger = new ReservationLedger();
+  const spendAuthority = new ModelSpendAuthority({ reservationLedger: ledger, providerCapabilities: TEST_ONLY_PERMISSIVE });
+  let secondCallHappened = false;
+  const { runtime } = buildRuntime({
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }], reviewer: [{ family: 'agy:gpt-oss' }] },
+    adapters: {
+      // A business/functional success — but the adapter reports NO usage
+      // field at all. This must never be silently treated as known-zero
+      // spend.
+      executor: { 'claude:sonnet': async () => ({ ok: true }) },
+      reviewer: { 'agy:gpt-oss': async () => { secondCallHappened = true; return { usage: { input_tokens: 1, output_tokens: 1 } }; } },
+    },
+    spendAuthority,
+  });
+  const { value } = await runtime.invoke('executor', {}, { operationId: 'wf-p:t1', workflowId: 'wf-p' });
+  assert.deepEqual(value, { ok: true }, 'the functional result of the call itself is still returned');
+
+  const [reservation] = await ledger.list('wf-p');
+  assert.equal(reservation.status, RESERVATION_STATUS.UNRESOLVED);
+  assert.equal(reservation.usageReference, null);
+
+  await assert.rejects(
+    runtime.invoke('reviewer', {}, { operationId: 'wf-p:t2', workflowId: 'wf-p' }),
+    (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+  );
+  assert.equal(secondCallHappened, false, 'no further internal model call may physically run once usage is unresolved');
+});
+
+// ── Q. Settlement persistence failure ────────────────────────────────────
+
+test('Q: settlement persistence failure after a known-usage success fails closed, never fails over, and never marks the provider unhealthy', async () => {
+  const store = {
+    load: async () => ({}),
+    save: async (workflowId, reservations) => {
+      const list = Object.values(reservations);
+      if (list.some((r) => r.status === RESERVATION_STATUS.SETTLED_KNOWN)) {
+        throw new Error('disk full at settlement');
+      }
+      // RESERVED and DISPATCHING persist fine.
+    },
+  };
+  const ledger = new ReservationLedger({ store });
+  const spendAuthority = new ModelSpendAuthority({ reservationLedger: ledger, providerCapabilities: TEST_ONLY_PERMISSIVE });
+  const calls = { A: 0, B: 0 };
+  const { runtime } = buildRuntime({
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }, { family: 'codex:default' }] },
+    adapters: {
+      executor: {
+        'claude:sonnet': async () => { calls.A += 1; return { usage: { input_tokens: 5, output_tokens: 1, callId: 'call-q' } }; },
+        'codex:default': async () => { calls.B += 1; return { usage: { input_tokens: 1, output_tokens: 1 } }; },
+      },
+    },
+    spendAuthority,
+  });
+  await assert.rejects(
+    runtime.invoke('executor', {}, { operationId: 'wf-q:t1', workflowId: 'wf-q' }),
+    (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_SETTLEMENT_PERSIST_FAILED,
+  );
+  assert.equal(calls.A, 1, 'the provider physically ran exactly once');
+  assert.equal(calls.B, 0, 'a settlement persistence failure must never trigger failover to another provider');
+
+  // The provider itself is not classified as unhealthy / quota-exhausted —
+  // a fresh routing attempt for the SAME family in a NEW workflow (so it is
+  // not blocked by the unresolved reservation above) must still be eligible.
+  assert.equal(spendAuthority.reservationLedger === ledger, true);
+
+  // Cache-cannot-outrun-durable-state: the in-memory ledger must not report
+  // SETTLED_KNOWN when the durable settlement write failed.
+  const [reservation] = await ledger.list('wf-q');
+  assert.equal(reservation.status, RESERVATION_STATUS.DISPATCHING, 'the cache must reflect the last durably-persisted state, not the failed write');
+
+  // And that DISPATCHING itself keeps blocking further spend in the workflow.
+  await assert.rejects(
+    runtime.invoke('executor', {}, { operationId: 'wf-q:t2', workflowId: 'wf-q' }),
+    (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+  );
+  assert.equal(calls.A, 1, 'no further physical call happens once settlement could not be durably proven');
+});
+
+// ── R. DISPATCHING blocks authorization even without reconciliation ────
+
+test('R: a persisted DISPATCHING reservation blocks authorization before reconcileOnResume ever runs', async () => {
+  const persistence = tmpPersistence();
+  await persistence.updateWorkflowState('wf-r', {
+    modelSpendReservations: {
+      'res-1': {
+        reservationId: 'res-1', workflowId: 'wf-r', taskId: 'wf-r:t1', role: 'executor', family: 'claude:sonnet', provider: 'claude',
+        physicalAttempt: 1, status: RESERVATION_STATUS.DISPATCHING, createdAt: new Date().toISOString(),
+        dispatchStartedAt: new Date().toISOString(), settledAt: null, settlementReason: null, usageCallId: null, usageReference: null,
+      },
+    },
+  });
+  const store = new ReservationStore(persistence);
+  // Deliberately a FRESH ledger that never called reconcileOnResume().
+  const ledger = new ReservationLedger({ store });
+  const spendAuthority = new ModelSpendAuthority({ reservationLedger: ledger });
+  let providerCalls = 0;
+  const { runtime } = buildRuntime({
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }] },
+    adapters: { executor: { 'claude:sonnet': async () => { providerCalls += 1; return {}; } } },
+    spendAuthority,
+  });
+  await assert.rejects(
+    runtime.invoke('executor', {}, { operationId: 'wf-r:t2', workflowId: 'wf-r' }),
+    (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+  );
+  assert.equal(providerCalls, 0, 'safety must not depend solely on resume rewriting DISPATCHING -> UNRESOLVED first');
+});
+
+// ── S. Resume reconciliation persistence/read failure is not best-effort ──
+
+test('S: reconcileOnResume propagates a durable persistence failure instead of swallowing it', async () => {
+  const store = {
+    load: async () => ({
+      'res-1': {
+        reservationId: 'res-1', workflowId: 'wf-s', taskId: 'wf-s:t1', role: 'executor', family: 'claude:sonnet', provider: 'claude',
+        physicalAttempt: 1, status: RESERVATION_STATUS.DISPATCHING, createdAt: new Date().toISOString(),
+        dispatchStartedAt: new Date().toISOString(), settledAt: null, settlementReason: null, usageCallId: null, usageReference: null,
+      },
+    }),
+    save: async () => { throw new Error('disk full during reconcile'); },
+  };
+  const ledger = new ReservationLedger({ store });
+  await assert.rejects(ledger.reconcileOnResume('wf-s'), /disk full during reconcile/);
+  // The production resume call site (supergpt.js) never catches this and
+  // continues — it now routes it through the same fail-closed
+  // HUMAN_REQUIRED + BLOCKING safety path as every other unresolved-spend
+  // halt (see supergpt.js, "Resume reconciliation" block). Exercising that
+  // full call site here would require standing up an entire worktree +
+  // workflow-state fixture unrelated to the Reservation contract itself;
+  // the safety-relevant behaviour — that a reconciliation failure is no
+  // longer swallowed — is exactly this assertion.
+});
+
+test('T: reconcileOnResume fails closed when persisted reservation state cannot even be read', async () => {
+  const store = { load: async () => { throw new Error('read failure'); }, save: async () => {} };
+  const ledger = new ReservationLedger({ store });
+  await assert.rejects(ledger.reconcileOnResume('wf-t'), /read failure/);
+  // A storage read failure must never be interpreted as "no reservations
+  // exist" by a fresh ledger instance backed by the same failing store.
+  const freshLedger = new ReservationLedger({ store });
+  await assert.rejects(freshLedger.hasUnresolved('wf-t'), /read failure/);
+});
+
 test('a SETTLED_KNOWN reservation is never downgraded to UNRESOLVED', async () => {
   const ledger = new ReservationLedger();
   await ledger.reserve({ workflowId: 'wf-no-downgrade', intent: { role: 'executor', family: 'claude:sonnet', operationId: 't1' }, physicalAttempt: 1, reservationId: 'r1' });

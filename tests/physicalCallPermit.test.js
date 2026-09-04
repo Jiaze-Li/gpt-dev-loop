@@ -240,6 +240,15 @@ test('G: Executor automatic chain stays claude:sonnet only under the permit boun
 
 // Test H — role behavior regression: default (allow-all) authority is transparent
 test('H: with the default allow-all authority, Planner/Supervisor/Reviewer results are unchanged', async () => {
+  // Each adapter reports reliable usage evidence alongside its business
+  // payload — a physical call with genuinely no usage evidence settles
+  // UNRESOLVED and blocks the next internal call in the same workflow (see
+  // modelSpendReservation.test.js "P"), which would make Supervisor's and
+  // Reviewer's calls below correctly denied rather than "unchanged". That is
+  // a different, already-covered invariant; this test's own invariant is
+  // that a SETTLED (known-usage) result's business payload passes through
+  // untouched.
+  const usage = { input_tokens: 1, output_tokens: 1 };
   const { runtime } = buildRuntime({
     rolePolicy: {
       planner: [{ family: 'codex:default' }],
@@ -247,14 +256,14 @@ test('H: with the default allow-all authority, Planner/Supervisor/Reviewer resul
       reviewer: [{ family: 'agy:gpt-oss' }],
     },
     adapters: {
-      planner: { 'codex:default': async () => ({ tasks: [] }) },
-      supervisor: { 'agy:gemini': async () => ({ action: 'NEXT_TASK' }) },
-      reviewer: { 'agy:gpt-oss': async () => ({ decision: 'PASS' }) },
+      planner: { 'codex:default': async () => ({ tasks: [], usage }) },
+      supervisor: { 'agy:gemini': async () => ({ action: 'NEXT_TASK', usage }) },
+      reviewer: { 'agy:gpt-oss': async () => ({ decision: 'PASS', usage }) },
     },
   });
-  assert.deepEqual((await runtime.invoke('planner', {}, { operationId: 'w' })).value, { tasks: [] });
-  assert.deepEqual((await runtime.invoke('supervisor', {}, { operationId: 'w' })).value, { action: 'NEXT_TASK' });
-  assert.deepEqual((await runtime.invoke('reviewer', {}, { operationId: 'w' })).value, { decision: 'PASS' });
+  assert.deepEqual((await runtime.invoke('planner', {}, { operationId: 'w' })).value, { tasks: [], usage });
+  assert.deepEqual((await runtime.invoke('supervisor', {}, { operationId: 'w' })).value, { action: 'NEXT_TASK', usage });
+  assert.deepEqual((await runtime.invoke('reviewer', {}, { operationId: 'w' })).value, { decision: 'PASS', usage });
 });
 
 test('runtime exposes its spendAuthority and RoleRouter still routes deterministically', () => {

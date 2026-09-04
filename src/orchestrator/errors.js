@@ -104,6 +104,17 @@ export const AUTHORIZATION_ERROR_CODES = Object.freeze({
   // authorize() could not durably persist the reservation required before a
   // permit may be issued. Fail closed: zero physical provider calls.
   RESERVATION_PERSIST_FAILED: 'RESERVATION_PERSIST_FAILED',
+  // dispatch() ran the physical provider call (with reliably known usage,
+  // success or failure) but the SETTLED_KNOWN write could not be durably
+  // persisted. This is an orchestrator persistence failure, never provider
+  // failure: it must never trigger failover or mark a provider unhealthy,
+  // and it blocks every further internal model spend attempt in the same
+  // workflow.
+  MODEL_SPEND_SETTLEMENT_PERSIST_FAILED: 'MODEL_SPEND_SETTLEMENT_PERSIST_FAILED',
+  // Resume could not reliably reconcile persisted Reservation state before
+  // the first invoke() of this process. Reconciliation is safety-critical,
+  // not best-effort — an unreconciled ledger is treated as unsafe.
+  MODEL_SPEND_RECONCILIATION_FAILED: 'MODEL_SPEND_RECONCILIATION_FAILED',
 });
 
 export function isAuthorizationFailure(error) {

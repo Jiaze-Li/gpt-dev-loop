@@ -47,6 +47,20 @@ export const RESERVATION_STATUS = Object.freeze({
 
 const WORKFLOW_STATE_KEY = 'modelSpendReservations';
 
+// A reservation in one of these statuses must block further internal model
+// spend in its workflow. DISPATCHING is included even though it has not yet
+// been rewritten to UNRESOLVED by reconcileOnResume(): it is itself proof
+// that a physical dispatch may have occurred, so safety must not depend
+// solely on reconciliation succeeding (§ Failure 2 / Failure 3).
+const BLOCKING_RESERVATION_STATUSES = new Set([
+  RESERVATION_STATUS.DISPATCHING,
+  RESERVATION_STATUS.UNRESOLVED,
+]);
+
+export function isBlockingReservationStatus(status) {
+  return BLOCKING_RESERVATION_STATUSES.has(status);
+}
+
 export function newReservationRecord({
   reservationId, workflowId, intent, physicalAttempt, createdAt,
 }) {
@@ -132,6 +146,16 @@ export class ReservationLedger {
     }
   }
 
+  // Persists an explicit candidate map WITHOUT touching the in-memory cache.
+  // Used by settleKnown() so the cache can never report a status ahead of
+  // what is durably persisted (§ Failure 2 / Option A): the candidate is
+  // written to durable storage first, and only committed to `this._cache`
+  // by the caller after this resolves successfully.
+  async _persistCandidate(workflowId, candidateMap) {
+    if (!this._store) return;
+    await this._store.save(workflowId ?? null, Object.fromEntries(candidateMap.entries()));
+  }
+
   // RESERVED — durably persisted BEFORE this resolves. Throws (fail closed)
   // if persistence fails; the caller must not proceed to mint a permit or
   // dispatch when this rejects.
@@ -161,6 +185,14 @@ export class ReservationLedger {
 
   // Idempotent: settling an already-SETTLED_KNOWN reservation again is a
   // no-op (never re-applied / double-counted) and never downgrades it.
+  //
+  // Cache-cannot-outrun-durable-state (§ Failure 2 / Option A): the candidate
+  // SETTLED_KNOWN record is durably persisted FIRST, on a candidate map that
+  // never touches `this._cache`. Only after that persistence resolves does
+  // the cache get mutated to match. If persistence throws, this rejects
+  // and the cache is left completely untouched — still whatever it was
+  // before this call (DISPATCHING, in production usage), which is a
+  // spend-blocking state. Callers must not catch this and proceed.
   async settleKnown({
     workflowId, reservationId, usageCallId = null, usageReference = null, reason = null,
   }) {
@@ -168,14 +200,21 @@ export class ReservationLedger {
     const record = map.get(reservationId);
     if (!record) throw new Error(`ReservationLedger.settleKnown: unknown reservation ${reservationId}`);
     if (record.status === RESERVATION_STATUS.SETTLED_KNOWN) return record;
-    record.status = RESERVATION_STATUS.SETTLED_KNOWN;
-    record.settledAt = new Date().toISOString();
-    record.settlementReason = reason;
-    record.usageCallId = usageCallId;
-    record.usageReference = usageReference;
-    await this._persistWorkflow(workflowId);
+    const candidate = {
+      ...record,
+      status: RESERVATION_STATUS.SETTLED_KNOWN,
+      settledAt: new Date().toISOString(),
+      settlementReason: reason,
+      usageCallId,
+      usageReference,
+    };
+    const candidateMap = new Map(map);
+    candidateMap.set(reservationId, candidate);
+    await this._persistCandidate(workflowId, candidateMap);
+    // Only reached once durable persistence has succeeded.
+    map.set(reservationId, candidate);
     this._onEvent?.({ type: 'RESERVATION_SETTLED_KNOWN', reservationId, workflowId: workflowId ?? null });
-    return record;
+    return candidate;
   }
 
   // A physical call may have occurred but reliable usage cannot be proven.
@@ -216,10 +255,17 @@ export class ReservationLedger {
     return record;
   }
 
+  // Blocking predicate (§ Failure 2): DISPATCHING is itself unsafe, not only
+  // UNRESOLVED. A reservation that has crossed the durable dispatch boundary
+  // is evidence a physical call MAY have run — it must block new spend
+  // whether or not reconcileOnResume() has yet rewritten it to UNRESOLVED.
+  // The name is kept for compatibility with existing callers/tests; it now
+  // answers "is there an unsafe spend reservation", not literally "is there
+  // a record whose status field equals UNRESOLVED".
   async hasUnresolved(workflowId) {
     const map = await this._loadWorkflow(workflowId);
     for (const record of map.values()) {
-      if (record.status === RESERVATION_STATUS.UNRESOLVED) return true;
+      if (isBlockingReservationStatus(record.status)) return true;
     }
     return false;
   }

@@ -46,6 +46,17 @@ export const SAFETY_EVENT_CODES = Object.freeze({
   // UNKNOWN USAGE != ZERO: this never estimates a token amount. It blocks
   // every further internal model spend attempt in the same workflow.
   MODEL_SPEND_USAGE_UNRESOLVED: 'MODEL_SPEND_USAGE_UNRESOLVED',
+  // A physical call SETTLED_KNOWN write could not be durably persisted after
+  // the provider ran. This is an orchestrator persistence failure, never
+  // provider failure: it must not trigger failover or mark a provider
+  // unhealthy, and it blocks every further internal model spend attempt in
+  // the same workflow until a human clears it.
+  MODEL_SPEND_SETTLEMENT_PERSIST_FAILED: 'MODEL_SPEND_SETTLEMENT_PERSIST_FAILED',
+  // Resume could not reliably reconcile persisted Reservation state (read or
+  // write failure). Reconciliation is safety-critical, not best-effort: an
+  // unreconciled ledger is treated as unsafe and blocks every internal model
+  // call until a human clears it.
+  MODEL_SPEND_RECONCILIATION_FAILED: 'MODEL_SPEND_RECONCILIATION_FAILED',
 });
 
 export const SAFETY_SEVERITY = Object.freeze({
