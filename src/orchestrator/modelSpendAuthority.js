@@ -4,6 +4,14 @@
 //              -> ModelSpendAuthority.dispatch(permit, intent, fn)  [default-deny]
 //              -> provider dispatch
 //
+// authorize()/dispatch() also drive Persistent Model Spend Reservation (see
+// modelSpendReservation.js): authorize() durably persists a RESERVED
+// reservation before a permit ever exists; dispatch() durably persists the
+// DISPATCHING boundary before the physical provider call, then settles the
+// reservation SETTLED_KNOWN or UNRESOLVED once the call completes. An
+// UNRESOLVED reservation blocks every further internal model spend attempt
+// in that workflow (see authorize()'s MODEL_SPEND_USAGE_UNRESOLVED gate).
+//
 // This module establishes the invariant "every real internal provider
 // invocation must hold a valid, single-use PhysicalCallPermit before
 // dispatch". It carries NO token-budget policy yet: the default injected
@@ -38,12 +46,19 @@
 import { randomUUID } from 'node:crypto';
 import { AuthorizationError, AUTHORIZATION_ERROR_CODES } from './errors.js';
 import { isExecutorEligible as productionIsExecutorEligible } from './providerCapabilities.js';
+import { ReservationLedger } from './modelSpendReservation.js';
 
 // The strongest invocation identifiers mechanically available at the role
 // runtime boundary. Missing semantic IDs are bound as null rather than
 // invented — a permit issued with operationId:null still only matches another
 // intent whose operationId is null.
-export const CALL_INTENT_KEYS = Object.freeze(['role', 'family', 'provider', 'operationId', 'attempt']);
+//
+// `workflowId` is an explicit minimal extension (not inferred from
+// `operationId`'s "${workflowId}:${taskId}" convention) so Persistent Model
+// Spend Reservation can key deterministically on the workflow a physical
+// call belongs to, regardless of how `operationId` happens to be formatted
+// by a given caller.
+export const CALL_INTENT_KEYS = Object.freeze(['role', 'family', 'provider', 'operationId', 'attempt', 'workflowId']);
 
 export function normalizeCallIntent(intent = {}) {
   const out = {};
@@ -87,6 +102,32 @@ export class PhysicalCallPermit {
 }
 PhysicalCallPermit._brand = Symbol('PhysicalCallPermit.brand');
 
+// Extracts whatever usage evidence a dispatch outcome carries, WITHOUT ever
+// estimating a token amount (UNKNOWN USAGE != ZERO).
+//
+//   - success: the adapter returned a value at all, which by construction
+//     proves the physical call completed and its outcome is known — settle
+//     as SETTLED_KNOWN using whatever `usage` field (possibly none, for a
+//     provider that plainly does not report usage) accompanies it. "The
+//     provider does not expose token counts" and "we do not know whether the
+//     call happened" are different states; only the second is UNRESOLVED.
+//   - failure: settlement is known ONLY when the thrown error itself carries
+//     explicit usage evidence (`error.details.usage` / `error.usage`) — the
+//     shape every adapter that reaches this call already uses when a
+//     post-send guard (budget / duplicate-call / invalid-output) fires with
+//     real provider usage in hand. Any other failure (timeout, killed
+//     process, transport failure, missing usage telemetry, ...) is
+//     conservatively UNRESOLVED: a business/protocol error never implies the
+//     spend was zero.
+function extractSettlementUsage(outcome) {
+  if (outcome.ok) {
+    const usage = outcome.value?.usage ?? outcome.value?.value?.usage ?? null;
+    return { known: true, usage, callId: usage?.callId ?? outcome.value?.callId ?? null };
+  }
+  const usage = outcome.error?.details?.usage ?? outcome.error?.usage ?? null;
+  return { known: usage !== null && usage !== undefined, usage, callId: usage?.callId ?? null };
+}
+
 export class ModelSpendAuthority {
   // `policy(intent) -> { allow: boolean, reason?: string }`. The default is a
   // deterministic allow-all: budget authorization is a later task. Swapping in
@@ -101,17 +142,57 @@ export class ModelSpendAuthority {
   // override it; only test fixtures that explicitly need to exercise the
   // generic multi-provider failover mechanism inject a TEST-ONLY permissive
   // source here — production `rolePolicy` choices never do.
-  constructor({ policy = () => ({ allow: true }), onEvent, providerCapabilities } = {}) {
+  //
+  // `reservationLedger` — the Persistent Model Spend Reservation lifecycle
+  // (see modelSpendReservation.js). Defaults to an in-memory-only ledger
+  // (no filesystem I/O; fine for unit tests). Production callers inject one
+  // backed by a `ReservationStore(persistence)` so a reservation survives
+  // the same restart/resume path as the rest of the workflow.
+  //
+  // `recordSafetyEvent` — optional `(event) => void` forwarded to the ledger
+  // so an UNRESOLVED reservation's BLOCKING safety event reaches the
+  // workflow's user-visible terminal result (see safetyEvents.js /
+  // workflowState.js#recordSafetyEvent) without this Authority needing to
+  // know how a workflow's terminal state is assembled.
+  constructor({
+    policy = () => ({ allow: true }), onEvent, providerCapabilities, reservationLedger, recordSafetyEvent,
+  } = {}) {
     this._policy = policy;
     this._onEvent = onEvent;
     this._isExecutorEligible = providerCapabilities?.isExecutorEligible ?? productionIsExecutorEligible;
-    this._issued = new Map(); // token -> { intent, consumed, consumedAt }
+    this._issued = new Map(); // token -> { intent, consumed, consumedAt, reservationId }
+    this._reservationLedger = reservationLedger
+      ?? new ReservationLedger({ onEvent, recordSafetyEvent });
+  }
+
+  get reservationLedger() {
+    return this._reservationLedger;
   }
 
   // CallIntent -> PhysicalCallPermit. Throws AuthorizationError (SPEND_DENIED /
-  // INTENT_INCOMPLETE) before any permit exists if the intent is rejected.
-  authorize(rawIntent) {
+  // INTENT_INCOMPLETE / MODEL_SPEND_USAGE_UNRESOLVED / RESERVATION_PERSIST_FAILED)
+  // before any permit exists if the intent is rejected.
+  //
+  // Ordering is safety-critical: the reservation is created and durably
+  // PERSISTED (RESERVED) BEFORE this returns a permit. A caller can never
+  // reach dispatch() without a durably persisted reservation already on
+  // record, and a persistence failure here means zero physical provider
+  // calls (fail closed) — no permit is ever minted.
+  async authorize(rawIntent) {
     const intent = normalizeCallIntent(rawIntent);
+    // Persistent Model Spend Reservation safety gate — checked before every
+    // other decision, for EVERY internal role (not only Executor): a prior
+    // physical call in this workflow whose usage could not be reliably
+    // settled blocks all further internal model spend until a human clears
+    // it. This is an orchestrator safety decision, never provider failure.
+    if (await this._reservationLedger.hasUnresolved(intent.workflowId)) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+        `workflow ${JSON.stringify(intent.workflowId)} has an unresolved model spend reservation; `
+          + 'further internal model spend is blocked until a human clears it',
+        { intent },
+      );
+    }
     // Provider eligibility is a built-in Authority invariant, not a
     // caller-overridable policy choice: it is checked BEFORE the injected
     // policy callback, so no custom policy can accidentally re-open a
@@ -143,8 +224,22 @@ export class ModelSpendAuthority {
         { intent },
       );
     }
+    const reservationId = randomUUID();
+    try {
+      await this._reservationLedger.reserve({ workflowId: intent.workflowId, intent, physicalAttempt: intent.attempt, reservationId });
+    } catch (error) {
+      // Fail closed: reservation persistence failed, so no permit is ever
+      // minted and the physical call count for this attempt is zero.
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.RESERVATION_PERSIST_FAILED,
+        `model spend reservation could not be durably persisted: ${error?.message ?? error}`,
+        { intent },
+      );
+    }
     const token = randomUUID();
-    this._issued.set(token, { intent, consumed: false, consumedAt: null });
+    this._issued.set(token, {
+      intent, consumed: false, consumedAt: null, reservationId,
+    });
     this._onEvent?.({ type: 'PERMIT_ISSUED', ...intent });
     return new PhysicalCallPermit(token, intent);
   }
@@ -155,6 +250,13 @@ export class ModelSpendAuthority {
   // BEFORE the dispatch fn runs, so a throwing / failing provider call can
   // never be retried on the same permit — the failover attempt must
   // authorize() again.
+  //
+  // The reservation's durable DISPATCHING boundary is persisted BEFORE
+  // dispatchFn is ever invoked (a persistence failure here means dispatchFn
+  // is never called — fail closed). After dispatchFn settles (success or
+  // throw), the reservation is settled: SETTLED_KNOWN when reliable usage
+  // evidence exists, UNRESOLVED otherwise (never estimated, never treated as
+  // zero — see extractSettlementUsage above).
   async dispatch(permit, rawIntent, dispatchFn) {
     const intent = normalizeCallIntent(rawIntent);
     const token = permit instanceof PhysicalCallPermit
@@ -189,10 +291,50 @@ export class ModelSpendAuthority {
         { intent, permitIntent: record.intent },
       );
     }
+    try {
+      await this._reservationLedger.markDispatching({ workflowId: intent.workflowId, reservationId: record.reservationId });
+    } catch (error) {
+      // Fail closed: the durable "dispatch may begin" boundary could not be
+      // persisted, so dispatchFn (the physical provider call) never runs.
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.RESERVATION_PERSIST_FAILED,
+        `model spend reservation dispatch boundary could not be durably persisted: ${error?.message ?? error}`,
+        { intent },
+      );
+    }
     record.consumed = true;
     record.consumedAt = Date.now();
     this._onEvent?.({ type: 'PERMIT_CONSUMED', ...intent });
-    return dispatchFn();
+    try {
+      const value = await dispatchFn();
+      const settlement = extractSettlementUsage({ ok: true, value });
+      await this._reservationLedger.settleKnown({
+        workflowId: intent.workflowId,
+        reservationId: record.reservationId,
+        usageCallId: settlement.callId,
+        usageReference: settlement.usage,
+        reason: 'PROVIDER_CALL_SUCCEEDED',
+      });
+      return value;
+    } catch (error) {
+      const settlement = extractSettlementUsage({ ok: false, error });
+      if (settlement.known) {
+        await this._reservationLedger.settleKnown({
+          workflowId: intent.workflowId,
+          reservationId: record.reservationId,
+          usageCallId: settlement.callId,
+          usageReference: settlement.usage,
+          reason: 'PROVIDER_CALL_FAILED_WITH_KNOWN_USAGE',
+        });
+      } else {
+        await this._reservationLedger.markUnresolved({
+          workflowId: intent.workflowId,
+          reservationId: record.reservationId,
+          reason: error?.code ?? error?.message ?? 'USAGE_UNKNOWN_AFTER_DISPATCH',
+        });
+      }
+      throw error;
+    }
   }
 
   // Test / diagnostics only.

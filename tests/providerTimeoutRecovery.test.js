@@ -50,13 +50,16 @@ test('RoleRouter & Runtime: claude:sonnet timeout allows failover to codex and t
 
   const adapters = {
     executor: {
+      // Reservation Case A — each timeout carries reliable usage evidence,
+      // so settlement is SETTLED_KNOWN and failover proceeds (see
+      // modelSpendReservation.js).
       'claude:sonnet': async () => {
         attempted.push('claude:sonnet');
-        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'executor "claude" did not respond within 600000ms');
+        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'executor "claude" did not respond within 600000ms', { usage: { input_tokens: 10, output_tokens: 0 } });
       },
       'codex:default': async () => {
         attempted.push('codex:default');
-        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'executor "codex" did not respond within 600000ms');
+        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'executor "codex" did not respond within 600000ms', { usage: { input_tokens: 10, output_tokens: 0 } });
       },
       'claude:opus': async () => {
         attempted.push('claude:opus');
@@ -112,13 +115,16 @@ test('RoleRouter & Runtime: when all candidates are exhausted, throws identifiab
 
   const adapters = {
     executor: {
+      // Reservation Case A — usage known on both, so failover reaches codex
+      // before the whole invocation is exhausted (see
+      // modelSpendReservation.js).
       'claude:sonnet': async () => {
         attempted.push('claude:sonnet');
-        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'sonnet timeout');
+        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'sonnet timeout', { usage: { input_tokens: 10, output_tokens: 0 } });
       },
       'codex:default': async () => {
         attempted.push('codex:default');
-        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'codex timeout');
+        throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'codex timeout', { usage: { input_tokens: 10, output_tokens: 0 } });
       },
     },
   };

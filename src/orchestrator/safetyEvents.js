@@ -40,6 +40,12 @@ export const SAFETY_EVENT_CODES = Object.freeze({
   // is PASSed — but the user must still learn the repository has N baseline
   // failures. WARNING severity: the workflow keeps running.
   PREEXISTING_VERIFICATION_FAILURES: 'PREEXISTING_VERIFICATION_FAILURES',
+  // A physical internal model call may have dispatched but its usage could
+  // not be reliably settled (timeout, killed process, crash, transport
+  // failure, missing usage telemetry — see modelSpendReservation.js).
+  // UNKNOWN USAGE != ZERO: this never estimates a token amount. It blocks
+  // every further internal model spend attempt in the same workflow.
+  MODEL_SPEND_USAGE_UNRESOLVED: 'MODEL_SPEND_USAGE_UNRESOLVED',
 });
 
 export const SAFETY_SEVERITY = Object.freeze({

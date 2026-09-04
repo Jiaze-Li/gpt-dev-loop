@@ -96,6 +96,14 @@ export const AUTHORIZATION_ERROR_CODES = Object.freeze({
   // authorize() rejected the CallIntent because the provider/family is not
   // declared executorEligible for this role (see providerCapabilities.js).
   PROVIDER_NOT_ELIGIBLE_FOR_ROLE: 'PROVIDER_NOT_ELIGIBLE_FOR_ROLE',
+  // authorize() rejected the CallIntent because this workflow already has an
+  // UNRESOLVED model spend reservation — a prior physical call may have
+  // dispatched with usage that could not be reliably settled. See
+  // modelSpendReservation.js. Blocks EVERY internal role, not only Executor.
+  MODEL_SPEND_USAGE_UNRESOLVED: 'MODEL_SPEND_USAGE_UNRESOLVED',
+  // authorize() could not durably persist the reservation required before a
+  // permit may be issued. Fail closed: zero physical provider calls.
+  RESERVATION_PERSIST_FAILED: 'RESERVATION_PERSIST_FAILED',
 });
 
 export function isAuthorizationFailure(error) {

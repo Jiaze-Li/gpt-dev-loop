@@ -239,11 +239,22 @@ export function createAgyReviewerProvider({
         throw err;
       }
       const callId = `call-agy-rev-${randomUUID()}`;
+      const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };
+      // The provider DID respond (usage known) even when its content fails
+      // the review-shape validator — attach usage to REVIEWER_INVALID_OUTPUT
+      // so the reservation settles SETTLED_KNOWN, not UNRESOLVED (see
+      // modelSpendReservation.js §6).
+      let parsedReview;
+      try {
+        parsedReview = parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null);
+      } catch (err) {
+        if (err instanceof AdapterError && !err.details?.usage) err.details = { ...(err.details ?? {}), usage: usageWithCallId };
+        throw err;
+      }
       const reviewResult = {
-        ...parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null),
+        ...parsedReview,
         conversationId: result.conversationId ?? null,
       };
-      const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };
       try {
         Object.defineProperties(reviewResult, {
           callId: { value: callId, writable: true, configurable: true, enumerable: false },

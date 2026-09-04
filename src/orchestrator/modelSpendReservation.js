@@ -1,0 +1,267 @@
+// Persistent Model Spend Reservation.
+//
+//   CallIntent -> ModelSpendAuthority.authorize()
+//              -> create + PERSIST reservation (RESERVED)
+//              -> PhysicalCallPermit
+//              -> ModelSpendAuthority.dispatch()
+//              -> PERSIST dispatch-may-begin (DISPATCHING)
+//              -> physical provider invocation
+//              -> settle: SETTLED_KNOWN | UNRESOLVED
+//
+// Safety principle: once a provider MAY have been physically called, the
+// spend must either be reliably accounted for, or treated as unresolved and
+// block further automatic internal model spend in that workflow.
+//
+//   UNKNOWN USAGE != ZERO. Unknown usage is never estimated.
+//
+// This module owns the reservation data model and its lifecycle
+// (ReservationLedger) plus the persistence adapter over the EXISTING
+// workflow-scoped snapshot (Persistence.readWorkflowState /
+// updateWorkflowState — see persistence.js and PERSISTENCE.md). It does not
+// duplicate that storage: a reservation survives the identical
+// restart/resume path as the rest of the workflow, under the
+// `modelSpendReservations` key of workflow.json. A workflow persisted before
+// this feature existed simply has no such key — that reads back as an empty
+// ledger, never as corruption.
+
+import { randomUUID } from 'node:crypto';
+
+export const RESERVATION_STATUS = Object.freeze({
+  // Durably persisted. Physical dispatch is still forbidden.
+  RESERVED: 'RESERVED',
+  // Durably persisted "dispatch may begin" boundary. Once here, a crash may
+  // make it impossible to know whether provider spend occurred — an
+  // abandoned DISPATCHING reservation is unsafe and reconciles to UNRESOLVED.
+  DISPATCHING: 'DISPATCHING',
+  // Reliable usage/accounting evidence exists for this physical call,
+  // independent of business/provider outcome.
+  SETTLED_KNOWN: 'SETTLED_KNOWN',
+  // Physical dispatch may have occurred but reliable usage settlement cannot
+  // be proven. Blocks further internal model spend in the same workflow.
+  UNRESOLVED: 'UNRESOLVED',
+  // A RESERVED reservation that PROVABLY never crossed the durable
+  // DISPATCHING boundary. Safe to close without treating it as unknown
+  // provider spend.
+  CANCELLED_PRE_DISPATCH: 'CANCELLED_PRE_DISPATCH',
+});
+
+const WORKFLOW_STATE_KEY = 'modelSpendReservations';
+
+export function newReservationRecord({
+  reservationId, workflowId, intent, physicalAttempt, createdAt,
+}) {
+  return {
+    reservationId,
+    workflowId: workflowId ?? null,
+    taskId: intent?.operationId ?? null,
+    role: intent?.role ?? null,
+    family: intent?.family ?? null,
+    provider: intent?.provider ?? null,
+    physicalAttempt: physicalAttempt ?? intent?.attempt ?? null,
+    status: RESERVATION_STATUS.RESERVED,
+    createdAt,
+    dispatchStartedAt: null,
+    settledAt: null,
+    settlementReason: null,
+    usageCallId: null,
+    usageReference: null,
+  };
+}
+
+// Persistence adapter over the existing workflow-scoped snapshot. Every
+// mutation is a read-modify-write against the SAME durable workflow.json the
+// rest of the orchestrator already uses (Persistence.updateWorkflowState),
+// so no parallel standalone database is introduced.
+export class ReservationStore {
+  constructor(persistence) {
+    this._persistence = persistence;
+  }
+
+  async load(workflowId) {
+    // A test double / minimal persistence stand-in that does not implement
+    // the workflow-state interface (see Persistence in persistence.js) is
+    // treated exactly like "no persistence configured" — in-memory only —
+    // never as a runtime failure. A REAL Persistence instance always
+    // implements this interface, so this only ever degrades a deliberately
+    // partial test fixture, never masks a genuine persistence error.
+    if (!workflowId || !this._persistence || typeof this._persistence.readWorkflowState !== 'function') return {};
+    const state = await this._persistence.readWorkflowState(workflowId);
+    const reservations = state?.[WORKFLOW_STATE_KEY];
+    return reservations && typeof reservations === 'object' ? { ...reservations } : {};
+  }
+
+  async save(workflowId, reservations) {
+    if (!workflowId || !this._persistence || typeof this._persistence.updateWorkflowState !== 'function') return;
+    await this._persistence.updateWorkflowState(workflowId, { [WORKFLOW_STATE_KEY]: reservations });
+  }
+}
+
+// The reservation lifecycle. One ledger typically backs one ModelSpendAuthority
+// (production wiring), but the ledger itself is authority-agnostic: it keys
+// everything by workflowId, never by which ModelSpendAuthority instance
+// called it, so "has this workflow got unresolved spend" is answered
+// correctly regardless of how many authority instances exist for that
+// workflow (e.g. the PR-closeout repair fallback path's own authority).
+//
+// Without a `store` (the default), the ledger is in-memory only for the
+// lifetime of the process — every mutation still goes through the exact same
+// ordering/awaiting contract, so unit tests exercise the real state machine
+// without needing a filesystem.
+export class ReservationLedger {
+  constructor({ store = null, onEvent, recordSafetyEvent } = {}) {
+    this._store = store;
+    this._onEvent = onEvent;
+    this._recordSafetyEvent = recordSafetyEvent;
+    this._cache = new Map(); // workflowId -> Map(reservationId -> record)
+  }
+
+  async _loadWorkflow(workflowId) {
+    const key = workflowId ?? null;
+    if (this._cache.has(key)) return this._cache.get(key);
+    const persisted = this._store ? await this._store.load(key) : {};
+    const map = new Map(Object.entries(persisted ?? {}));
+    this._cache.set(key, map);
+    return map;
+  }
+
+  async _persistWorkflow(workflowId) {
+    const key = workflowId ?? null;
+    const map = this._cache.get(key) ?? new Map();
+    if (this._store) {
+      await this._store.save(key, Object.fromEntries(map.entries()));
+    }
+  }
+
+  // RESERVED — durably persisted BEFORE this resolves. Throws (fail closed)
+  // if persistence fails; the caller must not proceed to mint a permit or
+  // dispatch when this rejects.
+  async reserve({ workflowId, intent, physicalAttempt, reservationId = randomUUID() }) {
+    const map = await this._loadWorkflow(workflowId);
+    const record = newReservationRecord({
+      reservationId, workflowId, intent, physicalAttempt, createdAt: new Date().toISOString(),
+    });
+    map.set(reservationId, record);
+    await this._persistWorkflow(workflowId);
+    this._onEvent?.({ type: 'RESERVATION_RESERVED', reservationId, workflowId: workflowId ?? null, role: intent?.role, family: intent?.family });
+    return record;
+  }
+
+  // Durable "dispatch may begin" boundary — MUST be awaited and completed
+  // before the physical provider adapter is ever invoked.
+  async markDispatching({ workflowId, reservationId }) {
+    const map = await this._loadWorkflow(workflowId);
+    const record = map.get(reservationId);
+    if (!record) throw new Error(`ReservationLedger.markDispatching: unknown reservation ${reservationId}`);
+    record.status = RESERVATION_STATUS.DISPATCHING;
+    record.dispatchStartedAt = new Date().toISOString();
+    await this._persistWorkflow(workflowId);
+    this._onEvent?.({ type: 'RESERVATION_DISPATCHING', reservationId, workflowId: workflowId ?? null });
+    return record;
+  }
+
+  // Idempotent: settling an already-SETTLED_KNOWN reservation again is a
+  // no-op (never re-applied / double-counted) and never downgrades it.
+  async settleKnown({
+    workflowId, reservationId, usageCallId = null, usageReference = null, reason = null,
+  }) {
+    const map = await this._loadWorkflow(workflowId);
+    const record = map.get(reservationId);
+    if (!record) throw new Error(`ReservationLedger.settleKnown: unknown reservation ${reservationId}`);
+    if (record.status === RESERVATION_STATUS.SETTLED_KNOWN) return record;
+    record.status = RESERVATION_STATUS.SETTLED_KNOWN;
+    record.settledAt = new Date().toISOString();
+    record.settlementReason = reason;
+    record.usageCallId = usageCallId;
+    record.usageReference = usageReference;
+    await this._persistWorkflow(workflowId);
+    this._onEvent?.({ type: 'RESERVATION_SETTLED_KNOWN', reservationId, workflowId: workflowId ?? null });
+    return record;
+  }
+
+  // A physical call may have occurred but reliable usage cannot be proven.
+  // Never downgrades an already-settled reservation. Fires the BLOCKING
+  // safety event so the reason reaches the terminal workflow result.
+  async markUnresolved({ workflowId, reservationId, reason = null }) {
+    const map = await this._loadWorkflow(workflowId);
+    const record = map.get(reservationId);
+    if (!record) throw new Error(`ReservationLedger.markUnresolved: unknown reservation ${reservationId}`);
+    if (record.status === RESERVATION_STATUS.SETTLED_KNOWN) return record;
+    record.status = RESERVATION_STATUS.UNRESOLVED;
+    record.settledAt = new Date().toISOString();
+    record.settlementReason = reason;
+    await this._persistWorkflow(workflowId);
+    this._onEvent?.({ type: 'RESERVATION_UNRESOLVED', reservationId, workflowId: workflowId ?? null, reason });
+    this._recordSafetyEvent?.({
+      code: 'MODEL_SPEND_USAGE_UNRESOLVED',
+      severity: 'BLOCKING',
+      role: record.role,
+      taskId: record.taskId,
+      attempt: record.physicalAttempt,
+      reason: reason ?? 'Physical model call may have dispatched but usage could not be reliably settled',
+      actionTaken: 'Further internal model spend blocked for this workflow',
+    });
+    return record;
+  }
+
+  // A RESERVED reservation that provably never crossed the durable
+  // DISPATCHING boundary. Only safe pre-dispatch; a no-op on anything else.
+  async cancelPreDispatch({ workflowId, reservationId, reason = null }) {
+    const map = await this._loadWorkflow(workflowId);
+    const record = map.get(reservationId);
+    if (!record || record.status !== RESERVATION_STATUS.RESERVED) return record ?? null;
+    record.status = RESERVATION_STATUS.CANCELLED_PRE_DISPATCH;
+    record.settledAt = new Date().toISOString();
+    record.settlementReason = reason;
+    await this._persistWorkflow(workflowId);
+    return record;
+  }
+
+  async hasUnresolved(workflowId) {
+    const map = await this._loadWorkflow(workflowId);
+    for (const record of map.values()) {
+      if (record.status === RESERVATION_STATUS.UNRESOLVED) return true;
+    }
+    return false;
+  }
+
+  async list(workflowId) {
+    const map = await this._loadWorkflow(workflowId);
+    return Array.from(map.values());
+  }
+
+  // Resume reconciliation (§10):
+  //   - RESERVED, never DISPATCHING  -> CANCELLED_PRE_DISPATCH (safe: the
+  //     ordering invariant proves physical dispatch was impossible).
+  //   - DISPATCHING, never settled   -> UNRESOLVED (conservative: the process
+  //     may have physically dispatched before crashing).
+  //   - UNRESOLVED / SETTLED_KNOWN   -> unchanged; a restart never clears an
+  //     unresolved condition, and a settled call is never re-flagged.
+  async reconcileOnResume(workflowId) {
+    const map = await this._loadWorkflow(workflowId);
+    let changed = false;
+    for (const record of map.values()) {
+      if (record.status === RESERVATION_STATUS.DISPATCHING) {
+        record.status = RESERVATION_STATUS.UNRESOLVED;
+        record.settledAt = new Date().toISOString();
+        record.settlementReason = 'RESUME_RECONCILE_DISPATCHING_UNSETTLED';
+        changed = true;
+        this._recordSafetyEvent?.({
+          code: 'MODEL_SPEND_USAGE_UNRESOLVED',
+          severity: 'BLOCKING',
+          role: record.role,
+          taskId: record.taskId,
+          attempt: record.physicalAttempt,
+          reason: 'Resume found a reservation that crossed the dispatch boundary with no durable settlement',
+          actionTaken: 'Further internal model spend blocked for this workflow',
+        });
+      } else if (record.status === RESERVATION_STATUS.RESERVED) {
+        record.status = RESERVATION_STATUS.CANCELLED_PRE_DISPATCH;
+        record.settledAt = new Date().toISOString();
+        record.settlementReason = 'RESUME_RECONCILE_NEVER_DISPATCHED';
+        changed = true;
+      }
+    }
+    if (changed) await this._persistWorkflow(workflowId);
+    return Array.from(map.values());
+  }
+}

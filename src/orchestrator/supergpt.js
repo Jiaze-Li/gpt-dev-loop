@@ -23,6 +23,7 @@ import { runAutomatedWorkflow } from './automatedLoop.js';
 import { selectProviders } from './providerSelection.js';
 import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
 import { ModelSpendAuthority } from './modelSpendAuthority.js';
+import { ReservationLedger, ReservationStore } from './modelSpendReservation.js';
 import { isAuthorizationFailure } from './errors.js';
 import { createGateRunner } from './adapters/gateRunner.js';
 import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.js';
@@ -886,6 +887,12 @@ export function createRealGithubPrCloseoutAdapters({
   workflowUsageVolumeCeiling = 0,
   taskExecutorUsageVolumeCeiling = 0,
   executorPhysicalCallCeiling = 0,
+  // Optional: the SAME workflow-scoped Persistence instance the primary
+  // pipeline uses (persistence.js). When supplied, the fallback repair
+  // Executor's Persistent Model Spend Reservation survives the same
+  // restart/resume path as the rest of the workflow; when omitted the
+  // reservation ledger for this fallback path is in-memory only.
+  persistence = null,
   // Test seam only: overrides the fallback Executor session manager used when
   // `selection` has no role runtime. Production always passes the real
   // `selection` and takes the runtime-backed primary path.
@@ -1178,7 +1185,19 @@ export function createRealGithubPrCloseoutAdapters({
           // CallIntent, authorize it, and run the provider dispatch only
           // through spendAuthority.dispatch(). Permit single-use / intent
           // binding / default-deny stay entirely inside the authority.
-          const spendAuthority = selection?.runtime?.spendAuthority ?? new ModelSpendAuthority();
+          // Persistent Model Spend Reservation for this fallback authority:
+          // reuse the SAME workflow-scoped persistence as the primary path
+          // when one is available, so a reservation created here survives
+          // the identical restart/resume path as the rest of the workflow.
+          const reservationLedger = new ReservationLedger({
+            store: persistence ? new ReservationStore(persistence) : null,
+            recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+          });
+          const spendAuthority = selection?.runtime?.spendAuthority
+            ?? new ModelSpendAuthority({
+              reservationLedger,
+              recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+            });
           const executorManager = createFallbackExecutorManager({ taskId: repairTaskId, cwd: repoRoot });
           const callIntent = {
             role: 'executor',
@@ -1186,8 +1205,9 @@ export function createRealGithubPrCloseoutAdapters({
             provider: 'claude',
             operationId: workflowId ?? repairTaskId,
             attempt: 1,
+            workflowId,
           };
-          const permit = spendAuthority.authorize(callIntent);
+          const permit = await spendAuthority.authorize(callIntent);
           runExecution = () => spendAuthority.dispatch(permit, callIntent, () => executorManager.execute(card, { signal }));
         }
         executionReport = await runExecution();
@@ -1817,7 +1837,25 @@ async function defaultPipeline({
   // Keeping it outside the isolated worktree prevents it being interpreted as
   // an untracked change and delivered into the invocation workspace.
   const persistence = new Persistence(workflowRuntimeDirectory(workflowId));
-  const selection = (_selectProviders || selectProviders)({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal, onEvent: (event) => emit(event.type, event) });
+  // Resume reconciliation (Persistent Model Spend Reservation, §10): any
+  // reservation that crossed the durable DISPATCHING boundary with no
+  // settlement conservatively becomes UNRESOLVED — a crash may have
+  // dispatched the physical call before this process restarted. A RESERVED
+  // reservation that never reached DISPATCHING is safely closed as
+  // CANCELLED_PRE_DISPATCH. Runs once, before the first invoke() of this
+  // process; every ModelSpendAuthority constructed below (primary runtime,
+  // PR-closeout fallback) reads the SAME persisted, now-reconciled ledger.
+  try {
+    await new ReservationLedger({
+      store: new ReservationStore(persistence),
+      recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+    }).reconcileOnResume(workflowId);
+  } catch { /* best effort — a reconciliation failure must not crash the run */ }
+  const selection = (_selectProviders || selectProviders)({
+    env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal,
+    onEvent: (event) => emit(event.type, event),
+    recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+  });
 
   // ---- Fast Path vs Full Path selection (deterministic, zero model tokens) ----
   // Selected once here, before the first model invocation. Persisted into the
@@ -1887,6 +1925,7 @@ async function defaultPipeline({
       workflowUsageVolumeCeiling,
       taskExecutorUsageVolumeCeiling,
       executorPhysicalCallCeiling,
+      persistence,
     });
 
     const outcome = await runPrCloseoutLoop({
@@ -1949,7 +1988,7 @@ async function defaultPipeline({
     const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
     resolved = (await selection.runtime.invoke('planner', {
       resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
-    }, { operationId: workflowId })).value;
+    }, { operationId: workflowId, workflowId })).value;
     if (usageTracker && workflowStateManager) {
       workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
     }

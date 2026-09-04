@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 
 import { runAutomatedWorkflow } from '../src/orchestrator/automatedLoop.js';
 import { selectProviders } from '../src/orchestrator/providerSelection.js';
-import { ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
+import { ADAPTER_ERROR_CODES, AUTHORIZATION_ERROR_CODES } from '../src/orchestrator/errors.js';
 import { AgyConversationResumeError } from '../src/agy/agyClient.js';
 import { evaluateResume, extractNumTurns } from '../scripts/test-agy-conversations-live.js';
 import { makeFakeCallAgy, validTaskCardObject } from './fixtures/fakeAgy.mjs';
@@ -154,14 +154,37 @@ test('fail closed: malformed Reviewer output aborts the workflow', async () => {
     'not-json-at-all',
   ]);
   const malformedCall = async () => ({ text: 'not-json-at-all', usage: null, durationMs: 1 });
-  await assert.rejects(() => run(callAgy, { codexCall: malformedCall, claudeCall: malformedCall }), (err) => err.code === ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+  // The agy Reviewer's own malformed reply carries known (if empty) usage —
+  // see agyReviewerProvider.js — so its reservation settles SETTLED_KNOWN and
+  // failover to codex/claude proceeds; those fakes then fail with genuinely
+  // UNKNOWN usage (no response at all), which correctly blocks further
+  // internal spend for this workflow (Persistent Model Spend Reservation —
+  // see modelSpendReservation.js). Either terminal reason still proves the
+  // real invariant: the workflow aborts and the malformed output never
+  // reaches Executor.
+  await assert.rejects(
+    () => run(callAgy, { codexCall: malformedCall, claudeCall: malformedCall }),
+    (err) => err.code === ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT || err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+  );
 });
 
 test('invalid Supervisor protocol output is treated as a provider failure and never executes the bad task', async () => {
   const bad = validTaskCardObject();
   delete bad.acceptance_criteria;
   const callAgy = makeFakeCallAgy([{ action: 'NEXT_TASK', task_card: bad }]);
-  await assert.rejects(() => run(callAgy), (err) => /INVALID_OUTPUT/.test(err.code));
+  // The agy Supervisor's own invalid-shape reply carries known (if empty)
+  // usage — see agySupervisorProvider.js — so its reservation settles
+  // SETTLED_KNOWN and failover to codex/claude/agy:gpt-oss proceeds; those
+  // fakes then fail with genuinely UNKNOWN usage (no response at all, per
+  // `run()`'s default codexCall/claudeCall), which correctly blocks further
+  // internal spend for this workflow rather than blindly cycling through
+  // every candidate (Persistent Model Spend Reservation — see
+  // modelSpendReservation.js). Either terminal reason still proves the real
+  // invariant: the malformed task card is never executed.
+  await assert.rejects(
+    () => run(callAgy),
+    (err) => /INVALID_OUTPUT/.test(err.code) || err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+  );
 });
 
 test('Supervisor and Reviewer run on different models in one workflow; neither leaks into Claude', async () => {

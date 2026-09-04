@@ -64,7 +64,9 @@ export function createProductionRoleRuntime({
   }));
   const roleRouter = router ?? new RoleRouter({ rolePolicy, quotaRegistry, providerHealth, resolveFamily: capabilityResolver, onEvent });
 
-  async function invoke(role, payload, { signals = {}, operationId = null, signal: callSignal = null } = {}) {
+  async function invoke(role, payload, {
+    signals = {}, operationId = null, signal: callSignal = null, workflowId = null,
+  } = {}) {
     const abortSignal = callSignal ?? signal;
     const attempted = new Set();
     let lastError = null;
@@ -96,10 +98,11 @@ export function createProductionRoleRuntime({
         provider: selection.provider,
         operationId,
         attempt: attempted.size,
+        workflowId,
       };
       let permit;
       try {
-        permit = spendAuthority.authorize(callIntent);
+        permit = await spendAuthority.authorize(callIntent);
       } catch (error) {
         // Authorization failure is an orchestrator decision, NOT provider
         // failure: no recordFailure, no health/quota mutation, no failover.

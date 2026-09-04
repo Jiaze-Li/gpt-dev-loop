@@ -510,8 +510,23 @@ export function createAgySupervisorProvider({
         throw err;
       }
       const callId = `call-agy-sup-${randomUUID()}`;
+      // The provider DID respond (result.usage is known at this point) even
+      // when its content fails the decision-shape validator below — a
+      // reliably-known-usage business/protocol failure, not an unknown-spend
+      // one (see modelSpendReservation.js §6). Attach usage to any
+      // SUPERVISOR_INVALID_OUTPUT thrown here so the reservation settles
+      // SETTLED_KNOWN instead of UNRESOLVED.
+      let parsedDecision;
+      try {
+        parsedDecision = parseSupervisorJson(obj);
+      } catch (err) {
+        if (err instanceof AdapterError && !err.details?.usage) {
+          err.details = { ...(err.details ?? {}), usage: result.usage ? { ...result.usage, callId } : { callId } };
+        }
+        throw err;
+      }
       const decision = {
-        ...parseSupervisorJson(obj),
+        ...parsedDecision,
         conversationId: result.conversationId ?? null,
       };
       const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };

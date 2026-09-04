@@ -57,7 +57,7 @@ function buildRuntime({ rolePolicy, adapters, policy, quota, health } = {}) {
 test('authority: authorize issues a bound permit; dispatch consumes it exactly once', async () => {
   const authority = new ModelSpendAuthority();
   const intent = { role: 'reviewer', family: 'codex:default', provider: 'codex', operationId: 'wf1:t1', attempt: 1 };
-  const permit = authority.authorize(intent);
+  const permit = await authority.authorize(intent);
   assert.ok(permit instanceof PhysicalCallPermit);
   assert.deepEqual(permit.intent, normalizeCallIntent(intent));
 
@@ -72,7 +72,7 @@ test('authority: a forged / cross-authority permit is rejected before dispatch',
   const a = new ModelSpendAuthority();
   const b = new ModelSpendAuthority();
   const intent = { role: 'planner', family: 'codex:default', provider: 'codex', operationId: 'x', attempt: 1 };
-  const foreignPermit = b.authorize(intent);
+  const foreignPermit = await b.authorize(intent);
 
   let calls = 0;
   await assert.rejects(
@@ -86,10 +86,10 @@ test('authority: a forged / cross-authority permit is rejected before dispatch',
   assert.equal(calls, 0);
 });
 
-test('authority: deny policy throws SPEND_DENIED and never issues a permit', () => {
+test('authority: deny policy throws SPEND_DENIED and never issues a permit', async () => {
   const authority = new ModelSpendAuthority({ policy: () => ({ allow: false, reason: 'nope' }) });
-  assert.throws(
-    () => authority.authorize({ role: 'executor', family: 'claude:sonnet', provider: 'claude' }),
+  await assert.rejects(
+    authority.authorize({ role: 'executor', family: 'claude:sonnet', provider: 'claude' }),
     (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.SPEND_DENIED,
   );
   assert.deepEqual(authority.stats(), { issued: 0, consumed: 0, outstanding: 0 });
@@ -127,7 +127,7 @@ test('B: dispatch path is default-deny — no permit means zero provider invocat
 test('C: a consumed permit cannot be reused — second dispatch invokes provider 0 times', async () => {
   const authority = new ModelSpendAuthority();
   const intent = { role: 'supervisor', family: 'agy:gemini', provider: 'agy-gemini', operationId: 'wf', attempt: 1 };
-  const permit = authority.authorize(intent);
+  const permit = await authority.authorize(intent);
   let providerCalls = 0;
   await authority.dispatch(permit, intent, async () => { providerCalls += 1; });
   await assert.rejects(
@@ -141,7 +141,7 @@ test('C: a consumed permit cannot be reused — second dispatch invokes provider
 test('D: a reviewer/codex permit does not authorize an executor/sonnet dispatch', async () => {
   const authority = new ModelSpendAuthority();
   const reviewerIntent = { role: 'reviewer', family: 'codex:default', provider: 'codex', operationId: 'wf', attempt: 1 };
-  const permit = authority.authorize(reviewerIntent);
+  const permit = await authority.authorize(reviewerIntent);
   let providerCalls = 0;
   await assert.rejects(
     authority.dispatch(permit, { role: 'executor', family: 'claude:sonnet', provider: 'claude', operationId: 'wf', attempt: 1 }, async () => { providerCalls += 1; }),
@@ -189,7 +189,12 @@ test('F: real retryable failure fails over and the next provider gets a NEW perm
       supervisor: {
         'agy:gemini': async () => {
           attempts.push('agy:gemini');
-          throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_TIMEOUT, 'did not respond within 600000ms');
+          // A retryable failure whose usage is reliably known (Reservation
+          // Case A — see modelSpendReservation.js): settlement is
+          // SETTLED_KNOWN, so failover to the next candidate proceeds.
+          throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_TIMEOUT, 'did not respond within 600000ms', {
+            usage: { input_tokens: 40, output_tokens: 0, callId: 'call-agy-gemini-1' },
+          });
         },
         'codex:default': async () => { attempts.push('codex:default'); return { action: 'WORKFLOW_DONE' }; },
       },

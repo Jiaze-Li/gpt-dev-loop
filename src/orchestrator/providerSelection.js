@@ -21,6 +21,7 @@ import { createFailoverSupervisorSession } from './supervisorFailover.js';
 import { createProductionRoleRuntime } from './productionRoleRuntime.js';
 import { PRODUCTION_ROLE_CAPABILITIES } from './roleRouting.js';
 import { ModelSpendAuthority } from './modelSpendAuthority.js';
+import { ReservationLedger, ReservationStore } from './modelSpendReservation.js';
 import { createExecutorBudgetPolicy } from './executorBudgetPolicy.js';
 import {
   resolveWorkflowCostCeilingUsd,
@@ -98,6 +99,10 @@ export function selectProviders({
   providerHealth,
   onEvent,
   signal,
+  // Optional: forwarded onto the ModelSpendAuthority's ReservationLedger so
+  // an UNRESOLVED reservation's BLOCKING safety event reaches the workflow's
+  // user-visible terminal result (workflowState.js#recordSafetyEvent).
+  recordSafetyEvent,
 } = {}) {
   // One shared persistent-conversation store for this workflow: the
   // Supervisor session and every per-task Reviewer session created below
@@ -162,7 +167,20 @@ export function selectProviders({
     taskExecutorUsageVolumeCeiling: resolveTaskExecutorUsageVolumeCeiling(env),
     executorPhysicalCallCeiling: resolveExecutorPhysicalCallCeiling(env),
   });
-  const spendAuthority = new ModelSpendAuthority({ policy: executorBudgetPolicy, onEvent });
+  // Persistent Model Spend Reservation: reuses the SAME workflow-scoped
+  // persistence as every other durable orchestrator state (persistence.js /
+  // workflow.json), so a reservation survives the identical restart/resume
+  // path as the rest of the workflow. Without a `persistence` instance (rare
+  // — some tests construct the runtime directly), the ledger stays
+  // in-memory-only for the process lifetime.
+  const reservationLedger = new ReservationLedger({
+    store: persistence ? new ReservationStore(persistence) : null,
+    onEvent,
+    recordSafetyEvent,
+  });
+  const spendAuthority = new ModelSpendAuthority({
+    policy: executorBudgetPolicy, onEvent, reservationLedger, recordSafetyEvent,
+  });
   const runtime = createProductionRoleRuntime({
     router, rolePolicy, quotaRegistry, providerHealth, onEvent, signal, spendAuthority,
     resolveFamily: (family) => ({
@@ -248,12 +266,12 @@ export function selectProviders({
         return local.decision;
       }
       onEvent?.({ type: 'SUPERVISOR_ESCALATED', workflowId, reason: local.reason });
-      return (await runtime.invoke('supervisor', context, { signals: context?.signals, operationId: workflowId })).value;
+      return (await runtime.invoke('supervisor', context, { signals: context?.signals, operationId: workflowId, workflowId })).value;
     },
   };
   const createReviewerSession = () => ({
     create: async () => ({}), close: async () => {},
-    review: async (taskId, taskCard, executionReport, evidence, opts = {}) => (await runtime.invoke('reviewer', { taskId, taskCard, executionReport, evidence, opts }, { signals: { reworkCycles: Math.max(0, (opts.attempt ?? 1) - 1) }, operationId: `${workflowId}:${taskId}` })).value,
+    review: async (taskId, taskCard, executionReport, evidence, opts = {}) => (await runtime.invoke('reviewer', { taskId, taskCard, executionReport, evidence, opts }, { signals: { reworkCycles: Math.max(0, (opts.attempt ?? 1) - 1) }, operationId: `${workflowId}:${taskId}`, workflowId })).value,
   });
 
   return {
@@ -268,7 +286,7 @@ export function selectProviders({
     createExecutorSessionManager: ({ taskId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited }) => ({
       async execute(taskCard, { signal: executionSignal } = {}) {
         if (executionSignal?.aborted) throw new Error('executor cancelled');
-        const result = await runtime.invoke('executor', { taskId, workflowId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited, taskCard }, { signals: { reasoningFailures: 0 }, operationId: `${workflowId}:${taskId}` });
+        const result = await runtime.invoke('executor', { taskId, workflowId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited, taskCard }, { signals: { reasoningFailures: 0 }, operationId: `${workflowId}:${taskId}`, workflowId });
         if (executionSignal?.aborted) throw new Error('executor cancelled');
         return result.value;
       },

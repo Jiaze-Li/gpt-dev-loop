@@ -44,9 +44,9 @@ function buildRuntime({ rolePolicy, adapters, onEvent, spendAuthority } = {}) {
 
 // ── A. production default ──────────────────────────────────────────────
 
-test('A: production default — Sonnet Executor authorizes', () => {
+test('A: production default — Sonnet Executor authorizes', async () => {
   const authority = new ModelSpendAuthority();
-  const permit = authority.authorize({ role: 'executor', family: 'claude:sonnet', provider: 'claude', operationId: 'op', attempt: 1 });
+  const permit = await authority.authorize({ role: 'executor', family: 'claude:sonnet', provider: 'claude', operationId: 'op', attempt: 1 });
   assert.ok(permit);
 });
 
@@ -76,21 +76,21 @@ test('A: production default — Claude Opus Executor is denied, 0 physical calls
   assert.equal(dispatched, 0);
 });
 
-test('A: production default — AGY Executor is denied', () => {
+test('A: production default — AGY Executor is denied', async () => {
   const authority = new ModelSpendAuthority();
   for (const family of ['agy:gemini', 'agy:gpt-oss']) {
-    assert.throws(
-      () => authority.authorize({ role: 'executor', family, provider: family.replace(':', '-'), operationId: 'op', attempt: 1 }),
+    await assert.rejects(
+      authority.authorize({ role: 'executor', family, provider: family.replace(':', '-'), operationId: 'op', attempt: 1 }),
       (err) => err instanceof AuthorizationError && err.code === AUTHORIZATION_ERROR_CODES.PROVIDER_NOT_ELIGIBLE_FOR_ROLE,
     );
   }
 });
 
-test('A: Planner/Reviewer/Supervisor on codex/agy are unaffected by executor eligibility', () => {
+test('A: Planner/Reviewer/Supervisor on codex/agy are unaffected by executor eligibility', async () => {
   const authority = new ModelSpendAuthority();
   for (const role of ['planner', 'supervisor', 'reviewer']) {
     for (const family of ['codex:default', 'agy:gemini', 'agy:gpt-oss', 'claude:opus']) {
-      const permit = authority.authorize({ role, family, provider: family.split(':')[0], operationId: 'op', attempt: 1 });
+      const permit = await authority.authorize({ role, family, provider: family.split(':')[0], operationId: 'op', attempt: 1 });
       assert.ok(permit, `${role}/${family} should not be denied by executor eligibility`);
     }
   }
@@ -107,8 +107,11 @@ test('B: an explicit TEST-ONLY capability source allows sonnet -> codex -> opus 
     spendAuthority,
     adapters: {
       executor: {
-        'claude:sonnet': async () => { attempted.push('claude:sonnet'); throw Object.assign(new Error('timeout'), { code: 'PROVIDER_TIMEOUT' }); },
-        'codex:default': async () => { attempted.push('codex:default'); throw Object.assign(new Error('timeout'), { code: 'PROVIDER_TIMEOUT' }); },
+        // Reservation Case A — each retryable failure carries reliable usage
+        // evidence, so settlement is SETTLED_KNOWN and failover proceeds
+        // (see modelSpendReservation.js).
+        'claude:sonnet': async () => { attempted.push('claude:sonnet'); throw Object.assign(new Error('timeout'), { code: 'PROVIDER_TIMEOUT', details: { usage: { input_tokens: 10, output_tokens: 0 } } }); },
+        'codex:default': async () => { attempted.push('codex:default'); throw Object.assign(new Error('timeout'), { code: 'PROVIDER_TIMEOUT', details: { usage: { input_tokens: 10, output_tokens: 0 } } }); },
         'claude:opus': async () => { attempted.push('claude:opus'); return 'ok'; },
       },
     },
@@ -179,10 +182,10 @@ test('C: end-to-end via productionRoleRuntime — Claude Sonnet Executor dispatc
   assert.equal(dispatched, 1);
 });
 
-test('the eligibility invariant cannot be bypassed by an injected allow-all `policy` callback', () => {
+test('the eligibility invariant cannot be bypassed by an injected allow-all `policy` callback', async () => {
   const authority = new ModelSpendAuthority({ policy: () => ({ allow: true }) });
-  assert.throws(
-    () => authority.authorize({ role: 'executor', family: 'codex:default', provider: 'codex', operationId: 'op', attempt: 1 }),
+  await assert.rejects(
+    authority.authorize({ role: 'executor', family: 'codex:default', provider: 'codex', operationId: 'op', attempt: 1 }),
     (err) => err.code === AUTHORIZATION_ERROR_CODES.PROVIDER_NOT_ELIGIBLE_FOR_ROLE,
   );
 });

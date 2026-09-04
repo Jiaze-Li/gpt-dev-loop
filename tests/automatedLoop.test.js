@@ -2006,9 +2006,12 @@ test('regression: an Executor provider timeout fails over sonnet -> codex -> opu
 
   const attempted = [];
   const events = [];
+  // Reservation Case A — each timeout carries reliable usage evidence, so
+  // settlement is SETTLED_KNOWN and failover proceeds (see
+  // modelSpendReservation.js).
   const timeout = (name) => async () => {
     attempted.push(name);
-    throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${name}" did not respond within 600000ms`);
+    throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${name}" did not respond within 600000ms`, { usage: { input_tokens: 10, output_tokens: 0 } });
   };
   const createClaudeSessionManager = makeRuntimeBackedClaudeManagerFactory({
     rolePolicy: {
