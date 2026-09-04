@@ -198,7 +198,7 @@ export function checkModels({ env = process.env } = {}) {
       ok: true,
       supervisor: resolveAgySupervisorModel(env),
       reviewer: resolveAgyReviewerModel(env),
-      executor: 'claude-sonnet-5 (default) / opus (escalation)',
+      executor: 'claude-sonnet-5 (Sonnet-only automatic chain)',
     };
   } catch (err) {
     return { name: 'models', ok: false, error: err.message };

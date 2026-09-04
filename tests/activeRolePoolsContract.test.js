@@ -29,7 +29,7 @@ test('Target active role pools match specification exactly', () => {
     'agy:gpt-oss', 'codex:default', 'agy:gemini', 'claude:opus'
   ]);
   assert.deepEqual(DEFAULT_ROLE_POLICY.executor.map((c) => c.family), [
-    'claude:sonnet', 'codex:default', 'claude:opus'
+    'claude:sonnet'
   ]);
 });
 
@@ -135,7 +135,7 @@ test('Fallback reachability: Reviewer fallback chain', () => {
   assert.equal(router.route('reviewer').requestedFamily, 'claude:opus');
 });
 
-test('Fallback reachability: Executor fallback chain', () => {
+test('Executor automatic chain is Sonnet-only (no codex/opus failover)', () => {
   const quota = new QuotaPoolRegistry({ filePath: null });
   const health = new ProviderHealthRegistry();
   const router = new RoleRouter({
@@ -152,25 +152,10 @@ test('Fallback reachability: Executor fallback chain', () => {
   // 1. Primary: claude:sonnet
   assert.equal(router.route('executor').requestedFamily, 'claude:sonnet');
 
-  // 2. Claude cooldown suppresses Sonnet and Opus -> codex:default
-  quota.recordCooldown('claude');
-  assert.equal(router.route('executor').requestedFamily, 'codex:default');
-
-  // 3. Claude healthy but codex unavailable -> claude:sonnet -> claude:opus
-  quota.pools['claude'].status = 'READY';
-  health.record('codex', 'UNAVAILABLE');
-  const opusRouter = new RoleRouter({
-    rolePolicy: { executor: [{ family: 'claude:opus' }] },
-    quotaRegistry: quota,
-    providerHealth: health,
-    resolveFamily: (family) => ({
-      requestedFamily: family,
-      resolvedModel: 'opus',
-      provider: 'claude',
-      capabilities: { roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [] },
-    }),
-  });
-  assert.equal(opusRouter.route('executor').requestedFamily, 'claude:opus');
+  // 2. Sonnet unusable -> NO codex:default / claude:opus automatic failover.
+  //    The router yields no candidate; the invocation fails back upward.
+  health.record('claude:sonnet', 'UNAVAILABLE', 'PROVIDER_TIMEOUT');
+  assert.equal(router.route('executor'), null);
 });
 
 test('Codex Reviewer Adapter: valid PASS and REWORK contracts', async () => {

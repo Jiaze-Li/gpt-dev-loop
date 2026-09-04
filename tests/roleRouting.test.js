@@ -53,10 +53,11 @@ test('Gemini cooldown skips Supervisor but not GPT-OSS reviewer', () => {
   assert.equal(router.route('reviewer').requestedFamily, 'agy:gpt-oss');
 });
 
-test('Claude shared cooldown skips Sonnet and Opus', () => {
+test('Claude shared cooldown leaves the Sonnet-only Executor chain with no candidate', () => {
   const quota = new QuotaPoolRegistry({ filePath: null }); quota.recordCooldown('claude');
   const router = new RoleRouter({ quotaRegistry: quota, resolveFamily: resolver });
-  assert.equal(router.route('executor').requestedFamily, 'codex:default');
+  // Executor automatic chain is Sonnet-only: no codex:default failover.
+  assert.equal(router.route('executor'), null);
 });
 
 test('reset expiry becomes UNKNOWN and can receive a genuine business call', () => {
@@ -79,5 +80,5 @@ test('resolution changes do not change family policy and health remains independ
   assert.equal(router.route('executor').resolvedModel, 'sonnet-old'); concrete = 'sonnet-new';
   assert.equal(router.route('executor').resolvedModel, 'sonnet-new');
   assert.equal(events.some((event) => event.type === 'MODEL_RESOLVED_CHANGED'), true);
-  health.record('claude', 'UNAVAILABLE'); assert.equal(router.route('executor').requestedFamily, 'codex:default');
+  health.record('claude', 'UNAVAILABLE'); assert.equal(router.route('executor'), null);
 });

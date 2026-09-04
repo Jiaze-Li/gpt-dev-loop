@@ -8,7 +8,12 @@ export const DEFAULT_ROLE_POLICY = Object.freeze({
   planner: Object.freeze([{ family: 'codex:default', effort: 'medium' }, { family: 'agy:gemini', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gpt-oss', effort: 'medium', degraded: true }]),
   supervisor: Object.freeze([{ family: 'agy:gemini', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gpt-oss', effort: 'medium', degraded: true }]),
   reviewer: Object.freeze([{ family: 'agy:gpt-oss', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'agy:gemini', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }]),
-  executor: Object.freeze([{ family: 'claude:sonnet' }, { family: 'codex:default', effort: 'medium' }, { family: 'claude:opus' }]),
+  // Executor automatic candidate chain is temporarily Sonnet-only. The
+  // codex:default and claude:opus executor adapters remain implemented and
+  // capability-declared, but are not automatic failover candidates: a
+  // retryable Sonnet failure fails the Executor invocation back to the upper
+  // workflow layer instead of silently rerunning on another model.
+  executor: Object.freeze([{ family: 'claude:sonnet' }]),
 });
 
 export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
