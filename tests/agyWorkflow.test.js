@@ -159,13 +159,22 @@ test('fail closed: malformed Reviewer output aborts the workflow', async () => {
   // failover to codex/claude proceeds; those fakes then fail with genuinely
   // UNKNOWN usage (no response at all), which correctly blocks further
   // internal spend for this workflow (Persistent Model Spend Reservation —
-  // see modelSpendReservation.js). Either terminal reason still proves the
-  // real invariant: the workflow aborts and the malformed output never
-  // reaches Executor.
-  await assert.rejects(
-    () => run(callAgy, { codexCall: malformedCall, claudeCall: malformedCall }),
-    (err) => err.code === ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT || err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
-  );
+  // see modelSpendReservation.js). An UNRESOLVED reservation is itself an
+  // IMMEDIATE Token Safety halt (the final Reservation rework — see
+  // modelSpendAuthority.js#dispatch), so automatedLoop.js resolves the
+  // workflow HUMAN_REQUIRED rather than rejecting the promise; a plain
+  // REVIEWER_INVALID_OUTPUT (no Reservation involvement) still surfaces as a
+  // rejection via the pre-existing failure path. Either terminal reason
+  // still proves the real invariant: the workflow aborts and the malformed
+  // output never reaches Executor.
+  let rejected = null;
+  const result = await run(callAgy, { codexCall: malformedCall, claudeCall: malformedCall }).catch((err) => { rejected = err; return null; });
+  if (rejected) {
+    assert.equal(rejected.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+  } else {
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.match(result.reason, /usage could not be reliably settled|unresolved model spend/i);
+  }
 });
 
 test('invalid Supervisor protocol output is treated as a provider failure and never executes the bad task', async () => {
@@ -179,12 +188,22 @@ test('invalid Supervisor protocol output is treated as a provider failure and ne
   // `run()`'s default codexCall/claudeCall), which correctly blocks further
   // internal spend for this workflow rather than blindly cycling through
   // every candidate (Persistent Model Spend Reservation — see
-  // modelSpendReservation.js). Either terminal reason still proves the real
-  // invariant: the malformed task card is never executed.
-  await assert.rejects(
-    () => run(callAgy),
-    (err) => /INVALID_OUTPUT/.test(err.code) || err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
-  );
+  // modelSpendReservation.js). An UNRESOLVED reservation is itself an
+  // IMMEDIATE Token Safety halt (the final Reservation rework — see
+  // modelSpendAuthority.js#dispatch), so automatedLoop.js resolves the
+  // workflow HUMAN_REQUIRED rather than rejecting the promise; a plain
+  // *_INVALID_OUTPUT (no Reservation involvement) still surfaces as a
+  // rejection via the pre-existing failure path. Either terminal reason
+  // still proves the real invariant: the malformed task card is never
+  // executed.
+  let rejected = null;
+  const result = await run(callAgy).catch((err) => { rejected = err; return null; });
+  if (rejected) {
+    assert.match(rejected.code, /INVALID_OUTPUT/);
+  } else {
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.match(result.reason, /usage could not be reliably settled|unresolved model spend/i);
+  }
 });
 
 test('Supervisor and Reviewer run on different models in one workflow; neither leaks into Claude', async () => {

@@ -485,9 +485,10 @@ test('settlement is idempotent: settling an already-SETTLED_KNOWN reservation ag
   assert.equal(second.usageCallId, first.usageCallId, 'a repeated settlement must not overwrite the original settlement');
 });
 
-// ── P. Success with missing usage must NOT be SETTLED_KNOWN ────────────
+// ── P. Success with missing usage must NOT be SETTLED_KNOWN, and must NOT
+//      escape dispatch() as an ordinary success either ─────────────────
 
-test('P: a successful provider call with no reliable usage settles UNRESOLVED and blocks the next internal call', async () => {
+test('P: a successful provider call with no reliable usage settles UNRESOLVED and is an IMMEDIATE Token Safety block, not an ordinary success', async () => {
   const ledger = new ReservationLedger();
   const spendAuthority = new ModelSpendAuthority({ reservationLedger: ledger, providerCapabilities: TEST_ONLY_PERMISSIVE });
   let secondCallHappened = false;
@@ -496,17 +497,22 @@ test('P: a successful provider call with no reliable usage settles UNRESOLVED an
     adapters: {
       // A business/functional success — but the adapter reports NO usage
       // field at all. This must never be silently treated as known-zero
-      // spend.
+      // spend, and must NEVER resolve the invocation as ordinary success:
+      // an UNRESOLVED reservation is an immediate workflow-blocking
+      // condition, not merely a guard against the NEXT call.
       executor: { 'claude:sonnet': async () => ({ ok: true }) },
       reviewer: { 'agy:gpt-oss': async () => { secondCallHappened = true; return { usage: { input_tokens: 1, output_tokens: 1 } }; } },
     },
     spendAuthority,
   });
-  const { value } = await runtime.invoke('executor', {}, { operationId: 'wf-p:t1', workflowId: 'wf-p' });
-  assert.deepEqual(value, { ok: true }, 'the functional result of the call itself is still returned');
+  await assert.rejects(
+    runtime.invoke('executor', {}, { operationId: 'wf-p:t1', workflowId: 'wf-p' }),
+    (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED
+      && err.details?.businessOutcome === 'SUCCESS',
+  );
 
   const [reservation] = await ledger.list('wf-p');
-  assert.equal(reservation.status, RESERVATION_STATUS.UNRESOLVED);
+  assert.equal(reservation.status, RESERVATION_STATUS.UNRESOLVED, 'the reservation is durably UNRESOLVED before the blocking error is thrown');
   assert.equal(reservation.usageReference, null);
 
   await assert.rejects(
@@ -514,6 +520,25 @@ test('P: a successful provider call with no reliable usage settles UNRESOLVED an
     (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
   );
   assert.equal(secondCallHappened, false, 'no further internal model call may physically run once usage is unresolved');
+});
+
+test('P2: a business FAILURE with no reliable usage is likewise an immediate Token Safety block, and the original failure is preserved only as diagnostic metadata', async () => {
+  const ledger = new ReservationLedger();
+  const spendAuthority = new ModelSpendAuthority({ reservationLedger: ledger });
+  const { runtime } = buildRuntime({
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }] },
+    adapters: { executor: { 'claude:sonnet': async () => { throw new AdapterError('EXECUTOR_TIMEOUT', 'timed out, no usage'); } } },
+    spendAuthority,
+  });
+  await assert.rejects(
+    runtime.invoke('executor', {}, { operationId: 'wf-p2:t1', workflowId: 'wf-p2' }),
+    (err) => isAuthorizationFailure(err)
+      && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED
+      && err.details?.businessOutcome === 'FAILURE'
+      && err.details?.originalErrorCode === 'EXECUTOR_TIMEOUT',
+  );
+  const [reservation] = await ledger.list('wf-p2');
+  assert.equal(reservation.status, RESERVATION_STATUS.UNRESOLVED);
 });
 
 // ── Q. Settlement persistence failure ────────────────────────────────────

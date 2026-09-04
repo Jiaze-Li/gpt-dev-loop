@@ -28,7 +28,9 @@
 // AdapterError(SUPERVISOR_ILLEGAL_TRANSITION) and the loop takes no action
 // at all for that reply.
 
-import { AdapterError, ADAPTER_ERROR_CODES, isCancellation } from './errors.js';
+import {
+  AdapterError, ADAPTER_ERROR_CODES, isCancellation, isAuthorizationFailure,
+} from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
 import { classifyVerificationPermissionBlocked, SAFETY_EVENT_CODES, SAFETY_SEVERITY } from './safetyEvents.js';
 import {
@@ -2164,6 +2166,34 @@ export async function runAutomatedWorkflow({
         await windowSession.close(windowId).catch(() => {});
       }
       throw err;
+    }
+    // Token-Safety orchestrator decision (ModelSpendAuthority /
+    // ReservationLedger — see modelSpendAuthority.js / modelSpendReservation.js).
+    // This is the SINGLE centralized point (not a Planner/Supervisor/
+    // Executor/Reviewer-specific check) where such a decision — from ANY
+    // role's call site above — is recognised and turned into the workflow's
+    // terminal status: HUMAN_REQUIRED, never an ordinary FAILED "task went
+    // wrong" outcome, and never allowed to fall through to normal
+    // state-machine progression (another Supervisor decision, Gate, Reviewer,
+    // or delivery). An UNRESOLVED reservation's own BLOCKING safety event was
+    // already recorded by the Reservation layer itself (markUnresolved());
+    // this is only the terminal-status projection of that decision.
+    if (isAuthorizationFailure(err)) {
+      const reason = err.message;
+      const question = `${reason} Review the workflow's model spend reservation state, then resume.`;
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+      if (!keepOpenOnFailure) {
+        await closeReviewer().catch(() => {});
+        await supervisorSession.close().catch(() => {});
+        await windowSession.close(windowId).catch(() => {});
+      }
+      return {
+        status: 'HUMAN_REQUIRED',
+        reason,
+        question,
+        history,
+        ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
+      };
     }
     workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: err.message });
     if (workflowStateManager) {

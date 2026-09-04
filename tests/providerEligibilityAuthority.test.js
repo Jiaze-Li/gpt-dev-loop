@@ -112,12 +112,12 @@ test('B: an explicit TEST-ONLY capability source allows sonnet -> codex -> opus 
         // (see modelSpendReservation.js).
         'claude:sonnet': async () => { attempted.push('claude:sonnet'); throw Object.assign(new Error('timeout'), { code: 'PROVIDER_TIMEOUT', details: { usage: { input_tokens: 10, output_tokens: 0 } } }); },
         'codex:default': async () => { attempted.push('codex:default'); throw Object.assign(new Error('timeout'), { code: 'PROVIDER_TIMEOUT', details: { usage: { input_tokens: 10, output_tokens: 0 } } }); },
-        'claude:opus': async () => { attempted.push('claude:opus'); return 'ok'; },
+        'claude:opus': async () => { attempted.push('claude:opus'); return { label: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }; },
       },
     },
   });
   const result = await runtime.invoke('executor', {}, { operationId: 'wf:t1' });
-  assert.equal(result.value, 'ok');
+  assert.equal(result.value.label, 'ok');
   assert.deepEqual(attempted, ['claude:sonnet', 'codex:default', 'claude:opus']);
   // Fresh authorize + fresh permit per physical attempt — none reused.
   assert.deepEqual(spendAuthority.stats(), { issued: 3, consumed: 3, outstanding: 0 });
@@ -175,10 +175,10 @@ test('C: end-to-end via productionRoleRuntime — Claude Sonnet Executor dispatc
   let dispatched = 0;
   const runtime = buildRuntime({
     rolePolicy: { executor: [{ family: 'claude:sonnet' }] },
-    adapters: { executor: { 'claude:sonnet': async () => { dispatched += 1; return 'ok'; } } },
+    adapters: { executor: { 'claude:sonnet': async () => { dispatched += 1; return { label: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }; } } },
   });
   const result = await runtime.invoke('executor', {}, { operationId: 'wf:t1' });
-  assert.equal(result.value, 'ok');
+  assert.equal(result.value.label, 'ok');
   assert.equal(dispatched, 1);
 });
 

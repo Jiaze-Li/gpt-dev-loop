@@ -63,7 +63,7 @@ test('RoleRouter & Runtime: claude:sonnet timeout allows failover to codex and t
       },
       'claude:opus': async () => {
         attempted.push('claude:opus');
-        return { status: 'DONE', model: 'opus' };
+        return { status: 'DONE', model: 'opus', usage: { input_tokens: 1, output_tokens: 1 } };
       },
     },
   };

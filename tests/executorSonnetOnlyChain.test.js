@@ -17,7 +17,9 @@ import {
   ProviderHealthRegistry,
 } from '../src/orchestrator/roleRouting.js';
 import { createProductionRoleRuntime } from '../src/orchestrator/productionRoleRuntime.js';
-import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
+import {
+  AdapterError, ADAPTER_ERROR_CODES, AUTHORIZATION_ERROR_CODES, isAuthorizationFailure,
+} from '../src/orchestrator/errors.js';
 
 const resolveFamily = (family) => ({
   requestedFamily: family,
@@ -55,11 +57,12 @@ test('A: production Executor automatic candidate pool is claude:sonnet only', ()
 
 // B. Sonnet success
 test('B: Sonnet success invokes Sonnet exactly once and no other provider', async () => {
+  const usage = { input_tokens: 1, output_tokens: 1 };
   const { runtime, attempts } = makeRuntime({
-    'claude:sonnet': async () => ({ ok: true, report: 'done' }),
+    'claude:sonnet': async () => ({ ok: true, report: 'done', usage }),
   });
   const { value, selection } = await runtime.invoke('executor', { taskId: 't1' }, { operationId: 'wf:t1' });
-  assert.deepEqual(value, { ok: true, report: 'done' });
+  assert.deepEqual(value, { ok: true, report: 'done', usage });
   assert.equal(selection.requestedFamily, 'claude:sonnet');
   assert.equal(attempts['claude:sonnet'], 1);
   assert.equal(attempts['codex:default'], 0);
@@ -73,9 +76,15 @@ test('C: retryable Sonnet failure fails back upward with no codex/opus failover'
       throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, 'executor "claude" did not respond within 600000ms');
     },
   });
+  // A timeout carries no reliable usage evidence, so this is now an
+  // IMMEDIATE Token Safety block (AuthorizationError), not merely "Sonnet
+  // failed, no failover" — the original EXECUTOR_TIMEOUT is preserved only
+  // as diagnostic metadata on the thrown AuthorizationError.
   await assert.rejects(
     runtime.invoke('executor', { taskId: 't2' }, { operationId: 'wf:t2' }),
-    (err) => err instanceof AdapterError && err.code === ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT,
+    (err) => isAuthorizationFailure(err)
+      && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED
+      && err.details?.originalErrorCode === ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT,
   );
   assert.equal(attempts['claude:sonnet'], 1);
   assert.equal(attempts['codex:default'], 0);

@@ -62,8 +62,8 @@ test('authority: authorize issues a bound permit; dispatch consumes it exactly o
   assert.deepEqual(permit.intent, normalizeCallIntent(intent));
 
   let calls = 0;
-  const out = await authority.dispatch(permit, intent, async () => { calls += 1; return 'ok'; });
-  assert.equal(out, 'ok');
+  const out = await authority.dispatch(permit, intent, async () => { calls += 1; return { label: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }; });
+  assert.equal(out.label, 'ok');
   assert.equal(calls, 1);
   assert.deepEqual(authority.stats(), { issued: 1, consumed: 1, outstanding: 0 });
 });
@@ -104,10 +104,10 @@ test('A: happy path — permit issued, consumed once, provider invoked once', as
   let providerCalls = 0;
   const { runtime, spendAuthority } = buildRuntime({
     rolePolicy: { reviewer: [{ family: 'codex:default' }] },
-    adapters: { reviewer: { 'codex:default': async () => { providerCalls += 1; return { decision: 'PASS' }; } } },
+    adapters: { reviewer: { 'codex:default': async () => { providerCalls += 1; return { decision: 'PASS', usage: { input_tokens: 1, output_tokens: 1 } }; } } },
   });
   const { value } = await runtime.invoke('reviewer', { taskId: 't1' }, { operationId: 'wf:t1' });
-  assert.deepEqual(value, { decision: 'PASS' });
+  assert.deepEqual(value, { decision: 'PASS', usage: { input_tokens: 1, output_tokens: 1 } });
   assert.equal(providerCalls, 1);
   assert.deepEqual(spendAuthority.stats(), { issued: 1, consumed: 1, outstanding: 0 });
 });
@@ -129,7 +129,7 @@ test('C: a consumed permit cannot be reused — second dispatch invokes provider
   const intent = { role: 'supervisor', family: 'agy:gemini', provider: 'agy-gemini', operationId: 'wf', attempt: 1 };
   const permit = await authority.authorize(intent);
   let providerCalls = 0;
-  await authority.dispatch(permit, intent, async () => { providerCalls += 1; });
+  await authority.dispatch(permit, intent, async () => { providerCalls += 1; return { usage: { input_tokens: 1, output_tokens: 1 } }; });
   await assert.rejects(
     authority.dispatch(permit, intent, async () => { providerCalls += 1; }),
     (err) => err.code === AUTHORIZATION_ERROR_CODES.PERMIT_CONSUMED,
@@ -196,14 +196,14 @@ test('F: real retryable failure fails over and the next provider gets a NEW perm
             usage: { input_tokens: 40, output_tokens: 0, callId: 'call-agy-gemini-1' },
           });
         },
-        'codex:default': async () => { attempts.push('codex:default'); return { action: 'WORKFLOW_DONE' }; },
+        'codex:default': async () => { attempts.push('codex:default'); return { action: 'WORKFLOW_DONE', usage: { input_tokens: 3, output_tokens: 1 } }; },
       },
     },
     policy: (intent) => { seenIntents.push(intent); return { allow: true }; },
   });
 
   const { value, selection } = await runtime.invoke('supervisor', { ctx: 1 }, { operationId: 'wf:s' });
-  assert.deepEqual(value, { action: 'WORKFLOW_DONE' });
+  assert.deepEqual(value, { action: 'WORKFLOW_DONE', usage: { input_tokens: 3, output_tokens: 1 } });
   assert.equal(selection.requestedFamily, 'codex:default');
   assert.deepEqual(attempts, ['agy:gemini', 'codex:default']);
 

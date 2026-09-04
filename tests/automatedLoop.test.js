@@ -2024,7 +2024,7 @@ test('regression: an Executor provider timeout fails over sonnet -> codex -> opu
         'codex:default': timeout('codex:default'),
         'claude:opus': async (payload) => {
           attempted.push('claude:opus');
-          return demoExecutionReport(payload.taskCard.task_id);
+          return demoExecutionReport(payload.taskCard.task_id, { usage: { input_tokens: 1, output_tokens: 1 } });
         },
       },
     },
@@ -2078,7 +2078,10 @@ test('executor mechanical budget breaker is not silently failed over into a seco
       executor: {
         'claude:sonnet': async () => {
           attempted.push('sonnet');
-          throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED, 'executor runtime exceeded mechanical limit');
+          // A post-send budget guard fires with real provider usage already
+          // in hand (see modelSpendAuthority.js's extractSettlementUsage
+          // doc) — it is never a bare "no response at all" failure.
+          throw new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED, 'executor runtime exceeded mechanical limit', { usage: { input_tokens: 50, output_tokens: 0 } });
         },
         'claude:opus': async () => {
           attempted.push('opus');

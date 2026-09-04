@@ -54,7 +54,10 @@ test('A: task usage at the limit after call #1 denies call #2 before dispatch', 
         'claude:sonnet': async () => {
           dispatched += 1;
           record(usageTracker, { taskId: 't1', callId: `c${dispatched}`, usageVolume: 100 });
-          return 'ok';
+          // The reliable usage evidence dispatch() itself needs to settle
+          // SETTLED_KNOWN (distinct from the manual usageTracker.record()
+          // above, which simulates this Card's own budget accounting).
+          return { value: 'ok', usage: { input_tokens: 100, output_tokens: 0 } };
         },
       },
     },
@@ -236,9 +239,9 @@ test('I: a well-formed operationId still passes under the ceiling', async () => 
     usageTracker,
     ceilings: { taskExecutorUsageVolumeCeiling: 100 },
     rolePolicy: { executor: [{ family: 'claude:sonnet' }] },
-    adapters: { executor: { 'claude:sonnet': async () => { dispatched += 1; return 'ok'; } } },
+    adapters: { executor: { 'claude:sonnet': async () => { dispatched += 1; return { label: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }; } } },
   });
   const result = await runtime.invoke('executor', {}, { operationId: 'wf-123:task-1' });
-  assert.equal(result.value, 'ok');
+  assert.equal(result.value.label, 'ok');
   assert.equal(dispatched, 1);
 });

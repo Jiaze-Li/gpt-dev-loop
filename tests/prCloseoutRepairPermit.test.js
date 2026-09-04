@@ -31,6 +31,12 @@ function execReport(overrides = {}) {
     task_id: 'pr-closeout-repair',
     repository_context: { repository_name: 'r', repository_url: null, branch: 'main', commit_sha: 'def' },
     status: 'COMPLETE', changed_files: [], tests_run: [], test_results: [], issues: 'none', next_recommendation: 'proceed',
+    // Reliable usage evidence — without it, dispatch() correctly settles
+    // UNRESOLVED and this becomes an immediate Token Safety block instead of
+    // an ordinary successful repair (see modelSpendAuthority.js §Failure 1
+    // and the final Reservation rework). Tests that specifically exercise
+    // that block (unresolved/settlement-failure cases) override this field.
+    usage: { input_tokens: 10, output_tokens: 5, callId: 'repair-call-1' },
     ...overrides,
   };
 }

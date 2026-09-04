@@ -132,7 +132,27 @@ export function selectProviders({
     }
     return resolved;
   };
-  const resolveAndCapture = async (resolve, call) => capturePlannerResolution(await resolve(call));
+  // `resolve` decides internally whether the real transport (`call`) is
+  // actually invoked — the documented "Planner happy path is zero-token"
+  // contract (a deterministic/local resolution, e.g. an already-complete
+  // plan) never calls it at all. That is the one case Token Safety's own
+  // rule already carves out (see modelSpendAuthority.js's
+  // extractSettlementUsage doc): usage is mechanically, provably zero only
+  // when the call type cannot have billed anything — never estimated, never
+  // assumed from a bare successful return. Tracking whether `call` was
+  // physically invoked lets this attach that mechanical zero rather than
+  // leaving a genuinely zero-spend local resolution UNRESOLVED and blocking
+  // the workflow. Any resolution that DID reach the transport is untouched:
+  // its own usage (or lack of it) stands, subject to the general rule.
+  const resolveAndCapture = async (resolve, call) => {
+    let transportInvoked = false;
+    const trackedCall = async (...args) => { transportInvoked = true; return call(...args); };
+    const resolved = await resolve(trackedCall);
+    if (!transportInvoked && resolved && typeof resolved === 'object' && resolved.usage == null) {
+      resolved.usage = { input_tokens: 0, output_tokens: 0 };
+    }
+    return capturePlannerResolution(resolved);
+  };
 
   const getSupervisor = (family) => {
     if (!sessions.has(family)) {

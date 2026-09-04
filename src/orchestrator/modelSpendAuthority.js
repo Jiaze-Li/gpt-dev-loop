@@ -44,7 +44,9 @@
 // one permit per physical attempt, never one per logical role invocation.
 
 import { randomUUID } from 'node:crypto';
-import { AuthorizationError, AUTHORIZATION_ERROR_CODES } from './errors.js';
+import {
+  AuthorizationError, AUTHORIZATION_ERROR_CODES, isCancellation,
+} from './errors.js';
 import { isExecutorEligible as productionIsExecutorEligible } from './providerCapabilities.js';
 import { ReservationLedger } from './modelSpendReservation.js';
 
@@ -260,8 +262,14 @@ export class ModelSpendAuthority {
   // dispatchFn is ever invoked (a persistence failure here means dispatchFn
   // is never called — fail closed). After dispatchFn settles (success or
   // throw), the reservation is settled: SETTLED_KNOWN when reliable usage
-  // evidence exists, UNRESOLVED otherwise (never estimated, never treated as
-  // zero — see extractSettlementUsage above).
+  // evidence exists (the original business success/failure is returned/
+  // thrown normally), UNRESOLVED otherwise (never estimated, never treated
+  // as zero — see extractSettlementUsage above). An UNRESOLVED outcome is
+  // itself an immediate Token Safety blocking condition: this method NEVER
+  // returns/throws the original business outcome once usage is unresolved —
+  // it throws AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED
+  // instead, so a caller cannot mistake "the call functionally succeeded"
+  // for "it is safe to keep advancing the workflow".
   async dispatch(permit, rawIntent, dispatchFn) {
     const intent = normalizeCallIntent(rawIntent);
     const token = permit instanceof PhysicalCallPermit
@@ -365,8 +373,44 @@ export class ModelSpendAuthority {
         ? 'PROVIDER_CALL_SUCCEEDED_NO_RELIABLE_USAGE'
         : (outcome.error?.code ?? outcome.error?.message ?? 'USAGE_UNKNOWN_AFTER_DISPATCH'),
     });
-    if (outcome.ok) return outcome.value;
-    throw outcome.error;
+    // A cancellation (AbortSignal, AGY_ABORTED, a killed child process, ...)
+    // is a pre-existing, orthogonal invariant (see errors.js#isCancellation):
+    // it is never a provider/spend failure and must reach the caller as
+    // EXACTLY the original cancellation error, unrecognisable-as-anything-
+    // else, so the runtime's own cancellation short-circuit (zero failover,
+    // zero classification, zero health/quota mutation) still fires. The
+    // reservation is still latched UNRESOLVED above — a cancellation gives no
+    // more proof of zero spend than any other unknown-usage outcome — but the
+    // error object propagated here is deliberately NOT wrapped, unlike every
+    // other unresolved-usage case below.
+    if (!outcome.ok && isCancellation(outcome.error)) {
+      throw outcome.error;
+    }
+    // An UNRESOLVED reservation is not merely a guard against the NEXT
+    // physical call — it is an immediate Token Safety blocking outcome for
+    // THIS invocation too. The reservation is already durably persisted as
+    // UNRESOLVED (above) and its own BLOCKING safety event already recorded
+    // (ReservationLedger.markUnresolved -> recordSafetyEvent) before this
+    // throws, so the workflow-visible halt is never racing ahead of the
+    // durable/user-visible record of why. dispatch() must NEVER let a
+    // provider/business outcome (success OR failure) escape as an ordinary
+    // result once usage is unresolved: the caller only ever sees a single
+    // deterministic AuthorizationError, exactly like every other Reservation
+    // fail-closed path — no failover, no provider-health mutation, no new
+    // physical call. The original functional outcome is preserved only as
+    // non-authoritative diagnostic metadata (`details.businessOutcome`),
+    // never as a signal that the invocation was safe to treat as complete.
+    throw new AuthorizationError(
+      AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+      `${intent.role} physical call for ${JSON.stringify(intent.family)} `
+        + `${outcome.ok ? 'completed' : 'may have completed'} but its usage could not be reliably settled; `
+        + 'further automatic workflow progression is blocked until a human clears the unresolved model spend reservation',
+      {
+        intent,
+        businessOutcome: outcome.ok ? 'SUCCESS' : 'FAILURE',
+        ...(outcome.ok ? {} : { originalErrorMessage: outcome.error?.message ?? String(outcome.error), originalErrorCode: outcome.error?.code ?? null }),
+      },
+    );
   }
 
   // Test / diagnostics only.
