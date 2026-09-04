@@ -3,9 +3,20 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
 import { createProductionRoleRuntime } from '../src/orchestrator/productionRoleRuntime.js';
+import { ModelSpendAuthority } from '../src/orchestrator/modelSpendAuthority.js';
 import { RoleRouter, QuotaPoolRegistry, ProviderHealthRegistry } from '../src/orchestrator/roleRouting.js';
 import { createGateRunner } from '../src/orchestrator/adapters/gateRunner.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
+
+// These two tests exercise the GENERIC productionRoleRuntime failover
+// mechanism across families, not the current SuperGPT production policy
+// (Sonnet-only Executor — see providerCapabilities.js). ModelSpendAuthority
+// always enforces provider eligibility regardless of rolePolicy, so a
+// TEST-ONLY permissive capability source is injected explicitly; production
+// code never does this.
+const testOnlyPermissiveCapabilities = {
+  isExecutorEligible: (family) => ['claude:sonnet', 'codex:default', 'claude:opus'].includes(family),
+};
 
 test('ProviderHealthRegistry: candidate-level failure does not disable other models of the same provider', () => {
   const health = new ProviderHealthRegistry();
@@ -66,6 +77,7 @@ test('RoleRouter & Runtime: claude:sonnet timeout allows failover to codex and t
     }),
     adapters,
     onEvent: (e) => events.push(e),
+    spendAuthority: new ModelSpendAuthority({ providerCapabilities: testOnlyPermissiveCapabilities }),
   });
 
   const result = await runtime.invoke('executor', { taskCard: { task_id: 't-1' } });
@@ -122,6 +134,7 @@ test('RoleRouter & Runtime: when all candidates are exhausted, throws identifiab
       capabilities: { roles: ['executor'] },
     }),
     adapters,
+    spendAuthority: new ModelSpendAuthority({ providerCapabilities: testOnlyPermissiveCapabilities }),
   });
 
   await assert.rejects(

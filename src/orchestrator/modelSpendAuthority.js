@@ -6,8 +6,21 @@
 //
 // This module establishes the invariant "every real internal provider
 // invocation must hold a valid, single-use PhysicalCallPermit before
-// dispatch". It intentionally carries NO token-budget policy yet: the default
-// policy is allow-all. Even so it still enforces:
+// dispatch". It carries NO token-budget policy yet: the default injected
+// policy is allow-all (budget authorization is a later task; see Card 3 for
+// per-physical-call budget rechecks). It DOES enforce one built-in
+// invariant ahead of the injected `policy` callback — provider eligibility
+// for the requested role, decided by an explicit `providerCapabilities`
+// source (default: the PRODUCTION Provider Capability Policy in
+// providerCapabilities.js) — so an Executor CallIntent for a family not
+// declared executorEligible (e.g. codex:default, claude:opus while the
+// automatic Executor chain is Sonnet-only) is denied before any `policy`
+// or permit exists, REGARDLESS of what rolePolicy routed it here. This is
+// not a bypassable flag: there is no "skip eligibility" switch, only which
+// capability source answers "is this family eligible" — production code
+// always uses the production source; only test fixtures that need to
+// exercise the generic multi-provider failover mechanism inject an
+// explicit TEST-ONLY permissive source. Even so it still enforces:
 //
 //   * permit issuance   — a permit is minted only by authorize(); an ordinary
 //                          caller cannot synthesize one (the token is held in
@@ -24,6 +37,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { AuthorizationError, AUTHORIZATION_ERROR_CODES } from './errors.js';
+import { isExecutorEligible as productionIsExecutorEligible } from './providerCapabilities.js';
 
 // The strongest invocation identifiers mechanically available at the role
 // runtime boundary. Missing semantic IDs are bound as null rather than
@@ -77,9 +91,20 @@ export class ModelSpendAuthority {
   // `policy(intent) -> { allow: boolean, reason?: string }`. The default is a
   // deterministic allow-all: budget authorization is a later task. Swapping in
   // a real policy does not change any of the permit mechanics below.
-  constructor({ policy = () => ({ allow: true }), onEvent } = {}) {
+  //
+  // `providerCapabilities` — an explicit { isExecutorEligible(family) ->
+  // boolean } source for the built-in eligibility invariant below. Defaults
+  // to the PRODUCTION Provider Capability Policy
+  // (providerCapabilities.js — Sonnet-only Executor). This is deliberately
+  // NOT a bypass flag: there is no "skip eligibility" option, only "which
+  // capability source decides eligibility". Production code must never
+  // override it; only test fixtures that explicitly need to exercise the
+  // generic multi-provider failover mechanism inject a TEST-ONLY permissive
+  // source here — production `rolePolicy` choices never do.
+  constructor({ policy = () => ({ allow: true }), onEvent, providerCapabilities } = {}) {
     this._policy = policy;
     this._onEvent = onEvent;
+    this._isExecutorEligible = providerCapabilities?.isExecutorEligible ?? productionIsExecutorEligible;
     this._issued = new Map(); // token -> { intent, consumed, consumedAt }
   }
 
@@ -87,6 +112,20 @@ export class ModelSpendAuthority {
   // INTENT_INCOMPLETE) before any permit exists if the intent is rejected.
   authorize(rawIntent) {
     const intent = normalizeCallIntent(rawIntent);
+    // Provider eligibility is a built-in Authority invariant, not a
+    // caller-overridable policy choice: it is checked BEFORE the injected
+    // policy callback, so no custom policy can accidentally re-open a
+    // provider that providerCapabilities.js does not declare eligible for
+    // this role. Today this only constrains role === 'executor' (Executor
+    // automatic chain is Sonnet-only); other roles are unaffected even when
+    // routed to codex/agy families.
+    if (intent.role === 'executor' && !this._isExecutorEligible(intent.family)) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.PROVIDER_NOT_ELIGIBLE_FOR_ROLE,
+        `provider family "${intent.family}" is not executorEligible; the automatic Executor chain does not include it`,
+        { intent },
+      );
+    }
     let decision;
     try {
       decision = this._policy(intent);

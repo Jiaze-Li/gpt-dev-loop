@@ -93,6 +93,9 @@ export const AUTHORIZATION_ERROR_CODES = Object.freeze({
   PERMIT_UNKNOWN: 'PERMIT_UNKNOWN',
   PERMIT_CONSUMED: 'PERMIT_CONSUMED',
   PERMIT_INTENT_MISMATCH: 'PERMIT_INTENT_MISMATCH',
+  // authorize() rejected the CallIntent because the provider/family is not
+  // declared executorEligible for this role (see providerCapabilities.js).
+  PROVIDER_NOT_ELIGIBLE_FOR_ROLE: 'PROVIDER_NOT_ELIGIBLE_FOR_ROLE',
 });
 
 export function isAuthorizationFailure(error) {

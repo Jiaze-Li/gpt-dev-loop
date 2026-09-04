@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { runAutomatedWorkflow } from '../src/orchestrator/automatedLoop.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
 import { createProductionRoleRuntime } from '../src/orchestrator/productionRoleRuntime.js';
+import { ModelSpendAuthority } from '../src/orchestrator/modelSpendAuthority.js';
 import { QuotaPoolRegistry, ProviderHealthRegistry } from '../src/orchestrator/roleRouting.js';
 import { buildPrompt, measureExecutorInputBreakdown } from '../src/orchestrator/adapters/claudeExecutorAdapter.js';
 import { UsageTracker } from '../src/orchestrator/usageTracker.js';
@@ -1948,7 +1949,7 @@ test('P1-1. Gate FAIL routes to REWORK with zero Reviewer calls; PASS after fix 
 // production wiring behaves. Used to prove the loop's implementation-retry
 // accounting (attemptCount / history.attempts) is not charged for provider
 // failover.
-function makeRuntimeBackedClaudeManagerFactory({ rolePolicy, adapters, onEvent } = {}) {
+function makeRuntimeBackedClaudeManagerFactory({ rolePolicy, adapters, onEvent, spendAuthority } = {}) {
   const managers = [];
   function createClaudeSessionManager({ taskId }) {
     const executions = [];
@@ -1964,6 +1965,7 @@ function makeRuntimeBackedClaudeManagerFactory({ rolePolicy, adapters, onEvent }
       }),
       adapters,
       onEvent,
+      ...(spendAuthority ? { spendAuthority } : {}),
     });
     const manager = {
       taskId,
@@ -1982,6 +1984,17 @@ function makeRuntimeBackedClaudeManagerFactory({ rolePolicy, adapters, onEvent }
 }
 
 test('regression: an Executor provider timeout fails over sonnet -> codex -> opus inside one attempt, without consuming an implementation retry', async () => {
+  // This test exercises the GENERIC productionRoleRuntime failover
+  // mechanism, not the current SuperGPT production policy (which is
+  // Sonnet-only — see providerCapabilities.js). ModelSpendAuthority always
+  // enforces provider eligibility regardless of rolePolicy, so a
+  // TEST-ONLY permissive capability source is injected explicitly here to
+  // allow codex/opus as Executor candidates; production code never does
+  // this.
+  const testOnlyPermissiveCapabilities = {
+    isExecutorEligible: (family) => ['claude:sonnet', 'codex:default', 'claude:opus'].includes(family),
+  };
+  const spendAuthority = new ModelSpendAuthority({ providerCapabilities: testOnlyPermissiveCapabilities });
   const taskCard = demoTaskCard();
   const supervisor = makeFakeSupervisor([
     { action: 'NEXT_TASK', task_card: taskCard },
@@ -2001,6 +2014,7 @@ test('regression: an Executor provider timeout fails over sonnet -> codex -> opu
     rolePolicy: {
       executor: [{ family: 'claude:sonnet' }, { family: 'codex:default' }, { family: 'claude:opus' }],
     },
+    spendAuthority,
     adapters: {
       executor: {
         'claude:sonnet': timeout('claude:sonnet'),
@@ -2043,6 +2057,11 @@ test('regression: an Executor provider timeout fails over sonnet -> codex -> opu
   const failed = events.filter((e) => e.type === 'ROLE_INVOCATION_FAILED');
   assert.deepEqual(failed.map((e) => e.failure), ['PROVIDER_TIMEOUT', 'PROVIDER_TIMEOUT']);
   assert.equal(events.filter((e) => e.type === 'ROLE_INVOCATION_SUCCEEDED').length, 1);
+
+  // Every physical failover attempt (sonnet, codex, opus) obtained and
+  // consumed its OWN fresh permit — none reused a prior candidate's permit
+  // or authorization decision.
+  assert.deepEqual(spendAuthority.stats(), { issued: 3, consumed: 3, outstanding: 0 });
 });
 
 test('executor mechanical budget breaker is not silently failed over into a second full provider run', async () => {
