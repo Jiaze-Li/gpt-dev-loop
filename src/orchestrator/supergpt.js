@@ -22,6 +22,8 @@ import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { runAutomatedWorkflow } from './automatedLoop.js';
 import { selectProviders } from './providerSelection.js';
 import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
+import { ModelSpendAuthority } from './modelSpendAuthority.js';
+import { isAuthorizationFailure } from './errors.js';
 import { createGateRunner } from './adapters/gateRunner.js';
 import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.js';
 import { Persistence } from './persistence.js';
@@ -884,8 +886,13 @@ export function createRealGithubPrCloseoutAdapters({
   workflowUsageVolumeCeiling = 0,
   taskExecutorUsageVolumeCeiling = 0,
   executorPhysicalCallCeiling = 0,
+  // Test seam only: overrides the fallback Executor session manager used when
+  // `selection` has no role runtime. Production always passes the real
+  // `selection` and takes the runtime-backed primary path.
+  _createClaudeSessionManager = null,
 } = {}) {
   const prNum = Number(prNumber);
+  const createFallbackExecutorManager = _createClaudeSessionManager || createClaudeSessionManager;
 
   const getPrHead = async () => {
     try {
@@ -1157,11 +1164,48 @@ export function createRealGithubPrCloseoutAdapters({
 
       let executionReport = null;
       try {
-        const executorManager = typeof selection?.createExecutorSessionManager === 'function'
-          ? selection.createExecutorSessionManager({ taskId: repairTaskId, cwd: repoRoot })
-          : createClaudeSessionManager({ taskId: repairTaskId, cwd: repoRoot });
-        executionReport = await executorManager.execute(card, { signal });
+        let runExecution;
+        if (typeof selection?.createExecutorSessionManager === 'function') {
+          // Primary path: the executor session manager routes through
+          // productionRoleRuntime.invoke('executor'), which already obtains
+          // and consumes a PhysicalCallPermit per physical attempt.
+          const executorManager = selection.createExecutorSessionManager({ taskId: repairTaskId, cwd: repoRoot });
+          runExecution = () => executorManager.execute(card, { signal });
+        } else {
+          // Fallback path: no role runtime available, so this internal
+          // Claude physical model call would otherwise bypass the authority.
+          // Apply the SAME ModelSpendAuthority contract here — build a
+          // CallIntent, authorize it, and run the provider dispatch only
+          // through spendAuthority.dispatch(). Permit single-use / intent
+          // binding / default-deny stay entirely inside the authority.
+          const spendAuthority = selection?.runtime?.spendAuthority ?? new ModelSpendAuthority();
+          const executorManager = createFallbackExecutorManager({ taskId: repairTaskId, cwd: repoRoot });
+          const callIntent = {
+            role: 'executor',
+            family: 'claude:sonnet',
+            provider: 'claude',
+            operationId: workflowId ?? repairTaskId,
+            attempt: 1,
+          };
+          const permit = spendAuthority.authorize(callIntent);
+          runExecution = () => spendAuthority.dispatch(permit, callIntent, () => executorManager.execute(card, { signal }));
+        }
+        executionReport = await runExecution();
       } catch (err) {
+        // An authorization / permit failure is an orchestrator decision, not
+        // a provider failure: the physical Claude call did not happen. Do not
+        // run it through the adapter-error / safety-event classification, do
+        // not record provider usage, do not retry or fail over — return a
+        // structured authorization failure immediately.
+        if (isAuthorizationFailure(err)) {
+          return {
+            status: 'FAILED',
+            gateResult: 'FAIL',
+            error: err.message,
+            authorizationFailure: true,
+            authorizationCode: err.code ?? null,
+          };
+        }
         // A post-send token-safety guard (budget / duplicate call) still
         // consumed a real provider call: record its usage, surface a
         // user-visible BLOCKING safety event, and return a STRUCTURED
