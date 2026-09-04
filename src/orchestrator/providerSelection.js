@@ -20,6 +20,14 @@ import { randomUUID } from 'node:crypto';
 import { createFailoverSupervisorSession } from './supervisorFailover.js';
 import { createProductionRoleRuntime } from './productionRoleRuntime.js';
 import { PRODUCTION_ROLE_CAPABILITIES } from './roleRouting.js';
+import { ModelSpendAuthority } from './modelSpendAuthority.js';
+import { createExecutorBudgetPolicy } from './executorBudgetPolicy.js';
+import {
+  resolveWorkflowCostCeilingUsd,
+  resolveWorkflowUsageVolumeCeiling,
+  resolveTaskExecutorUsageVolumeCeiling,
+  resolveExecutorPhysicalCallCeiling,
+} from './workflowCostGuard.js';
 import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
 import { createAgyReviewerProvider } from './adapters/agyReviewerProvider.js';
 import {
@@ -139,8 +147,24 @@ export function selectProviders({
     }
     return sessions.get(family);
   };
+  // Re-checked fresh at EVERY physical dispatch attempt (ModelSpendAuthority
+  // .authorize() runs once per physical attempt, including a future
+  // re-enabled failover's 2nd/3rd candidate inside one invoke()) — reuses
+  // the same env-resolved ceilings and the same usageTracker as the
+  // pre-invoke() checks in automatedLoop.js / supergpt.js, so it agrees with
+  // them in the common single-attempt case and only ever adds a stop that
+  // those pre-checks could not see (a second physical attempt after the
+  // first one's usage was recorded).
+  const executorBudgetPolicy = createExecutorBudgetPolicy({
+    usageTracker,
+    workflowCostCeilingUsd: resolveWorkflowCostCeilingUsd(env),
+    workflowUsageVolumeCeiling: resolveWorkflowUsageVolumeCeiling(env),
+    taskExecutorUsageVolumeCeiling: resolveTaskExecutorUsageVolumeCeiling(env),
+    executorPhysicalCallCeiling: resolveExecutorPhysicalCallCeiling(env),
+  });
+  const spendAuthority = new ModelSpendAuthority({ policy: executorBudgetPolicy, onEvent });
   const runtime = createProductionRoleRuntime({
-    router, rolePolicy, quotaRegistry, providerHealth, onEvent, signal,
+    router, rolePolicy, quotaRegistry, providerHealth, onEvent, signal, spendAuthority,
     resolveFamily: (family) => ({
       requestedFamily: family,
       resolvedModel: family === 'codex:default' ? codexModel : family === 'agy:gpt-oss' ? gptOssModel : family === 'agy:gemini' ? geminiModel : family.split(':')[1],
