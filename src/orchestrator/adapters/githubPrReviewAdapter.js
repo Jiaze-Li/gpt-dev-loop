@@ -368,6 +368,31 @@ export function createGithubPrReviewAdapter({
       return pendingState;
     }
 
+    // Zero-spend mechanical availability probe FIRST, before the authority is
+    // ever touched. Proving a reviewer unavailable here never creates a
+    // reservation and never consumes a trigger slot (§ Part E) — a different
+    // reviewer may still authorize the SAME head afterward. This makes the
+    // documented invariant ("availability failure is zero-spend") literally
+    // true rather than aspirational: nothing below this point runs for an
+    // unavailable reviewer.
+    if (typeof github.isReviewerAvailable === 'function') {
+      let available;
+      try {
+        available = await github.isReviewerAvailable({ reviewer: reviewerKey });
+      } catch (error) {
+        throw Object.assign(new Error('reviewer availability probe failed'), {
+          _classified: classifyClientError(error),
+          _dispatched: false,
+        });
+      }
+      if (!available) {
+        throw Object.assign(new Error(`reviewer ${reviewerKey} unavailable`), {
+          _classified: GITHUB_REVIEW_FAILURES.UNAVAILABLE,
+          _dispatched: false,
+        });
+      }
+    }
+
     const triggerIntent = {
       workflowId, prNumber, headSha: head, triggerKind: 'PR_REVIEW', reviewer: reviewerKey, semanticAction: 'EXTERNAL_PR_REVIEW',
     };
@@ -376,9 +401,11 @@ export function createGithubPrReviewAdapter({
     // External Model Trigger Authority FIRST. This is what makes "one
     // external trigger per semantic HEAD state" hold across reviewers: a
     // duplicate/ceiling/wall-clock denial here is a fail-closed orchestrator
-    // decision, never a reviewer/provider failure. A durably TRIGGERED
-    // record for this exact head (posted by ANY reviewer, in this or a
-    // prior process) is reused via 'REUSE' rather than posted again.
+    // decision, never a reviewer/provider failure. Once authorize() has been
+    // called, the physical dispatch boundary MAY have been crossed — every
+    // failure from here on is classified `_dispatched: true` so the caller
+    // never treats it as a zero-spend reviewer failure eligible for
+    // cross-reviewer failover.
     let authorization;
     try {
       authorization = await triggerAuthority.authorize(triggerIntent);
@@ -386,41 +413,36 @@ export function createGithubPrReviewAdapter({
       throw Object.assign(new Error(error?.message ?? 'external trigger authorization denied'), {
         _classified: GITHUB_REVIEW_FAILURES.AUTHORITY_BLOCKED,
         _authorityCode: error?.code ?? null,
+        _dispatched: true,
       });
     }
 
     if (authorization.outcome === 'REUSE') {
+      // A durably TRIGGERED record for this exact head — posted by ANY
+      // reviewer, in this or a prior process — is reused, never re-posted.
+      // Preserve the ORIGINAL reviewer identity from the persisted trigger;
+      // never reinterpret it as belonging to whichever reviewer happens to
+      // be asking now (§ REUSE reviewer semantics). `matchResult` below polls
+      // for a result authored by this ORIGINAL identity, not by whichever
+      // reviewer's adapter happens to be reusing the trigger — a Claude
+      // adapter reusing a Codex-posted trigger keeps polling for Codex's
+      // result, and never mistakes silence for its own timeout identity.
+      const originalReviewer = String(authorization.trigger.reviewer ?? '').trim().toLowerCase();
       pendingState = {
-        reviewer: reviewerKey,
+        reviewer: originalReviewer || reviewerKey,
         headSha: head,
         commentId: authorization.trigger.commentId,
         triggeredAt: authorization.trigger.triggeredAt,
         body: resolveTriggerText(reviewerKey, { overrides: triggerOverrides }),
+        reused: true,
+        reusedFromDifferentReviewer: Boolean(originalReviewer && originalReviewer !== reviewerKey),
       };
       await savePending();
       return pendingState;
     }
 
-    // ALLOW — the zero-spend availability probe still gates the physical
-    // post: proving a reviewer unavailable BEFORE dispatch() ever runs never
-    // consumes the authorization (§ Part E), so another reviewer may still
-    // authorize the SAME head afterward.
-    if (typeof github.isReviewerAvailable === 'function') {
-      let available;
-      try {
-        available = await github.isReviewerAvailable({ reviewer: reviewerKey });
-      } catch (error) {
-        throw Object.assign(new Error('reviewer availability probe failed'), {
-          _classified: classifyClientError(error),
-        });
-      }
-      if (!available) {
-        throw Object.assign(new Error(`reviewer ${reviewerKey} unavailable`), {
-          _classified: GITHUB_REVIEW_FAILURES.UNAVAILABLE,
-        });
-      }
-    }
-
+    // ALLOW — availability was already proven above, so the physical post
+    // runs unconditionally from here.
     const body = resolveTriggerText(reviewerKey, { overrides: triggerOverrides });
     let trigger;
     try {
@@ -433,6 +455,7 @@ export function createGithubPrReviewAdapter({
       throw Object.assign(new Error(error?.message ?? 'failed to post review trigger comment'), {
         _classified: GITHUB_REVIEW_FAILURES.AUTHORITY_BLOCKED,
         _authorityCode: error?.code ?? null,
+        _dispatched: true,
       });
     }
     pendingState = {
@@ -446,10 +469,18 @@ export function createGithubPrReviewAdapter({
     return pendingState;
   }
 
+  // Match against the ORIGINAL reviewer identity that dispatched `trigger`
+  // (§ REUSE reviewer semantics) — this reviewerKey's own `identity` only when
+  // the trigger is genuinely ours; a reused trigger from another reviewer
+  // polls for THAT reviewer's authored result, never ours.
   function matchResult(results, trigger, head) {
     if (!Array.isArray(results)) return null;
+    const matchReviewerKey = String(trigger?.reviewer ?? reviewerKey).trim().toLowerCase();
+    const matchIdentity = String(
+      reviewerIdentities[matchReviewerKey] ?? PR_REVIEWER_IDENTITY[matchReviewerKey] ?? matchReviewerKey,
+    ).trim().toLowerCase();
     for (const result of results) {
-      if (!authorMatchesReviewer(authorOf(result), identity, reviewerKey, reviewerIdentities)) continue;
+      if (!authorMatchesReviewer(authorOf(result), matchIdentity, matchReviewerKey, reviewerIdentities)) continue;
       if (headShaOf(result) !== head) continue; // provably bound to current head
       if (!isAfterTrigger(result, trigger)) continue; // ignore stale reviews
       return result;
@@ -466,10 +497,13 @@ export function createGithubPrReviewAdapter({
       try {
         head = String(await github.getPrHead({ prNumber }) ?? '').trim();
       } catch (error) {
-        return failure(classifyClientError(error), { reviewer: reviewerKey });
+        // No trigger has been attempted yet — mechanically zero-spend.
+        return failure(classifyClientError(error), { reviewer: reviewerKey, externalTriggerDispatched: false });
       }
     }
-    if (!head) return failure(GITHUB_REVIEW_FAILURES.INFRASTRUCTURE, { reviewer: reviewerKey });
+    if (!head) {
+      return failure(GITHUB_REVIEW_FAILURES.INFRASTRUCTURE, { reviewer: reviewerKey, externalTriggerDispatched: false });
+    }
 
     const deadline = now() + maxWaitMs;
     let interval = baseInterval;
@@ -481,6 +515,9 @@ export function createGithubPrReviewAdapter({
         reviewer: reviewerKey,
         head,
         authorityCode: error?._authorityCode ?? null,
+        externalTriggerDispatched: error?._dispatched === true,
+        triggerReused: error?._reused === true,
+        originalReviewer: error?._originalReviewer ?? null,
       });
     }
 
@@ -492,7 +529,8 @@ export function createGithubPrReviewAdapter({
       try {
         liveHead = String(await github.getPrHead({ prNumber }) ?? '').trim();
       } catch (error) {
-        return failure(classifyClientError(error), { reviewer: reviewerKey, head });
+        // A trigger already exists for `head` at this point — never zero-spend.
+        return failure(classifyClientError(error), { reviewer: reviewerKey, head, externalTriggerDispatched: true });
       }
       if (liveHead && liveHead !== head) {
         head = liveHead;
@@ -505,6 +543,10 @@ export function createGithubPrReviewAdapter({
           return failure(error?._classified ?? GITHUB_REVIEW_FAILURES.TRIGGER_FAILED, {
             reviewer: reviewerKey,
             head,
+            authorityCode: error?._authorityCode ?? null,
+            externalTriggerDispatched: error?._dispatched === true,
+            triggerReused: error?._reused === true,
+            originalReviewer: error?._originalReviewer ?? null,
           });
         }
       }
@@ -517,7 +559,7 @@ export function createGithubPrReviewAdapter({
           since: trigger.triggeredAt,
         });
       } catch (error) {
-        return failure(classifyClientError(error), { reviewer: reviewerKey, head });
+        return failure(classifyClientError(error), { reviewer: reviewerKey, head, externalTriggerDispatched: true });
       }
 
       const hit = matchResult(results, trigger, head);
@@ -551,6 +593,13 @@ export function createGithubPrReviewAdapter({
     return failure(GITHUB_REVIEW_FAILURES.TIMEOUT, {
       reviewer: reviewerKey,
       head,
+      // A trigger for this head was posted/reused before this wait began —
+      // never eligible for cross-reviewer failover or a synthetic clean
+      // fallback; the external review may still be running.
+      externalTriggerDispatched: true,
+      triggerState: 'TRIGGERED',
+      triggerReused: trigger?.reused === true,
+      originalReviewer: trigger?.reused ? (trigger.reviewer ?? null) : null,
       // The trigger stays pending so a later retry / resume de-dupes instead
       // of re-commenting.
       pending: snapshot(),

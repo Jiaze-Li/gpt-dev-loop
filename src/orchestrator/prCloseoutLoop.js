@@ -308,6 +308,19 @@ export async function runPrCloseoutLoop({
       ? await requestTrustedReview({ prNumber: current.prNumber, prHead: head })
       : await requestReview({ prNumber: current.prNumber, prHead: head });
 
+    // An external "@codex review" / "@claude review" trigger for this HEAD
+    // has already crossed the dispatch boundary and no trusted matching
+    // result has arrived yet (posted-trigger timeout, or a duplicate-blocked
+    // reuse under a different reviewer identity — see
+    // adapters/githubPrReviewAdapter.js and supergpt.js#requestTrustedReview).
+    // The external model may already be running: this must stop at
+    // HUMAN_REQUIRED rather than being ingested as a review payload (which
+    // would either throw on the malformed shape or, worse, be mistaken for a
+    // clean/actionable result).
+    if (review && typeof review === 'object' && review.pending === true) {
+      return terminal(PR_CLOSEOUT_LOOP_STATUS.HUMAN_REQUIRED, review.reason || 'external_review_pending', current);
+    }
+
     // A pushed repair is only confirmed by the same reviewer examining the
     // new head.  Compare stable signatures; absence confirms only that exact
     // subset.  Merely moving the head never changes finding lifecycle.

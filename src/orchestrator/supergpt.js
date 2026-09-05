@@ -86,7 +86,7 @@ import {
 } from './workflowState.js';
 import { runPrCloseoutLoop, PR_CLOSEOUT_LOOP_STATUS } from './prCloseoutLoop.js';
 import { initialCloseoutState, DEFAULT_MAX_REPAIR_ROUNDS, resolveReviewerFallbackOrder } from './prCloseoutPolicy.js';
-import { createGithubPrReviewAdapter } from './adapters/githubPrReviewAdapter.js';
+import { createGithubPrReviewAdapter, GITHUB_REVIEW_FAILURES } from './adapters/githubPrReviewAdapter.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import {
   WorkflowLifecycleManager,
@@ -876,6 +876,31 @@ export function startSuperGPT(options = {}) {
   return { status: WORKFLOW_STATUSES.RUNNING, workflowId };
 }
 
+// § Pending external review must never project to a synthetic internal clean
+// review. Once a "@codex review" / "@claude review" trigger for this exact
+// HEAD has crossed the External Model Trigger Authority's dispatch boundary
+// (DISPATCHING or later — see externalModelTriggerAuthority.js), the
+// external model has already been paid for / may already be running: a
+// mechanical timeout or an authority-blocked duplicate for that SAME head is
+// NEVER reinterpreted as "no review happened" and must NEVER be reported as
+// an ordinary reviewer failure. `createRealGithubPrCloseoutAdapters().
+// requestTrustedReview` is the only caller; exported so the closeout-loop
+// projection (-> HUMAN_REQUIRED, never DONE) is directly testable against
+// real githubPrReviewAdapter.js results without a live GitHub call.
+export function pendingTrustedReview(reviewerKey, res, prHead) {
+  return {
+    pending: true,
+    reviewer: res.originalReviewer || reviewerKey,
+    headSha: res.head || prHead || null,
+    reason: res.failure === GITHUB_REVIEW_FAILURES.TIMEOUT
+      ? 'external_review_posted_trigger_timeout'
+      : 'external_review_trigger_already_dispatched',
+    triggerState: res.triggerState ?? null,
+    triggerReused: res.triggerReused === true,
+    authorityCode: res.authorityCode ?? null,
+  };
+}
+
 export function createRealGithubPrCloseoutAdapters({
   repoRoot,
   cwd,
@@ -1092,6 +1117,7 @@ export function createRealGithubPrCloseoutAdapters({
       });
       const res = await codexAdapter.requestReview({ prNumber: p, prHead });
       if (res.ok) return res.review;
+      if (res.externalTriggerDispatched) return pendingTrustedReview('codex', res, prHead);
 
       const claudeAdapter = createGithubPrReviewAdapter({
         github: githubClient,
@@ -1103,7 +1129,12 @@ export function createRealGithubPrCloseoutAdapters({
       });
       const claudeRes = await claudeAdapter.requestReview({ prNumber: p, prHead });
       if (claudeRes.ok) return claudeRes.review;
+      if (claudeRes.externalTriggerDispatched) return pendingTrustedReview('claude', claudeRes, prHead);
 
+      // Neither reviewer ever crossed the dispatch boundary (both proven
+      // mechanically unavailable pre-dispatch) — zero external spend
+      // occurred, so an empty internal review is a truthful "nothing to
+      // report", never a mask over an unresolved external trigger.
       return {
         reviewer: 'internal',
         headSha: prHead || getPrHead(),
