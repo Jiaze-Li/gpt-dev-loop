@@ -73,6 +73,17 @@ function makeTempWorktreeRoot() {
   return root;
 }
 
+// Zombie/liveness reconciliation treats a non-terminal (RUNNING/STARTING/EXECUTOR)
+// workflow with no owner lease or heartbeat as stale once `startedAt` is more than
+// 24h in the past (see checkWorkflowLiveness in src/orchestrator/workflowState.js).
+// Fixtures representing a CURRENTLY LIVE workflow must anchor to Date.now(), not a
+// hard-coded calendar date, or they silently zombie-reconcile to STOPPED as the
+// suite ages. `offsetMs` lets a fixture look like it started slightly in the past
+// while staying well inside the 24h grace window.
+function liveIso(offsetMs = 0) {
+  return new Date(Date.now() - offsetMs).toISOString();
+}
+
 test('1. Security: Dashboard default binds to loopback and rejects 0.0.0.0 or foreign hosts', () => {
   assert.throws(
     () => createDashboardServer({ host: '0.0.0.0' }),
@@ -411,16 +422,17 @@ test('C. Workflow selector badge is identical to the header badge (single canoni
 test('D. Timeline shows newest-first in the view while the derived API stays chronological with untouched timestamps', () => {
   const root = makeTempWorktreeRoot();
   const wf = 'wf-agy-timeline-1111-2222-3333-444455556666';
+  const startedAt = liveIso(3 * 60_000);
   const state = {
     workflowId: wf,
     workflowStatus: 'RUNNING',
     stage: 'GATE',
-    startedAt: '2026-08-31T09:59:00.000Z',
+    startedAt,
     workflowPath: 'FULL',
     stageHistory: [
-      { stage: 'PLANNING', startedAt: '2026-08-31T10:00:00.000Z' },
-      { stage: 'EXECUTOR', startedAt: '2026-08-31T10:01:00.000Z', taskId: 'task-1', attempt: 1 },
-      { stage: 'GATE', startedAt: '2026-08-31T10:02:00.000Z', taskId: 'task-1', attempt: 1 },
+      { stage: 'PLANNING', startedAt: liveIso(2 * 60_000) },
+      { stage: 'EXECUTOR', startedAt: liveIso(1 * 60_000), taskId: 'task-1', attempt: 1 },
+      { stage: 'GATE', startedAt: liveIso(0), taskId: 'task-1', attempt: 1 },
     ],
   };
   fs.writeFileSync(path.join(root, `${wf}.state.json`), JSON.stringify(state, null, 2));
@@ -433,7 +445,7 @@ test('D. Timeline shows newest-first in the view while the derived API stays chr
       assert.ok(chronological[i].timestamp <= chronological[i + 1].timestamp);
     }
     const startEvent = chronological.find((e) => e.label === 'Workflow started');
-    assert.equal(startEvent.timestamp, new Date('2026-08-31T09:59:00.000Z').getTime());
+    assert.equal(startEvent.timestamp, new Date(startedAt).getTime());
 
     const detail = getWorkflowDetail({ workflowId: wf, root });
     // View copy is the exact reverse — newest first — with identical values.
@@ -447,7 +459,7 @@ test('D. Timeline shows newest-first in the view while the derived API stays chr
     // Source event timestamps are not mutated by the display reversal.
     assert.equal(
       deriveWorkflowTimeline(state)[0].timestamp,
-      new Date('2026-08-31T09:59:00.000Z').getTime()
+      new Date(startedAt).getTime()
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -564,18 +576,18 @@ test('M. /api/workflows returns Attention workflows by default, supports history
   const root = makeTempWorktreeRoot();
   try {
     // 2 active
-    fs.writeFileSync(path.join(root, 'wf-real-active-1.state.json'), JSON.stringify({ workflowId: 'wf-real-active-1', workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: '2026-08-31T10:00:00.000Z' }));
-    fs.writeFileSync(path.join(root, 'wf-real-active-2.state.json'), JSON.stringify({ workflowId: 'wf-real-active-2', workflowStatus: 'STARTING', stage: 'PLANNING', startedAt: '2026-08-31T09:00:00.000Z' }));
-    // 1 HUMAN_REQUIRED
+    fs.writeFileSync(path.join(root, 'wf-real-active-1.state.json'), JSON.stringify({ workflowId: 'wf-real-active-1', workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: liveIso(60_000) }));
+    fs.writeFileSync(path.join(root, 'wf-real-active-2.state.json'), JSON.stringify({ workflowId: 'wf-real-active-2', workflowStatus: 'STARTING', stage: 'PLANNING', startedAt: liveIso(120_000) }));
+    // 1 HUMAN_REQUIRED (terminal for liveness purposes — old timestamp is fine)
     fs.writeFileSync(path.join(root, 'wf-real-hr-1.state.json'), JSON.stringify({ workflowId: 'wf-real-hr-1', workflowStatus: 'HUMAN_REQUIRED', stage: 'HUMAN_REQUIRED', startedAt: '2026-08-31T08:00:00.000Z' }));
-    // 25 terminal workflows
+    // 25 terminal workflows (DONE is terminal for liveness — old timestamps are fine)
     for (let i = 1; i <= 25; i++) {
       const pad = String(i).padStart(2, '0');
       fs.writeFileSync(path.join(root, `wf-real-done-${pad}.state.json`), JSON.stringify({ workflowId: `wf-real-done-${pad}`, workflowStatus: 'DONE', stage: 'DONE', startedAt: `2026-08-30T${pad}:00:00.000Z` }));
     }
     // 5 test workflows
     fs.writeFileSync(path.join(root, 'wf-test-1.state.json'), JSON.stringify({ workflowId: 'wf-test-1', workflowStatus: 'DONE', stage: 'DONE', startedAt: '2026-08-31T11:00:00.000Z' }));
-    fs.writeFileSync(path.join(root, 'wf-agy-test-2.state.json'), JSON.stringify({ workflowId: 'wf-agy-test-2', workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: '2026-08-31T11:00:00.000Z' }));
+    fs.writeFileSync(path.join(root, 'wf-agy-test-2.state.json'), JSON.stringify({ workflowId: 'wf-agy-test-2', workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: liveIso(60_000) }));
     fs.writeFileSync(path.join(root, 'test-unit-3.state.json'), JSON.stringify({ workflowId: 'test-unit-3', workflowStatus: 'FAILED', stage: 'FAILED', startedAt: '2026-08-31T11:00:00.000Z' }));
 
     const server = createDashboardServer({ port: 0, root });
@@ -622,7 +634,7 @@ test('M2. User-facing semantics: Default selector shows ONLY active/unresolved w
   const root = makeTempWorktreeRoot();
   try {
     // A: RUNNING
-    fs.writeFileSync(path.join(root, 'wf-agy-a-running.state.json'), JSON.stringify({ workflowId: 'wf-agy-a-running', workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: '2026-08-31T10:00:00.000Z' }));
+    fs.writeFileSync(path.join(root, 'wf-agy-a-running.state.json'), JSON.stringify({ workflowId: 'wf-agy-a-running', workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: liveIso(60_000) }));
     // B: HUMAN_REQUIRED unresolved
     fs.writeFileSync(path.join(root, 'wf-agy-b-hr.state.json'), JSON.stringify({ workflowId: 'wf-agy-b-hr', workflowStatus: 'HUMAN_REQUIRED', stage: 'HUMAN_REQUIRED', startedAt: '2026-08-31T09:00:00.000Z' }));
     // C: DONE
@@ -690,7 +702,7 @@ test('Scenario A: Starting unrelated USER workflow C does NOT supersede A or B i
       kind: 'USER',
       workflowStatus: 'RUNNING',
       stage: 'EXECUTOR',
-      startedAt: '2026-08-31T09:00:00.000Z',
+      startedAt: liveIso(60_000),
     }));
 
     // Verify A and B are NOT modified and remain in HUMAN_REQUIRED
@@ -741,7 +753,7 @@ test('Scenario B: Explicit replacement B starting with supersedesWorkflowId mark
       kind: 'USER',
       workflowStatus: 'RUNNING',
       stage: 'EXECUTOR',
-      startedAt: '2026-08-31T09:00:00.000Z',
+      startedAt: liveIso(60_000),
     }));
 
     // A is superseded
@@ -797,12 +809,13 @@ test('Scenario D: Workflow A in HUMAN_REQUIRED when resume succeeds transitions 
   try {
     const wfA = 'wf-agy-a-hr';
     const stateFile = path.join(root, `${wfA}.state.json`);
+    const startedAt = liveIso(5 * 60_000);
     fs.writeFileSync(stateFile, JSON.stringify({
       workflowId: wfA,
       kind: 'USER',
       workflowStatus: 'HUMAN_REQUIRED',
       stage: 'HUMAN_REQUIRED',
-      startedAt: '2026-08-31T08:00:00.000Z',
+      startedAt,
     }));
 
     let att = listRecentWorkflows({ root, view: 'attention' });
@@ -816,7 +829,7 @@ test('Scenario D: Workflow A in HUMAN_REQUIRED when resume succeeds transitions 
       workflowStatus: 'RUNNING',
       stage: 'EXECUTOR',
       humanAnswer: 'Proceed',
-      startedAt: '2026-08-31T08:00:00.000Z',
+      startedAt,
     }));
 
     att = listRecentWorkflows({ root, view: 'attention' });
@@ -829,7 +842,7 @@ test('Scenario D: Workflow A in HUMAN_REQUIRED when resume succeeds transitions 
       kind: 'USER',
       workflowStatus: 'DONE',
       stage: 'DONE',
-      startedAt: '2026-08-31T08:00:00.000Z',
+      startedAt,
     }));
 
     // DONE workflow disappears from Attention and enters History
@@ -909,7 +922,7 @@ test('Q. API /api/focus and /api/workflows return active focus and header', asyn
   const root = makeTempWorktreeRoot();
   try {
     const wf = 'wf-agy-focus-test-1111-2222-3333-444455556666';
-    fs.writeFileSync(path.join(root, `${wf}.state.json`), JSON.stringify({ workflowId: wf, workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: '2026-08-31T10:00:00.000Z' }));
+    fs.writeFileSync(path.join(root, `${wf}.state.json`), JSON.stringify({ workflowId: wf, workflowStatus: 'RUNNING', stage: 'EXECUTOR', startedAt: liveIso(60_000) }));
     recordDashboardFocus({ workflowId: wf, kind: 'USER', root });
 
     const server = createDashboardServer({ port: 0, root });
@@ -1092,6 +1105,49 @@ test('T. Zombie / stale workflow lifecycle: dead process & expired heartbeat rec
     } finally {
       await server.close();
     }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('U. Regression: Attention fixtures must not silently depend on the wall-clock date (startedAt-only liveness path)', async () => {
+  const root = makeTempWorktreeRoot();
+  try {
+    // No lease, no heartbeatAt: liveness falls back to comparing `startedAt` against
+    // a 24h grace window (checkWorkflowLiveness, src/orchestrator/workflowState.js).
+    // A hard-coded calendar date here would eventually age past 24h and vanish from
+    // Attention as the suite keeps running on later days.
+    const wfFreshActive = 'wf-agy-fresh-active-3333';
+    fs.writeFileSync(path.join(root, `${wfFreshActive}.state.json`), JSON.stringify({
+      workflowId: wfFreshActive,
+      kind: 'USER',
+      workflowStatus: 'RUNNING',
+      stage: 'EXECUTOR',
+      startedAt: liveIso(30_000), // relative to Date.now(), not a calendar date
+    }));
+
+    const wfStaleActive = 'wf-agy-stale-active-4444';
+    fs.writeFileSync(path.join(root, `${wfStaleActive}.state.json`), JSON.stringify({
+      workflowId: wfStaleActive,
+      kind: 'USER',
+      workflowStatus: 'RUNNING',
+      stage: 'EXECUTOR',
+      startedAt: new Date(Date.now() - 25 * 60 * 60_000).toISOString(), // > 24h ago, no heartbeat/lease
+    }));
+
+    const att = listRecentWorkflows({ root, view: 'attention' });
+    const attIds = att.map(w => w.workflowId);
+    assert.ok(attIds.includes(wfFreshActive), 'fresh active workflow (relative to now) must stay in Attention');
+    assert.ok(!attIds.includes(wfStaleActive), 'stale active workflow (>24h, no lease/heartbeat) must be reconciled out of Attention');
+
+    const hist = listRecentWorkflows({ root, view: 'history' });
+    const histEntry = hist.find(w => w.workflowId === wfStaleActive);
+    assert.ok(histEntry, 'stale workflow must be reconciled into History');
+    assert.equal(histEntry.status, 'STOPPED');
+
+    const disk = JSON.parse(fs.readFileSync(path.join(root, `${wfStaleActive}.state.json`), 'utf8'));
+    assert.equal(disk.workflowStatus, 'STOPPED');
+    assert.ok(disk.stoppedReason.includes('zombie_reconciled'));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
