@@ -25,6 +25,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { callAgy, DEFAULT_AGY_MODEL } from '../src/agy/agyClient.js';
+import { assertRealProviderCallsAuthorized, REAL_PROVIDER_CALL_FLAG } from '../src/orchestrator/realProviderCallGuard.js';
 
 // Tolerant extraction of a turn counter from whatever envelope
 // `agy --output-format json` produced — the exact field name is
@@ -80,8 +81,13 @@ function detectExecutable() {
 }
 
 async function main() {
+  const rawArgs = process.argv.slice(2);
+  const explicitLiveIntent = rawArgs.includes(REAL_PROVIDER_CALL_FLAG);
+  assertRealProviderCallsAuthorized({ explicitLiveIntent, entrypoint: 'scripts/test-agy-conversations-live.js' });
+
+  const argv = rawArgs.filter((a) => a !== REAL_PROVIDER_CALL_FLAG);
   const model =
-    (typeof process.argv[2] === 'string' && process.argv[2].trim() !== '' && process.argv[2].trim()) ||
+    (typeof argv[0] === 'string' && argv[0].trim() !== '' && argv[0].trim()) ||
     (typeof process.env.AGY_MODEL === 'string' && process.env.AGY_MODEL.trim() !== '' && process.env.AGY_MODEL.trim()) ||
     DEFAULT_AGY_MODEL;
 
@@ -140,5 +146,8 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
+  main().catch((err) => {
+    console.error(err.message);
+    process.exit(err.exitCode ?? 1);
+  });
 }

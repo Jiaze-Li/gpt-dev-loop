@@ -17,6 +17,7 @@ import { decideAutoRoute } from '../src/control/autoRoutePolicy.js';
 import { compileSuperGptRequest } from '../src/control/requestCompiler.js';
 import { runSuperGPT, supergptStatus, supergptWait, SUPERGPT_EVENTS } from '../src/orchestrator/supergpt.js';
 import { UsageTracker } from '../src/orchestrator/usageTracker.js';
+import { assertRealProviderCallsAuthorized, REAL_PROVIDER_CALL_FLAG } from '../src/orchestrator/realProviderCallGuard.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -94,6 +95,11 @@ function formatDuration(ms) {
 }
 
 async function run() {
+  assertRealProviderCallsAuthorized({
+    explicitLiveIntent: process.argv.slice(2).includes(REAL_PROVIDER_CALL_FLAG),
+    entrypoint: 'scripts/run-final-e2e.js',
+  });
+
   console.log('========================================================================');
   console.log('SUPERGPT V1 FINAL FRESH E2E ACCEPTANCE & LIVE UX PROGRESS');
   console.log('========================================================================\n');
@@ -415,7 +421,7 @@ test('Task 2: index.js exports all library functions', async () => {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
   run().catch((err) => {
-    console.error('\n✖ E2E ACCEPTANCE FAILED:', err);
-    process.exit(1);
+    console.error('\n✖ E2E ACCEPTANCE FAILED:', err.message ?? err);
+    process.exit(err.exitCode ?? 1);
   });
 }

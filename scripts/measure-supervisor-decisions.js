@@ -1,10 +1,18 @@
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { createAgySupervisorProvider, buildAgySupervisorPrompt } from '../src/orchestrator/adapters/agySupervisorProvider.js';
 import { createAgySupervisorSession, createAgyProviderSessionStore } from '../src/orchestrator/agyProviderSessions.js';
 import { UsageTracker } from '../src/orchestrator/usageTracker.js';
 import { TokenAwareSessionPolicy, createSupervisorCheckpoint } from '../src/orchestrator/tokenAwareSessionPolicy.js';
 import { SUPERVISOR_SESSION_STRATEGIES } from '../src/orchestrator/supervisorCostPolicy.js';
+import { assertRealProviderCallsAuthorized, REAL_PROVIDER_CALL_FLAG } from '../src/orchestrator/realProviderCallGuard.js';
 
 async function main() {
+  assertRealProviderCallsAuthorized({
+    explicitLiveIntent: process.argv.slice(2).includes(REAL_PROVIDER_CALL_FLAG),
+    entrypoint: 'scripts/measure-supervisor-decisions.js',
+  });
+
   const usageTracker = new UsageTracker();
   const store = createAgyProviderSessionStore();
   const rawProvider = createAgySupervisorProvider();
@@ -82,7 +90,10 @@ async function main() {
   console.log(JSON.stringify(results, null, 2));
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Only run the live measurement when executed directly, not when imported.
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch((err) => {
+    console.error(err.message ?? err);
+    process.exit(err.exitCode ?? 1);
+  });
+}

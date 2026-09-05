@@ -28,6 +28,7 @@ import {
   probeEnvironmentMetadata,
 } from '../src/orchestrator/tokenAnomalyMonitor.js';
 import { runSuperGPT } from '../src/orchestrator/supergpt.js';
+import { assertRealProviderCallsAuthorized } from '../src/orchestrator/realProviderCallGuard.js';
 
 export function getEnvironmentMetadata(opts = {}) {
   return probeEnvironmentMetadata(opts);
@@ -203,6 +204,15 @@ export function runDeterministicBenchmark({
 }
 
 export async function runLiveBenchmark({ scenario = 'rework' } = {}) {
+  // --live is itself the explicit CLI live intent for this command (see
+  // PART G of the guard task): a second --allow-real-provider-calls flag
+  // would be redundant since the command has no other purpose. The env
+  // opt-in is still required.
+  assertRealProviderCallsAuthorized({
+    explicitLiveIntent: true,
+    entrypoint: 'bin/benchmark-tokens.js --live',
+  });
+
   const currentEnv = getEnvironmentMetadata();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supergpt-live-bench-'));
 
@@ -371,7 +381,7 @@ const invokedDirectly =
 
 if (invokedDirectly) {
   main().catch((err) => {
-    console.error('Benchmark failed:', err);
-    process.exitCode = 1;
+    console.error('Benchmark failed:', err.message ?? err);
+    process.exitCode = err.exitCode ?? 1;
   });
 }

@@ -2,6 +2,7 @@
 // Focused Live Production E2E to verify the Reviewer REWORK convergence path.
 
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -15,6 +16,7 @@ import { createSuperGptMcpServer } from '../src/mcp/supergptMcpServer.js';
 import { decideAutoRoute } from '../src/control/autoRoutePolicy.js';
 import { compileSuperGptRequest } from '../src/control/requestCompiler.js';
 import { runSuperGPT, supergptStatus, SUPERGPT_EVENTS } from '../src/orchestrator/supergpt.js';
+import { assertRealProviderCallsAuthorized, REAL_PROVIDER_CALL_FLAG } from '../src/orchestrator/realProviderCallGuard.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -23,6 +25,11 @@ function sha256(content) {
 }
 
 async function run() {
+  assertRealProviderCallsAuthorized({
+    explicitLiveIntent: process.argv.slice(2).includes(REAL_PROVIDER_CALL_FLAG),
+    entrypoint: 'scripts/test-rework-live-e2e.js',
+  });
+
   console.log('========================================================================');
   console.log('SUPERGPT V1 LIVE REWORK CONVERGENCE PROOF');
   console.log('========================================================================\n');
@@ -172,7 +179,10 @@ test('parseKeyValue throws SyntaxError with "Unterminated quote" on unclosed quo
   return { runResult, recordedRework, dirtyPreserved: dirtyHashBefore === dirtyHashAfter };
 }
 
-run().catch((err) => {
-  console.error('✖ REWORK E2E FAILED:', err);
-  process.exit(1);
-});
+// Only run the live E2E when executed directly, not when imported by tests.
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  run().catch((err) => {
+    console.error('✖ REWORK E2E FAILED:', err.message ?? err);
+    process.exit(err.exitCode ?? 1);
+  });
+}

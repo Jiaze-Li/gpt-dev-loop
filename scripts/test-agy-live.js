@@ -18,6 +18,7 @@
 import { execFileSync } from 'node:child_process';
 import { callAgy, DEFAULT_AGY_MODEL } from '../src/agy/agyClient.js';
 import { resolveAgySupervisorModel, resolveAgyReviewerModel } from '../src/agy/agyConfig.js';
+import { assertRealProviderCallsAuthorized, REAL_PROVIDER_CALL_FLAG } from '../src/orchestrator/realProviderCallGuard.js';
 
 // Testable config helper: resolve the model for exactly ONE tiny live probe.
 // No shell, no side effects.
@@ -48,7 +49,11 @@ function detectExecutable() {
 }
 
 async function main() {
-  const { model, role } = resolveAgyLiveConfig(process.env, process.argv.slice(2));
+  const rawArgs = process.argv.slice(2);
+  const explicitLiveIntent = rawArgs.includes(REAL_PROVIDER_CALL_FLAG);
+  assertRealProviderCallsAuthorized({ explicitLiveIntent, entrypoint: 'scripts/test-agy-live.js' });
+
+  const { model, role } = resolveAgyLiveConfig(process.env, rawArgs.filter((a) => a !== REAL_PROVIDER_CALL_FLAG));
 
   console.log('executable detected :', detectExecutable());
   console.log('role               :', role);
@@ -79,5 +84,8 @@ async function main() {
 
 // Only run the live request when executed directly, not when imported by tests.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
+  main().catch((err) => {
+    console.error(err.message);
+    process.exit(err.exitCode ?? 1);
+  });
 }

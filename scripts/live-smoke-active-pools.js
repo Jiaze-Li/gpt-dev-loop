@@ -3,6 +3,7 @@ import { selectProviders } from '../src/orchestrator/providerSelection.js';
 import { DEFAULT_ROLE_POLICY, QuotaPoolRegistry, ProviderHealthRegistry } from '../src/orchestrator/roleRouting.js';
 import { UsageTracker } from '../src/orchestrator/usageTracker.js';
 import { callAgy } from '../src/agy/agyClient.js';
+import { assertRealProviderCallsAuthorized, REAL_PROVIDER_CALL_FLAG } from '../src/orchestrator/realProviderCallGuard.js';
 import { parseAgyJsonObject } from '../src/agy/agyJson.js';
 import { buildPlannerPrompt, parsePlannerJson } from '../src/orchestrator/planner.js';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
@@ -307,6 +308,11 @@ async function smokeExecutor(family, suppress = [], rolePolicyOverride = null) {
 }
 
 async function main() {
+  assertRealProviderCallsAuthorized({
+    explicitLiveIntent: process.argv.slice(2).includes(REAL_PROVIDER_CALL_FLAG),
+    entrypoint: 'scripts/live-smoke-active-pools.js',
+  });
+
   console.log('========================================================================');
   console.log('SUPERGPT V1 LIVE SMOKE VALIDATION ACROSS ACTIVE ROLE POOLS');
   console.log('========================================================================');
@@ -344,7 +350,10 @@ async function main() {
   console.log(JSON.stringify(matrix, null, 2));
 }
 
-main().catch((err) => {
-  console.error('Fatal live smoke error:', err);
-  process.exit(1);
-});
+// Only run the live smoke when executed directly, not when imported by tests.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => {
+    console.error('Fatal live smoke error:', err.message ?? err);
+    process.exit(err.exitCode ?? 1);
+  });
+}
