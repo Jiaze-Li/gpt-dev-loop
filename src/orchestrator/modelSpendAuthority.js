@@ -186,16 +186,23 @@ export class ModelSpendAuthority {
   // newInformation.js). OPTIONAL, exactly like `policy` and
   // `reservationLedger` are optional collaborators with safe defaults: when
   // no ledger is wired, authorize() performs NO evidence check at all —
-  // identical to this Authority's behavior before this feature existed. This
-  // is NOT a bypass flag (there is no `skipNewInformationCheck` toggle
-  // anywhere in this module): it is simply "which collaborator objects this
-  // Authority instance was constructed with", the same pattern already used
-  // for `policy`/`providerCapabilities`/`reservationLedger`. Production
-  // wiring (providerSelection.js#selectProviders) always constructs this
-  // Authority WITH an informationLedger; a caller that constructs its own
-  // ModelSpendAuthority without one gets the pre-existing, unaffected
-  // behavior — the intended migration path for a codebase-wide test suite
-  // that predates this policy.
+  // identical to this Authority's behavior before this feature existed. When
+  // a ledger IS wired, enforcement is MANDATORY for every authorize() call,
+  // regardless of what the raw CallIntent does or does not carry — there is
+  // no per-CallIntent opt-out (no `evidenceIds` property, an `undefined` /
+  // `null` / empty one, or one whose ids are all unregistered/ineligible/
+  // already-consumed, all resolve to "zero eligible evidence" and are
+  // denied identically). This is NOT a bypass flag (there is no
+  // `skipNewInformationCheck` toggle anywhere in this module): it is simply
+  // "which collaborator objects this Authority instance was constructed
+  // with", the same pattern already used for
+  // `policy`/`providerCapabilities`/`reservationLedger`. Production wiring
+  // (providerSelection.js#selectProviders) always constructs this Authority
+  // WITH an informationLedger, so production enforcement is unconditional; a
+  // caller that constructs its own ModelSpendAuthority without one gets the
+  // pre-existing, unaffected behavior — the intended compatibility boundary
+  // for a codebase-wide test suite that predates this policy and exercises
+  // permit/reservation/provider mechanics directly.
   constructor({
     policy = () => ({ allow: true }), onEvent, providerCapabilities, reservationLedger, recordSafetyEvent,
     informationLedger = null,
@@ -295,27 +302,33 @@ export class ModelSpendAuthority {
     // supplies `evidenceIds`; production enforcement is therefore effectively
     // unconditional for every real workflow.
     //
-    // The enforcement gate itself remains explicit and per-CallIntent, NOT a
-    // global switch: a CallIntent is "evidence-aware" — and therefore
-    // enforced — if and only if its RAW intent carries an `evidenceIds`
-    // property that is not `undefined` (an empty array still counts: an
-    // evidence-aware call site that legitimately found zero eligible
-    // evidence must still be denied, never silently skipped). This keeps a
-    // caller that constructs its own ModelSpendAuthority directly (never
-    // through providerSelection.js's factory — the overwhelming majority of
-    // this codebase's unit tests) behaving exactly as it did before this
-    // feature existed, with no boolean "skipNewInformationPolicy" flag
-    // anywhere: the ONLY way to be exempt is to literally not pass
-    // `evidenceIds` into `invoke()`. Grep for `evidenceIds:` at invoke() call
-    // sites in src/orchestrator/{automatedLoop,providerSelection,supergpt}.js
-    // to verify the production inventory has not silently grown or shrunk —
-    // see also tests/newInformationProductionWiring.test.js.
-    const evidenceAware = this._informationLedger
-      && Object.prototype.hasOwnProperty.call(rawIntent, 'evidenceIds')
-      && rawIntent.evidenceIds !== undefined;
-    if (evidenceAware) {
-      const candidateEvidenceIds = Array.isArray(rawIntent.evidenceIds)
-        ? rawIntent.evidenceIds.filter((id) => id !== null && id !== undefined)
+    // The enforcement gate is keyed SOLELY on whether this Authority instance
+    // was constructed with an informationLedger — never on anything about the
+    // raw CallIntent. This is deliberate: a per-CallIntent "evidence-aware"
+    // escape (gating enforcement on whether the caller happened to supply an
+    // `evidenceIds` property) would let a production call site silently
+    // bypass the global policy merely by forgetting to thread evidence
+    // through. The Authority boundary must establish "no eligible new
+    // information -> no permit" itself, not rely on every call site to opt in
+    // correctly. A missing / undefined / null / empty `evidenceIds`, or one
+    // whose ids are all unregistered/ineligible/already-consumed, is treated
+    // identically: zero candidates, so `findEligibleUnconsumed` finds nothing
+    // and this denies. This keeps a caller that constructs its own
+    // ModelSpendAuthority directly WITHOUT an informationLedger (the
+    // overwhelming majority of this codebase's low-level unit tests that
+    // exercise permit/reservation/provider mechanics) behaving exactly as it
+    // did before this feature existed — that absence of an informationLedger
+    // is the ONLY compatibility boundary, not a per-call property. Every
+    // production ModelSpendAuthority (providerSelection.js#selectProviders)
+    // is constructed WITH an informationLedger, so production enforcement is
+    // unconditional. Grep for `evidenceIds:` at invoke() call sites in
+    // src/orchestrator/{automatedLoop,providerSelection,supergpt}.js to
+    // verify the production inventory has not silently grown or shrunk — see
+    // also tests/newInformationProductionWiring.test.js.
+    if (this._informationLedger) {
+      const rawEvidenceIds = rawIntent?.evidenceIds;
+      const candidateEvidenceIds = Array.isArray(rawEvidenceIds)
+        ? rawEvidenceIds.filter((id) => id !== null && id !== undefined)
         : [];
       let eligible;
       try {

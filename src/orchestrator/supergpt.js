@@ -1221,6 +1221,23 @@ export function createRealGithubPrCloseoutAdapters({
           // CallIntent, authorize it, and run the provider dispatch only
           // through spendAuthority.dispatch(). Permit single-use / intent
           // binding / default-deny stay entirely inside the authority.
+          //
+          // § PR-repair fallback audit (default-deny hardening): this branch
+          // is MECHANICALLY UNREACHABLE in production. `selection` above is
+          // always the real selectProviders() output (see this function's
+          // `const selection = (_selectProviders || selectProviders)({...})`
+          // — `_selectProviders` is a test-only seam never wired in
+          // production), and selectProviders() always returns
+          // `createExecutorSessionManager` as a function, so the `if` branch
+          // above is always taken for real. Only a test that deliberately
+          // constructs a stripped-down `selection` stand-in (see
+          // tests/prCloseoutRepairPermit.test.js) reaches here — see
+          // tests/prCloseoutFallbackAuthorityAudit.test.js for the mechanical
+          // proof. Even so, the `new ModelSpendAuthority(...)` just below
+          // still always receives the SAME `informationLedger` this adapter
+          // registered evidence against when one is available (§ PART C) —
+          // never `null` while a production-shaped ledger exists — so this
+          // path was never a silent New Information bypass either way.
           // Persistent Model Spend Reservation for this fallback authority:
           // reuse the SAME workflow-scoped persistence as the primary path
           // when one is available, so a reservation created here survives
