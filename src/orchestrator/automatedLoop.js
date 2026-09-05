@@ -964,13 +964,16 @@ export async function runAutomatedWorkflow({
     //     NEW_GATE_FINGERPRINT / NEW_REVIEW_FINDINGS evidence registered for
     //     it just before this runAttempt() call — see the CONTINUE_REWORK
     //     branch below.
-    //   - an escalation attempt (Model Supervisor escalation — out of scope
-    //     for this card, see Part Q): no evidenceIds at all, exactly like
-    //     every other unmigrated call site.
+    //   - an escalation attempt (Model Supervisor escalation, or a
+    //     deterministically-auto-continued round once escalation is already
+    //     active): the SAME NEW_GATE_FINGERPRINT / NEW_REVIEW_FINDINGS
+    //     evidence registered for it in the CONTINUE_REWORK branch below,
+    //     just like an ordinary rework — escalation is a bounded-retry
+    //     policy decision, not an exemption from evidence gating.
     const isFirstExecutorAttempt = attemptCount === 1 && !escalationActive;
     const executorEvidenceIds = isFirstExecutorAttempt
       ? (fastPathExecutorEvidenceIds ?? currentTaskCardEvidenceIds ?? undefined)
-      : (escalationActive ? undefined : (pendingReworkEvidenceIds ?? undefined));
+      : (pendingReworkEvidenceIds ?? undefined);
     let executionReport;
     try {
       executionReport = await claudeManager.execute(executorTaskCard, {
@@ -2219,18 +2222,21 @@ export async function runAutomatedWorkflow({
       }
 
       if (decision.action === 'CONTINUE_REWORK') {
-        // § Global New Information Policy / Wiring Card 2 — Part C/E/F.
-        // Checked BEFORE the escalationActive reassignment just below: a
-        // deterministic CONTINUE_REWORK (Gate FAIL or ordinary Reviewer
-        // REWORK) can only ever be produced by decideDeterministically()
-        // while normalAttempts < maxAttemptsPerTask (its own gate-rework
-        // branch explicitly escalates to the model Supervisor once attempts
-        // are exhausted — see deterministicSupervisorPolicy.js), so
-        // `escalationActive` here still reflects "was this rework reached
-        // without the (unmigrated, Part Q) Model Supervisor escalation path"
-        // — never mutated by the reassignment that follows.
-        const isDeterministicRework = !escalationActive;
-        if (isDeterministicRework && informationLedger && latestReviewResult) {
+        // § Global New Information Policy / Wiring Card 2 — Part C/E/F,
+        // extended to cover the escalation Executor dispatch (previously
+        // "Part Q, out of scope"): a CONTINUE_REWORK here — whether produced
+        // deterministically (Gate FAIL / ordinary Reviewer REWORK) or by the
+        // model Supervisor's own escalation decision — is always grounded in
+        // the SAME `latestReviewResult` (a genuine Gate or Reviewer finding);
+        // register the identical Gate-fingerprint / review-findings evidence
+        // for it regardless of escalation state, so the next Executor
+        // dispatch below — including the FIRST escalation attempt and every
+        // deterministically-auto-continued escalation round after it — is
+        // never unconditionally denied by ModelSpendAuthority merely for
+        // having been reached via escalation. This does not change what
+        // counts as evidence, only ensures every CONTINUE_REWORK Executor
+        // dispatch (escalating or not) presents it.
+        if (informationLedger && latestReviewResult) {
           try {
             if (latestReviewResult.source === 'GATE') {
               const fingerprint = gateFailureFingerprint(latestReviewResult, latestGateEvidence);
