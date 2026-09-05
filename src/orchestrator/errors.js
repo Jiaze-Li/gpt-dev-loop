@@ -115,6 +115,23 @@ export const AUTHORIZATION_ERROR_CODES = Object.freeze({
   // the first invoke() of this process. Reconciliation is safety-critical,
   // not best-effort — an unreconciled ledger is treated as unsafe.
   MODEL_SPEND_RECONCILIATION_FAILED: 'MODEL_SPEND_RECONCILIATION_FAILED',
+  // dispatch() ran the physical provider call and usage could NOT be
+  // reliably determined, but the durable UNRESOLVED write itself failed
+  // (§ Phase 0B). This is an orchestrator persistence failure, never a
+  // provider outcome: it must never be classified as provider unavailable/
+  // timeout/protocol error, must never trigger failover, and must never
+  // mutate provider health. The reservation's durable status remains
+  // whatever it was before this write attempted (DISPATCHING in production
+  // usage), which is itself already a blocking status.
+  MODEL_SPEND_UNRESOLVED_PERSIST_FAILED: 'MODEL_SPEND_UNRESOLVED_PERSIST_FAILED',
+  // A Global New Information denial (Phase 1-6): the CallIntent is otherwise
+  // eligible (provider/budget/reservation all clear) but no fresh, unconsumed
+  // evidence justifies this physical call for this role/operation.
+  NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED: 'NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED',
+  // The durable New Information ledger could not be read, or a claimed
+  // evidence consumption could not be durably persisted. Fail closed: zero
+  // physical provider calls.
+  MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE: 'MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE',
 });
 
 export function isAuthorizationFailure(error) {

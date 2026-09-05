@@ -57,6 +57,19 @@ export const SAFETY_EVENT_CODES = Object.freeze({
   // unreconciled ledger is treated as unsafe and blocks every internal model
   // call until a human clears it.
   MODEL_SPEND_RECONCILIATION_FAILED: 'MODEL_SPEND_RECONCILIATION_FAILED',
+  // A physical call's durable UNRESOLVED write itself failed (§ Phase 0B).
+  // Never a provider outcome; blocks every further internal model spend
+  // attempt in the same workflow until a human clears it.
+  MODEL_SPEND_UNRESOLVED_PERSIST_FAILED: 'MODEL_SPEND_UNRESOLVED_PERSIST_FAILED',
+  // A Token-Safety AuthorizationError arose from the Full Path Planner
+  // boundary (§ Phase 0A) — no Supervisor / Executor / Reviewer / delivery
+  // followed; the workflow durable status terminalizes HUMAN_REQUIRED.
+  PLANNER_AUTHORIZATION_DENIED: 'PLANNER_AUTHORIZATION_DENIED',
+  // Global New Information Policy (§ Phase 1-6): a physical model call was
+  // denied because no fresh, unconsumed deterministic evidence justified it
+  // for this role/operation. Retry / failover / timeout / provider failure
+  // are never new information.
+  NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED: 'NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED',
 });
 
 export const SAFETY_SEVERITY = Object.freeze({

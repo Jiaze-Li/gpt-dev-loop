@@ -235,6 +235,22 @@ export async function runPrCloseoutLoop({
       verificationCommands: config.verificationCommands ?? [],
     });
     if (extraContext) card.supervisor_escalation = extraContext;
+    // § Global New Information Policy / Wiring Card 3 — PART B. Deterministic
+    // external-result identity for the PR-closeout repair Executor: the PR
+    // head this review actually examined + the normalized, sorted actionable
+    // finding signatures (never a raw comment/request id or timestamp alone
+    // — see normalizedPrReview.js#normalizedFindingSignature). The adapter
+    // boundary (supergpt.js#createRealGithubPrCloseoutAdapters.runRepairTask)
+    // registers this as NEW_EXTERNAL_RESULT evidence against the SAME
+    // informationLedger the production ModelSpendAuthority enforces, head-
+    // binding the repair call to the exact review it is fixing (§B3): a
+    // replay of the identical findings against the identical head can never
+    // mint a second physical repair call.
+    card.new_information = {
+      subject: current.prNumber != null ? `pr-${current.prNumber}` : 'pr-closeout',
+      headSha: trusted.headSha ?? head ?? null,
+      signatures: [...(trusted.actionableSignatures ?? [])].map(String).sort(),
+    };
     assertRepairActionSafe(
       { changedFiles: card.allowed_files, files: card.allowed_files },
       { allowMerge: config.allowMerge === true, allowWorkflowEdits: false },

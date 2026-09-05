@@ -220,15 +220,35 @@ export class ReservationLedger {
   // A physical call may have occurred but reliable usage cannot be proven.
   // Never downgrades an already-settled reservation. Fires the BLOCKING
   // safety event so the reason reaches the terminal workflow result.
+  //
+  // Durable-before-cache (same principle as settleKnown, § Phase 0B): the
+  // candidate UNRESOLVED record is durably persisted FIRST, on a candidate
+  // map that never touches `this._cache`. Only after that persistence
+  // resolves does the cache get mutated to match. If persistence throws,
+  // this rejects and the cache is left completely untouched — still
+  // whatever it was before this call (DISPATCHING in production usage),
+  // which is itself already a spend-blocking status. Callers must not catch
+  // this and proceed; ModelSpendAuthority.dispatch() classifies a rejection
+  // here as its own dedicated AuthorizationError
+  // (MODEL_SPEND_UNRESOLVED_PERSIST_FAILED) rather than letting the raw
+  // persistence error escape unclassified (where it could otherwise be
+  // mistaken for a provider failure and trigger failover / health mutation).
   async markUnresolved({ workflowId, reservationId, reason = null }) {
     const map = await this._loadWorkflow(workflowId);
     const record = map.get(reservationId);
     if (!record) throw new Error(`ReservationLedger.markUnresolved: unknown reservation ${reservationId}`);
     if (record.status === RESERVATION_STATUS.SETTLED_KNOWN) return record;
-    record.status = RESERVATION_STATUS.UNRESOLVED;
-    record.settledAt = new Date().toISOString();
-    record.settlementReason = reason;
-    await this._persistWorkflow(workflowId);
+    const candidate = {
+      ...record,
+      status: RESERVATION_STATUS.UNRESOLVED,
+      settledAt: new Date().toISOString(),
+      settlementReason: reason,
+    };
+    const candidateMap = new Map(map);
+    candidateMap.set(reservationId, candidate);
+    await this._persistCandidate(workflowId, candidateMap);
+    // Only reached once durable persistence has succeeded.
+    map.set(reservationId, candidate);
     this._onEvent?.({ type: 'RESERVATION_UNRESOLVED', reservationId, workflowId: workflowId ?? null, reason });
     this._recordSafetyEvent?.({
       code: 'MODEL_SPEND_USAGE_UNRESOLVED',
@@ -239,7 +259,7 @@ export class ReservationLedger {
       reason: reason ?? 'Physical model call may have dispatched but usage could not be reliably settled',
       actionTaken: 'Further internal model spend blocked for this workflow',
     });
-    return record;
+    return candidate;
   }
 
   // A RESERVED reservation that provably never crossed the durable

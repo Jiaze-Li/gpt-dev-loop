@@ -65,7 +65,7 @@ export function createProductionRoleRuntime({
   const roleRouter = router ?? new RoleRouter({ rolePolicy, quotaRegistry, providerHealth, resolveFamily: capabilityResolver, onEvent });
 
   async function invoke(role, payload, {
-    signals = {}, operationId = null, signal: callSignal = null, workflowId = null,
+    signals = {}, operationId = null, signal: callSignal = null, workflowId = null, evidenceIds = null,
   } = {}) {
     const abortSignal = callSignal ?? signal;
     const attempted = new Set();
@@ -92,6 +92,14 @@ export function createProductionRoleRuntime({
       // One CallIntent per PHYSICAL attempt. `attempted.size` is the 1-based
       // physical-attempt counter for this invoke(), so provider B on failover
       // is bound to attempt:2 and cannot reuse provider A's permit.
+      // `evidenceIds` (§ Global New Information Policy) is deliberately the
+      // SAME candidate list on every physical attempt within this invoke():
+      // ModelSpendAuthority's evidence-consumption key is (role, operationId,
+      // evidenceId) — it excludes provider family AND physical attempt
+      // number on purpose, so a failover attempt that presents the identical
+      // evidence set as the first attempt finds it already consumed and is
+      // denied, exactly per "provider failover with no new evidence cannot
+      // physically run".
       const callIntent = {
         role,
         family: selection.requestedFamily,
@@ -99,6 +107,7 @@ export function createProductionRoleRuntime({
         operationId,
         attempt: attempted.size,
         workflowId,
+        evidenceIds: Array.isArray(evidenceIds) ? evidenceIds : (evidenceIds ? [evidenceIds] : undefined),
       };
       let permit;
       try {

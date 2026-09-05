@@ -592,6 +592,74 @@ test('Q: settlement persistence failure after a known-usage success fails closed
   assert.equal(calls.A, 1, 'no further physical call happens once settlement could not be durably proven');
 });
 
+// ── Q2. Phase 0B — markUnresolved() persistence failure fails closed ───
+
+test('Q2: an UNRESOLVED persistence failure fails closed with a DEDICATED code — never provider-classified, never failover', async () => {
+  const store = {
+    load: async () => ({}),
+    save: async (workflowId, reservations) => {
+      const list = Object.values(reservations);
+      if (list.some((r) => r.status === RESERVATION_STATUS.UNRESOLVED)) {
+        throw new Error('disk full at unresolved-write');
+      }
+      // RESERVED and DISPATCHING persist fine.
+    },
+  };
+  const ledger = new ReservationLedger({ store });
+  const spendAuthority = new ModelSpendAuthority({ reservationLedger: ledger, providerCapabilities: TEST_ONLY_PERMISSIVE });
+  const calls = { A: 0, B: 0 };
+  const { runtime } = buildRuntime({
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }, { family: 'codex:default' }] },
+    adapters: {
+      executor: {
+        // No reliable usage on success -> would normally go through
+        // markUnresolved(), which this store makes fail.
+        'claude:sonnet': async () => { calls.A += 1; return { status: 'DONE' }; },
+        'codex:default': async () => { calls.B += 1; return { usage: { input_tokens: 1, output_tokens: 1 } }; },
+      },
+    },
+    spendAuthority,
+  });
+
+  await assert.rejects(
+    runtime.invoke('executor', {}, { operationId: 'wf-q2:t1', workflowId: 'wf-q2' }),
+    (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_UNRESOLVED_PERSIST_FAILED,
+  );
+  assert.equal(calls.A, 1, 'the provider physically ran exactly once');
+  assert.equal(calls.B, 0, 'a fail-closed persistence error must never trigger failover to another provider');
+
+  // Cache-cannot-outrun-durable-state: still DISPATCHING (the prior durably
+  // persisted status), never UNRESOLVED and never SETTLED_KNOWN, because the
+  // UNRESOLVED write itself never durably succeeded.
+  const [reservation] = await ledger.list('wf-q2');
+  assert.equal(reservation.status, RESERVATION_STATUS.DISPATCHING);
+
+  // DISPATCHING keeps blocking further internal spend in this workflow —
+  // for every role, not only Executor.
+  await assert.rejects(
+    runtime.invoke('executor', {}, { operationId: 'wf-q2:t2', workflowId: 'wf-q2' }),
+    (err) => isAuthorizationFailure(err) && err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+  );
+  assert.equal(calls.A, 1, 'no further physical call happens once the UNRESOLVED write could not be durably proven');
+});
+
+test('Q3: ReservationLedger.markUnresolved itself leaves the cache untouched when persistence fails', async () => {
+  const store = {
+    load: async () => ({}),
+    // RESERVED and DISPATCHING persist fine; only the UNRESOLVED write fails.
+    save: async (workflowId, reservations) => {
+      const list = Object.values(reservations);
+      if (list.some((r) => r.status === RESERVATION_STATUS.UNRESOLVED)) throw new Error('EIO');
+    },
+  };
+  const ledger = new ReservationLedger({ store });
+  const record = await ledger.reserve({ workflowId: 'wf-q3', intent: { role: 'executor', family: 'claude:sonnet', operationId: 'wf-q3:t1' }, physicalAttempt: 1 });
+  await ledger.markDispatching({ workflowId: 'wf-q3', reservationId: record.reservationId });
+  await assert.rejects(ledger.markUnresolved({ workflowId: 'wf-q3', reservationId: record.reservationId, reason: 'x' }));
+  const [after] = await ledger.list('wf-q3');
+  assert.equal(after.status, RESERVATION_STATUS.DISPATCHING, 'the cache must reflect the last durably-persisted state, not the failed write');
+});
+
 // ── R. DISPATCHING blocks authorization even without reconciliation ────
 
 test('R: a persisted DISPATCHING reservation blocks authorization before reconcileOnResume ever runs', async () => {

@@ -24,7 +24,10 @@ import { selectProviders } from './providerSelection.js';
 import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
 import { ModelSpendAuthority } from './modelSpendAuthority.js';
 import { ReservationLedger, ReservationStore } from './modelSpendReservation.js';
-import { isAuthorizationFailure } from './errors.js';
+import { AuthorizationError, AUTHORIZATION_ERROR_CODES, isAuthorizationFailure } from './errors.js';
+import {
+  registerUserInputEvidence, registerTaskCardEvidence, registerExternalResultEvidence, sha256 as newInformationSha256,
+} from './newInformation.js';
 import { createGateRunner } from './adapters/gateRunner.js';
 import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.js';
 import { Persistence } from './persistence.js';
@@ -1171,13 +1174,46 @@ export function createRealGithubPrCloseoutAdapters({
 
       let executionReport = null;
       try {
+        // § Global New Information Policy / Wiring Card 3 — PART B. Register
+        // the deterministic external-result evidence prCloseoutLoop.js
+        // attached to `card.new_information` (PR head + normalized, sorted
+        // actionable finding signatures) against the SAME informationLedger
+        // the production ModelSpendAuthority enforces, BEFORE the repair
+        // Executor is invoked. Idempotent: replaying the identical
+        // head+findings resolves to the SAME evidenceId, so
+        // ModelSpendAuthority.authorize() finds it already consumed and
+        // denies a second physical repair call for it. A registration
+        // failure fails closed via the SAME isAuthorizationFailure branch
+        // below every other authorization/permit failure in this function
+        // already uses — no physical Executor call is ever attempted.
+        let repairEvidenceIds;
+        const informationLedger = selection?.informationLedger ?? null;
+        if (informationLedger && card?.new_information) {
+          try {
+            const evidence = await registerExternalResultEvidence(informationLedger, {
+              workflowId,
+              subject: card.new_information.subject ?? null,
+              fingerprint: newInformationSha256(JSON.stringify({
+                headSha: card.new_information.headSha ?? null,
+                signatures: card.new_information.signatures ?? [],
+              })),
+            });
+            repairEvidenceIds = [evidence.evidenceId];
+          } catch (err) {
+            throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+              AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+              `New Information evidence for the PR-closeout repair Executor could not be durably registered: ${err?.message ?? err}`,
+              { workflowId, taskId: repairTaskId },
+            );
+          }
+        }
         let runExecution;
         if (typeof selection?.createExecutorSessionManager === 'function') {
           // Primary path: the executor session manager routes through
           // productionRoleRuntime.invoke('executor'), which already obtains
           // and consumes a PhysicalCallPermit per physical attempt.
           const executorManager = selection.createExecutorSessionManager({ taskId: repairTaskId, cwd: repoRoot });
-          runExecution = () => executorManager.execute(card, { signal });
+          runExecution = () => executorManager.execute(card, { signal, evidenceIds: repairEvidenceIds });
         } else {
           // Fallback path: no role runtime available, so this internal
           // Claude physical model call would otherwise bypass the authority.
@@ -1197,6 +1233,11 @@ export function createRealGithubPrCloseoutAdapters({
             ?? new ModelSpendAuthority({
               reservationLedger,
               recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+              // § PART C — production must never construct a ModelSpendAuthority
+              // without the information ledger; reuse the SAME one this
+              // adapter just registered evidence against when `selection`
+              // did not already provide a fully-wired runtime.
+              informationLedger,
             });
           const executorManager = createFallbackExecutorManager({ taskId: repairTaskId, cwd: repoRoot });
           const callIntent = {
@@ -1206,6 +1247,7 @@ export function createRealGithubPrCloseoutAdapters({
             operationId: workflowId ?? repairTaskId,
             attempt: 1,
             workflowId,
+            evidenceIds: repairEvidenceIds,
           };
           const permit = await spendAuthority.authorize(callIntent);
           runExecution = () => spendAuthority.dispatch(permit, callIntent, () => executorManager.execute(card, { signal }));
@@ -1384,6 +1426,69 @@ async function defaultPipeline({
     }
     workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
     return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question };
+  };
+
+  // § Phase 0A — reusable local helper: an AuthorizationError raised at the
+  // Full Path Planner boundary terminalizes the workflow's DURABLE status as
+  // HUMAN_REQUIRED (never RUNNING, never FAILED), records a BLOCKING
+  // user-visible safety event, and returns a structured HUMAN_REQUIRED
+  // result — mirroring guardWorkflowCeilings' terminalization shape so the
+  // caller (Front Agent / MCP) sees the same contract for every safety halt.
+  // No Supervisor / Executor / Reviewer / delivery step follows this return.
+  const terminalizePlannerAuthorizationDenied = (err) => {
+    const reason = `Planner physical model call was denied by Token Safety: ${err?.message ?? String(err)}`;
+    const question = `${reason} Review the workflow's model-spend / information-safety state, then resume once cleared.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.PLANNER_AUTHORIZATION_DENIED,
+        severity: 'BLOCKING',
+        role: 'planner',
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no Supervisor/Executor/Reviewer call made, nothing delivered',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    if (usageTracker && workflowStateManager) {
+      try {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      } catch { /* best effort */ }
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, tokenUsage: usageTracker?.summary?.() ?? null };
+  };
+
+  // § Global New Information Policy / Wiring Card 2 — mirror of
+  // terminalizePlannerAuthorizationDenied for the Fast Path first Executor
+  // call: used ONLY when the frozen Fast Path task-card's NEW_TASK_CARD
+  // evidence could not be durably registered BEFORE runAutomatedWorkflow /
+  // the Executor is ever invoked — i.e. zero physical Executor calls, zero
+  // reservation. A genuine authorize()-time denial (no fresh evidence, e.g.
+  // an exact replay) is intentionally NOT routed through this helper: it
+  // surfaces from INSIDE automatedLoop.js's own centralized
+  // isAuthorizationFailure terminalization (§ Phase 0A's sibling — see
+  // automatedLoop.js's outer catch), which already halts HUMAN_REQUIRED with
+  // zero further calls using the SAME safety-event code the Authority itself
+  // records (NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED).
+  const terminalizeFastPathExecutorAuthorizationDenied = (err) => {
+    const reason = `Fast Path Executor physical model call was denied by Token Safety: ${err?.message ?? String(err)}`;
+    const question = `${reason} Review the workflow's model-spend / information-safety state, then resume once cleared.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED,
+        severity: 'BLOCKING',
+        role: 'executor',
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no Executor call made, nothing delivered',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    if (usageTracker && workflowStateManager) {
+      try {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      } catch { /* best effort */ }
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, tokenUsage: usageTracker?.summary?.() ?? null };
   };
 
   validateWorkflowId(workflowId);
@@ -1994,11 +2099,43 @@ async function defaultPipeline({
   emit(SUPERGPT_EVENTS.PLANNING_STARTED);
   workflowStateManager?.startStage(WORKFLOW_STAGES.PLANNING);
   let resolved;
+  let fastPathFirstExecutorEvidenceIds = null;
   if (pathDecision.path === WORKFLOW_PATHS.FAST) {
     // Fast Path bypasses the Planner and the model Supervisor. The frozen
     // single-task contract becomes the plan directly; Executor -> deterministic
     // Gate -> independent Reviewer -> DONE | ordinary REWORK still runs below.
     resolved = fastPathResolvedPlan(pathDecision, { goal });
+    // § Global New Information Policy / Wiring Card 2 — Fast Path first
+    // Executor. `pathDecision.taskContract` is the frozen, deterministic
+    // single-task contract (see pathSelection.js) — the exact semantic
+    // artifact this physical Executor call is justified by. Registration is
+    // idempotent: the SAME frozen contract always resolves to the SAME
+    // evidenceId, so a legitimate replay (same workflow, same task, same
+    // contract) finds it already consumed and is denied — never a second
+    // physical Executor call for the same task card. Registered here, BEFORE
+    // runAutomatedWorkflow / the Executor is ever invoked, so a registration
+    // failure halts with zero physical Executor calls and zero reservation.
+    // Backward compatible with any caller/test whose (possibly injected
+    // `_selectProviders`) provider selection predates this feature and
+    // exposes no `informationLedger` at all: registration/enforcement is
+    // simply skipped, exactly like "no informationLedger wired" everywhere
+    // else in this policy (see modelSpendAuthority.js's constructor doc).
+    if (selection.informationLedger) {
+      try {
+        const evidence = await registerTaskCardEvidence(selection.informationLedger, {
+          workflowId, taskId: pathDecision.taskContract.task_id, taskCard: pathDecision.taskContract,
+        });
+        fastPathFirstExecutorEvidenceIds = [evidence.evidenceId];
+      } catch (err) {
+        return terminalizeFastPathExecutorAuthorizationDenied(
+          isAuthorizationFailure(err) ? err : new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+            `New Information evidence for the Fast Path Executor could not be durably registered: ${err?.message ?? err}`,
+            { workflowId, taskId: pathDecision.taskContract.task_id },
+          ),
+        );
+      }
+    }
   } else {
     let planArg = planPath ?? goal;
     if (answer && !planPath) {
@@ -2011,9 +2148,64 @@ async function defaultPipeline({
     if (prePlannerStop) return prePlannerStop;
 
     const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
-    resolved = (await selection.runtime.invoke('planner', {
-      resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
-    }, { operationId: workflowId, workflowId })).value;
+    // § Global New Information Policy / Wiring Card 2 — Full Path initial
+    // Planner. `planArg` (above) is exactly the semantic input actually
+    // presented to planning: the goal or plan-path content, plus a genuine
+    // user clarification/answer appended when one is present — never a
+    // timestamp, provider, attempt, or session id. Registration is
+    // idempotent (newInformation.js#registerEvidence): re-registering the
+    // EXACT SAME planArg in the same workflow resolves to the SAME
+    // evidenceId, so a legitimate replay of this call finds it already
+    // consumed and is denied by ModelSpendAuthority — never a second
+    // physical Planner call. A genuinely different planArg (a real new
+    // clarification) fingerprints differently and authorizes the Planner
+    // once more.
+    //
+    // Registration happens BEFORE invoke() and its own failure is treated
+    // exactly like a Token Safety AuthorizationError: zero physical Planner
+    // calls, HUMAN_REQUIRED, via the SAME terminalizePlannerAuthorizationDenied
+    // helper used for every other Planner-boundary denial (§ Phase 0A).
+    // Backward compatible with any caller/test whose (possibly injected
+    // `_selectProviders`) provider selection predates this feature and
+    // exposes no `informationLedger` at all: registration/enforcement is
+    // simply skipped, exactly like "no informationLedger wired" everywhere
+    // else in this policy (see modelSpendAuthority.js's constructor doc).
+    let plannerEvidenceIds;
+    if (selection.informationLedger) {
+      try {
+        const evidence = await registerUserInputEvidence(selection.informationLedger, {
+          workflowId, interactionId: 'planner-initial-input', text: planArg,
+        });
+        plannerEvidenceIds = [evidence.evidenceId];
+      } catch (err) {
+        return terminalizePlannerAuthorizationDenied(
+          isAuthorizationFailure(err) ? err : new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+            `New Information evidence for the Planner could not be durably registered: ${err?.message ?? err}`,
+            { workflowId },
+          ),
+        );
+      }
+    }
+    try {
+      resolved = (await selection.runtime.invoke('planner', {
+        resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
+      }, { operationId: workflowId, workflowId, evidenceIds: plannerEvidenceIds })).value;
+    } catch (err) {
+      // § Phase 0A — a Token Safety AuthorizationError at the Planner
+      // boundary is an orchestrator decision, never a cancellation and never
+      // a provider failure. It must stop immediately (no Supervisor, no
+      // Executor, no Reviewer, no delivery) and terminalize the workflow's
+      // DURABLE status as HUMAN_REQUIRED — never leave it at RUNNING/FAILED —
+      // so a resume/status read sees the same terminal state the caller does.
+      // Cancellation semantics are untouched: only an AuthorizationError is
+      // intercepted here; every other error (including CancellationError /
+      // AbortSignal) propagates exactly as before.
+      if (isAuthorizationFailure(err)) {
+        return terminalizePlannerAuthorizationDenied(err);
+      }
+      throw err;
+    }
     if (usageTracker && workflowStateManager) {
       workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
     }
@@ -2151,6 +2343,13 @@ async function defaultPipeline({
     workflowUsageVolumeCeiling,
     taskExecutorUsageVolumeCeiling,
     executorPhysicalCallCeiling,
+    fastPathExecutorEvidenceIds: fastPathFirstExecutorEvidenceIds,
+    // § Global New Information Policy / Wiring Card 2 — the SAME ledger
+    // instance `selection.spendAuthority` (constructed inside
+    // providerSelection.js#selectProviders) actually enforces against, so
+    // Full Path first Executor / Executor rework / Reviewer registrations
+    // made inside runAutomatedWorkflow are genuinely load-bearing.
+    informationLedger: selection.informationLedger,
     onCloseoutPass: async (proof) => {
       const fingerprint = getFingerprint(worktree.worktree_path);
       if (isValidWorktreeFingerprint(fingerprint)) {

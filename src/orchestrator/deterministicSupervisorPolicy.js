@@ -3,6 +3,7 @@
 // for genuine ambiguity / non-convergence.
 
 import { sha256, extractFailingTestIds, normalizeGateOutput } from './gateFailureIdentity.js';
+import { NEW_INFORMATION_EVENT_TYPES } from './newInformation.js';
 
 // A deterministic decision is computed by the orchestrator Core without any
 // model call. It must be accounted as exactly zero provider calls and zero
@@ -18,11 +19,73 @@ function asList(value) {
   return text ? [text] : [];
 }
 
-function reworkSignature(review) {
+// § Global New Information Policy / Wiring Card 2 — exported so
+// automatedLoop.js can compute the IDENTICAL deterministic signature this
+// heuristic already uses when registering NEW_REVIEW_FINDINGS evidence,
+// rather than duplicating the normalization logic.
+export function reworkSignature(review) {
   return asList(review?.required_changes)
     .map((item) => item.toLowerCase().replace(/\s+/g, ' ').trim())
     .sort()
     .join('\n');
+}
+
+// § Global New Information Policy / Wiring Card 3 — PART A. Model Supervisor
+// escalation only happens when decideDeterministically() itself could not
+// decide (see below); this derives the DETERMINISTIC evidence descriptor
+// that justifies the ONE physical Supervisor call for that escalation,
+// reusing the SAME fingerprint functions the Gate-rework no-new-information
+// heuristic already computes (gateFailureFingerprint / reworkSignature)
+// rather than duplicating normalization logic. Deliberately grounded in the
+// actual mechanically-inspectable state (the latest Review Result, the
+// current/planned Task Card) — never in `reason`, attempt counters, or
+// `escalationActive` itself (§A3: those are not new information). Returns
+// { type, subject, fingerprint } — never null: even an escalation with no
+// review/task-card context yet (e.g. a legacy hand-written plan with no
+// structured task queue) still has a concrete workflow goal / repository
+// context / history to fingerprint, so this always returns SOME deterministic
+// descriptor for the caller to register as evidence.
+export function supervisorEscalationEvidence(context = {}) {
+  const review = context.latestReviewResult ?? null;
+  if (review && review.source === 'GATE' && context.latestGateEvidence) {
+    return {
+      type: NEW_INFORMATION_EVENT_TYPES.NEW_GATE_FINGERPRINT,
+      subject: typeof review.task_id === 'string' ? review.task_id.trim() : null,
+      fingerprint: gateFailureFingerprint(review, context.latestGateEvidence),
+    };
+  }
+  if (review && typeof review.decision === 'string' && review.decision !== 'PASS' && review.decision !== 'OUT_OF_SCOPE') {
+    const signature = reworkSignature(review)
+      || sha256(JSON.stringify({ decision: review.decision, taskId: review.task_id ?? null }));
+    return {
+      type: NEW_INFORMATION_EVENT_TYPES.NEW_REVIEW_FINDINGS,
+      subject: typeof review.task_id === 'string' ? review.task_id.trim() : null,
+      fingerprint: signature,
+    };
+  }
+  if (context.currentTaskCard && typeof context.currentTaskCard === 'object') {
+    return {
+      type: NEW_INFORMATION_EVENT_TYPES.NEW_TASK_CARD,
+      subject: context.currentTaskCard.task_id ?? null,
+      fingerprint: sha256(JSON.stringify(context.currentTaskCard)),
+    };
+  }
+  if (Array.isArray(context.plannedTasks) && context.plannedTasks.length > 0) {
+    return {
+      type: NEW_INFORMATION_EVENT_TYPES.NEW_TASK_CARD,
+      subject: 'planned-tasks',
+      fingerprint: sha256(JSON.stringify(context.plannedTasks)),
+    };
+  }
+  return {
+    type: NEW_INFORMATION_EVENT_TYPES.NEW_USER_INPUT,
+    subject: 'supervisor-escalation-context',
+    fingerprint: sha256(JSON.stringify({
+      workflowGoal: context.workflowGoal ?? null,
+      repositoryContext: context.repositoryContext ?? null,
+      history: context.history ?? null,
+    })),
+  };
 }
 
 // Deterministic fingerprint of a Gate FAIL. Two Gate failures with the same

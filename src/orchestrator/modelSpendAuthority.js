@@ -49,6 +49,7 @@ import {
 } from './errors.js';
 import { isExecutorEligible as productionIsExecutorEligible } from './providerCapabilities.js';
 import { ReservationLedger } from './modelSpendReservation.js';
+import { NewInformationLedger } from './newInformation.js';
 
 // The strongest invocation identifiers mechanically available at the role
 // runtime boundary. Missing semantic IDs are bound as null rather than
@@ -60,14 +61,33 @@ import { ReservationLedger } from './modelSpendReservation.js';
 // Spend Reservation can key deterministically on the workflow a physical
 // call belongs to, regardless of how `operationId` happens to be formatted
 // by a given caller.
-export const CALL_INTENT_KEYS = Object.freeze(['role', 'family', 'provider', 'operationId', 'attempt', 'workflowId']);
+//
+// `evidenceRef` (§ Global New Information Policy, Phase 2 item 9) is a
+// COMPACT deterministic digest of the CallIntent's `evidenceIds` — never the
+// raw ids array (arrays don't compare by value) and never the underlying
+// Gate output / diff / review transcript. It binds a permit to the exact
+// evidence set that justified it: a permit minted for evidence set A cannot
+// be replayed against an intent claiming evidence set B. Intents that never
+// carry `evidenceIds` (the overwhelming majority of existing callers/tests
+// that do not wire a NewInformationLedger) normalize to `evidenceRef: null`
+// on both sides and are unaffected.
+export const CALL_INTENT_KEYS = Object.freeze(['role', 'family', 'provider', 'operationId', 'attempt', 'workflowId', 'evidenceRef']);
+
+function computeEvidenceRef(evidenceIds) {
+  if (!Array.isArray(evidenceIds) || evidenceIds.length === 0) return null;
+  const cleaned = evidenceIds.filter((id) => id !== null && id !== undefined).map(String);
+  if (cleaned.length === 0) return null;
+  return [...cleaned].sort().join(',');
+}
 
 export function normalizeCallIntent(intent = {}) {
   const out = {};
   for (const key of CALL_INTENT_KEYS) {
+    if (key === 'evidenceRef') continue;
     const value = intent[key];
     out[key] = value === undefined ? null : value;
   }
+  out.evidenceRef = computeEvidenceRef(intent.evidenceIds);
   if (!out.role || !out.family) {
     throw new AuthorizationError(
       AUTHORIZATION_ERROR_CODES.INTENT_INCOMPLETE,
@@ -161,8 +181,24 @@ export class ModelSpendAuthority {
   // workflow's user-visible terminal result (see safetyEvents.js /
   // workflowState.js#recordSafetyEvent) without this Authority needing to
   // know how a workflow's terminal state is assembled.
+  //
+  // `informationLedger` — Global New Information Policy (§ Phase 1-6,
+  // newInformation.js). OPTIONAL, exactly like `policy` and
+  // `reservationLedger` are optional collaborators with safe defaults: when
+  // no ledger is wired, authorize() performs NO evidence check at all —
+  // identical to this Authority's behavior before this feature existed. This
+  // is NOT a bypass flag (there is no `skipNewInformationCheck` toggle
+  // anywhere in this module): it is simply "which collaborator objects this
+  // Authority instance was constructed with", the same pattern already used
+  // for `policy`/`providerCapabilities`/`reservationLedger`. Production
+  // wiring (providerSelection.js#selectProviders) always constructs this
+  // Authority WITH an informationLedger; a caller that constructs its own
+  // ModelSpendAuthority without one gets the pre-existing, unaffected
+  // behavior — the intended migration path for a codebase-wide test suite
+  // that predates this policy.
   constructor({
     policy = () => ({ allow: true }), onEvent, providerCapabilities, reservationLedger, recordSafetyEvent,
+    informationLedger = null,
   } = {}) {
     this._policy = policy;
     this._onEvent = onEvent;
@@ -170,10 +206,16 @@ export class ModelSpendAuthority {
     this._issued = new Map(); // token -> { intent, consumed, consumedAt, reservationId }
     this._reservationLedger = reservationLedger
       ?? new ReservationLedger({ onEvent, recordSafetyEvent });
+    this._informationLedger = informationLedger;
+    this._recordSafetyEvent = recordSafetyEvent;
   }
 
   get reservationLedger() {
     return this._reservationLedger;
+  }
+
+  get informationLedger() {
+    return this._informationLedger;
   }
 
   // CallIntent -> PhysicalCallPermit. Throws AuthorizationError (SPEND_DENIED /
@@ -230,6 +272,95 @@ export class ModelSpendAuthority {
         decision?.reason || `spend denied for ${intent.role}/${intent.family}`,
         { intent },
       );
+    }
+    // § Global New Information Policy (Phase 1-6) — NECESSARY, NOT
+    // SUFFICIENT: this runs only when an informationLedger is wired (see the
+    // constructor doc above); it never bypasses any check above or below it,
+    // and nothing above/below it ever bypasses this. Deterministic, zero
+    // model calls: `findEligibleUnconsumed` only ever consults durably
+    // registered evidence records and this workflow's consumption ledger.
+    //
+    // Ordering: evidence is durably CONSUMED here, before the reservation is
+    // even created — so a caller can never reach a permit / dispatch for a
+    // CallIntent whose evidence was not already durably claimed. A read or
+    // write failure against the information ledger fails closed (zero
+    // physical provider calls), exactly like every other Reservation
+    // fail-closed path in this module.
+    //
+    // § Global New Information Policy (Wiring Cards 1-3): production wires
+    // ONE shared informationLedger onto the ONE ModelSpendAuthority used by
+    // every role (Planner, Supervisor, Executor, Reviewer, PR-closeout
+    // repair) — see providerSelection.js#selectProviders and supergpt.js. As
+    // of Wiring Card 3 every production internal physical model call site
+    // supplies `evidenceIds`; production enforcement is therefore effectively
+    // unconditional for every real workflow.
+    //
+    // The enforcement gate itself remains explicit and per-CallIntent, NOT a
+    // global switch: a CallIntent is "evidence-aware" — and therefore
+    // enforced — if and only if its RAW intent carries an `evidenceIds`
+    // property that is not `undefined` (an empty array still counts: an
+    // evidence-aware call site that legitimately found zero eligible
+    // evidence must still be denied, never silently skipped). This keeps a
+    // caller that constructs its own ModelSpendAuthority directly (never
+    // through providerSelection.js's factory — the overwhelming majority of
+    // this codebase's unit tests) behaving exactly as it did before this
+    // feature existed, with no boolean "skipNewInformationPolicy" flag
+    // anywhere: the ONLY way to be exempt is to literally not pass
+    // `evidenceIds` into `invoke()`. Grep for `evidenceIds:` at invoke() call
+    // sites in src/orchestrator/{automatedLoop,providerSelection,supergpt}.js
+    // to verify the production inventory has not silently grown or shrunk —
+    // see also tests/newInformationProductionWiring.test.js.
+    const evidenceAware = this._informationLedger
+      && Object.prototype.hasOwnProperty.call(rawIntent, 'evidenceIds')
+      && rawIntent.evidenceIds !== undefined;
+    if (evidenceAware) {
+      const candidateEvidenceIds = Array.isArray(rawIntent.evidenceIds)
+        ? rawIntent.evidenceIds.filter((id) => id !== null && id !== undefined)
+        : [];
+      let eligible;
+      try {
+        eligible = await this._informationLedger.findEligibleUnconsumed({
+          workflowId: intent.workflowId, role: intent.role, operationId: intent.operationId, evidenceIds: candidateEvidenceIds,
+        });
+      } catch (error) {
+        throw new AuthorizationError(
+          AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+          `new information state could not be read: ${error?.message ?? error}`,
+          { intent },
+        );
+      }
+      if (!eligible) {
+        // § Phase 6 — a Global New Information denial is a BLOCKING,
+        // user-visible safety event, exactly like an UNRESOLVED reservation.
+        // Mechanical context only (role/operation/candidate evidence types) —
+        // never a prompt, diff, or Gate output body.
+        this._recordSafetyEvent?.({
+          code: 'NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED',
+          severity: 'BLOCKING',
+          role: intent.role,
+          taskId: intent.operationId,
+          reason: `no fresh, unconsumed, eligible New Information evidence justifies this ${intent.role} call`,
+          actionTaken: 'physical model call denied — retry/failover/timeout/provider failure are never new information',
+        });
+        throw new AuthorizationError(
+          AUTHORIZATION_ERROR_CODES.NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED,
+          `no fresh, unconsumed, eligible New Information evidence justifies a ${intent.role} call `
+            + `for operation ${JSON.stringify(intent.operationId)}; retry / failover / timeout / provider `
+            + 'failure are never new information',
+          { intent, candidateEvidenceIds },
+        );
+      }
+      try {
+        await this._informationLedger.consume({
+          workflowId: intent.workflowId, role: intent.role, operationId: intent.operationId, evidenceId: eligible.evidenceId,
+        });
+      } catch (error) {
+        throw new AuthorizationError(
+          AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+          `new information consumption could not be durably persisted: ${error?.message ?? error}`,
+          { intent },
+        );
+      }
     }
     const reservationId = randomUUID();
     try {
@@ -366,13 +497,33 @@ export class ModelSpendAuthority {
     // Usage was not reliably known — UNRESOLVED regardless of whether the
     // provider call itself succeeded or failed (§ Failure 1). A successful
     // functional result never implies the token spend was accounted for.
-    await this._reservationLedger.markUnresolved({
-      workflowId: intent.workflowId,
-      reservationId: record.reservationId,
-      reason: outcome.ok
-        ? 'PROVIDER_CALL_SUCCEEDED_NO_RELIABLE_USAGE'
-        : (outcome.error?.code ?? outcome.error?.message ?? 'USAGE_UNKNOWN_AFTER_DISPATCH'),
-    });
+    //
+    // § Phase 0B: the durable UNRESOLVED write itself must fail closed. If
+    // `markUnresolved` cannot durably persist the candidate (its own
+    // durable-before-cache discipline guarantees the cache is left
+    // completely untouched — still DISPATCHING, itself already blocking),
+    // this must surface as a DEDICATED AuthorizationError, never as the raw
+    // persistence error: an unclassified error here would otherwise reach
+    // productionRoleRuntime.invoke()'s generic failure path, get
+    // misclassified as provider unavailable/timeout, mutate provider health,
+    // and potentially trigger failover to another provider — exactly the
+    // ambiguity this task closes.
+    try {
+      await this._reservationLedger.markUnresolved({
+        workflowId: intent.workflowId,
+        reservationId: record.reservationId,
+        reason: outcome.ok
+          ? 'PROVIDER_CALL_SUCCEEDED_NO_RELIABLE_USAGE'
+          : (outcome.error?.code ?? outcome.error?.message ?? 'USAGE_UNKNOWN_AFTER_DISPATCH'),
+      });
+    } catch (persistError) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.MODEL_SPEND_UNRESOLVED_PERSIST_FAILED,
+        `model spend UNRESOLVED state could not be durably persisted: ${persistError?.message ?? persistError}; `
+          + 'the reservation remains at its prior (already-blocking) durable status',
+        { intent, providerOutcome: outcome.ok ? 'SUCCESS' : 'FAILURE' },
+      );
+    }
     // A cancellation (AbortSignal, AGY_ABORTED, a killed child process, ...)
     // is a pre-existing, orthogonal invariant (see errors.js#isCancellation):
     // it is never a provider/spend failure and must reach the caller as

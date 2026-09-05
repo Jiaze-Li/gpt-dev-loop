@@ -30,6 +30,7 @@
 
 import {
   AdapterError, ADAPTER_ERROR_CODES, isCancellation, isAuthorizationFailure,
+  AuthorizationError, AUTHORIZATION_ERROR_CODES,
 } from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
 import { classifyVerificationPermissionBlocked, SAFETY_EVENT_CODES, SAFETY_SEVERITY } from './safetyEvents.js';
@@ -50,7 +51,12 @@ import {
 } from './preflight.js';
 import { getValidHostEvidence, markHostEvidenceConsumed, hashCommandSet, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
-import { decideDeterministically } from './deterministicSupervisorPolicy.js';
+import {
+  decideDeterministically, gateFailureFingerprint, reworkSignature, taskDiffHash, supervisorEscalationEvidence,
+} from './deterministicSupervisorPolicy.js';
+import {
+  registerTaskCardEvidence, registerGateFingerprintEvidence, registerReviewFindingsEvidence, registerTaskDiffEvidence,
+} from './newInformation.js';
 import {
   diffBaselineFailures,
   summarizeBaselineEvidence,
@@ -274,6 +280,26 @@ export async function runAutomatedWorkflow({
   // to persist/detect post-Gate drift for a REVIEW_PENDING resume.
   computeGateFingerprint = null,
   _execSync,
+  // § Global New Information Policy / Wiring Card 2 — Fast Path first
+  // Executor. Non-null ONLY when supergpt.js has already durably registered
+  // NEW_TASK_CARD evidence for the frozen Fast Path task contract (Fast Path
+  // has exactly one task). Deliberately NOT threaded into every Executor
+  // call: it is attached to the physical Executor dispatch ONLY on that
+  // task's very first normal attempt (attemptCount === 1, not escalation —
+  // see runAttempt() below), so REWORK/escalation retries of the SAME task
+  // — explicitly out of scope for this wiring card — never receive
+  // evidenceIds and remain exactly as unmigrated/unaffected as Full Path's
+  // Executor calls. `null` for Full Path (and for every other caller/test
+  // that predates this feature) — identical to omitting the option.
+  fastPathExecutorEvidenceIds = null,
+  // § Global New Information Policy / Wiring Card 2 — Full Path first
+  // Executor, Executor Gate/Reviewer rework, and Reviewer. The SAME shared
+  // durable ledger `providerSelection.js#selectProviders` constructs and
+  // wires onto the ONE ModelSpendAuthority every role shares (identical
+  // instance as `fastPathExecutorEvidenceIds`' registrations were already
+  // made against). `null` for any caller/test that predates this feature —
+  // identical to omitting evidenceIds everywhere below (no enforcement).
+  informationLedger = null,
 }) {
   const throwIfAborted = () => {
     if (signal?.aborted) throw new Error('automated workflow cancelled');
@@ -393,6 +419,18 @@ export async function runAutomatedWorkflow({
   const seenBlockers = new Map();
   let currentTaskCard = null;
   const loopReworkMemory = new Map();
+  // § Global New Information Policy / Wiring Card 2. `currentTaskCardEvidenceIds`
+  // is the NEW_TASK_CARD evidence justifying this task's very first Executor
+  // attempt (Fast Path's pre-registered `fastPathExecutorEvidenceIds`, or a
+  // freshly registered Full Path task-card evidence — see the NEXT_TASK
+  // branch below). `pendingReworkEvidenceIds` is the SINGLE evidence item
+  // (NEW_GATE_FINGERPRINT xor NEW_REVIEW_FINDINGS — never both at once,
+  // since `latestReviewResult` only ever carries one source at a time)
+  // justifying the NEXT Executor dispatch after a deterministic CONTINUE_REWORK
+  // — see that branch below. Both are null (no enforcement) unless
+  // `informationLedger` was supplied.
+  let currentTaskCardEvidenceIds = null;
+  let pendingReworkEvidenceIds = null;
   let reviewerSession = null;
   let reviewerCreated = false;
   let reviewerTabId = null;
@@ -913,11 +951,45 @@ export async function runAutomatedWorkflow({
     const executorTaskGate = enforceExecutorTaskCeilings(currentTaskCard.task_id, attemptCount);
     if (executorTaskGate) return executorTaskGate;
 
+    // § Global New Information Policy / Wiring Card 2 — this dispatch's
+    // evidenceIds depend on which attempt this is:
+    //   - the task's very first normal attempt (attemptCount is set to 1
+    //     exactly once per task, above, the first time normalAttempts
+    //     advances past 0 — never on an escalation attempt): the NEW_TASK_CARD
+    //     evidence registered at NEXT_TASK time (Fast Path's pre-registered
+    //     fastPathExecutorEvidenceIds, or Full Path's freshly registered
+    //     currentTaskCardEvidenceIds — see the NEXT_TASK branch below).
+    //   - a rework attempt reached via a deterministic CONTINUE_REWORK
+    //     decision (Gate FAIL or ordinary Reviewer REWORK): the single
+    //     NEW_GATE_FINGERPRINT / NEW_REVIEW_FINDINGS evidence registered for
+    //     it just before this runAttempt() call — see the CONTINUE_REWORK
+    //     branch below.
+    //   - an escalation attempt (Model Supervisor escalation — out of scope
+    //     for this card, see Part Q): no evidenceIds at all, exactly like
+    //     every other unmigrated call site.
+    const isFirstExecutorAttempt = attemptCount === 1 && !escalationActive;
+    const executorEvidenceIds = isFirstExecutorAttempt
+      ? (fastPathExecutorEvidenceIds ?? currentTaskCardEvidenceIds ?? undefined)
+      : (escalationActive ? undefined : (pendingReworkEvidenceIds ?? undefined));
     let executionReport;
     try {
-      executionReport = await claudeManager.execute(executorTaskCard, { signal, attempt: attemptCount, physicalCallReason: 'PRIMARY' });
+      executionReport = await claudeManager.execute(executorTaskCard, {
+        signal,
+        attempt: attemptCount,
+        physicalCallReason: 'PRIMARY',
+        ...(executorEvidenceIds ? { evidenceIds: executorEvidenceIds } : {}),
+      });
     } catch (err) {
       if (isCancellation(err, signal)) throw err;
+      // § Global New Information Policy / Wiring Card 2 — a Token Safety
+      // AuthorizationError (including NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED
+      // and MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE) is an orchestrator
+      // decision, never an "Executor infrastructure failure": it must reach
+      // the SINGLE centralized Token-Safety terminalization below (the outer
+      // catch's isAuthorizationFailure branch — see its own comment), never
+      // be reclassified as FAILURE_CATEGORIES.INFRASTRUCTURE here, and never
+      // trigger another Executor attempt.
+      if (isAuthorizationFailure(err)) throw err;
       // A post-send budget / duplicate-call failure still consumed a real
       // provider call. Record its usage before surfacing the blocker so the
       // dashboard never shows executor.calls = 0 for a call that happened.
@@ -1520,6 +1592,35 @@ export async function runAutomatedWorkflow({
     await activateReviewerTab();
     log(`review started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
     workflowStateManager?.startStage(WORKFLOW_STAGES.REVIEWER);
+
+    // § Global New Information Policy / Wiring Card 2 — Part I/J. The
+    // reviewable implementation state IS this task-scoped diff: the same
+    // deterministic taskDiffHash() the pre-existing Supervisor no-new-info
+    // heuristic already uses (deterministicSupervisorPolicy.js). Registration
+    // is idempotent — the SAME diff (identical changed_files + normalized
+    // patch) always resolves to the SAME CHANGED_TASK_DIFF evidenceId, so a
+    // repeated Reviewer call against an unchanged diff finds it already
+    // consumed and is denied; a genuinely changed diff authorizes one fresh
+    // Reviewer call. Registration failure fails closed via the SAME
+    // centralized Token-Safety terminalization the outer catch already
+    // applies to every AuthorizationError.
+    let reviewerEvidenceIds;
+    if (informationLedger) {
+      try {
+        const diffHash = taskDiffHash(evidence, null);
+        const diffEvidence = await registerTaskDiffEvidence(informationLedger, {
+          workflowId, taskId: currentTaskCard.task_id, diffHash,
+        });
+        reviewerEvidenceIds = [diffEvidence.evidenceId];
+      } catch (err) {
+        throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+          AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+          `New Information evidence for the Reviewer could not be durably registered: ${err?.message ?? err}`,
+          { workflowId, taskId: currentTaskCard.task_id },
+        );
+      }
+    }
+
     let reviewResult;
     try {
       reviewResult = await runWithRateLimitRecovery({
@@ -1528,6 +1629,7 @@ export async function runAutomatedWorkflow({
         run: (retry) =>
           reviewerSession.review(currentTaskCard.task_id, currentTaskCard, executionReport, evidence, {
             reuseAttempt: retry > 0,
+            ...(reviewerEvidenceIds ? { evidenceIds: reviewerEvidenceIds } : {}),
           }),
         reactivate: activateReviewerTab,
       });
@@ -1797,6 +1899,41 @@ export async function runAutomatedWorkflow({
         decision = deterministic.decision;
         log(`deterministic supervisor decision: ${decision.action} (${deterministic.reason})`);
       } else {
+        // § Global New Information Policy / Wiring Card 3 — PART A. A model
+        // Supervisor escalation is the ONLY path here that reaches a real
+        // physical Supervisor call (decideDeterministically() above already
+        // handled every deterministic transition with zero tokens). Register
+        // the deterministic evidence that justifies it — the same latest
+        // Review Result / Task Card state decideDeterministically() itself
+        // just inspected to decide it could NOT resolve this locally — and
+        // forward it as `decisionContext.evidenceIds` so
+        // providerSelection.js#supervisorSession.decide() carries it into
+        // productionRoleRuntime.invoke('supervisor', ...). A replay of the
+        // IDENTICAL escalation state (same review/task-card fingerprint) can
+        // never mint a second physical Supervisor call; a genuinely changed
+        // one can mint exactly one fresh call. A registration failure fails
+        // closed via the SAME centralized AuthorizationError terminalization
+        // every other evidence-registration call site in this file already
+        // uses.
+        if (informationLedger) {
+          try {
+            const evidence = supervisorEscalationEvidence(decisionContext);
+            const registered = await informationLedger.registerEvidence({
+              workflowId,
+              type: evidence.type,
+              subject: evidence.subject,
+              fingerprint: evidence.fingerprint,
+              source: 'supervisor-escalation',
+            });
+            decisionContext.evidenceIds = [registered.evidenceId];
+          } catch (err) {
+            throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+              AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+              `New Information evidence for the Model Supervisor escalation could not be durably registered: ${err?.message ?? err}`,
+              { workflowId, taskId: currentTaskCard ? currentTaskCard.task_id : null },
+            );
+          }
+        }
         await activateSupervisorTab();
         workflowStateManager?.startStage(WORKFLOW_STAGES.SUPERVISOR);
         try {
@@ -2082,6 +2219,49 @@ export async function runAutomatedWorkflow({
       }
 
       if (decision.action === 'CONTINUE_REWORK') {
+        // § Global New Information Policy / Wiring Card 2 — Part C/E/F.
+        // Checked BEFORE the escalationActive reassignment just below: a
+        // deterministic CONTINUE_REWORK (Gate FAIL or ordinary Reviewer
+        // REWORK) can only ever be produced by decideDeterministically()
+        // while normalAttempts < maxAttemptsPerTask (its own gate-rework
+        // branch explicitly escalates to the model Supervisor once attempts
+        // are exhausted — see deterministicSupervisorPolicy.js), so
+        // `escalationActive` here still reflects "was this rework reached
+        // without the (unmigrated, Part Q) Model Supervisor escalation path"
+        // — never mutated by the reassignment that follows.
+        const isDeterministicRework = !escalationActive;
+        if (isDeterministicRework && informationLedger && latestReviewResult) {
+          try {
+            if (latestReviewResult.source === 'GATE') {
+              const fingerprint = gateFailureFingerprint(latestReviewResult, latestGateEvidence);
+              const gateEvidence = await registerGateFingerprintEvidence(informationLedger, {
+                workflowId, taskId: currentTaskCard.task_id, fingerprint,
+              });
+              pendingReworkEvidenceIds = [gateEvidence.evidenceId];
+            } else {
+              const signature = reworkSignature(latestReviewResult);
+              if (signature) {
+                const findingsEvidence = await registerReviewFindingsEvidence(informationLedger, {
+                  workflowId, taskId: currentTaskCard.task_id, signature,
+                });
+                pendingReworkEvidenceIds = [findingsEvidence.evidenceId];
+              } else {
+                // No normalizable required_changes to fingerprint — never
+                // manufacture evidence from nothing; the next Executor
+                // dispatch below simply gets no evidenceIds (unmigrated).
+                pendingReworkEvidenceIds = null;
+              }
+            }
+          } catch (err) {
+            throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+              AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+              `New Information evidence for the Executor rework could not be durably registered: ${err?.message ?? err}`,
+              { workflowId, taskId: currentTaskCard.task_id },
+            );
+          }
+        } else {
+          pendingReworkEvidenceIds = null;
+        }
         if (normalAttempts >= maxAttemptsPerTask) {
           escalationActive = true;
         }
@@ -2145,6 +2325,39 @@ export async function runAutomatedWorkflow({
       unauthorizedProbeGuidance = null;
       attemptCount = 0;
       latestReviewResult = null;
+      pendingReworkEvidenceIds = null;
+
+      // § Global New Information Policy / Wiring Card 2 — Full Path first
+      // Executor (Part A/B). Fast Path already durably registered
+      // NEW_TASK_CARD evidence for its one frozen task at the supergpt.js
+      // boundary BEFORE runAutomatedWorkflow was ever called — reuse it
+      // verbatim rather than re-registering. Full Path registers it HERE,
+      // for every planned task's own NEXT_TASK selection, against the exact
+      // materialized task_card this Executor call will receive. Registration
+      // is idempotent (newInformation.js#registerEvidence): the SAME
+      // semantic task contract (task_id + full card content, timestamps/
+      // provider/attempt excluded) always resolves to the SAME evidenceId.
+      // A registration failure fails closed via the SAME centralized
+      // Token-Safety terminalization the outer catch already applies to every
+      // other AuthorizationError (isAuthorizationFailure branch, below).
+      if (fastPathExecutorEvidenceIds) {
+        currentTaskCardEvidenceIds = fastPathExecutorEvidenceIds;
+      } else if (informationLedger) {
+        try {
+          const cardEvidence = await registerTaskCardEvidence(informationLedger, {
+            workflowId, taskId: currentTaskCard.task_id, taskCard: currentTaskCard,
+          });
+          currentTaskCardEvidenceIds = [cardEvidence.evidenceId];
+        } catch (err) {
+          throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+            `New Information evidence for the Full Path Executor could not be durably registered: ${err?.message ?? err}`,
+            { workflowId, taskId: currentTaskCard.task_id },
+          );
+        }
+      } else {
+        currentTaskCardEvidenceIds = null;
+      }
 
       // BASELINE-DIFF GATE: capture the pre-existing verification failures now,
       // before the Executor's first edit, while this is still a clean baseline.
