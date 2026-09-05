@@ -282,7 +282,7 @@ function buildPrScenario({ heads, findingsByHead, informationLedger, executorImp
     cwd: process.cwd(),
     prNumber: 42,
     selection,
-    createGateRunner: () => ({ runGate: async () => ({ pass: true, results: [] }) }),
+    createGateRunner: () => ({ run: async () => ({ pass: true, results: [] }) }),
     baseline: null,
     signal: null,
     workflowId: 'wf-pr',
@@ -341,7 +341,7 @@ test('R2. Replaying the SAME head + findings can never authorize a second physic
   const adaptersAgain = createRealGithubPrCloseoutAdapters({
     repoRoot: process.cwd(), cwd: process.cwd(), prNumber: 42,
     selection,
-    createGateRunner: () => ({ runGate: async () => ({ pass: true, results: [] }) }),
+    createGateRunner: () => ({ run: async () => ({ pass: true, results: [] }) }),
     workflowId: 'wf-pr',
   });
   const replay = await adaptersAgain.runRepairTask({ ...card, allowed_files: ['a.js'], verification_commands: [] });
@@ -396,7 +396,7 @@ test('R4. Provider failover on the SAME repair evidence: A physically attempts o
   };
   const adapters = createRealGithubPrCloseoutAdapters({
     repoRoot: process.cwd(), cwd: process.cwd(), prNumber: 43,
-    selection, createGateRunner: () => ({ runGate: async () => ({ pass: true, results: [] }) }), workflowId: 'wf-pr4',
+    selection, createGateRunner: () => ({ run: async () => ({ pass: true, results: [] }) }), workflowId: 'wf-pr4',
   });
   const card = { task_id: 'pr-closeout-repair-43-round', allowed_files: ['a.js'], verification_commands: [], new_information: { subject: 'pr-43', headSha: 'sha-1', signatures: ['P1:a.js:bug'] } };
   const out = await adapters.runRepairTask(card);
@@ -535,7 +535,7 @@ test('X3. An information-store failure at the PR-repair boundary halts with zero
       informationLedger,
       createExecutorSessionManager: () => ({ execute: async () => { dispatched += 1; return { status: 'COMPLETE' }; } }),
     },
-    createGateRunner: () => ({ runGate: async () => ({ pass: true, results: [] }) }),
+    createGateRunner: () => ({ run: async () => ({ pass: true, results: [] }) }),
     workflowId: 'wf-x3',
   });
   const out = await adapters.runRepairTask({
@@ -587,7 +587,7 @@ test('X5. Fresh PR-repair evidence does not bypass the workflow cost ceiling', a
       informationLedger,
       createExecutorSessionManager: () => ({ execute: async () => { dispatched += 1; return { status: 'COMPLETE' }; } }),
     },
-    createGateRunner: () => ({ runGate: async () => ({ pass: true, results: [] }) }),
+    createGateRunner: () => ({ run: async () => ({ pass: true, results: [] }) }),
     workflowId: 'wf-x5',
     usageTracker,
     workflowCostCeilingUsd: 5,

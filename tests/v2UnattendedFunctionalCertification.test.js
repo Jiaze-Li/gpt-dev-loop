@@ -16,16 +16,26 @@
 //     against real files the fake Executor writes)
 //   - ModelSpendAuthority + NewInformationLedger + ReservationLedger +
 //     createProductionRoleRuntime (the SAME Token Safety wiring
-//     providerSelection.js#selectProviders constructs in production)
+//     providerSelection.js#selectProviders constructs in production) —
+//     Planner, Executor, Supervisor AND Reviewer every physical dispatch all
+//     cross the SAME Authority + Ledger, exactly like production; none of
+//     the four roles is New-Information-gating-exempt (see
+//     newInformation.js#ROLE_EVENT_ELIGIBILITY — every role has a real
+//     eligible event-type set) and the PR-closeout repair Executor crosses
+//     it too (§ Wiring Card 3)
 //   - the deterministic Fast/Full path selection, deterministic Supervisor
 //     policy (decideDeterministically), Gate-vs-Reviewer rework routing, and
 //     bounded escalation/HUMAN_REQUIRED thresholds in automatedLoop.js
-//   - runPrCloseoutLoop's repair/re-review state machine (PR closeout tests)
+//   - runPrCloseoutLoop's repair/re-review state machine (PR closeout tests),
+//     including — for the repair-loop scenario (test M) — the real internal
+//     repair Executor dispatch + real Gate run, not a synthetic
+//     `runRepairTask => COMPLETE` stub
 //
 // What is faked (an EXTERNAL or physically-nondeterministic boundary only):
 //   - the Planner/Executor/Reviewer/Supervisor model transport (an adapter
 //     function that writes/reads real files, never a hand-rolled workflow
-//     status decision)
+//     status decision, and — for Supervisor/Reviewer — living INSIDE
+//     createProductionRoleRuntime's own adapters, never outside it)
 //   - the GitHub PR (getPrHead / requestTrustedReview / pushRepair /
 //     escalateSupervisor) via the SAME adapter contract
 //     runPrCloseoutLoop/createRealGithubPrCloseoutAdapters use in production
@@ -40,13 +50,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 
-import { runSuperGPT, supergptResume } from '../src/orchestrator/supergpt.js';
+import { runSuperGPT, supergptResume, createRealGithubPrCloseoutAdapters } from '../src/orchestrator/supergpt.js';
+import { createGateRunner } from '../src/orchestrator/adapters/gateRunner.js';
+import { createGitEvidenceCollector } from '../src/adapters/gate/git-evidence/index.js';
 import { supergptRoute, ROUTE_DECISION } from '../src/control/autoRoutePolicy.js';
 import { SUPERGPT_WORKTREE_ROOT } from '../src/orchestrator/workflowWorktree.js';
 import { nullWindowSession } from '../src/orchestrator/agyProviderSessions.js';
 import { ModelSpendAuthority } from '../src/orchestrator/modelSpendAuthority.js';
 import { ReservationLedger } from '../src/orchestrator/modelSpendReservation.js';
-import { NewInformationLedger } from '../src/orchestrator/newInformation.js';
+import { NewInformationLedger, NEW_INFORMATION_EVENT_TYPES } from '../src/orchestrator/newInformation.js';
+import { AUTHORIZATION_ERROR_CODES } from '../src/orchestrator/errors.js';
 import { createProductionRoleRuntime } from '../src/orchestrator/productionRoleRuntime.js';
 import {
   DEFAULT_ROLE_POLICY, PRODUCTION_ROLE_CAPABILITIES, QuotaPoolRegistry, ProviderHealthRegistry,
@@ -141,12 +154,30 @@ const resolveFamily = (family) => ({
 // (ModelSpendAuthority + NewInformationLedger + ReservationLedger +
 // createProductionRoleRuntime — the identical wiring providerSelection.js's
 // production selectProviders() constructs) and fakes only the physical
-// Executor transport (production Executor pool is claude:sonnet ONLY — see
-// roleRouting.js DEFAULT_ROLE_POLICY.executor). supervisorImpl/reviewerImpl
-// are plain fakes (Supervisor/Reviewer are not yet New-Information-gated
-// call sites in this codebase — see newInformation.js Wiring Card 2 scope).
+// transport for every role — Planner, Executor, Supervisor, Reviewer alike
+// (production Executor pool is claude:sonnet ONLY — see roleRouting.js
+// DEFAULT_ROLE_POLICY.executor; Supervisor/Reviewer each route through their
+// own DEFAULT_ROLE_POLICY primary family).
+//
+// § PART A — Supervisor and Reviewer are New-Information-gated call sites in
+// this codebase exactly like Executor/Planner (see newInformation.js
+// ROLE_EVENT_ELIGIBILITY — 'supervisor' and 'reviewer' both have real
+// eligible event-type sets, and providerSelection.js#supervisorSession.decide
+// / createReviewerSession().review both forward `evidenceIds` into
+// productionRoleRuntime.invoke()). The fake PHYSICAL transports therefore
+// live INSIDE the runtime's `adapters.supervisor` / `adapters.reviewer`
+// exactly like `adapters.executor` already did — never as a hand-rolled
+// decision outside the runtime — and the externally exposed
+// `supervisorSession.decide` / `createReviewerSession().review` wrappers
+// below are thin shims that call `runtime.invoke(...)`, mirroring
+// providerSelection.js's production shape verbatim (down to the same
+// `operationId` / `evidenceIds` forwarding). `counters.supervisor` /
+// `counters.reviewer` therefore count PHYSICAL FAKE TRANSPORT invocations —
+// the SAME thing `counters.executor` already counted — not merely wrapper
+// calls. `evidenceLog` (optional) records the `evidenceIds` each CallIntent
+// actually carried, for PART C's mechanical evidence proof.
 function buildFakeSelection({
-  executorImpl, reviewerImpl, supervisorImpl, counters,
+  executorImpl, reviewerImpl, supervisorImpl, counters, evidenceLog,
 }) {
   const informationLedger = new NewInformationLedger({});
   let recordSafetyEventSink = null;
@@ -191,38 +222,70 @@ function buildFakeSelection({
           return executorImpl(payload, counters.executor);
         },
       },
+      // DEFAULT_ROLE_POLICY.supervisor's primary candidate — see
+      // roleRouting.js. Only this one family is declared (exactly like
+      // `executor` above), so RoleRouter never has a second candidate to
+      // fail over to in these scenarios.
+      supervisor: {
+        'agy:gemini': async (context) => {
+          counters.supervisor += 1;
+          if (!supervisorImpl) throw new Error('unexpected Supervisor call — none of this scenario\'s attempts should escalate');
+          const decision = await supervisorImpl(context);
+          return { ...decision, usage: { input_tokens: 1, output_tokens: 1 } };
+        },
+      },
+      // DEFAULT_ROLE_POLICY.reviewer's primary candidate.
+      reviewer: {
+        'agy:gpt-oss': async ({ taskId }) => {
+          counters.reviewer += 1;
+          const decision = await reviewerImpl(taskId, counters.reviewer);
+          return { ...decision, usage: { input_tokens: 1, output_tokens: 1 } };
+        },
+      },
     },
   });
-  return ({ recordSafetyEvent } = {}) => {
+  const factory = ({ recordSafetyEvent, workflowId } = {}) => {
     recordSafetyEventSink = recordSafetyEvent ?? null;
     return {
       runtime,
       informationLedger,
+      // Mirrors providerSelection.js#supervisorSession.decide verbatim: a
+      // thin shim over runtime.invoke('supervisor', ...), never a
+      // hand-rolled decision. `context.evidenceIds` is whatever
+      // automatedLoop.js registered before calling decide() (§ Global New
+      // Information Policy / Wiring Card 3) — forwarded, never invented here.
       supervisorSession: {
         create: async () => ({}),
-        decide: async (ctx) => {
-          counters.supervisor += 1;
-          if (!supervisorImpl) throw new Error('unexpected Supervisor call — none of this scenario\'s attempts should escalate');
-          return supervisorImpl(ctx);
+        decide: async (context) => {
+          evidenceLog?.supervisor?.push(context?.evidenceIds ?? null);
+          return (await runtime.invoke('supervisor', context, {
+            signals: context?.signals, operationId: workflowId, workflowId, evidenceIds: context?.evidenceIds,
+          })).value;
         },
         close: async () => {},
       },
+      // Mirrors providerSelection.js#createReviewerSession().review verbatim.
       createReviewerSession: () => ({
         create: async () => ({}),
-        review: async (taskId) => {
-          counters.reviewer += 1;
-          return reviewerImpl(taskId, counters.reviewer);
+        review: async (taskId, taskCard, executionReport, evidence, opts = {}) => {
+          evidenceLog?.reviewer?.push(opts?.evidenceIds ?? null);
+          return (await runtime.invoke('reviewer', {
+            taskId, taskCard, executionReport, evidence, opts,
+          }, {
+            signals: { reworkCycles: Math.max(0, (opts.attempt ?? 1) - 1) }, operationId: `${workflowId}:${taskId}`, workflowId, evidenceIds: opts.evidenceIds,
+          })).value;
         },
         close: async () => {},
       }),
       createExecutorSessionManager: ({
-        taskId, persistence, cwd, workflowId, onRoutingDecision, onProcessStarted, onProcessExited,
+        taskId, persistence, cwd, workflowId: execWorkflowId, onRoutingDecision, onProcessStarted, onProcessExited,
       }) => ({
         async execute(taskCard, { signal, evidenceIds } = {}) {
+          evidenceLog?.executor?.push(evidenceIds ?? null);
           if (signal?.aborted) throw new Error('executor cancelled');
           const result = await runtime.invoke('executor', {
-            taskId, workflowId, persistence, cwd, taskCard, onRoutingDecision, onProcessStarted, onProcessExited,
-          }, { operationId: `${workflowId}:${taskId}`, workflowId, evidenceIds });
+            taskId, workflowId: execWorkflowId, persistence, cwd, taskCard, onRoutingDecision, onProcessStarted, onProcessExited,
+          }, { operationId: `${execWorkflowId}:${taskId}`, workflowId: execWorkflowId, evidenceIds });
           return result.value;
         },
       }),
@@ -230,6 +293,11 @@ function buildFakeSelection({
       sessionStore: { snapshot: () => ({}) },
     };
   };
+  // Test-introspection only (never read by production code): lets a test
+  // inspect the SAME NewInformationLedger instance the runtime above
+  // enforces against, after the run, for PART C's mechanical evidence proof.
+  factory.informationLedger = informationLedger;
+  return factory;
 }
 
 function pass(taskId) {
@@ -349,6 +417,13 @@ test('E+F+Q+R+S. Fast Path happy path, then a second Fast Path task with one aut
       if (n === 2) {
         assert.ok(payload.taskCard.rework_feedback, 'attempt 2 must automatically carry the Reviewer\'s feedback');
         assert.deepEqual(payload.taskCard.rework_feedback.required_changes, ['fix add-doc-comment']);
+        // § PART B — a real Executor addressing "add-doc-comment" genuinely
+        // changes the diff (that IS the fix); actually make that change here
+        // instead of re-submitting byte-identical content, so the Reviewer's
+        // own New-Information gate (CHANGED_TASK_DIFF — see PART A above)
+        // sees a real second diff to authorize attempt 2's Reviewer call
+        // against, exactly like production requires.
+        fs.appendFileSync(path.join(payload.cwd, 'src', 'value.js'), '// doc comment added per Reviewer feedback\n');
       }
       return {
         task_id: payload.taskCard.task_id, status: 'DONE', changed_files: ['src/value.js'], usage: { input_tokens: 1, output_tokens: 1 }, callId: `exec-${payload.taskCard.task_id}-${n}`,
@@ -439,6 +514,11 @@ test('G+H+I+Q+R. Full Path: Planner once, task order automatic, one Gate rework 
         writeSource(payload.cwd, 'beta', 2);
         if (n === 2) {
           assert.ok(payload.taskCard.rework_feedback, 'attempt 2 must automatically carry the Reviewer\'s feedback');
+          // § PART B — see the matching comment in the Fast Path Reviewer
+          // rework scenario: really address the feedback so the diff (and
+          // therefore the Reviewer's own CHANGED_TASK_DIFF evidence) is
+          // genuinely fresh on attempt 2, not byte-identical to attempt 1.
+          fs.appendFileSync(path.join(payload.cwd, 'src', 'beta.js'), '// doc comment added per Reviewer feedback\n');
         }
       }
       return {
@@ -504,6 +584,10 @@ test('J. Bounded non-convergence: 3 ordinary REWORKs escalate to exactly one Sup
   const counters = {
     executor: 0, reviewer: 0, supervisor: 0,
   };
+  // § PART C — records the exact evidenceIds each CallIntent carried, so the
+  // escalation Supervisor call and the escalation Executor dispatch can be
+  // proven to rest on legitimate, already-approved evidence types below.
+  const evidenceLog = { supervisor: [], reviewer: [], executor: [] };
   let guidanceSeenByExecutor = null;
   // Each wrong attempt writes a DIFFERENT wrong value: the real Gate must
   // see a genuinely changed (still-failing) diff each round, or the
@@ -512,6 +596,7 @@ test('J. Bounded non-convergence: 3 ordinary REWORKs escalate to exactly one Sup
   // (see automatedLoop.js / deterministicSupervisorPolicy.js).
   const _selectProviders = buildFakeSelection({
     counters,
+    evidenceLog,
     executorImpl: (payload, n) => {
       if (payload.taskCard.supervisor_guidance) {
         guidanceSeenByExecutor = payload.taskCard.supervisor_guidance;
@@ -551,6 +636,67 @@ test('J. Bounded non-convergence: 3 ordinary REWORKs escalate to exactly one Sup
     assert.equal(counters.executor, 4, '3 normal attempts + 1 guided escalation attempt');
     assert.ok(guidanceSeenByExecutor && /Switch strategy/.test(guidanceSeenByExecutor), 'SUPERVISOR_GUIDANCE_REACHES_EXECUTOR');
     assert.match(fs.readFileSync(path.join(sourceRepo, 'src', 'value.js'), 'utf8'), /export const value = 2;/);
+
+    // § PART C — explicit proof that escalation uses legitimate evidence,
+    // mechanically, not merely inferred from the final DONE.
+    const informationLedger = _selectProviders.informationLedger;
+    const supervisorEvidenceIds = evidenceLog.supervisor.filter((ids) => Array.isArray(ids) && ids.length > 0);
+    const executorEvidenceIds = evidenceLog.executor.filter((ids) => Array.isArray(ids) && ids.length > 0);
+    assert.equal(supervisorEvidenceIds.length, 1, 'exactly the one escalation Supervisor call carried evidenceIds');
+    // 1. neither is empty.
+    assert.ok(supervisorEvidenceIds[0].length > 0, 'Supervisor CallIntent evidenceIds is non-empty');
+    assert.ok(executorEvidenceIds.length > 0 && executorEvidenceIds.some((ids) => ids.length > 0), 'at least one Executor CallIntent carried evidenceIds');
+    const supervisorEvidenceId = supervisorEvidenceIds[0][0];
+    // The guided (escalation) Executor attempt is the LAST one dispatched —
+    // it is the one this fix (d6549fb) made carry evidence at all.
+    const escalationExecutorEvidenceIds = executorEvidenceIds[executorEvidenceIds.length - 1];
+    const escalationExecutorEvidenceId = escalationExecutorEvidenceIds[0];
+
+    const ledgerState = await informationLedger.list(workflowId);
+    const byId = new Map(ledgerState.events.map((e) => [e.evidenceId, e]));
+    // 2. both refer to registered evidence.
+    assert.ok(byId.has(supervisorEvidenceId), 'the Supervisor CallIntent evidenceId is a registered event');
+    assert.ok(byId.has(escalationExecutorEvidenceId), 'the escalation Executor CallIntent evidenceId is a registered event');
+    // 3. evidence type is an already-approved legitimate type.
+    const legitimateTypes = new Set([
+      NEW_INFORMATION_EVENT_TYPES.NEW_GATE_FINGERPRINT,
+      NEW_INFORMATION_EVENT_TYPES.NEW_REVIEW_FINDINGS,
+    ]);
+    assert.ok(legitimateTypes.has(byId.get(supervisorEvidenceId).type), `Supervisor evidence type is legitimate: ${byId.get(supervisorEvidenceId).type}`);
+    assert.ok(legitimateTypes.has(byId.get(escalationExecutorEvidenceId).type), `Executor escalation evidence type is legitimate: ${byId.get(escalationExecutorEvidenceId).type}`);
+    // 4. no new escalation-specific evidence type exists anywhere in the
+    // ledger for this workflow — every registered event is one of the
+    // pre-existing taxonomy's types (newInformation.js#NEW_INFORMATION_EVENT_TYPES).
+    const allValidTypes = new Set(Object.values(NEW_INFORMATION_EVENT_TYPES));
+    assert.ok(ledgerState.events.every((e) => allValidTypes.has(e.type)), 'every registered event uses a pre-existing New Information event type — none invented for escalation');
+    // This is a Gate-rework scenario, so the SAME triggering Gate-failure
+    // fingerprint justifies both the Supervisor escalation call and the
+    // escalation Executor dispatch (see d6549fb) — literally the same
+    // registered event, consumed independently under two different roles.
+    assert.equal(supervisorEvidenceId, escalationExecutorEvidenceId, 'the escalation Supervisor call and the escalation Executor dispatch rest on the SAME underlying Gate-failure evidence');
+
+    // 5. Supervisor consumption and Executor consumption are separate
+    // because role is part of consumption identity.
+    const supervisorConsumed = await informationLedger.isConsumed({
+      workflowId, role: 'supervisor', operationId: workflowId, evidenceId: supervisorEvidenceId,
+    });
+    const executorConsumed = await informationLedger.isConsumed({
+      workflowId, role: 'executor', operationId: `${workflowId}:value-escalate`, evidenceId: escalationExecutorEvidenceId,
+    });
+    assert.equal(supervisorConsumed, true, 'the Supervisor role independently consumed the evidence');
+    assert.equal(executorConsumed, true, 'the Executor role independently consumed the SAME evidence under its own (role, operation) identity');
+
+    // 6. same evidence cannot authorize the same role/operation twice: a
+    // second lookup for the SAME (role, operationId) finds nothing eligible
+    // left to authorize a replay.
+    const supervisorReplay = await informationLedger.findEligibleUnconsumed({
+      workflowId, role: 'supervisor', operationId: workflowId, evidenceIds: [supervisorEvidenceId],
+    });
+    const executorReplay = await informationLedger.findEligibleUnconsumed({
+      workflowId, role: 'executor', operationId: `${workflowId}:value-escalate`, evidenceIds: [escalationExecutorEvidenceId],
+    });
+    assert.equal(supervisorReplay, null, 'a replayed Supervisor CallIntent finds no fresh unconsumed evidence');
+    assert.equal(executorReplay, null, 'a replayed Executor CallIntent finds no fresh unconsumed evidence');
   } finally {
     cleanupWorkflow(workflowId);
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -653,6 +799,104 @@ function setupCloseoutRepo(tmpRoot) {
   return sourceRepo;
 }
 
+// Like setupCloseoutRepo, but `value` starts genuinely wrong (1) against an
+// accepted target of 2 — a real bug for the real internal repair Executor +
+// real Gate (PART D/E) to actually fix, instead of a no-op repo where any
+// repair round trivially "passes" without changing anything.
+function setupCloseoutRepoWithBug(tmpRoot) {
+  const sourceRepo = setupSourceRepo(tmpRoot, { units: [{ name: 'value', initial: 1, target: 2 }] });
+  fs.mkdirSync(path.join(sourceRepo, '.supergpt'), { recursive: true });
+  fs.writeFileSync(
+    path.join(sourceRepo, '.supergpt', 'config.json'),
+    JSON.stringify({ closeoutCommands: [verifyCommand('value')] }, null, 2),
+  );
+  return sourceRepo;
+}
+
+// § PART D/E — builds a PR-closeout scenario whose `runRepairTask` is the
+// REAL supergpt.js#createRealGithubPrCloseoutAdapters().runRepairTask,
+// wired to a production-shaped `selection` (ModelSpendAuthority +
+// NewInformationLedger + createProductionRoleRuntime — the SAME composition
+// buildFakeSelection above uses for the primary pipeline) and the REAL Gate
+// (adapters/gateRunner.js + the real git evidence collector, running real
+// shell commands against the real `sourceRepo` checkout — PR-closeout repair
+// always operates directly on the PR branch working directory, never an
+// isolated worktree; see createRealGithubPrCloseoutAdapters). Only the
+// GitHub-facing operations (getPrHead / requestTrustedReview / pushRepair /
+// escalateSupervisor) are faked — never runRepairTask, never the Gate.
+function buildRealPrRepairScenario({
+  sourceRepo, workflowId, prNumber, heads, findingsByHead, repairExecutorImpl,
+}) {
+  const informationLedger = new NewInformationLedger({});
+  const executorCalls = { calls: 0 };
+  const providerHealth = new ProviderHealthRegistry();
+  const spendAuthority = new ModelSpendAuthority({ informationLedger });
+  const runtime = createProductionRoleRuntime({
+    rolePolicy: { executor: [{ family: 'claude:sonnet' }] },
+    quotaRegistry: new QuotaPoolRegistry({ filePath: null }),
+    providerHealth,
+    resolveFamily,
+    spendAuthority,
+    adapters: {
+      executor: {
+        'claude:sonnet': async (payload) => {
+          executorCalls.calls += 1;
+          return repairExecutorImpl(payload, executorCalls.calls);
+        },
+      },
+    },
+  });
+  const selection = {
+    informationLedger,
+    runtime,
+    createExecutorSessionManager: ({ taskId, cwd }) => ({
+      async execute(card, { signal, evidenceIds } = {}) {
+        const result = await runtime.invoke('executor', {
+          taskId, taskCard: card, cwd,
+        }, { operationId: `${workflowId}:${taskId}`, workflowId, evidenceIds });
+        return result.value;
+      },
+    }),
+  };
+  // The REAL adapter machinery — never a synthetic `runRepairTask => COMPLETE`
+  // stub. `createGateRunner` here is the REAL module export
+  // (adapters/gateRunner.js), so `.run()` actually spawns the shell and
+  // actually collects real git evidence.
+  const realAdapters = createRealGithubPrCloseoutAdapters({
+    repoRoot: sourceRepo,
+    cwd: sourceRepo,
+    prNumber,
+    selection,
+    createGateRunner,
+    baseline: null,
+    signal: null,
+    workflowId,
+  });
+  const repairCards = [];
+  const runRepairTask = async (card) => {
+    repairCards.push(card);
+    return realAdapters.runRepairTask(card);
+  };
+
+  const headIndex = { i: 0 };
+  const currentHead = () => heads[Math.min(headIndex.i, heads.length - 1)];
+  const reviewCalls = [];
+  const pushCalls = [];
+  return {
+    informationLedger, executorCalls, selection, realAdapters, repairCards, reviewCalls, pushCalls,
+    loopAdapters: {
+      getPrHead: async () => currentHead(),
+      requestTrustedReview: async ({ prHead }) => {
+        reviewCalls.push(prHead);
+        return { reviewer: 'codex', headSha: prHead, findings: findingsByHead[prHead] ?? [] };
+      },
+      runRepairTask,
+      pushRepair: async () => { headIndex.i += 1; pushCalls.push(currentHead()); return currentHead(); },
+      escalateSupervisor: async () => null,
+    },
+  };
+}
+
 // A `_selectProviders` stub for the PR_CLOSEOUT path: this branch never
 // touches supervisorSession/createReviewerSession/createExecutorSessionManager
 // (prCloseoutAdapters fully owns repair/review), so every one of those
@@ -693,33 +937,76 @@ test('L. PR Closeout clean path: trusted external review is clean on the first h
   }
 });
 
-test('M. PR Closeout repair loop: an actionable finding on H1 triggers exactly one automatic internal repair, pushes H2, re-review is CLEAN -> DONE', async () => {
+test('M. PR Closeout repair loop: a real actionable H1 finding drives the REAL internal repair Executor + REAL Gate, pushes H2, re-review is CLEAN -> DONE', async () => {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'v2cert-pr-repair-'));
-  const sourceRepo = setupCloseoutRepo(tmpRoot);
+  const sourceRepo = setupCloseoutRepoWithBug(tmpRoot);
   const workflowId = `wf-v2cert-pr-repair-${Date.now()}`;
+  const prNumber = 43;
 
-  const scenario = closeoutScenario({
+  const scenario = buildRealPrRepairScenario({
+    sourceRepo,
+    workflowId,
+    prNumber,
     heads: ['sha-h1', 'sha-h2'],
-    reviews: {
-      'sha-h1': { reviewer: 'codex', headSha: 'sha-h1', findings: [{ severity: 'P1', file: 'src/value.js', message: 'off-by-one' }] },
-      'sha-h2': { reviewer: 'codex', headSha: 'sha-h2', findings: [] },
+    findingsByHead: {
+      'sha-h1': [{ severity: 'P1', file: 'src/value.js', message: 'off-by-one' }],
+    },
+    // The physical fake transport is the ONLY faked piece: a real Executor
+    // asked to fix this exact finding would write the corrected value.
+    // Everything downstream — the New Information registration/consumption,
+    // the runtime/Authority dispatch, and the Gate that actually verifies
+    // the fix — is the real production code.
+    repairExecutorImpl: (payload, n) => {
+      writeSource(payload.cwd, 'value', 2);
+      return {
+        status: 'COMPLETE', changed_files: ['src/value.js'], usage: { input_tokens: 1, output_tokens: 1 }, callId: `repair-exec-${n}`,
+      };
     },
   });
 
   try {
     const result = await runSuperGPT({
       workflowId,
-      goal: 'closeout PR #43',
+      goal: `closeout PR #${prNumber}`,
       cwd: sourceRepo,
-      prCloseoutAdapters: scenario.adapters,
+      prCloseoutAdapters: scenario.loopAdapters,
       _selectProviders: neverUsedSelection(),
     });
 
     assert.equal(result.status, 'WORKFLOW_DONE', `repair loop must reach DONE: ${result.reason}`);
-    assert.equal(scenario.state.repairCards.length, 1, 'repair task generated and run automatically exactly once');
-    assert.equal(scenario.state.pushCalls.length, 1, 'exactly one push (H1 -> H2)');
-    assert.notEqual(scenario.state.pushCalls[0], 'sha-h1');
-    assert.deepEqual(scenario.state.reviewCalls, ['sha-h1', 'sha-h2'], 'external reviews = 2, H1 != H2');
+    assert.equal(scenario.repairCards.length, 1, 'repair task generated and run automatically exactly once');
+    assert.equal(scenario.executorCalls.calls, 1, 'PR REPAIR EXECUTOR PHYSICAL FAKE CALLS = 1 (the transport is fake; the dispatch path around it is real)');
+    assert.equal(scenario.pushCalls.length, 1, 'exactly one push (H1 -> H2)');
+    assert.notEqual(scenario.pushCalls[0], 'sha-h1');
+    assert.deepEqual(scenario.reviewCalls, ['sha-h1', 'sha-h2'], 'external reviews = 2, H1 != H2');
+    // The REAL Gate actually ran the real verification command against the
+    // REAL repo checkout and actually passed — not a synthetic `PASS` label.
+    assert.match(
+      fs.readFileSync(path.join(sourceRepo, 'src', 'value.js'), 'utf8'),
+      /export const value = 2;/,
+      'the REAL repair Executor + REAL Gate actually fixed the file in the real source repo',
+    );
+
+    // § PART E — external result evidence proof: the shared informationLedger
+    // carries a registered NEW_EXTERNAL_RESULT for H1, and the repair
+    // Executor CallIntent actually consumed it through the real Authority —
+    // not merely inferred from the final DONE.
+    const ledgerState = await scenario.informationLedger.list(workflowId);
+    const externalResultEvents = ledgerState.events.filter((e) => e.type === NEW_INFORMATION_EVENT_TYPES.NEW_EXTERNAL_RESULT);
+    assert.equal(externalResultEvents.length, 1, 'exactly one NEW_EXTERNAL_RESULT evidence registered — for the H1 finding');
+    assert.equal(externalResultEvents[0].subject, `pr-${prNumber}`);
+    const repairTaskId = scenario.repairCards[0].task_id;
+    const consumed = await scenario.informationLedger.isConsumed({
+      workflowId, role: 'executor', operationId: `${workflowId}:${repairTaskId}`, evidenceId: externalResultEvents[0].evidenceId,
+    });
+    assert.equal(consumed, true, 'the repair Executor CallIntent actually consumed the NEW_EXTERNAL_RESULT evidence through the real Authority');
+
+    // Replaying the IDENTICAL H1 finding (same card.new_information) can
+    // never authorize a second physical repair Executor call.
+    const replay = await scenario.realAdapters.runRepairTask(scenario.repairCards[0]);
+    assert.equal(scenario.executorCalls.calls, 1, 'no additional physical repair Executor call on replay of the identical H1 finding');
+    assert.equal(replay.authorizationFailure, true);
+    assert.equal(replay.authorizationCode, AUTHORIZATION_ERROR_CODES.NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED);
   } finally {
     cleanupWorkflow(workflowId);
     fs.rmSync(tmpRoot, { recursive: true, force: true });

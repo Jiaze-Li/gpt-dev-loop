@@ -41,7 +41,7 @@ function execReport(overrides = {}) {
   };
 }
 
-const fakeGateRunner = () => () => ({ runGate: async () => ({ pass: true, results: [] }) });
+const fakeGateRunner = () => () => ({ run: async () => ({ pass: true, results: [] }) });
 
 // A fallback selection: no createExecutorSessionManager, but it exposes the
 // shared authority through selection.runtime.spendAuthority.

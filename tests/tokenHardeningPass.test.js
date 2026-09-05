@@ -55,7 +55,7 @@ function fakeSelection(executeImpl) {
 }
 
 function fakeGateRunner() {
-  return () => ({ runGate: async () => ({ pass: true, results: [] }) });
+  return () => ({ run: async () => ({ pass: true, results: [] }) });
 }
 
 function makeAdapters({ executeImpl, usageTracker, workflowStateManager, workflowCostCeilingUsd = 0 }) {

@@ -260,7 +260,7 @@ test('final fuse: PR-closeout repair Executor stops before spending when the Tas
     const adapters = createRealGithubPrCloseoutAdapters({
       repoRoot: process.cwd(), cwd: process.cwd(), prNumber: 123,
       selection: { createExecutorSessionManager: () => ({ async execute() { executeCalls += 1; return { task_id: 'pr-closeout-repair', status: 'COMPLETE', changed_files: [], tests_run: [], test_results: [], issues: 'none', next_recommendation: 'proceed' }; } }) },
-      createGateRunner: () => ({ runGate: async () => ({ pass: true, results: [] }) }),
+      createGateRunner: () => ({ run: async () => ({ pass: true, results: [] }) }),
       baseline: null, signal: null,
       workflowId: 'wf-internal-test-closeout-final',
       workflowStateManager, usageTracker,

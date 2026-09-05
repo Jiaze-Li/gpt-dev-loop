@@ -1376,12 +1376,24 @@ export function createRealGithubPrCloseoutAdapters({
         physicalCallReason: executionReport?.physicalCallReason ?? 'PRIMARY',
       });
 
+      // Real Gate contract per docs/workflow/ADAPTER_INTERFACE.md §3:
+      // run(verification_commands) -> evidence — the SAME `.run()` shape the
+      // primary pipeline's own Gate rerun uses (see the `rerunGate.run(...)`
+      // call above in this file). `runGate(card)` was never a real adapter
+      // method (the production gateRunner.js — adapters/gateRunner.js — only
+      // ever exported `.run`); every existing test exercising this repair
+      // path supplied a fake gate runner shaped to match, so the mismatch
+      // against the REAL gate runner went uncaught. `gitEvidenceCollector` is
+      // likewise required by the real runner's `.run()` (it hands the
+      // pass/fail summary to it to build the evidence object) and was
+      // previously omitted here.
       const runner = (createGateRunner || _createGateRunner)({
+        gitEvidenceCollector: createGitEvidenceCollector(),
         cwd: repoRoot,
         signal,
         baseline,
       });
-      const gateResult = await runner.runGate(card);
+      const gateResult = await runner.run(card.verification_commands, { signal });
       const isComplete = executionReport?.status === 'COMPLETE' && gateResult?.pass;
       return {
         status: isComplete ? 'COMPLETE' : (executionReport?.status || 'FAILED'),
