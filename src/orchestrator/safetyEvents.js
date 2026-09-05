@@ -70,6 +70,17 @@ export const SAFETY_EVENT_CODES = Object.freeze({
   // for this role/operation. Retry / failover / timeout / provider failure
   // are never new information.
   NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED: 'NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED',
+  // External Model Trigger Authority (externalModelTriggerAuthority.js): a
+  // GitHub "@codex review" / "@claude review" comment spends model quota in
+  // an EXTERNAL system, outside the internal provider runtime. These codes
+  // are deliberately separate from the internal NO_NEW_INFORMATION_* /
+  // MODEL_SPEND_* codes above — never fused with them.
+  EXTERNAL_MODEL_TRIGGER_DUPLICATE_BLOCKED: 'EXTERNAL_MODEL_TRIGGER_DUPLICATE_BLOCKED',
+  EXTERNAL_MODEL_TRIGGER_LIMIT_EXCEEDED: 'EXTERNAL_MODEL_TRIGGER_LIMIT_EXCEEDED',
+  EXTERNAL_MODEL_REVIEW_ROUND_LIMIT_EXCEEDED: 'EXTERNAL_MODEL_REVIEW_ROUND_LIMIT_EXCEEDED',
+  EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED: 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED',
+  EXTERNAL_MODEL_TRIGGER_UNRESOLVED: 'EXTERNAL_MODEL_TRIGGER_UNRESOLVED',
+  EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE: 'EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE',
 });
 
 export const SAFETY_SEVERITY = Object.freeze({

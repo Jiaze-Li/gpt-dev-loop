@@ -33,6 +33,15 @@ import {
   recordThreadResolution,
 } from './normalizedPrReview.js';
 
+// Every "@codex review" / "@claude review" comment this adapter posts is an
+// External Model Trigger (see externalModelTriggerAuthority.js) — it spends
+// model quota in a system OUTSIDE this process. `triggerAuthority` is
+// therefore a REQUIRED production collaborator, not an optional one: there
+// is no allow-all default here. Production wiring
+// (supergpt.js#createRealGithubPrCloseoutAdapters) always constructs a real
+// ExternalModelTriggerAuthority; only tests may inject an explicit,
+// clearly-named test authority/fake.
+
 // Canonical, evidence-backed trigger comment bodies. `resolveTriggerText`
 // allows a tested injection override (metadata / config) but never silently
 // invents an alternate format.
@@ -61,6 +70,13 @@ export const GITHUB_REVIEW_FAILURES = Object.freeze({
   TRIGGER_FAILED: 'TRIGGER_FAILED',
   TIMEOUT: 'REVIEW_TIMEOUT',
   INFRASTRUCTURE: 'GITHUB_INFRASTRUCTURE',
+  // The External Model Trigger Authority denied this trigger deterministically
+  // (duplicate / ceiling / wall-clock / unresolved / unreadable state) — see
+  // externalModelTriggerAuthority.js. Distinct from an ordinary GitHub-side
+  // TRIGGER_FAILED/INFRASTRUCTURE failure: this is an orchestrator safety
+  // decision, never a reviewer/provider outage, and must never be converted
+  // into a cross-reviewer failover attempt for the SAME head.
+  AUTHORITY_BLOCKED: 'EXTERNAL_TRIGGER_AUTHORITY_BLOCKED',
 });
 
 // GitHub polling bounds. The interval is deliberately clamped into the
@@ -274,12 +290,29 @@ function isAfterTrigger(result, trigger) {
 //
 // clock (injected): now() -> ms epoch; sleep(ms) -> Promise
 //
+// triggerAuthority (REQUIRED, injected — see externalModelTriggerAuthority.js):
+//   authorize(triggerIntent) -> { outcome: 'ALLOW', permit } | { outcome: 'REUSE', trigger }
+//                              | throws ExternalTriggerError (fail closed)
+//   dispatch(permit, triggerIntent, dispatchFn) -> { commentId, triggeredAt }
+//                              | throws ExternalTriggerError
+//   recordResult?({ workflowId, prNumber, headSha, triggerKind, resultMeta }) -> void (best effort)
+// Every physical postReviewTrigger() call crosses this authority first —
+// there is no bypass path. A duplicate-blocked / limit / round / wall-clock
+// denial classifies as GITHUB_REVIEW_FAILURES.AUTHORITY_BLOCKED, distinct
+// from an ordinary GitHub-side TRIGGER_FAILED/INFRASTRUCTURE failure.
+//
+// workflowId (REQUIRED, forwarded verbatim into every TriggerIntent) scopes
+// the authority's durable ledger — the SAME workflowId the rest of the
+// workflow's persistence already uses.
+//
 // persist?(pendingSnapshot) is called after every trigger / head rebind so a
 // restart resumes the same pending reviewer/head without a second comment.
 export function createGithubPrReviewAdapter({
   github,
   clock = {},
   reviewer,
+  workflowId = null,
+  triggerAuthority,
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   maxWaitMs = DEFAULT_MAX_WAIT_MS,
   backoffFactor = 1.5,
@@ -294,6 +327,14 @@ export function createGithubPrReviewAdapter({
     throw new PrCloseoutError(
       PR_CLOSEOUT_ERROR_CODES.MALFORMED_REVIEW,
       'createGithubPrReviewAdapter requires a github client with getPrHead/postReviewTrigger/listReviewResults',
+    );
+  }
+  if (!triggerAuthority || typeof triggerAuthority.authorize !== 'function'
+    || typeof triggerAuthority.dispatch !== 'function') {
+    throw new PrCloseoutError(
+      PR_CLOSEOUT_ERROR_CODES.MALFORMED_REVIEW,
+      'createGithubPrReviewAdapter requires a triggerAuthority (ExternalModelTriggerAuthority) with '
+        + 'authorize/dispatch — every @codex/@claude review trigger must cross the External Model Trigger Authority',
     );
   }
   const reviewerKey = String(reviewer ?? '').trim().toLowerCase();
@@ -326,6 +367,44 @@ export function createGithubPrReviewAdapter({
       && pendingState.commentId != null) {
       return pendingState;
     }
+
+    const triggerIntent = {
+      workflowId, prNumber, headSha: head, triggerKind: 'PR_REVIEW', reviewer: reviewerKey, semanticAction: 'EXTERNAL_PR_REVIEW',
+    };
+
+    // Every trigger — new or re-triggered on a head change — crosses the
+    // External Model Trigger Authority FIRST. This is what makes "one
+    // external trigger per semantic HEAD state" hold across reviewers: a
+    // duplicate/ceiling/wall-clock denial here is a fail-closed orchestrator
+    // decision, never a reviewer/provider failure. A durably TRIGGERED
+    // record for this exact head (posted by ANY reviewer, in this or a
+    // prior process) is reused via 'REUSE' rather than posted again.
+    let authorization;
+    try {
+      authorization = await triggerAuthority.authorize(triggerIntent);
+    } catch (error) {
+      throw Object.assign(new Error(error?.message ?? 'external trigger authorization denied'), {
+        _classified: GITHUB_REVIEW_FAILURES.AUTHORITY_BLOCKED,
+        _authorityCode: error?.code ?? null,
+      });
+    }
+
+    if (authorization.outcome === 'REUSE') {
+      pendingState = {
+        reviewer: reviewerKey,
+        headSha: head,
+        commentId: authorization.trigger.commentId,
+        triggeredAt: authorization.trigger.triggeredAt,
+        body: resolveTriggerText(reviewerKey, { overrides: triggerOverrides }),
+      };
+      await savePending();
+      return pendingState;
+    }
+
+    // ALLOW — the zero-spend availability probe still gates the physical
+    // post: proving a reviewer unavailable BEFORE dispatch() ever runs never
+    // consumes the authorization (§ Part E), so another reviewer may still
+    // authorize the SAME head afterward.
     if (typeof github.isReviewerAvailable === 'function') {
       let available;
       try {
@@ -341,25 +420,26 @@ export function createGithubPrReviewAdapter({
         });
       }
     }
+
     const body = resolveTriggerText(reviewerKey, { overrides: triggerOverrides });
-    let comment;
+    let trigger;
     try {
-      comment = await github.postReviewTrigger({ prNumber, body });
+      trigger = await triggerAuthority.dispatch(
+        authorization.permit,
+        triggerIntent,
+        () => github.postReviewTrigger({ prNumber, body }),
+      );
     } catch (error) {
-      throw Object.assign(new Error('failed to post review trigger comment'), {
-        _classified: error?._classified ?? GITHUB_REVIEW_FAILURES.TRIGGER_FAILED,
-      });
-    }
-    if (!comment || comment.id == null) {
-      throw Object.assign(new Error('review trigger comment returned no id'), {
-        _classified: GITHUB_REVIEW_FAILURES.TRIGGER_FAILED,
+      throw Object.assign(new Error(error?.message ?? 'failed to post review trigger comment'), {
+        _classified: GITHUB_REVIEW_FAILURES.AUTHORITY_BLOCKED,
+        _authorityCode: error?.code ?? null,
       });
     }
     pendingState = {
       reviewer: reviewerKey,
       headSha: head,
-      commentId: comment.id,
-      triggeredAt: comment.createdAt ?? new Date(now()).toISOString(),
+      commentId: trigger.commentId,
+      triggeredAt: trigger.triggeredAt,
       body,
     };
     await savePending();
@@ -400,6 +480,7 @@ export function createGithubPrReviewAdapter({
       return failure(error?._classified ?? GITHUB_REVIEW_FAILURES.TRIGGER_FAILED, {
         reviewer: reviewerKey,
         head,
+        authorityCode: error?._authorityCode ?? null,
       });
     }
 
@@ -443,6 +524,13 @@ export function createGithubPrReviewAdapter({
       if (hit) {
         pendingState = null;
         await savePending();
+        // Best-effort audit transition (TRIGGERED -> RESULT_RECEIVED). Never
+        // makes this head triggerable again either way — a persistence
+        // hiccup here must not mask an otherwise-successful review result.
+        await triggerAuthority.recordResult?.({
+          workflowId, prNumber, headSha: head, triggerKind: 'PR_REVIEW',
+          resultMeta: { reviewId: hit.id ?? null, reviewer: hit.reviewer ?? hit.author ?? null },
+        });
         return {
           ok: true,
           review: {

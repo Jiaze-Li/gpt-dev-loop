@@ -32,8 +32,18 @@ import {
   MIN_POLL_INTERVAL_MS,
   MAX_POLL_INTERVAL_MS,
 } from '../src/orchestrator/adapters/githubPrReviewAdapter.js';
+import { ExternalModelTriggerAuthority } from '../src/orchestrator/externalModelTriggerAuthority.js';
 
 const REVIEWER = 'trusted-claude-reviewer';
+
+// A fresh, in-memory, per-call External Model Trigger Authority for adapter
+// tests that are not specifically exercising cross-reviewer/cross-process
+// trigger dedupe (see externalModelTriggerAuthority.test.js for those). Every
+// createGithubPrReviewAdapter() call below is a REQUIRED production
+// collaborator, never a silent allow-all default.
+function testTriggerAuthority(overrides = {}) {
+  return new ExternalModelTriggerAuthority(overrides);
+}
 
 function rawReview(head, findings = []) {
   return { reviewer: REVIEWER, headSha: head, findings };
@@ -478,7 +488,9 @@ test('adapter triggers @codex review then returns the reviewer result bound to t
     },
   });
   const clock = fakeClock();
-  const adapter = createGithubPrReviewAdapter({ github: gh, clock, reviewer: 'codex' });
+  const adapter = createGithubPrReviewAdapter({
+    github: gh, clock, reviewer: 'codex', workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
+  });
   const out = await adapter.requestReview({ prNumber: 7, prHead: 'sha-1' });
 
   assert.equal(out.ok, true);
@@ -505,7 +517,9 @@ test('adapter ignores stale reviews: wrong author, old head, pre-trigger', async
       ],
     },
   });
-  const adapter = createGithubPrReviewAdapter({ github: gh, clock: fakeClock(), reviewer: 'claude' });
+  const adapter = createGithubPrReviewAdapter({
+    github: gh, clock: fakeClock(), reviewer: 'claude', workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
+  });
   const out = await adapter.requestReview({ prNumber: 7, prHead: 'sha-2' });
   assert.equal(out.ok, true);
   assert.equal(out.review.reviewId, 902);
@@ -514,7 +528,9 @@ test('adapter ignores stale reviews: wrong author, old head, pre-trigger', async
 test('adapter de-dupes a pending trigger for the same reviewer/head (no second comment)', async () => {
   const gh = fakeGithub({ head: 'sha-1', results: [] });
   const clock = fakeClock();
-  const adapter = createGithubPrReviewAdapter({ github: gh, clock, reviewer: 'codex', maxWaitMs: 40_000 });
+  const adapter = createGithubPrReviewAdapter({
+    github: gh, clock, reviewer: 'codex', maxWaitMs: 40_000, workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
+  });
   const first = await adapter.requestReview({ prNumber: 7, prHead: 'sha-1' });
   assert.equal(first.failure, GITHUB_REVIEW_FAILURES.TIMEOUT);
   assert.equal(gh.postCalls, 1);
@@ -523,6 +539,7 @@ test('adapter de-dupes a pending trigger for the same reviewer/head (no second c
   // Resume: the pending trigger is reused, not re-posted.
   const resumed = createGithubPrReviewAdapter({
     github: gh, clock, reviewer: 'codex', maxWaitMs: 40_000, pending: first.pending,
+    workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   await resumed.requestReview({ prNumber: 7, prHead: 'sha-1' });
   assert.equal(gh.postCalls, 1);
@@ -540,6 +557,7 @@ test('external head change during the wait invalidates and re-triggers against t
   const persisted = [];
   const adapter = createGithubPrReviewAdapter({
     github: gh, clock: fakeClock(), reviewer: 'codex', persist: (p) => persisted.push(p),
+    workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   const out = await adapter.requestReview({ prNumber: 7 });
   assert.equal(out.ok, true);
@@ -548,25 +566,32 @@ test('external head change during the wait invalidates and re-triggers against t
   assert.equal(gh.forcePush, 0);
 });
 
-test('adapter returns classified failures: UNAVAILABLE / TRIGGER_FAILED / TIMEOUT / INFRASTRUCTURE', async () => {
+test('adapter returns classified failures: UNAVAILABLE / AUTHORITY_BLOCKED / TIMEOUT / INFRASTRUCTURE', async () => {
   const unavailable = createGithubPrReviewAdapter({
     github: fakeGithub({ availableReviewers: ['claude'] }), clock: fakeClock(), reviewer: 'codex',
+    workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   assert.equal((await unavailable.requestReview({ prNumber: 1, prHead: 'sha-1' })).failure, GITHUB_REVIEW_FAILURES.UNAVAILABLE);
 
+  // A postReviewTrigger() error crosses the External Model Trigger Authority
+  // (already durably DISPATCHING at that point) and is therefore ambiguous —
+  // classified as an authority-blocked UNRESOLVED, never a plain retryable
+  // TRIGGER_FAILED (§ Part H: unknown trigger outcome != zero).
   const triggerFailed = createGithubPrReviewAdapter({
     github: fakeGithub({ postError: new Error('422 unprocessable') }), clock: fakeClock(), reviewer: 'codex',
+    workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
-  assert.equal((await triggerFailed.requestReview({ prNumber: 1, prHead: 'sha-1' })).failure, GITHUB_REVIEW_FAILURES.TRIGGER_FAILED);
+  assert.equal((await triggerFailed.requestReview({ prNumber: 1, prHead: 'sha-1' })).failure, GITHUB_REVIEW_FAILURES.AUTHORITY_BLOCKED);
 
   const timedOut = createGithubPrReviewAdapter({
     github: fakeGithub({ results: [] }), clock: fakeClock(), reviewer: 'codex', maxWaitMs: 30_000,
+    workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   assert.equal((await timedOut.requestReview({ prNumber: 1, prHead: 'sha-1' })).failure, GITHUB_REVIEW_FAILURES.TIMEOUT);
 
   const infra = createGithubPrReviewAdapter({
     github: fakeGithub({ listError: Object.assign(new Error('bad gateway'), { status: 502 }) }),
-    clock: fakeClock(), reviewer: 'codex',
+    clock: fakeClock(), reviewer: 'codex', workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   assert.equal((await infra.requestReview({ prNumber: 1, prHead: 'sha-1' })).failure, GITHUB_REVIEW_FAILURES.INFRASTRUCTURE);
 });
@@ -581,6 +606,7 @@ test('adapter result feeds the closeout loop as a trusted review payload', async
   const adapter = createGithubPrReviewAdapter({
     github: gh, clock: fakeClock(), reviewer: 'claude',
     reviewerIdentities: { claude: 'trusted-claude-reviewer' },
+    workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   const out = await adapter.requestReview({ prNumber: 7, prHead: 'sha-1' });
   assert.equal(out.ok, true);
@@ -625,6 +651,11 @@ test('Codex -> Claude -> internal timeout fallback: no repair round burned, no r
     const adapter = createGithubPrReviewAdapter({
       github: fakeGithub({ head: 'sha-1', results: [] }),
       clock, reviewer: candidate, maxWaitMs: 45_000,
+      // Fresh per-candidate authority: this test exercises the closeout
+      // policy's reviewerCandidateOrder failover, not the External Model
+      // Trigger Authority's cross-reviewer same-HEAD dedupe (covered in
+      // externalModelTriggerAuthority.test.js).
+      workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
     });
     const res = await adapter.requestReview({ prNumber: 7, prHead: 'sha-1' });
     assert.equal(res.failure, GITHUB_REVIEW_FAILURES.TIMEOUT);
@@ -659,7 +690,7 @@ test('adapter INFRASTRUCTURE failure drives failover, never a repair round', asy
   let state = initialCloseoutState({ prNumber: 7, prHead: 'sha-1', configuredReviewer: REVIEWER });
   const adapter = createGithubPrReviewAdapter({
     github: fakeGithub({ listError: Object.assign(new Error('bad gateway'), { status: 502 }) }),
-    clock: fakeClock(), reviewer: 'codex',
+    clock: fakeClock(), reviewer: 'codex', workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   const res = await adapter.requestReview({ prNumber: 7, prHead: 'sha-1' });
   assert.equal(res.failure, GITHUB_REVIEW_FAILURES.INFRASTRUCTURE);
@@ -690,7 +721,7 @@ test('polling wait spends zero model tokens: only the GitHub client and clock ar
   const gh = recordingProxy(fakeGithub({ head: 'sha-1', results: [] }), seenGh);
   const clock = recordingProxy(fakeClock(), seenClock);
   const adapter = createGithubPrReviewAdapter({
-    github: gh, clock, reviewer: 'codex', maxWaitMs: 60_000,
+    github: gh, clock, reviewer: 'codex', maxWaitMs: 60_000, workflowId: 'wf-test', triggerAuthority: testTriggerAuthority(),
   });
   const res = await adapter.requestReview({ prNumber: 7, prHead: 'sha-1' });
   assert.equal(res.failure, GITHUB_REVIEW_FAILURES.TIMEOUT);

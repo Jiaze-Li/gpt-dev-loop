@@ -138,6 +138,61 @@ export function isAuthorizationFailure(error) {
   return Boolean(error) && (error instanceof AuthorizationError || error.authorizationFailure === true);
 }
 
+// External Model Trigger Authority boundary (see
+// externalModelTriggerAuthority.js). A GitHub PR-review comment such as
+// "@codex review" / "@claude review" spends model quota in an EXTERNAL
+// system, outside the internal provider runtime ModelSpendAuthority governs.
+// This is a deliberately SEPARATE authorization failure family — never
+// fused with AuthorizationError — so a denial here is never mistaken for an
+// internal model-spend decision, and never routed through the internal
+// New Information / Reservation ledgers. Like AuthorizationError, this is an
+// ORCHESTRATOR safety decision, never evidence that a reviewer/provider is
+// unavailable: no failover, no provider-health mutation.
+export class ExternalTriggerError extends Error {
+  constructor(code, message, details) {
+    super(message ?? code);
+    this.name = 'ExternalTriggerError';
+    this.code = code;
+    this.externalTriggerFailure = true;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+export const EXTERNAL_TRIGGER_ERROR_CODES = Object.freeze({
+  // authorize() rejected the TriggerIntent before any permit was issued.
+  EXTERNAL_TRIGGER_INTENT_INCOMPLETE: 'EXTERNAL_TRIGGER_INTENT_INCOMPLETE',
+  // A prior trigger for the SAME workflow+PR+HEAD already reached DISPATCHING
+  // or later (any reviewer). Reviewer change / timeout / retry is never new
+  // information for the same semantic review state.
+  EXTERNAL_MODEL_TRIGGER_DUPLICATE_BLOCKED: 'EXTERNAL_MODEL_TRIGGER_DUPLICATE_BLOCKED',
+  // Hard ceiling on total external trigger dispatches (DISPATCHING or later)
+  // for this workflow+PR+kind. A fresh HEAD does not bypass it.
+  EXTERNAL_MODEL_TRIGGER_LIMIT_EXCEEDED: 'EXTERNAL_MODEL_TRIGGER_LIMIT_EXCEEDED',
+  // Hard ceiling on distinct semantic review rounds (distinct HEADs that
+  // reached DISPATCHING or later) for this workflow+PR+kind.
+  EXTERNAL_MODEL_REVIEW_ROUND_LIMIT_EXCEEDED: 'EXTERNAL_MODEL_REVIEW_ROUND_LIMIT_EXCEEDED',
+  // Durable, restart-surviving wall-clock ceiling on external review
+  // activity exceeded. Elapsed time alone never authorizes a new trigger.
+  EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED: 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED',
+  // A trigger dispatch may have occurred but reliable settlement cannot be
+  // proven (dispatchFn threw / returned no id / a durable write itself
+  // failed). Blocks another trigger for the same semantic HEAD.
+  EXTERNAL_MODEL_TRIGGER_UNRESOLVED: 'EXTERNAL_MODEL_TRIGGER_UNRESOLVED',
+  // The durable trigger ledger could not be read or written. Fail closed:
+  // zero external trigger dispatches. Never interpret unreadable state as an
+  // empty trigger history.
+  EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE: 'EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE',
+  // dispatch() refused to run without / with an invalid ExternalTriggerPermit.
+  EXTERNAL_TRIGGER_PERMIT_MISSING: 'EXTERNAL_TRIGGER_PERMIT_MISSING',
+  EXTERNAL_TRIGGER_PERMIT_UNKNOWN: 'EXTERNAL_TRIGGER_PERMIT_UNKNOWN',
+  EXTERNAL_TRIGGER_PERMIT_CONSUMED: 'EXTERNAL_TRIGGER_PERMIT_CONSUMED',
+  EXTERNAL_TRIGGER_PERMIT_INTENT_MISMATCH: 'EXTERNAL_TRIGGER_PERMIT_INTENT_MISMATCH',
+});
+
+export function isExternalTriggerFailure(error) {
+  return Boolean(error) && (error instanceof ExternalTriggerError || error.externalTriggerFailure === true);
+}
+
 export const ADAPTER_ERROR_CODES = Object.freeze({
   EXECUTOR_UNAVAILABLE: 'EXECUTOR_UNAVAILABLE',
   EXECUTOR_TIMEOUT: 'EXECUTOR_TIMEOUT',

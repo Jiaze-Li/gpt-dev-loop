@@ -24,6 +24,7 @@ import { selectProviders } from './providerSelection.js';
 import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
 import { ModelSpendAuthority } from './modelSpendAuthority.js';
 import { ReservationLedger, ReservationStore } from './modelSpendReservation.js';
+import { ExternalModelTriggerAuthority, ExternalTriggerStore } from './externalModelTriggerAuthority.js';
 import { AuthorizationError, AUTHORIZATION_ERROR_CODES, isAuthorizationFailure } from './errors.js';
 import {
   registerUserInputEvidence, registerTaskCardEvidence, registerExternalResultEvidence, sha256 as newInformationSha256,
@@ -1065,11 +1066,17 @@ export function createRealGithubPrCloseoutAdapters({
     },
   };
 
-  const reviewAdapter = createGithubPrReviewAdapter({
-    github: githubClient,
-    reviewer: 'codex',
-    pollIntervalMs: 15_000,
-    maxWaitMs: 3 * 60_000,
+  // Single, workflow-scoped External Model Trigger Authority — the ONE
+  // deterministic boundary every "@codex review" / "@claude review" comment
+  // this closeout run posts must cross (see externalModelTriggerAuthority.js
+  // / githubPrReviewAdapter.js). Shared across the codex/claude adapters
+  // below so a trigger already DISPATCHING/TRIGGERED under one reviewer
+  // durably blocks the other from triggering the SAME PR head. Backed by the
+  // SAME workflow-scoped persistence as the primary pipeline when available,
+  // so it survives the same restart/resume path as the rest of the workflow.
+  const triggerAuthority = new ExternalModelTriggerAuthority({
+    store: persistence ? new ExternalTriggerStore(persistence) : null,
+    recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
   });
 
   return {
@@ -1078,6 +1085,8 @@ export function createRealGithubPrCloseoutAdapters({
       const codexAdapter = createGithubPrReviewAdapter({
         github: githubClient,
         reviewer: 'codex',
+        workflowId,
+        triggerAuthority,
         pollIntervalMs: 5_000,
         maxWaitMs: 30_000,
       });
@@ -1087,6 +1096,8 @@ export function createRealGithubPrCloseoutAdapters({
       const claudeAdapter = createGithubPrReviewAdapter({
         github: githubClient,
         reviewer: 'claude',
+        workflowId,
+        triggerAuthority,
         pollIntervalMs: 5_000,
         maxWaitMs: 30_000,
       });
@@ -1989,6 +2000,39 @@ async function defaultPipeline({
         taskId: null,
         reason,
         actionTaken: 'workflow halted — HUMAN_REQUIRED; no further model call made',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'HUMAN_REQUIRED', reason });
+    return {
+      ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, conversations: null, tokenUsage: usageTracker?.summary() ?? null,
+    };
+  }
+  // Resume reconciliation for the External Model Trigger Authority (see
+  // externalModelTriggerAuthority.js), same fail-closed discipline as the
+  // Persistent Model Spend Reservation reconciliation just above: a trigger
+  // that crossed the durable DISPATCHING boundary with no settlement
+  // conservatively becomes UNRESOLVED (a crash may have posted the GitHub
+  // comment before this process restarted); a RESERVED trigger that never
+  // reached DISPATCHING is safely closed as CANCELLED_PRE_DISPATCH. A no-op
+  // for any workflow that never used the PR-closeout review adapters.
+  try {
+    await new ExternalModelTriggerAuthority({
+      store: new ExternalTriggerStore(persistence),
+      recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+    }).reconcileOnResume(workflowId);
+  } catch (err) {
+    const reason = `External model trigger reconciliation failed on resume: ${err?.message ?? err}`;
+    const question = `${reason}. No further external review trigger will be posted. Review the workflow's persisted trigger state, then resume.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE,
+        severity: 'BLOCKING',
+        role: 'workflow',
+        taskId: null,
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further external model trigger posted',
       });
     } catch { /* never let safety-event recording mask the stop */ }
     workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
