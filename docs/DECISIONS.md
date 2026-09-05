@@ -1,5 +1,23 @@
 # Architecture / Product Decisions
 
+> **Historical initial-design document.**
+>
+> This file records the project's original browser / ChatGPT-Web concept and is
+> **not** the active V2 product contract. Several decisions below (ChatGPT web
+> session reviewer, mechanical browser handoff, `ask_gpt` transport) describe
+> the original design and were superseded during V1/V2 by a local deterministic
+> Core with role-routed model providers and no browser dependency.
+>
+> Current sources of truth:
+> - `README.md`
+> - `agent-policy/COMMON.md`
+> - `docs/ARCHITECTURE.md`
+> - `docs/GLOBAL_INSTALL.md`
+> - `docs/V2_PLAN.md`
+>
+> The decision record is preserved rather than rewritten, so the original
+> reasoning stays visible.
+
 This file records decisions already agreed during initial design discussion so that later implementation does not accidentally reopen them without cause.
 
 ## D-001 — The product is a development loop, not a new coding agent

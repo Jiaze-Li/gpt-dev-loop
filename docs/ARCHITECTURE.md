@@ -1,6 +1,8 @@
-# SuperGPT V1 Architecture — Current Source of Truth
+# SuperGPT V2 Architecture — Current Source of Truth
 
-This document describes the active V1 architecture. Historical browser-bridge and pre-V1 orchestration designs are not production contracts.
+This document describes the active V2 architecture. V1 is the historical
+foundation (see `docs/ROADMAP.md`). Historical browser-bridge and pre-V1
+orchestration designs are not production contracts.
 
 ## 1. Ownership boundary
 
@@ -15,7 +17,9 @@ SUPERGPT CORE
 = workflow owner
 ```
 
-All three frontends use the same `agent-policy/COMMON.md` and the same global `supergpt` MCP server. Client-specific configuration formats are installer details only; they do not create different product behavior.
+All three frontends use the same `agent-policy/COMMON.md` and the same global
+`supergpt` MCP server. Client-specific configuration formats are installer
+details only; they do not create different product behavior.
 
 There is one canonical execution engine: `src/orchestrator/supergpt.js -> runSuperGPT()`.
 
@@ -24,51 +28,100 @@ There is one canonical execution engine: `src/orchestrator/supergpt.js -> runSup
 A frontend may:
 
 - accept the user's goal;
-- choose DIRECT vs SuperGPT using the shared V1 policy;
-- invoke SuperGPT MCP operations;
+- obtain a routing decision from the shared deterministic operation;
+- launch one SuperGPT workflow when routed to SuperGPT;
 - display local persisted progress;
 - relay a terminal result or a genuine `HUMAN_REQUIRED` question.
 
-A frontend must not create its own Task Cards, duplicate SuperGPT implementation/review work, or use the CLI as an alternate autonomous-agent path.
+A frontend must not decide routing on its own, create its own Task Cards,
+duplicate SuperGPT implementation/review work, or use the CLI as an alternate
+autonomous-agent path.
 
-When SuperGPT is selected, the normal launch contract is:
+The normal contract is:
 
 ```text
-supergpt_start({ goal, cwd })
--> { status: "RUNNING", workflowId }
--> supergpt_watch({ workflowId })
--> terminal result
+supergpt_route({ goal, cwd })
+-> DIRECT | SUPERGPT
+
+DIRECT
+-> handled in the front agent (explanation/research, trivial low-risk edit, explicit bypass)
+
+SUPERGPT
+-> supergpt_start_and_wait({ goal, cwd })
+-> { status, summary, deliveredFiles, workflowId, ... }  (terminal)
+   or a genuine HUMAN_REQUIRED question
 ```
 
-`status`, `watch`, and `wait` observe local persisted state. They do not spend model calls asking whether the workflow is still alive.
+`supergpt_route` is deterministic and consumes zero model tokens.
+`supergpt_start_and_wait` starts the workflow and blocks locally for the
+terminal result; the front agent model is invoked once to start and once to
+read the result.
 
-## 3. Normal workflow
+`supergpt_status`, `supergpt_watch`, and `supergpt_wait` observe local
+persisted state. They are manual / debug / recovery operations and must not be
+run as an autonomous polling loop.
 
-For a structured Planner task queue, Core owns ordinary transitions without a model Supervisor:
+## 3. Core path selection
+
+The Core selects one path per workflow:
+
+```text
+route decision = SUPERGPT
+-> Core path selection
+     FAST        — one safely bounded task
+     FULL        — multi-step / planning required / ambiguous
+     PR_CLOSEOUT — "review and fix PR #N" style request
+```
+
+### Fast Path
+
+```text
+Executor
+-> deterministic Gate
+-> independent Reviewer
+-> DONE / REWORK
+```
+
+Planning is skipped only when the Core can safely form the single bounded task
+contract; otherwise it falls closed to the Full Path.
+
+### Full Path
 
 ```text
 Planner once
--> Task 1
+-> ordered task queue
 -> Executor
 -> deterministic Gate
 -> independent Reviewer
 
-Reviewer PASS
--> next task automatically
-
-Gate FAIL
--> Executor repair
-
-first ordinary Reviewer REWORK
--> Executor repair using Reviewer findings
-
-last task PASS
--> WORKFLOW_DONE
+Reviewer PASS            -> next task automatically
+Gate FAIL                -> Executor repair
+first ordinary REWORK    -> Executor repair using Reviewer findings
+last task PASS           -> WORKFLOW_DONE
 ```
 
-Supervisor is exception-only. Examples include repeated non-convergence, `HUMAN_REQUIRED`, plan/task mismatch, contradictory evidence, or a state Core cannot safely resolve deterministically.
+### PR Closeout
 
-If Planner output is not reliable enough to define the task queue, Core fails closed to the safe fallback path rather than guessing task progression.
+```text
+trusted review
+-> clean                     -> WORKFLOW_DONE
+-> actionable P1/P2 finding   -> repair task
+-> Executor fixes
+-> deterministic Gate
+-> push new head
+-> re-review
+-> repeat, or escalate to Supervisor, or HUMAN_REQUIRED
+```
+
+The trusted reviewer is a separate read-only trust boundary. Never force-push;
+no automatic merge by default.
+
+### Supervisor
+
+Supervisor is exception-only in every path: repeated non-convergence,
+`HUMAN_REQUIRED`, plan/task mismatch, contradictory evidence, or a state the
+Core cannot safely resolve deterministically. If Planner output is not reliable
+enough to define the task queue, the Core fails closed rather than guessing.
 
 ## 4. Role separation
 
@@ -80,17 +133,53 @@ Models are role providers, not workflow owners:
 - Reviewer: independently evaluates task scope, diff/evidence, and Gate result.
 - Supervisor: resolves exceptional judgment states only.
 
-Provider families may fail over through the existing role-routing, quota, health, effort, and session policies without changing these logical responsibilities.
+Provider families may fail over through the existing role-routing, quota,
+health, effort, and session policies without changing these logical
+responsibilities.
 
-## 5. Workspace and delivery
+## 5. Model-spend control boundary
 
-Before execution, Core snapshots the exact invocation workspace into an owned isolated worktree. Staged, unstaged, and untracked pre-existing changes form the baseline rather than being misclassified as model output.
+Every metered internal model call (Planner, Supervisor, Executor, internal
+Reviewer, PR-closeout repair Executor) passes a fail-closed boundary before it
+is dispatched:
 
-Approved changes are delivered back only through the Core delivery path. Delivery checks for conflicts and unsafe paths and preserves unrelated user work. Frontends and humans should not manually copy/cherry-pick intermediate worktree changes as a substitute for delivery.
+```text
+eligible New Information
+  + role capability
+  + per-call budget + aggregate task/workflow ceilings
+  + reservation safety
+-> PhysicalCallPermit  (default-deny; one permit per physical attempt)
+-> physical model call
+-> known settlement   (usage recorded)
+   or explicit UNRESOLVED
+```
 
-## 6. Persistence and terminal states
+Properties:
 
-Core persists workflow state and owns recovery. Normal terminal states are:
+- an authorization failure is never reported as a provider failure;
+- an identical failure fingerprint with an unchanged diff does not trigger
+  another Executor dispatch — the workflow goes to `HUMAN_REQUIRED`;
+- if prior spend cannot be reconstructed on resume and any ceiling is enabled,
+  the workflow does not resume with a fresh zero budget;
+- aggregate cost / token-volume ceilings are a last-resort mechanical fuse
+  independent of every heuristic.
+
+Token Safety implementation details live in the source and its tests, not here.
+
+## 6. Workspace and delivery
+
+Before execution, the Core snapshots the exact invocation workspace into an
+owned isolated worktree. Staged, unstaged, and untracked pre-existing changes
+form the baseline rather than being misclassified as model output.
+
+Approved changes are delivered back only through the Core delivery path.
+Delivery checks for conflicts and unsafe paths and preserves unrelated user
+work. Frontends and humans should not manually copy/cherry-pick intermediate
+worktree changes as a substitute for delivery.
+
+## 7. Persistence and terminal states
+
+The Core persists workflow state and owns recovery. Normal terminal states are:
 
 - `WORKFLOW_DONE`
 - `HUMAN_REQUIRED`
@@ -99,11 +188,13 @@ Core persists workflow state and owns recovery. Normal terminal states are:
 - `STALLED`
 - `STOPPED`
 
-A frontend disconnect does not stop the workflow. Resume keeps the workflow identity and required isolation state.
+A frontend disconnect does not stop the workflow. Resume keeps the workflow
+identity and required isolation state.
 
-## 7. Installation contract
+## 8. Installation contract
 
-`npm run install-global` installs the same global launcher contract for AGY, Claude, and Codex:
+`npm run install-global` installs the same global launcher contract for AGY,
+Claude, and Codex:
 
 ```text
 same COMMON policy
@@ -111,16 +202,19 @@ same COMMON policy
 + same MCP operation names
 ```
 
-There is no active repository-local `.mcp.json`, no separate Claude/Codex/AGY routing policy, and no second agent execution entrypoint.
+There is no active repository-local `.mcp.json`, no separate Claude/Codex/AGY
+routing policy, and no second agent execution entrypoint.
 
-## 8. Canonical documentation
+## 9. Canonical documentation
 
 Active sources of truth:
 
 - `README.md` — product overview;
 - `agent-policy/COMMON.md` — only active front-agent policy;
-- `docs/ARCHITECTURE.md` — V1 architecture;
+- `docs/ARCHITECTURE.md` — V2 architecture;
 - `docs/GLOBAL_INSTALL.md` — global installation contract;
-- `docs/V2_PLAN.md` — only active V2 plan.
+- `docs/V2_PLAN.md` — agreed V2 design plan.
 
-Historical browser material belongs only under `docs/handoff/archive/` and Git history. When a new active rule or entrypoint replaces an old one, the old active rule/entrypoint must be removed rather than retained as a parallel fallback.
+Historical browser material belongs only under `docs/handoff/archive/` and Git
+history. When a new active rule or entrypoint replaces an old one, the old
+active rule/entrypoint is removed rather than retained as a parallel fallback.

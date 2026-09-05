@@ -1,10 +1,12 @@
 # SuperGPT Roadmap
 
-This file is intentionally short. Old browser-bridge phase plans and pre-V1 role designs are retired; Git history and `docs/handoff/archive/` preserve that history.
+This file is intentionally short. Old browser-bridge phase plans and pre-V1
+role designs are retired; Git history and `docs/handoff/archive/` preserve that
+history.
 
-## V1 — current baseline
+## V1 — foundation / historical baseline
 
-V1 is the production foundation:
+V1 established the production foundation:
 
 - one canonical `runSuperGPT()` execution engine;
 - one global `COMMON.md` frontend contract for Claude, Codex, and AGY;
@@ -15,16 +17,29 @@ V1 is the production foundation:
 - Supervisor exception-only;
 - durable status, stop, resume, provider failover, quota/health, and process cleanup.
 
-## V2 — next planned work
+## V2 — current release candidate
 
-`docs/V2_PLAN.md` is the sole detailed V2 plan.
+`docs/V2_PLAN.md` records the agreed V2 design.
 
-The planned sequence is:
+- ✓ centralized deterministic zero-token `supergpt_route` (route-first frontend contract)
+- ✓ `supergpt_start_and_wait` single-call launch-and-block; no autonomous watch/wait loop
+- ✓ Fast Path / Full Path selection without weakening independent review
+- ✓ trusted PR review -> fix -> re-review closeout loop
+- ✓ bounded non-convergence / escalation handling
+- ✓ zero-token Dashboard + attention/history workflow lifecycle
+- ✓ Token Safety architecture — mock-certified
+- ✓ V2 unattended functional workflow — mock-certified
+- ✓ bounded real Fast-Path provider smoke — PASS (one bounded workflow only)
 
-1. centralized deterministic zero-token `supergpt_route`;
-2. Fast Path / Full Path selection without weakening independent review;
-3. trusted PR review -> fix -> re-review closeout loop;
-4. bounded non-convergence/escalation and unattended end-to-end validation;
-5. optional browser adviser only after the local production path remains stable.
+Not live-certified: provider failover, escalation, PR closeout, and the full
+provider pools.
 
-Rule: new active policy or entrypoints replace old ones. Do not create V1.1-style parallel frontend behavior or preserve obsolete fallback paths.
+## Optional / deferred future work
+
+- optional browser adviser (`V2-D`): only as an adviser/provider for unusually
+  difficult cases, never a workflow owner, Supervisor path, execution/review
+  dependency, or second frontend launch path. Deferred; not required for the V2
+  release.
+
+Rule: new active policy or entrypoints replace old ones. Do not create
+V1.1-style parallel frontend behavior or preserve obsolete fallback paths.

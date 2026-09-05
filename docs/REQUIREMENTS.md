@@ -1,5 +1,23 @@
 # Requirements
 
+> **Historical initial-design document.**
+>
+> This file records the project's original browser / ChatGPT-Web concept and is
+> **not** the active V2 product contract. The production architecture no longer
+> depends on a browser bridge or a ChatGPT web session; SuperGPT routes work to
+> a local deterministic Core with role-routed model providers.
+>
+> Current sources of truth:
+> - `README.md`
+> - `agent-policy/COMMON.md`
+> - `docs/ARCHITECTURE.md`
+> - `docs/GLOBAL_INSTALL.md`
+> - `docs/V2_PLAN.md`
+>
+> The requirements below are preserved as historical record. Where they describe
+> a ChatGPT-Web reviewer, browser transport, or `ask_gpt` interface as the
+> intended path, that reflects the original design, not current production.
+
 ## 1. User problem
 
 The current manual workflow requires a human to repeatedly copy prompts from ChatGPT to a coding agent, wait for implementation, copy completion reports back to ChatGPT, ask ChatGPT to inspect GitHub, then copy review feedback back to the coding agent. The latter half of the loop is transport work rather than a valuable human decision.

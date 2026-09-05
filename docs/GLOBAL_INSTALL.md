@@ -37,11 +37,20 @@ Those are installer adapters only. The visible tool name, policy, launch sequenc
 All three frontends follow the same sequence:
 
 ```text
-supergpt_start({ goal, cwd })
--> workflowId
--> supergpt_watch({ workflowId })
+supergpt_route({ goal, cwd })
+-> DIRECT | SUPERGPT
+
+if SUPERGPT:
+supergpt_start_and_wait({ goal, cwd })
 -> terminal result / HUMAN_REQUIRED
 ```
+
+`supergpt_route` is deterministic and consumes zero model tokens.
+`supergpt_start_and_wait` starts the workflow and blocks locally for the
+terminal result in a single call.
+
+`supergpt_watch` / `supergpt_wait` loops are forbidden for normal autonomous
+observation. They exist only for manual status checks, debugging, or recovery.
 
 The SuperGPT CLI is not an agent fallback. If MCP is unavailable, the frontend should report the installation/configuration problem rather than silently create a second execution path.
 
