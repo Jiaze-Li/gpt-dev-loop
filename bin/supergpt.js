@@ -39,6 +39,7 @@ import {
 } from '../src/renderers/genericTextRenderer.js';
 import { runDoctor } from '../scripts/doctor.js';
 import { installGlobal, uninstallGlobal, checkGlobalStatus } from './install-plugin.js';
+import { createDashboardServer } from '../src/dashboard/server.js';
 
 function parseArgs(argv) {
   const opts = {
@@ -48,7 +49,7 @@ function parseArgs(argv) {
     positionals: [],
   };
 
-  const knownCommands = ['run', 'plan', 'status', 'wait', 'resume', 'stop', 'doctor', 'install', 'uninstall'];
+  const knownCommands = ['run', 'plan', 'status', 'wait', 'resume', 'stop', 'doctor', 'install', 'uninstall', 'dashboard'];
 
   let i = 0;
   if (argv.length > 0 && knownCommands.includes(argv[0])) {
@@ -69,6 +70,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--status=')) opts.targetStatus = arg.slice('--status='.length);
     else if (arg.startsWith('--timeout=')) opts.timeoutMs = Number(arg.slice('--timeout='.length));
     else if (arg.startsWith('--frontend=')) opts.frontend = arg.slice('--frontend='.length);
+    else if (arg.startsWith('--port=')) opts.port = parseInt(arg.slice('--port='.length), 10);
+    else if (arg.startsWith('--host=')) opts.host = arg.slice('--host='.length);
     else if (arg === '--global') opts.global = true;
     else if (arg.startsWith('--')) opts.unknown = arg;
     else opts.positionals.push(arg);
@@ -102,11 +105,14 @@ Commands:
   supergpt wait <workflowId> [--status=..]  Wait locally for workflow completion
   supergpt resume <workflowId> [--answer=]  Resume suspended workflow
   supergpt stop <workflowId> [--reason=..]  Stop active workflow safely
+  supergpt dashboard [--port=..] [--host=.] Start local zero-token read-only dashboard
   supergpt doctor                           Run zero-token health diagnostics
   supergpt install [--frontend=..]          Install MCP server & global skills
   supergpt uninstall                        Remove global installation
 
 Options:
+  --port=<port>                 Dashboard port (default: 4317)
+  --host=<host>                 Dashboard host (default: 127.0.0.1)
   --plan=<path>                 Path to plan file
   --cwd=<path>                  Workspace directory (default: current cwd)
   --output-format=text|json     Output format (default: text)
@@ -317,7 +323,25 @@ async function main() {
     return;
   }
 
-  // 7. RESUME or RUN
+  // 7. DASHBOARD
+  if (opts.command === 'dashboard') {
+    const port = opts.port || 4317;
+    const host = opts.host || '127.0.0.1';
+    const dashboard = createDashboardServer({ port, host });
+    const info = await dashboard.start();
+    process.stdout.write(`SuperGPT Dashboard\n${info.url}\n\n(Press Ctrl+C to stop)\n`);
+    await new Promise((resolve) => {
+      const onExit = async () => {
+        await dashboard.close().catch(() => {});
+        resolve();
+      };
+      process.on('SIGINT', onExit);
+      process.on('SIGTERM', onExit);
+    });
+    return;
+  }
+
+  // 8. RESUME or RUN
   if (opts.command === 'resume' && !opts.workflowId) {
     process.stderr.write(`supergpt resume requires a workflowId\n${USAGE}\n`);
     process.exitCode = 1;

@@ -5,7 +5,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn as nodeSpawn } from 'node:child_process';
-import { buildAgySupervisorPrompt, parseSupervisorJson } from './agySupervisorProvider.js';
+import { assembleSupervisorPrompt, parseSupervisorJson } from './agySupervisorProvider.js';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
 
@@ -104,14 +104,26 @@ export function createCodexSupervisorProvider({ call = callCodex, model = null, 
   return {
     provider: 'codex', model,
     async decide(context = {}, { effort = null, conversationId = null } = {}) {
-      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort, conversationId, signal });
-      let raw;
-      try { raw = JSON.parse(result.text.trim()); } catch {
-        throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT, 'Codex Supervisor did not return a JSON decision', { providerFailure: 'PROVIDER_PROTOCOL_ERROR', model });
-      }
+      const { prompt } = assembleSupervisorPrompt(context);
+      const result = await call({ prompt, model, timeoutMs, executable, spawn, effort, conversationId, signal });
       const callId = `call-codex-sup-${randomUUID()}`;
-      const decision = { ...parseSupervisorJson(raw), conversationId: result.conversationId ?? null };
       const usage = result.usage ? { ...result.usage, callId } : { callId };
+      let raw;
+      // The provider DID respond (usage known) even when its reply fails
+      // decoding/shape validation — attach usage to SUPERVISOR_INVALID_OUTPUT
+      // so the reservation settles SETTLED_KNOWN, not UNRESOLVED (see
+      // modelSpendReservation.js §6).
+      try { raw = JSON.parse(result.text.trim()); } catch {
+        throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT, 'Codex Supervisor did not return a JSON decision', { providerFailure: 'PROVIDER_PROTOCOL_ERROR', model, usage });
+      }
+      let parsedDecision;
+      try {
+        parsedDecision = parseSupervisorJson(raw);
+      } catch (err) {
+        if (err instanceof AdapterError && !err.details?.usage) err.details = { ...(err.details ?? {}), usage };
+        throw err;
+      }
+      const decision = { ...parsedDecision, conversationId: result.conversationId ?? null };
       Object.defineProperties(decision, {
         callId: { value: callId, enumerable: false },
         usage: { value: usage, enumerable: false },

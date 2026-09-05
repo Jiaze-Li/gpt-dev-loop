@@ -46,17 +46,170 @@ export function isCancellation(error, signal) {
   return codes.has(code);
 }
 
+// V2-C trusted PR-closeout trust-boundary failures. Every one of these is a
+// fail-closed condition: the deterministic closeout loop must stop and surface
+// the reason rather than guess when reviewer identity, PR head, write
+// capability, or repair safety cannot be established.
+export class PrCloseoutError extends Error {
+  constructor(code, message, details) {
+    super(message ?? code);
+    this.name = 'PrCloseoutError';
+    this.code = code;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+export const PR_CLOSEOUT_ERROR_CODES = Object.freeze({
+  UNTRUSTED_REVIEWER: 'UNTRUSTED_REVIEWER',
+  STALE_REVIEW_HEAD: 'STALE_REVIEW_HEAD',
+  MALFORMED_REVIEW: 'MALFORMED_REVIEW',
+  UNSAFE_REPAIR_ACTION: 'UNSAFE_REPAIR_ACTION',
+  FORK_WRITE_FORBIDDEN: 'FORK_WRITE_FORBIDDEN',
+  REPAIR_GATE_NOT_PASSED: 'REPAIR_GATE_NOT_PASSED',
+  THREAD_RESOLUTION_UNAVAILABLE: 'THREAD_RESOLUTION_UNAVAILABLE',
+});
+
+// Token-Safety authorization boundary. A permit / spend-authorization failure
+// is an ORCHESTRATOR decision, never evidence that a provider is unavailable:
+// the role runtime must propagate it immediately, perform ZERO failover, and
+// must never mutate provider-health or quota state. It is deliberately NOT an
+// AdapterError and is never classified through providerFailure().
+export class AuthorizationError extends Error {
+  constructor(code, message, details) {
+    super(message ?? code);
+    this.name = 'AuthorizationError';
+    this.code = code;
+    this.authorizationFailure = true;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+export const AUTHORIZATION_ERROR_CODES = Object.freeze({
+  // authorize() rejected the CallIntent before any permit was issued
+  SPEND_DENIED: 'SPEND_DENIED',
+  INTENT_INCOMPLETE: 'INTENT_INCOMPLETE',
+  // dispatch() refused to run without / with an invalid permit
+  PERMIT_MISSING: 'PERMIT_MISSING',
+  PERMIT_UNKNOWN: 'PERMIT_UNKNOWN',
+  PERMIT_CONSUMED: 'PERMIT_CONSUMED',
+  PERMIT_INTENT_MISMATCH: 'PERMIT_INTENT_MISMATCH',
+  // authorize() rejected the CallIntent because the provider/family is not
+  // declared executorEligible for this role (see providerCapabilities.js).
+  PROVIDER_NOT_ELIGIBLE_FOR_ROLE: 'PROVIDER_NOT_ELIGIBLE_FOR_ROLE',
+  // authorize() rejected the CallIntent because this workflow already has an
+  // UNRESOLVED model spend reservation — a prior physical call may have
+  // dispatched with usage that could not be reliably settled. See
+  // modelSpendReservation.js. Blocks EVERY internal role, not only Executor.
+  MODEL_SPEND_USAGE_UNRESOLVED: 'MODEL_SPEND_USAGE_UNRESOLVED',
+  // authorize() could not durably persist the reservation required before a
+  // permit may be issued. Fail closed: zero physical provider calls.
+  RESERVATION_PERSIST_FAILED: 'RESERVATION_PERSIST_FAILED',
+  // dispatch() ran the physical provider call (with reliably known usage,
+  // success or failure) but the SETTLED_KNOWN write could not be durably
+  // persisted. This is an orchestrator persistence failure, never provider
+  // failure: it must never trigger failover or mark a provider unhealthy,
+  // and it blocks every further internal model spend attempt in the same
+  // workflow.
+  MODEL_SPEND_SETTLEMENT_PERSIST_FAILED: 'MODEL_SPEND_SETTLEMENT_PERSIST_FAILED',
+  // Resume could not reliably reconcile persisted Reservation state before
+  // the first invoke() of this process. Reconciliation is safety-critical,
+  // not best-effort — an unreconciled ledger is treated as unsafe.
+  MODEL_SPEND_RECONCILIATION_FAILED: 'MODEL_SPEND_RECONCILIATION_FAILED',
+  // dispatch() ran the physical provider call and usage could NOT be
+  // reliably determined, but the durable UNRESOLVED write itself failed
+  // (§ Phase 0B). This is an orchestrator persistence failure, never a
+  // provider outcome: it must never be classified as provider unavailable/
+  // timeout/protocol error, must never trigger failover, and must never
+  // mutate provider health. The reservation's durable status remains
+  // whatever it was before this write attempted (DISPATCHING in production
+  // usage), which is itself already a blocking status.
+  MODEL_SPEND_UNRESOLVED_PERSIST_FAILED: 'MODEL_SPEND_UNRESOLVED_PERSIST_FAILED',
+  // A Global New Information denial (Phase 1-6): the CallIntent is otherwise
+  // eligible (provider/budget/reservation all clear) but no fresh, unconsumed
+  // evidence justifies this physical call for this role/operation.
+  NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED: 'NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED',
+  // The durable New Information ledger could not be read, or a claimed
+  // evidence consumption could not be durably persisted. Fail closed: zero
+  // physical provider calls.
+  MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE: 'MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE',
+});
+
+export function isAuthorizationFailure(error) {
+  return Boolean(error) && (error instanceof AuthorizationError || error.authorizationFailure === true);
+}
+
+// External Model Trigger Authority boundary (see
+// externalModelTriggerAuthority.js). A GitHub PR-review comment such as
+// "@codex review" / "@claude review" spends model quota in an EXTERNAL
+// system, outside the internal provider runtime ModelSpendAuthority governs.
+// This is a deliberately SEPARATE authorization failure family — never
+// fused with AuthorizationError — so a denial here is never mistaken for an
+// internal model-spend decision, and never routed through the internal
+// New Information / Reservation ledgers. Like AuthorizationError, this is an
+// ORCHESTRATOR safety decision, never evidence that a reviewer/provider is
+// unavailable: no failover, no provider-health mutation.
+export class ExternalTriggerError extends Error {
+  constructor(code, message, details) {
+    super(message ?? code);
+    this.name = 'ExternalTriggerError';
+    this.code = code;
+    this.externalTriggerFailure = true;
+    if (details && typeof details === 'object') this.details = details;
+  }
+}
+
+export const EXTERNAL_TRIGGER_ERROR_CODES = Object.freeze({
+  // authorize() rejected the TriggerIntent before any permit was issued.
+  EXTERNAL_TRIGGER_INTENT_INCOMPLETE: 'EXTERNAL_TRIGGER_INTENT_INCOMPLETE',
+  // A prior trigger for the SAME workflow+PR+HEAD already reached DISPATCHING
+  // or later (any reviewer). Reviewer change / timeout / retry is never new
+  // information for the same semantic review state.
+  EXTERNAL_MODEL_TRIGGER_DUPLICATE_BLOCKED: 'EXTERNAL_MODEL_TRIGGER_DUPLICATE_BLOCKED',
+  // Hard ceiling on total external trigger dispatches (DISPATCHING or later)
+  // for this workflow+PR+kind. A fresh HEAD does not bypass it.
+  EXTERNAL_MODEL_TRIGGER_LIMIT_EXCEEDED: 'EXTERNAL_MODEL_TRIGGER_LIMIT_EXCEEDED',
+  // Hard ceiling on distinct semantic review rounds (distinct HEADs that
+  // reached DISPATCHING or later) for this workflow+PR+kind.
+  EXTERNAL_MODEL_REVIEW_ROUND_LIMIT_EXCEEDED: 'EXTERNAL_MODEL_REVIEW_ROUND_LIMIT_EXCEEDED',
+  // Durable, restart-surviving wall-clock ceiling on external review
+  // activity exceeded. Elapsed time alone never authorizes a new trigger.
+  EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED: 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED',
+  // A trigger dispatch may have occurred but reliable settlement cannot be
+  // proven (dispatchFn threw / returned no id / a durable write itself
+  // failed). Blocks another trigger for the same semantic HEAD.
+  EXTERNAL_MODEL_TRIGGER_UNRESOLVED: 'EXTERNAL_MODEL_TRIGGER_UNRESOLVED',
+  // The durable trigger ledger could not be read or written. Fail closed:
+  // zero external trigger dispatches. Never interpret unreadable state as an
+  // empty trigger history.
+  EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE: 'EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE',
+  // dispatch() refused to run without / with an invalid ExternalTriggerPermit.
+  EXTERNAL_TRIGGER_PERMIT_MISSING: 'EXTERNAL_TRIGGER_PERMIT_MISSING',
+  EXTERNAL_TRIGGER_PERMIT_UNKNOWN: 'EXTERNAL_TRIGGER_PERMIT_UNKNOWN',
+  EXTERNAL_TRIGGER_PERMIT_CONSUMED: 'EXTERNAL_TRIGGER_PERMIT_CONSUMED',
+  EXTERNAL_TRIGGER_PERMIT_INTENT_MISMATCH: 'EXTERNAL_TRIGGER_PERMIT_INTENT_MISMATCH',
+});
+
+export function isExternalTriggerFailure(error) {
+  return Boolean(error) && (error instanceof ExternalTriggerError || error.externalTriggerFailure === true);
+}
+
 export const ADAPTER_ERROR_CODES = Object.freeze({
   EXECUTOR_UNAVAILABLE: 'EXECUTOR_UNAVAILABLE',
   EXECUTOR_TIMEOUT: 'EXECUTOR_TIMEOUT',
+  // The local Executor budget is intentionally a terminal safety brake, not
+  // an implementation failure that another model may silently retry.
+  EXECUTOR_BUDGET_EXCEEDED: 'EXECUTOR_BUDGET_EXCEEDED',
+  EXECUTOR_DUPLICATE_CALL_REJECTED: 'EXECUTOR_DUPLICATE_CALL_REJECTED',
   EXECUTOR_INVALID_OUTPUT: 'EXECUTOR_INVALID_OUTPUT',
   REVIEWER_UNAVAILABLE: 'REVIEWER_UNAVAILABLE',
   REVIEWER_TIMEOUT: 'REVIEWER_TIMEOUT',
   REVIEWER_INVALID_OUTPUT: 'REVIEWER_INVALID_OUTPUT',
+  REVIEWER_CONTEXT_BUDGET_EXCEEDED: 'REVIEWER_CONTEXT_BUDGET_EXCEEDED',
   GATE_FAILED: 'GATE_FAILED',
   GATE_RUNNER_ERROR: 'GATE_RUNNER_ERROR',
   SUPERVISOR_INVALID_OUTPUT: 'SUPERVISOR_INVALID_OUTPUT',
   SUPERVISOR_ILLEGAL_TRANSITION: 'SUPERVISOR_ILLEGAL_TRANSITION',
   SUPERVISOR_UNAVAILABLE: 'SUPERVISOR_UNAVAILABLE',
   SUPERVISOR_TIMEOUT: 'SUPERVISOR_TIMEOUT',
+  SUPERVISOR_CONTEXT_BUDGET_EXCEEDED: 'SUPERVISOR_CONTEXT_BUDGET_EXCEEDED',
 });

@@ -61,6 +61,29 @@ test('writeWorkflowState fails closed on a missing workflow id', async () => {
   });
 });
 
+test('updateWorkflowState merges PR closeout reviewer state without clobbering siblings', async () => {
+  await withPersistence(async (p) => {
+    await p.writeWorkflowState('wf-1', { supervisor: { conversation_id: 'sup-1' } });
+    await p.updateWorkflowState('wf-1', {
+      prCloseout: { prReviewer: 'codex', reviewerLocked: false, repairRounds: 0, maxRepairRounds: 3 },
+    });
+    const merged = await p.updateWorkflowState('wf-1', {
+      prCloseout: { prReviewer: 'codex', reviewerLocked: true, activeReviewer: 'codex', repairRounds: 1, maxRepairRounds: 3 },
+    });
+    assert.equal(merged.supervisor.conversation_id, 'sup-1');
+    assert.equal(merged.prCloseout.reviewerLocked, true);
+    assert.equal(merged.prCloseout.activeReviewer, 'codex');
+    assert.equal(merged.prCloseout.repairRounds, 1);
+    assert.deepEqual((await p.readWorkflowState('wf-1')).prCloseout, merged.prCloseout);
+  });
+});
+
+test('updateWorkflowState fails closed on a missing workflow id', async () => {
+  await withPersistence(async (p) => {
+    await assert.rejects(() => p.updateWorkflowState('', { a: 1 }), /non-empty workflowId/);
+  });
+});
+
 test('workflow state and task state live side by side without collision', async () => {
   await withPersistence(async (p) => {
     await p.writeState({ workflow_id: 'wf-1', task_id: 'task-a', last_error: 'x' });

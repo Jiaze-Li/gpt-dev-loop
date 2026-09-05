@@ -1,6 +1,20 @@
 # SuperGPT V2 Plan
 
-This document is the sole active V2 plan. It records the agreed direction so V2 work does not depend on chat history or revive retired paths.
+This document records the agreed V2 direction so the work does not depend on
+chat history or revive retired paths.
+
+## Status
+
+Implemented through V2-C and unattended functional certification. V2-A, V2-B,
+and V2-C are complete, and implementation-order items 1–5 below are done.
+Token Safety and the V2 unattended functional workflow are mock-certified; one
+bounded Fast-Path workflow has additionally passed a real-provider smoke.
+
+V2-D (browser adviser) remains optional / deferred and is **not** required for
+the V2 release.
+
+For current status tracking see `docs/ROADMAP.md`; for the current architecture
+see `docs/ARCHITECTURE.md`.
 
 ## Product goal
 
@@ -149,12 +163,13 @@ Do not create CLAUDE/CODEX/AGY policy fragments. Client configuration difference
 
 ## Implementation order
 
-1. add/test `supergpt_route`;
-2. update COMMON to require route-first behavior;
-3. add Fast/Full Path selection;
-4. add trusted PR-review ingestion and Closeout Loop;
-5. add bounded escalation/non-convergence end-to-end tests;
-6. consider optional browser adviser last.
+1. add/test `supergpt_route` — done;
+2. update COMMON to require route-first behavior (and `supergpt_start_and_wait`
+   single-call launch-and-block) — done;
+3. add Fast/Full Path selection — done;
+4. add trusted PR-review ingestion and Closeout Loop — done;
+5. add bounded escalation/non-convergence end-to-end tests — done;
+6. consider optional browser adviser last — deferred / optional.
 
 ## Success criteria
 

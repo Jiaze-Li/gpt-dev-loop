@@ -191,6 +191,113 @@ test('installer fails before writes or MCP registration when AGY config is malfo
   }
 });
 
+test('installGlobal manages a GEMINI.md block from COMMON alongside Claude, Codex, and the AGY skill', async () => {
+  const tmp = path.join('/tmp', `supergpt-gemini-${Date.now()}`);
+  const configDir = path.join(tmp, '.gemini', 'config');
+  const geminiFile = path.join(tmp, '.gemini', 'GEMINI.md');
+  const claudeFile = path.join(tmp, '.claude', 'CLAUDE.md');
+  const codexFile = path.join(tmp, '.codex', 'AGENTS.md');
+  const userGemini = '# My Gemini notes\nTop matter.\n\n## Footer\nBottom matter.';
+  const fake = makeFrontendExec();
+  await mkdir(path.dirname(geminiFile), { recursive: true });
+  await writeFile(geminiFile, `${userGemini}\n`);
+
+  const opts = {
+    configDir,
+    homeDir: tmp,
+    policyFile: COMMON,
+    mcpBin: '/opt/supergpt/bin/supergpt-mcp.js',
+    nodeBin: '/usr/bin/node',
+    execFileSync: fake.execFileSync,
+  };
+  const statusOpts = { configDir, homeDir: tmp, policyFile: COMMON, execFileSync: fake.execFileSync };
+  const common = (await readFile(COMMON, 'utf8')).trim();
+
+  try {
+    const result = await installGlobal(opts);
+    assert.equal(result.geminiPolicyFile, geminiFile);
+
+    let gemini = await readFile(geminiFile, 'utf8');
+    const claude = await readFile(claudeFile, 'utf8');
+    const codex = await readFile(codexFile, 'utf8');
+    // Every auto-loaded target carries the exact same COMMON-sourced content.
+    assert.equal(managedContent(gemini), common);
+    assert.equal(managedContent(gemini), managedContent(claude));
+    assert.equal(managedContent(gemini), managedContent(codex));
+    // Bytes outside the managed block survive verbatim.
+    assert.ok(gemini.includes(userGemini));
+    assert.equal(occurrences(gemini, MANAGED_BEGIN), 1);
+
+    // Repeat install is idempotent.
+    await installGlobal(opts);
+    gemini = await readFile(geminiFile, 'utf8');
+    assert.equal(occurrences(gemini, MANAGED_BEGIN), 1);
+    assert.ok(gemini.includes(userGemini));
+
+    const status = await checkGlobalStatus(statusOpts);
+    assert.equal(status.agy.policyInstalled, true);
+    assert.equal(status.agy.policyFile, geminiFile);
+    assert.equal(status.agy.skillInstalled, true);
+    assert.equal(status.agy.mcpInstalled, true);
+    assert.equal(status.claude.policyInstalled, true);
+    assert.equal(status.codex.policyInstalled, true);
+
+    // COMMON upgrade replaces the block in place and makes the old content stale.
+    const bumped = path.join(tmp, 'COMMON-v2.md');
+    await writeFile(bumped, `${common}\n\n## Added Section\nNew rule.\n`);
+    await installGlobal({ ...opts, policyFile: bumped });
+    gemini = await readFile(geminiFile, 'utf8');
+    assert.match(managedContent(gemini), /Added Section/);
+    assert.equal(occurrences(gemini, MANAGED_BEGIN), 1);
+    assert.ok(gemini.includes(userGemini));
+
+    const stale = await checkGlobalStatus(statusOpts);
+    assert.equal(stale.agy.policyInstalled, false);
+    assert.equal(stale.agy.policyReason, 'stale-content');
+    assert.equal(stale.claude.policyInstalled, false);
+    assert.equal(stale.codex.policyInstalled, false);
+
+    // Uninstall drops only the managed block and the AGY MCP entry / skill.
+    const removed = await uninstallGlobal({ configDir, homeDir: tmp, execFileSync: fake.execFileSync });
+    assert.equal(removed.removedGeminiPolicy, true);
+    const finalGemini = await readFile(geminiFile, 'utf8');
+    assert.doesNotMatch(finalGemini, /SUPERGPT-GLOBAL-POLICY/);
+    assert.ok(finalGemini.includes(userGemini));
+    assert.equal(existsSync(path.join(configDir, 'skills', 'supergpt')), false);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test('status rejects a GEMINI.md target that only exists or carries a broken/forged block', async () => {
+  const tmp = path.join('/tmp', `supergpt-gemini-bad-${Date.now()}`);
+  const configDir = path.join(tmp, '.gemini', 'config');
+  const geminiFile = path.join(tmp, '.gemini', 'GEMINI.md');
+  const fake = makeFrontendExec();
+  await mkdir(path.dirname(geminiFile), { recursive: true });
+  const common = (await readFile(COMMON, 'utf8')).trim();
+  const statusOpts = { configDir, homeDir: tmp, policyFile: COMMON, execFileSync: fake.execFileSync };
+
+  try {
+    await writeFile(geminiFile, '');
+    assert.equal((await checkGlobalStatus(statusOpts)).agy.policyReason, 'missing-block');
+
+    await writeFile(geminiFile, `${MANAGED_BEGIN}\nnot the real policy\n${MANAGED_END}\n`);
+    assert.equal((await checkGlobalStatus(statusOpts)).agy.policyReason, 'stale-content');
+
+    await writeFile(geminiFile, `${MANAGED_BEGIN}\n${common}\n${MANAGED_END}\n\n${MANAGED_BEGIN}\n${common}\n${MANAGED_END}\n`);
+    assert.equal((await checkGlobalStatus(statusOpts)).agy.policyReason, 'corrupt-block');
+
+    await writeFile(geminiFile, `dangling tail\n${MANAGED_END}\n`);
+    assert.equal((await checkGlobalStatus(statusOpts)).agy.policyReason, 'corrupt-block');
+
+    const s = await checkGlobalStatus(statusOpts);
+    assert.equal(s.agy.policyInstalled, false);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test('installer requires all three frontends before changing configuration', async () => {
   const tmp = path.join('/tmp', `supergpt-missing-client-${Date.now()}`);
   const configDir = path.join(tmp, '.gemini', 'config');

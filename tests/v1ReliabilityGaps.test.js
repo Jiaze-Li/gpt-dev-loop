@@ -1318,6 +1318,16 @@ test('Hardening G & H (Real). supergptResume runs defaultPipeline without _pipel
 
   const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
   fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  // Clear any stale per-workflow state left behind by a previously crashed run
+  // in the shared worktree root: the worktree directory itself (so `git
+  // worktree add` does not fail closed with "already exists"), plus the durable
+  // control/workspace files and the persisted host-evidence directory (whose
+  // controlled-acceptance bundle would otherwise re-validate against this
+  // run's fresh worktree and fail closed on drift).
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, workflowId), { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), { force: true });
   execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
 
   // 1. Initial workflow persisted policy: ["swift test"]
@@ -1333,6 +1343,14 @@ test('Hardening G & H (Real). supergptResume runs defaultPipeline without _pipel
       baseline_head: headSha,
       closeout_verification_commands: ['swift test'],
     })
+  );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
   );
 
   // 2. Before resume: workspace config/docs change to ["npm test"]
@@ -1555,6 +1573,16 @@ test('Fingerprint Fail-Closed C: Core closeout Gate PASS + fingerprint unavailab
 
   const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
   fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  // Clear any stale per-workflow state left behind by a previously crashed run
+  // in the shared worktree root: the worktree directory itself (so `git
+  // worktree add` does not fail closed with "already exists"), plus the durable
+  // control/workspace files and the persisted host-evidence directory (whose
+  // controlled-acceptance bundle would otherwise re-validate against this
+  // run's fresh worktree and fail closed on drift).
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, workflowId), { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), { force: true });
   execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
 
   const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
@@ -1569,6 +1597,14 @@ test('Fingerprint Fail-Closed C: Core closeout Gate PASS + fingerprint unavailab
       baseline_head: headSha,
       closeout_verification_commands: ['swift test'],
     })
+  );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
   );
 
   const fakePlanner = async () => ({
@@ -1652,6 +1688,16 @@ test('Fingerprint Fail-Closed D: Prior closeout evidence has null fingerprint + 
 
   const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
   fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  // Clear any stale per-workflow state left behind by a previously crashed run
+  // in the shared worktree root: the worktree directory itself (so `git
+  // worktree add` does not fail closed with "already exists"), plus the durable
+  // control/workspace files and the persisted host-evidence directory (whose
+  // controlled-acceptance bundle would otherwise re-validate against this
+  // run's fresh worktree and fail closed on drift).
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, workflowId), { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), { force: true });
   execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
 
   const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
@@ -1666,6 +1712,14 @@ test('Fingerprint Fail-Closed D: Prior closeout evidence has null fingerprint + 
       baseline_head: headSha,
       closeout_verification_commands: ['swift test'],
     })
+  );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
   );
 
   // Directly set control file with delivery_ready and null worktree_fingerprint in evidence
@@ -1730,6 +1784,16 @@ test('Fingerprint Fail-Closed E: Delivery-ready resume with fingerprint failure 
 
   const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
   fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  // Clear any stale per-workflow state left behind by a previously crashed run
+  // in the shared worktree root: the worktree directory itself (so `git
+  // worktree add` does not fail closed with "already exists"), plus the durable
+  // control/workspace files and the persisted host-evidence directory (whose
+  // controlled-acceptance bundle would otherwise re-validate against this
+  // run's fresh worktree and fail closed on drift).
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, workflowId), { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), { force: true });
   execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
 
   const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
@@ -1744,6 +1808,14 @@ test('Fingerprint Fail-Closed E: Delivery-ready resume with fingerprint failure 
       baseline_head: headSha,
       closeout_verification_commands: ['swift test'],
     })
+  );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
   );
 
   // Set control file to delivery_ready with a valid prior fingerprint
@@ -1807,6 +1879,16 @@ test('Fingerprint Fail-Closed F: Once fingerprinting works again, fresh closeout
 
   const worktreeDir = path.join(SUPERGPT_WORKTREE_ROOT, `repo-${workflowId}`);
   fs.mkdirSync(SUPERGPT_WORKTREE_ROOT, { recursive: true });
+  // Clear any stale per-workflow state left behind by a previously crashed run
+  // in the shared worktree root: the worktree directory itself (so `git
+  // worktree add` does not fail closed with "already exists"), plus the durable
+  // control/workspace files and the persisted host-evidence directory (whose
+  // controlled-acceptance bundle would otherwise re-validate against this
+  // run's fresh worktree and fail closed on drift).
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, workflowId), { recursive: true, force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.control.json`), { force: true });
+  fs.rmSync(path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), { force: true });
   execSync(`git worktree add --detach ${worktreeDir} HEAD`, { cwd: sourceRepo });
 
   const metaPath = path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`);
@@ -1821,6 +1903,14 @@ test('Fingerprint Fail-Closed F: Once fingerprinting works again, fresh closeout
       baseline_head: headSha,
       closeout_verification_commands: ['swift test'],
     })
+  );
+  // A real delivery-ready resume state always carries a token-usage snapshot;
+  // this hand-built fixture predates cost tracking, so add a reconstructable
+  // (empty) one so the resume cost-state gate is satisfied and the test
+  // exercises its own fingerprint / closeout-policy invariant.
+  fs.writeFileSync(
+    path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.state.json`),
+    JSON.stringify({ workflowId, workflowStatus: 'HUMAN_REQUIRED', tokenUsage: { records: [], measuredTotal: { calls: 0, costUsd: 0 } } }),
   );
 
   // delivery_ready state with stale/missing evidence

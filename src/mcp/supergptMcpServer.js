@@ -11,6 +11,11 @@
 //                     returning the structured result plus every typed
 //                     event that was emitted.
 //   supergpt_start  — non-blocking workflow start returning RUNNING and workflowId.
+//   supergpt_start_and_wait — unified autonomous entrypoint: start + local
+//                     blocking wait continued internally until terminal (0 model
+//                     tokens during the wait; front-agent model invoked once).
+//   supergpt_telemetry — local zero-token front-agent invocation counters +
+//                     polling-regression verdict.
 //   supergpt_watch  — watch active workflow locally with live streaming MCP progress notifications (0 tokens).
 //   supergpt_status — report on SuperGPT workflows with live state, progress block,
 //                     heartbeat, and process health without calling an LLM.
@@ -35,16 +40,58 @@ import {
   supergptVerify,
   supergptFormatProgress,
   toCanonicalProgress,
+  SUPERGPT_WATCH_TIMEOUT_MS,
 } from '../orchestrator/supergpt.js';
 import { SUPERGPT_WORKTREE_ROOT } from '../orchestrator/workflowWorktree.js';
+import { summarizeSafetyEvents, formatBlockingSafetyReason } from '../orchestrator/safetyEvents.js';
 import { validateWorkflowId } from '../orchestrator/workflowId.js';
 import { resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import { compileSuperGptRequest } from '../control/requestCompiler.js';
+import { supergptRoute as defaultSupergptRoute } from '../control/autoRoutePolicy.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from '../orchestrator/runtimeIdentity.js';
+import { ensureDashboardOpen as defaultEnsureDashboardOpen } from '../dashboard/launcher.js';
 
 const WORKSPACE_METADATA_SUFFIX = '.workspace.json';
+
+// Pure-local, zero-token guard. Detects the two ways a front agent burns model
+// tokens observing an autonomous workflow instead of using the single
+// `supergpt_start_and_wait` call:
+//   1. an automatic `supergpt_watch` / `supergpt_wait` polling loop
+//      (repeated model-facing tool calls), and
+//   2. the legacy `supergpt_start` -> `supergpt_watch` pattern.
+// A single manual watch/wait (debug / recovery) is allowed: only counts above
+// `maxManualChecks` are treated as a regression.
+export const FRONT_AGENT_CONTRACT_VERSION = 2;
+
+export function checkPollingRegression(counters, { maxManualChecks = 1 } = {}) {
+  const issues = [];
+  if ((counters.watchCount ?? 0) > maxManualChecks) {
+    issues.push({
+      code: 'FRONT_AGENT_POLLING_REGRESSION',
+      signal: 'watch-loop',
+      detail: `watchCount=${counters.watchCount} exceeds ${maxManualChecks} — automatic supergpt_watch loop`,
+    });
+  }
+  if ((counters.waitCount ?? 0) > maxManualChecks) {
+    issues.push({
+      code: 'FRONT_AGENT_POLLING_REGRESSION',
+      signal: 'wait-loop',
+      detail: `waitCount=${counters.waitCount} exceeds ${maxManualChecks} — front agent re-woken to continue waiting`,
+    });
+  }
+  if ((counters.startCount ?? 0) > 0
+    && (counters.startAndWaitCount ?? 0) === 0
+    && ((counters.watchCount ?? 0) > 0 || (counters.waitCount ?? 0) > 0)) {
+    issues.push({
+      code: 'FRONT_AGENT_POLLING_REGRESSION',
+      signal: 'legacy-start-watch',
+      detail: 'legacy supergpt_start -> supergpt_watch pattern instead of supergpt_start_and_wait',
+    });
+  }
+  return { regression: issues.length > 0, issues };
+}
 
 // Shared zod schema for a workflow-id tool argument. Rejects a path-traversal
 // or otherwise malformed id at the schema boundary with a clean
@@ -119,6 +166,8 @@ export async function readWorkflowStatus({
       runtimeCheck,
       status: live?.workflowStatus ?? 'UNKNOWN',
       stage: live?.stage ?? 'UNKNOWN',
+      path: live?.workflowPath ?? meta?.workflow_path ?? null,
+      pathSelectionReason: live?.pathSelectionReason ?? meta?.path_selection?.reason ?? null,
       taskIndex: live?.taskIndex ?? null,
       taskTotal: live?.taskTotal ?? null,
       taskId: live?.taskId ?? null,
@@ -156,10 +205,61 @@ export function createSuperGptMcpServer({
   watchSuperGptFn = supergptWatch,
   resolveWorkflowPlanFn = resolveWorkflowPlan,
   readWorkflowStatusFn = readWorkflowStatus,
+  supergptRouteFn = defaultSupergptRoute,
+  ensureDashboardOpenFn = defaultEnsureDashboardOpen,
   callAgy = defaultCallAgy,
   cwd = process.cwd(),
 } = {}) {
   const server = new McpServer({ name: 'supergpt', version: '1.0.0' });
+
+  // Front-agent invocation counters — local, zero-token accounting.
+  // usageAvailable=false because MCP cannot observe the caller's real token spend.
+  const frontAgentCounters = {
+    routeCount: 0,
+    startCount: 0,
+    startAndWaitCount: 0,
+    waitCount: 0,
+    watchCount: 0,
+    statusCount: 0,
+    usageAvailable: false,
+  };
+  server._frontAgentCounters = frontAgentCounters;
+
+  // Internal MCP-local state polls performed inside `supergpt_start_and_wait`
+  // while blocking for a terminal result. These consume 0 model tokens and MUST
+  // NOT be conflated with `frontAgentCounters.waitCount` (model-facing calls).
+  let internalPollCount = 0;
+  server._getInternalPollCount = () => internalPollCount;
+
+  server.registerTool(
+    'supergpt_route',
+    {
+      description:
+        'Authoritative deterministic router deciding whether a request should be handled DIRECT by the front agent or delegated to SUPERGPT. Consumes 0 model tokens.',
+      inputSchema: {
+        goal: z.string().min(1).describe('natural-language user request'),
+        cwd: z.string().optional().describe('invocation workspace (default: server cwd)'),
+      },
+      outputSchema: {
+        decision: z.enum(['DIRECT', 'SUPERGPT']),
+        rule: z.string(),
+        reason: z.string(),
+      },
+    },
+    async ({ goal, cwd: requestCwd }) => {
+      frontAgentCounters.routeCount++;
+      const result = supergptRouteFn({ goal, cwd: requestCwd ? path.resolve(requestCwd) : cwd });
+      const structured = {
+        decision: result.decision,
+        rule: result.rule,
+        reason: result.reason,
+      };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+        structuredContent: structured,
+      };
+    },
+  );
 
   server.registerTool(
     'supergpt_prepare',
@@ -244,6 +344,7 @@ export function createSuperGptMcpServer({
       reason: result.reason ?? null,
       question: result.question ?? null,
       tokenUsage: result.tokenUsage ?? null,
+      path: result.path ?? null,
       events,
     };
     return {
@@ -271,6 +372,7 @@ export function createSuperGptMcpServer({
         reason: z.string().nullable(),
         question: z.string().nullable(),
         tokenUsage: z.record(z.string(), z.any()).nullable().optional(),
+        path: z.string().nullable().optional(),
         events: z.array(z.record(z.string(), z.any())),
       },
     },
@@ -284,6 +386,7 @@ export function createSuperGptMcpServer({
       inputSchema: {
         goal: z.string().min(1).optional().describe('natural-language instruction'),
         planPath: z.string().min(1).optional().describe('path to an existing plan file'),
+        supersedesWorkflowId: z.string().optional().describe('optional prior workflowId to explicitly supersede when retrying/rerunning the same task'),
         cwd: z.string().optional().describe('invocation workspace (default: server cwd)'),
       },
       outputSchema: {
@@ -291,15 +394,239 @@ export function createSuperGptMcpServer({
         workflowId: z.string().nullable(),
       },
     },
-    async ({ goal, planPath, cwd: runCwd }) => {
+    async ({ goal, planPath, supersedesWorkflowId, cwd: runCwd }) => {
+      frontAgentCounters.startCount++;
       if (!goal && !planPath) throw new Error('supergpt_start requires either "goal" or "planPath"');
       const started = startSuperGptFn({
         goal,
         planPath,
+        supersedesWorkflowId,
         cwd: runCwd ? path.resolve(runCwd) : cwd,
       });
+      // Fire-and-forget background dashboard ensure & browser open
+      if (started?.workflowId) {
+        Promise.resolve(ensureDashboardOpenFn({ workflowId: started.workflowId })).catch(() => {});
+      }
       const structured = { status: 'RUNNING', workflowId: started.workflowId };
       return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
+    },
+  );
+
+  server.registerTool(
+    'supergpt_start_and_wait',
+    {
+      description:
+        'Unified autonomous entrypoint. Starts a SuperGPT workflow AND blocks locally until it reaches a terminal state (DONE / FAILED / HUMAN_REQUIRED / STOPPED / TIMEOUT / STALLED). The wait is continued internally across transport keep-alive slices with zero model tokens; the front-agent model is invoked exactly once to launch and exactly once to read the terminal result — never once per poll. Do NOT wrap this in a watch/wait loop: it already loops internally.',
+      inputSchema: {
+        goal: z.string().min(1).optional().describe('natural-language instruction'),
+        planPath: z.string().min(1).optional().describe('path to an existing plan file'),
+        supersedesWorkflowId: z.string().optional().describe('optional prior workflowId to explicitly supersede when retrying/rerunning the same task'),
+        cwd: z.string().optional().describe('invocation workspace (default: server cwd)'),
+        keepaliveMs: z.number().optional().describe('internal keep-alive slice length in ms (default: 30000)'),
+        maxWaitMs: z.number().optional().describe('overall safety cap on the local wait in ms (default: 6h)'),
+      },
+      outputSchema: {
+        status: z.string(),
+        stage: z.string().nullable().optional(),
+        workflowId: z.string().nullable(),
+        summary: z.string().nullable().optional(),
+        reason: z.string().nullable().optional(),
+        question: z.string().nullable().optional(),
+        path: z.string().nullable().optional(),
+        evidence: z.record(z.string(), z.any()).nullable().optional(),
+        deliveredFiles: z.array(z.string()).optional(),
+        formattedProgress: z.string().nullable().optional(),
+        localPollCount: z.number(),
+        frontAgentWaitCount: z.number(),
+        frontAgentWatchCount: z.number(),
+        // User-visible cost / safety events projected from workflow state,
+        // plus any front-agent polling regression detected locally. Additive
+        // and backward compatible.
+        safetyEvents: z.array(z.record(z.string(), z.any())).optional(),
+        blockingSafetyEvent: z.record(z.string(), z.any()).nullable().optional(),
+      },
+    },
+    async ({ goal, planPath, supersedesWorkflowId, cwd: runCwd, keepaliveMs = 30000, maxWaitMs = 6 * 60 * 60 * 1000 }, extra) => {
+      frontAgentCounters.startAndWaitCount++;
+      if (!goal && !planPath) throw new Error('supergpt_start_and_wait requires either "goal" or "planPath"');
+
+      const started = startSuperGptFn({
+        goal,
+        planPath,
+        supersedesWorkflowId,
+        cwd: runCwd ? path.resolve(runCwd) : cwd,
+      });
+      const workflowId = started?.workflowId ?? null;
+      if (workflowId) {
+        Promise.resolve(ensureDashboardOpenFn({ workflowId })).catch(() => {});
+      }
+
+      const TERMINAL = ['DONE', 'HUMAN_REQUIRED', 'FAILED', 'TIMEOUT', 'STALLED', 'STOPPED'];
+      const progressToken = extra?._meta?.progressToken;
+      const slice = Math.max(1000, keepaliveMs);
+      const deadline = Date.now() + Math.max(slice, maxWaitMs);
+      let localPolls = 0;
+      let state = null;
+
+      while (!extra?.signal?.aborted) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        try {
+          // MCP-local blocking poll — NOT a front-agent (model) invocation.
+          state = await waitSuperGptFn({
+            workflowId,
+            timeoutMs: Math.min(slice, remaining),
+            predicate: (s) => TERMINAL.includes(s.workflowStatus),
+          });
+          break;
+        } catch (err) {
+          if (!/tim(?:e|ed)?\s*out/i.test(String(err?.message))) throw err;
+          localPolls += 1;
+          internalPollCount += 1;
+          // Zero-token progress notification keeps the client transport from
+          // deadlining the call, without re-entering the front-agent model.
+          if (typeof extra?.sendNotification === 'function') {
+            try {
+              await extra.sendNotification({
+                method: 'notifications/progress',
+                params: {
+                  progressToken: progressToken ?? workflowId ?? 'supergpt',
+                  progress: localPolls,
+                  message: `SUPERGPT ${workflowId ?? ''}: running (local poll ${localPolls}, 0 model tokens)`,
+                },
+              });
+            } catch {
+              /* ignore notification delivery error */
+            }
+          }
+        }
+      }
+
+      const canonical = state ? toCanonicalProgress(state) || state : null;
+
+      // Project the workflow's own safety events, then fold in any local
+      // front-agent polling regression (workflow-independent, WARNING —
+      // the workflow itself is unaffected but the pattern must not be silent).
+      const collectedSafetyEvents = Array.isArray(state?.safetyEvents) ? [...state.safetyEvents] : [];
+      const pollingVerdict = checkPollingRegression(frontAgentCounters);
+      if (pollingVerdict.regression) {
+        for (const issue of pollingVerdict.issues) {
+          collectedSafetyEvents.push({
+            code: 'FRONT_AGENT_POLLING_REGRESSION',
+            severity: 'WARNING',
+            role: 'frontAgent',
+            taskId: null,
+            attempt: null,
+            reason: issue.detail,
+            repeatCount: null,
+            actionTaken: 'workflow result unaffected; front-agent polling pattern flagged for the user',
+            at: new Date().toISOString(),
+          });
+        }
+      }
+      const safetyProjection = summarizeSafetyEvents(collectedSafetyEvents);
+
+      let reason = state?.reason ?? state?.error ?? null;
+      if (safetyProjection.blockingSafetyEvent) {
+        const line = formatBlockingSafetyReason(safetyProjection.blockingSafetyEvent);
+        if (line && !(reason ?? '').includes(safetyProjection.blockingSafetyEvent.code)) {
+          reason = reason ? `${reason} | ${line}` : line;
+        }
+      }
+
+      const structured = {
+        status: state?.workflowStatus ?? (extra?.signal?.aborted ? 'CANCELLED' : 'TIMEOUT'),
+        stage: state?.stage ?? null,
+        workflowId,
+        summary: state?.summary ?? null,
+        reason,
+        question: state?.question ?? null,
+        path: state?.workflowPath ?? null,
+        evidence: state?.evidence ?? null,
+        deliveredFiles: state?.deliveredFiles ?? [],
+        formattedProgress: canonical ? renderGenericProgress(canonical) : null,
+        localPollCount: localPolls,
+        frontAgentWaitCount: frontAgentCounters.waitCount,
+        frontAgentWatchCount: frontAgentCounters.watchCount,
+        safetyEvents: safetyProjection.safetyEvents,
+        blockingSafetyEvent: safetyProjection.blockingSafetyEvent,
+      };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+        structuredContent: structured,
+        isError: ['FAILED', 'TIMEOUT', 'STALLED'].includes(structured.status),
+      };
+    },
+  );
+
+  server.registerTool(
+    'supergpt_telemetry',
+    {
+      description:
+        'Return local, zero-token front-agent invocation counters plus a polling-regression verdict. Real per-request model token usage is NOT observable from the MCP server, so usageAvailable is always false — the counters are the mechanical signal for detecting a polling regression.',
+      inputSchema: {},
+      outputSchema: {
+        usageAvailable: z.boolean(),
+        contractVersion: z.number(),
+        routeCount: z.number(),
+        startCount: z.number(),
+        startAndWaitCount: z.number(),
+        waitCount: z.number(),
+        watchCount: z.number(),
+        statusCount: z.number(),
+        internalPollCount: z.number(),
+        regression: z.boolean(),
+        regressionIssues: z.array(z.record(z.string(), z.any())),
+      },
+    },
+    async () => {
+      const verdict = checkPollingRegression(frontAgentCounters);
+      const structured = {
+        usageAvailable: false,
+        contractVersion: FRONT_AGENT_CONTRACT_VERSION,
+        routeCount: frontAgentCounters.routeCount,
+        startCount: frontAgentCounters.startCount,
+        startAndWaitCount: frontAgentCounters.startAndWaitCount,
+        waitCount: frontAgentCounters.waitCount,
+        watchCount: frontAgentCounters.watchCount,
+        statusCount: frontAgentCounters.statusCount,
+        internalPollCount,
+        regression: verdict.regression,
+        regressionIssues: verdict.issues,
+      };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+        structuredContent: structured,
+      };
+    },
+  );
+
+  server.registerTool(
+    'supergpt_dashboard_open',
+    {
+      description:
+        'Ensure the local zero-token read-only SuperGPT dashboard is running on 127.0.0.1:4317 and open the workflow view in the system browser. Consumes 0 model tokens.',
+      inputSchema: {
+        workflowId: workflowIdArg('workflow id to open'),
+        port: z.number().optional().describe('dashboard port (default: 4317)'),
+      },
+      outputSchema: {
+        opened: z.boolean(),
+        url: z.string(),
+        serverStarted: z.boolean(),
+      },
+    },
+    async ({ workflowId, port = 4317 }) => {
+      const res = await ensureDashboardOpenFn({ workflowId, port });
+      const structured = {
+        opened: Boolean(res?.opened),
+        url: res?.url || `http://127.0.0.1:${port}/workflow/${encodeURIComponent(workflowId)}`,
+        serverStarted: Boolean(res?.serverStarted),
+      };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
+        structuredContent: structured,
+      };
     },
   );
 
@@ -316,6 +643,7 @@ export function createSuperGptMcpServer({
       },
     },
     async ({ workflowId }) => {
+      frontAgentCounters.statusCount++;
       const workflows = await readWorkflowStatusFn({ workflowId });
       const structured = { workflows };
       return {
@@ -339,11 +667,13 @@ export function createSuperGptMcpServer({
         workflowId: z.string(),
         status: z.string(),
         stage: z.string(),
+        path: z.string().nullable().optional(),
         formattedProgress: z.string(),
         evidence: z.record(z.string(), z.any()).nullable().optional(),
       },
     },
     async ({ workflowId, timeoutMs = 60000, targetStatus }) => {
+      frontAgentCounters.waitCount++;
       const state = await waitSuperGptFn({
         workflowId,
         timeoutMs,
@@ -353,6 +683,7 @@ export function createSuperGptMcpServer({
         workflowId,
         status: state.workflowStatus,
         stage: state.stage,
+        path: state.workflowPath ?? null,
         formattedProgress: renderGenericProgress(toCanonicalProgress(state) || state),
         evidence: state.evidence ?? null,
       };
@@ -371,12 +702,13 @@ export function createSuperGptMcpServer({
       inputSchema: {
         workflowId: workflowIdArg('workflow id to watch'),
         intervalMs: z.number().optional().describe('refresh interval in milliseconds (default: 1000)'),
-        timeoutMs: z.number().optional().describe('optional maximum milliseconds to watch before returning (default: runs until terminal or cancelled)'),
+        timeoutMs: z.number().optional().describe(`optional maximum milliseconds to watch before returning (default: ${SUPERGPT_WATCH_TIMEOUT_MS})`),
       },
       outputSchema: {
         workflowId: z.string(),
         status: z.string(),
         stage: z.string(),
+        path: z.string().nullable().optional(),
         formattedProgress: z.string(),
         summary: z.string().nullable().optional(),
         reason: z.string().nullable().optional(),
@@ -389,7 +721,8 @@ export function createSuperGptMcpServer({
         cancelled: z.boolean().optional(),
       },
     },
-    async ({ workflowId, intervalMs = 1000, timeoutMs }, extra) => {
+    async ({ workflowId, intervalMs = 1000, timeoutMs = SUPERGPT_WATCH_TIMEOUT_MS }, extra) => {
+      frontAgentCounters.watchCount++;
       const progressToken = extra?._meta?.progressToken;
       const structured = await watchSuperGptFn({
         workflowId,
@@ -441,6 +774,7 @@ export function createSuperGptMcpServer({
         reason: z.string().nullable(),
         question: z.string().nullable(),
         tokenUsage: z.record(z.string(), z.any()).nullable().optional(),
+        path: z.string().nullable().optional(),
         events: z.array(z.record(z.string(), z.any())),
       },
     },
@@ -460,6 +794,7 @@ export function createSuperGptMcpServer({
         reason: result.reason ?? null,
         question: result.question ?? null,
         tokenUsage: result.tokenUsage ?? null,
+        path: result.path ?? null,
         events,
       };
       return {

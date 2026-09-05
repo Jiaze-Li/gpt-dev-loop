@@ -28,8 +28,20 @@
 // AdapterError(SUPERVISOR_ILLEGAL_TRANSITION) and the loop takes no action
 // at all for that reply.
 
-import { AdapterError, ADAPTER_ERROR_CODES } from './errors.js';
+import {
+  AdapterError, ADAPTER_ERROR_CODES, isCancellation, isAuthorizationFailure,
+  AuthorizationError, AUTHORIZATION_ERROR_CODES,
+} from './errors.js';
 import { WORKFLOW_STAGES, WORKFLOW_STATUSES } from './workflowState.js';
+import { classifyVerificationPermissionBlocked, SAFETY_EVENT_CODES, SAFETY_SEVERITY } from './safetyEvents.js';
+import {
+  workflowCostExceeded,
+  formatWorkflowCostReason,
+  workflowUsageVolumeExceeded,
+  formatWorkflowUsageVolumeReason,
+  taskExecutorCeilingExceeded,
+  formatTaskExecutorCeilingReason,
+} from './workflowCostGuard.js';
 import { defaultOrganicReworkRecorder } from './organicReworkRecorder.js';
 import { nullWindowSession } from './agyProviderSessions.js';
 import {
@@ -39,10 +51,35 @@ import {
 } from './preflight.js';
 import { getValidHostEvidence, markHostEvidenceConsumed, hashCommandSet, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
+import {
+  decideDeterministically, gateFailureFingerprint, reworkSignature, taskDiffHash, supervisorEscalationEvidence,
+} from './deterministicSupervisorPolicy.js';
+import {
+  registerTaskCardEvidence, registerGateFingerprintEvidence, registerReviewFindingsEvidence, registerTaskDiffEvidence,
+} from './newInformation.js';
+import {
+  diffBaselineFailures,
+  summarizeBaselineEvidence,
+  BASELINE_DIFF_VERDICTS,
+} from './baselineDiffGate.js';
+import {
+  createAcceptanceChain,
+  serializeAcceptanceChain,
+  deserializeAcceptanceChain,
+  stampActiveAcceptance,
+} from './taskCard.js';
 
 function defaultLog(line) {
   console.log(`gpt-loop: ${line}`);
 }
+
+// A BLOCKED report whose only permission_denials are commands the current
+// Task Card never approved as verification_commands: the Executor tripped its
+// own security boundary running an unauthorized environment probe. This is
+// never an ENVIRONMENT blocker and never consumes an implementation retry.
+const EXECUTOR_UNAUTHORIZED_PROBE = 'EXECUTOR_UNAUTHORIZED_PROBE';
+// Bounded so a persistently misbehaving Executor cannot loop forever.
+const MAX_UNAUTHORIZED_PROBE_RETRIES = 3;
 
 // Local deterministic warning only: it never changes the Reviewer verdict.
 export function reviewerReworkNonConvergence(previous, current, evidence) {
@@ -189,6 +226,8 @@ export async function runAutomatedWorkflow({
   workflowGoal,
   repositoryContext,
   maxAttemptsPerTask = 3,
+  maxEscalationAttempts = 2,
+  humanAnswer = null,
   keepOpenOnFailure = false,
   keepOpenOnSuccess = false,
   sourceWorkspace = null,
@@ -204,11 +243,32 @@ export async function runAutomatedWorkflow({
   log = defaultLog,
   workflowStateManager = null,
   usageTracker = null,
+  // Hard aggregate workflow model-cost ceiling in USD. 0 disables it. The
+  // caller (supergpt.js) resolves this from WORKFLOW_MAX_COST_USD; tests
+  // inject a low value rather than spending real money.
+  workflowCostCeilingUsd = 0,
+  // ── Mechanical token ceilings (the last-resort fuse). 0 disables each. ──
+  // Whole-workflow cumulative usageVolume (all metered roles).
+  workflowUsageVolumeCeiling = 0,
+  // One Task's cumulative Executor usageVolume across its physical calls.
+  taskExecutorUsageVolumeCeiling = 0,
+  // One Task's maximum real Executor physical calls.
+  executorPhysicalCallCeiling = 0,
   onTaskCompleted = null,
   signal = null,
+  // BASELINE-DIFF GATE. When a runner is supplied, each task's
+  // verification_commands are run once BEFORE the Executor's first edit (in
+  // the isolated workspace, baseline fixed) and the pre-existing failing-test
+  // identities are recorded. The post-Executor Gate then attributes only
+  // NEW failures to the task; pre-existing repository red tests do not
+  // trigger REWORK. Local deterministic commands only — zero model calls.
+  // Feature is OFF when null (every existing caller/test is unaffected).
+  baselineGateRunner = null,
   closeoutVerificationCommands = [],
   onCloseoutPass = null,
   taskTotal = null,
+  plannedTasks = null,
+  planSummary = null,
   // Deterministic loop-resume support. `checkpoint` (if given) rehydrates
   // the exact suspension point — accepted-task history, the mid-flight task
   // card, its attempt counter and latest Review Result — so a resumed run
@@ -220,6 +280,26 @@ export async function runAutomatedWorkflow({
   // to persist/detect post-Gate drift for a REVIEW_PENDING resume.
   computeGateFingerprint = null,
   _execSync,
+  // § Global New Information Policy / Wiring Card 2 — Fast Path first
+  // Executor. Non-null ONLY when supergpt.js has already durably registered
+  // NEW_TASK_CARD evidence for the frozen Fast Path task contract (Fast Path
+  // has exactly one task). Deliberately NOT threaded into every Executor
+  // call: it is attached to the physical Executor dispatch ONLY on that
+  // task's very first normal attempt (attemptCount === 1, not escalation —
+  // see runAttempt() below), so REWORK/escalation retries of the SAME task
+  // — explicitly out of scope for this wiring card — never receive
+  // evidenceIds and remain exactly as unmigrated/unaffected as Full Path's
+  // Executor calls. `null` for Full Path (and for every other caller/test
+  // that predates this feature) — identical to omitting the option.
+  fastPathExecutorEvidenceIds = null,
+  // § Global New Information Policy / Wiring Card 2 — Full Path first
+  // Executor, Executor Gate/Reviewer rework, and Reviewer. The SAME shared
+  // durable ledger `providerSelection.js#selectProviders` constructs and
+  // wires onto the ONE ModelSpendAuthority every role shares (identical
+  // instance as `fastPathExecutorEvidenceIds`' registrations were already
+  // made against). `null` for any caller/test that predates this feature —
+  // identical to omitting evidenceIds everywhere below (no enforcement).
+  informationLedger = null,
 }) {
   const throwIfAborted = () => {
     if (signal?.aborted) throw new Error('automated workflow cancelled');
@@ -233,13 +313,145 @@ export async function runAutomatedWorkflow({
   const history = [];
   let latestReviewResult = null;
   let latestGateEvidence = null;
+
+  // BASELINE-DIFF GATE state. `taskBaselineEvidence` is the trimmed, persisted
+  // pre-Executor verification result for `taskBaselineTaskId`. It is captured
+  // exactly once per task (in the NEXT_TASK branch, before the first Executor
+  // call) or rehydrated from a checkpoint — NEVER re-captured on a worktree
+  // the Executor has already modified.
+  const baselineDiffEnabled = Boolean(baselineGateRunner);
+  let taskBaselineEvidence = null;
+  let taskBaselineTaskId = null;
+  let taskBaselineCommandsHash = null;
+
+  // ── Mechanical token ceilings — the last-resort fuse ───────────────
+  // Checked BEFORE every expensive model dispatch (Supervisor / Executor /
+  // Reviewer). The call that crossed a ceiling has already been recorded into
+  // usageTracker; this stops the NEXT one. Fires exactly once, then routes
+  // through the existing HUMAN_REQUIRED terminal + BLOCKING safety-event path
+  // with no provider failover or retry. These are pure aggregate counters (no
+  // heuristics), so a bug that slips past every other guard still hits a wall.
+  let tokenCeilingTripped = false;
+  let tokenCeilingTerminalResult = null;
+  const tripTokenCeiling = ({ code, role, reason, taskId = null, attempt = null, physicalCalls = null, usageVolume = null, limit = null }) => {
+    tokenCeilingTripped = true;
+    const question = `${reason}. No further model call will be made. Review the task scope / budget, then resume the workflow.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code,
+        severity: 'BLOCKING',
+        role,
+        taskId: taskId ?? currentTaskCard?.task_id ?? null,
+        attempt,
+        reason,
+        physicalCalls,
+        usageVolume,
+        limit,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further Planner/Supervisor/Executor/Reviewer/repair model call made',
+      });
+    } catch (seErr) {
+      log(`token-ceiling safety event record failed: ${seErr.message}`);
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+      reason,
+      question,
+      blockerCategory: FAILURE_CATEGORIES.INFRASTRUCTURE,
+    });
+    tokenCeilingTerminalResult = {
+      status: 'HUMAN_REQUIRED',
+      reason,
+      question,
+      history,
+      ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
+    };
+    return { done: true, result: tokenCeilingTerminalResult };
+  };
+
+  // Workflow-wide guards: cumulative $ cost, then cumulative usage volume.
+  // Applied before EVERY expensive dispatch (Supervisor / Executor / Reviewer /
+  // — in supergpt.js — Planner and the PR-closeout repair Executor).
+  const enforceWorkflowCost = () => {
+    if (tokenCeilingTripped) return { done: true, result: tokenCeilingTerminalResult };
+    const costHit = workflowCostExceeded(usageTracker, workflowCostCeilingUsd);
+    if (costHit) {
+      return tripTokenCeiling({
+        code: SAFETY_EVENT_CODES.WORKFLOW_COST_BUDGET_EXCEEDED,
+        role: 'workflow',
+        reason: formatWorkflowCostReason(costHit),
+        limit: costHit.limitUsd,
+      });
+    }
+    const volHit = workflowUsageVolumeExceeded(usageTracker, workflowUsageVolumeCeiling);
+    if (volHit) {
+      return tripTokenCeiling({
+        code: SAFETY_EVENT_CODES.WORKFLOW_USAGE_VOLUME_EXCEEDED,
+        role: 'workflow',
+        reason: formatWorkflowUsageVolumeReason(volHit),
+        usageVolume: volHit.totalUsageVolume,
+        limit: volHit.limit,
+      });
+    }
+    return null;
+  };
+
+  // Per-Task Executor guards: physical-call count, then cumulative usage
+  // volume. Applied only immediately before a real Executor dispatch.
+  const enforceExecutorTaskCeilings = (taskId, attempt) => {
+    if (tokenCeilingTripped) return { done: true, result: tokenCeilingTerminalResult };
+    const hit = taskExecutorCeilingExceeded(usageTracker, taskId, {
+      volumeLimit: taskExecutorUsageVolumeCeiling,
+      callLimit: executorPhysicalCallCeiling,
+    });
+    if (!hit) return null;
+    return tripTokenCeiling({
+      code: hit.kind === 'CALLS'
+        ? SAFETY_EVENT_CODES.EXECUTOR_CALL_CEILING_EXCEEDED
+        : SAFETY_EVENT_CODES.TASK_EXECUTOR_USAGE_VOLUME_EXCEEDED,
+      role: 'executor',
+      taskId,
+      attempt: Number.isFinite(attempt) ? attempt : null,
+      reason: formatTaskExecutorCeilingReason(taskId, hit),
+      physicalCalls: hit.physicalCalls,
+      usageVolume: hit.usageVolume,
+      limit: hit.limit,
+    });
+  };
   const seenBlockers = new Map();
   let currentTaskCard = null;
+  const loopReworkMemory = new Map();
+  // § Global New Information Policy / Wiring Card 2. `currentTaskCardEvidenceIds`
+  // is the NEW_TASK_CARD evidence justifying this task's very first Executor
+  // attempt (Fast Path's pre-registered `fastPathExecutorEvidenceIds`, or a
+  // freshly registered Full Path task-card evidence — see the NEXT_TASK
+  // branch below). `pendingReworkEvidenceIds` is the SINGLE evidence item
+  // (NEW_GATE_FINGERPRINT xor NEW_REVIEW_FINDINGS — never both at once,
+  // since `latestReviewResult` only ever carries one source at a time)
+  // justifying the NEXT Executor dispatch after a deterministic CONTINUE_REWORK
+  // — see that branch below. Both are null (no enforcement) unless
+  // `informationLedger` was supplied.
+  let currentTaskCardEvidenceIds = null;
+  let pendingReworkEvidenceIds = null;
   let reviewerSession = null;
   let reviewerCreated = false;
   let reviewerTabId = null;
   let claudeManager = null;
+  let normalAttempts = 0;
+  let escalationAttempts = 0;
+  let escalationActive = false;
+  let supervisorGuidance = null;
+  let taskAttemptHistory = [];
   let attemptCount = 0;
+  let unauthorizedProbeRetries = 0;
+  let unauthorizedProbeGuidance = null;
+
+  // Monotonic per-attempt round id. Every committed Executor attempt bumps it,
+  // and every Review Result it produces (Reviewer verdict, Gate-fail REWORK, or
+  // closeout-fail REWORK) is stamped with the round it belongs to. On a
+  // checkpoint resume a persisted REWORK whose round no longer matches the
+  // restored round — or whose task_id is not the restored mid-flight task — is
+  // STALE: it came from a superseded or already-closed review round and must
+  // never re-trigger rework. See the checkpoint-rehydration block below.
+  let reviewRound = 0;
   let supervisorTabId = null;
   // P2-1: set when resuming from a REVIEW_PENDING checkpoint — carries the
   // persisted Executor Report + Gate evidence to feed straight into review.
@@ -257,7 +469,13 @@ export async function runAutomatedWorkflow({
       history: history.map((entry) => ({ ...entry })),
       currentTaskCard: currentTaskCard ?? null,
       currentTaskId: currentTaskCard?.task_id ?? null,
-      attempt: attemptCount,
+      attempt: normalAttempts + escalationAttempts,
+      normalAttempts,
+      escalationAttempts,
+      escalationActive,
+      supervisorGuidance: supervisorGuidance ?? null,
+      reviewRound,
+      humanAnswer: humanAnswer ?? null,
       latestReviewResult: latestReviewResult ?? null,
       // Default: a plain engineering checkpoint. A REVIEW_PENDING checkpoint
       // (P2-1) passes phase + the immutable Executor/Gate material via extra.
@@ -265,22 +483,143 @@ export async function runAutomatedWorkflow({
       executionReport: null,
       gateEvidence: null,
       worktreeFingerprint: null,
+      // BASELINE-DIFF GATE: the pre-Executor verification snapshot survives a
+      // resume so the baseline is never re-taken on an already-modified tree.
+      taskBaseline: (baselineDiffEnabled && taskBaselineTaskId)
+        ? {
+          taskId: taskBaselineTaskId,
+          commandsHash: taskBaselineCommandsHash,
+          evidence: taskBaselineEvidence,
+        }
+        : null,
       ...extra,
     });
   };
 
+  // BASELINE-DIFF GATE: run the current task's verification_commands ONCE,
+  // before the Executor has touched anything, and remember which failures
+  // were already there. Local deterministic commands only — zero model calls.
+  // A baseline that could not be captured leaves the feature inert for this
+  // task (the original Gate FAIL behaviour stands); it is never fatal.
+  async function captureTaskBaseline() {
+    taskBaselineEvidence = null;
+    taskBaselineTaskId = null;
+    taskBaselineCommandsHash = null;
+    if (!baselineDiffEnabled || !currentTaskCard) return;
+    const commands = Array.isArray(currentTaskCard.verification_commands)
+      ? currentTaskCard.verification_commands.map((c) => String(c))
+      : [];
+    if (commands.length === 0) return;
+    try {
+      log(`baseline verification started: task=${currentTaskCard.task_id} (pre-Executor)`);
+      const raw = await baselineGateRunner.run(commands);
+      throwIfAborted();
+      taskBaselineEvidence = summarizeBaselineEvidence(raw);
+      taskBaselineTaskId = currentTaskCard.task_id;
+      taskBaselineCommandsHash = hashCommandSet(commands);
+      const failing = (taskBaselineEvidence.results || []).filter((r) => !r.pass).length;
+      log(
+        `baseline verification completed: task=${currentTaskCard.task_id} `
+        + `pass=${taskBaselineEvidence.pass} preexistingFailingCommands=${failing}`
+      );
+      workflowStateManager?.recordProgress({
+        taskBaseline: {
+          taskId: taskBaselineTaskId,
+          commandsHash: taskBaselineCommandsHash,
+          pass: taskBaselineEvidence.pass,
+          capturedAt: new Date().toISOString(),
+          evidence: taskBaselineEvidence,
+        },
+      });
+    } catch (err) {
+      if (isCancellation(err, signal)) throw err;
+      log(
+        `baseline verification could not run (${err.message}) — baseline-diff gate `
+        + `disabled for task=${currentTaskCard?.task_id}; original Gate FAIL behaviour stands`
+      );
+      taskBaselineEvidence = null;
+      taskBaselineTaskId = null;
+      taskBaselineCommandsHash = null;
+    }
+  }
+
   if (checkpoint && typeof checkpoint === 'object') {
     if (Array.isArray(checkpoint.history)) history.push(...checkpoint.history);
-    // Only rehydrate a mid-flight task when the last Review Result was not a
-    // PASS. An accepted task is already in `history`; re-seeding it as
-    // current would make the loop re-run its Executor/Reviewer.
-    if (checkpoint.phase === 'REVIEW_PENDING' && checkpoint.currentTaskCard
-      && checkpoint.executionReport && checkpoint.gateEvidence
-      && checkpoint.latestReviewResult?.decision !== 'PASS') {
+    reviewRound = Number.isFinite(checkpoint.reviewRound) ? checkpoint.reviewRound : 0;
+    supervisorGuidance = checkpoint.supervisorGuidance ?? null;
+
+    // BASELINE-DIFF GATE: restore the pre-Executor baseline captured before
+    // suspension. Never re-run baseline verification on resume — the worktree
+    // now carries the Executor's edits and is no longer a valid baseline.
+    if (baselineDiffEnabled && checkpoint.taskBaseline && checkpoint.taskBaseline.evidence) {
+      taskBaselineEvidence = checkpoint.taskBaseline.evidence;
+      taskBaselineTaskId = checkpoint.taskBaseline.taskId ?? null;
+      taskBaselineCommandsHash = checkpoint.taskBaseline.commandsHash ?? null;
+      log(`baseline verification restored from checkpoint: task=${taskBaselineTaskId}`);
+    }
+
+    // Stale-REWORK isolation. A persisted Review Result is a LIVE rework
+    // trigger only when it (a) is not a terminal decision (PASS / OUT_OF_SCOPE
+    // close the task) and (b) is POSITIVELY identified as belonging to the
+    // restored mid-flight task AND the restored review round. Missing identity
+    // is NOT treated as a match: a persisted REWORK whose round or task_id is
+    // absent, from an older/superseded round, or from a different task is
+    // stale and must not resume the loop into a rework attempt.
+    //
+    // Migration rule for legacy checkpoints: a checkpoint written before
+    // lifecycle-metadata stamping carries no `reviewRound` field at all. Those
+    // predate the isolation contract and have no identity to verify, so they
+    // fall back to the original rule (any non-terminal persisted Review Result
+    // resumes the task). Once `reviewRound` is present the checkpoint is
+    // new-format and positive identification is mandatory.
+    const persistedReview = checkpoint.latestReviewResult ?? null;
+    const reviewIsTerminal = persistedReview?.decision === 'PASS'
+      || persistedReview?.decision === 'OUT_OF_SCOPE';
+    const checkpointIsLegacy = checkpoint.reviewRound === undefined
+      || checkpoint.reviewRound === null;
+    const restoredTaskId = checkpoint.currentTaskCard?.task_id ?? null;
+    const reviewRoundIsCurrent = Number.isFinite(persistedReview?.round)
+      && Number.isFinite(checkpoint.reviewRound)
+      && persistedReview.round === checkpoint.reviewRound;
+    const reviewTaskIsCurrent = typeof persistedReview?.task_id === 'string'
+      && typeof restoredTaskId === 'string'
+      && persistedReview.task_id === restoredTaskId;
+    const reviewPositivelyCurrent = checkpointIsLegacy
+      ? reviewTaskIsCurrent
+      : (reviewRoundIsCurrent && reviewTaskIsCurrent);
+    const hasLiveRework = persistedReview !== null
+      && !reviewIsTerminal
+      && reviewPositivelyCurrent;
+    if (persistedReview && !reviewIsTerminal && !hasLiveRework) {
+      log('loop checkpoint: stale REWORK ignored (not positively identified as the restored task/round) — not resumed as mid-flight');
+    }
+
+    // Only rehydrate a mid-flight task when there is a live, current-round
+    // rework to continue. An accepted task is already in `history`; re-seeding
+    // it as current would make the loop re-run its Executor/Reviewer.
+    const isPendingReviewForCurrentTask = checkpoint.phase === 'REVIEW_PENDING'
+      && checkpoint.currentTaskCard
+      && (!checkpoint.currentTaskId || checkpoint.currentTaskId === checkpoint.currentTaskCard.task_id)
+      && checkpoint.executionReport
+      && checkpoint.gateEvidence
+      && !reviewIsTerminal
+      && (persistedReview === null || reviewTaskIsCurrent);
+
+    if (isPendingReviewForCurrentTask) {
       // Executor + Gate already completed for this attempt; only the Reviewer
       // call was blocked. Restore that exact point and re-enter at review.
       currentTaskCard = checkpoint.currentTaskCard;
-      attemptCount = Number.isFinite(checkpoint.attempt) ? checkpoint.attempt : 1;
+      normalAttempts = Number.isFinite(checkpoint.normalAttempts)
+        ? checkpoint.normalAttempts
+        : (Number.isFinite(checkpoint.attempt) ? checkpoint.attempt : 1);
+      escalationAttempts = Number.isFinite(checkpoint.escalationAttempts)
+        ? checkpoint.escalationAttempts
+        : 0;
+      escalationActive = Boolean(checkpoint.escalationActive);
+      if (humanAnswer && (normalAttempts >= maxAttemptsPerTask || escalationActive)) {
+        escalationActive = true;
+      }
+      attemptCount = normalAttempts + escalationAttempts;
       latestReviewResult = checkpoint.latestReviewResult ?? null;
       claudeManager = createClaudeSessionManager({ taskId: currentTaskCard.task_id });
       reviewerSession = createReviewerSession();
@@ -290,15 +629,25 @@ export async function runAutomatedWorkflow({
         evidence: checkpoint.gateEvidence,
         worktreeFingerprint: checkpoint.worktreeFingerprint ?? null,
       };
-      log(`loop checkpoint restored: REVIEW_PENDING task=${currentTaskCard.task_id} attempt=${attemptCount} completed=${history.length}`);
-    } else if (checkpoint.currentTaskCard && checkpoint.latestReviewResult?.decision !== 'PASS') {
+      log(`loop checkpoint restored: REVIEW_PENDING task=${currentTaskCard.task_id} attempt=${attemptCount} (normal=${normalAttempts}, escalation=${escalationAttempts}, escalationActive=${escalationActive}) completed=${history.length}`);
+    } else if (checkpoint.currentTaskCard && hasLiveRework) {
       currentTaskCard = checkpoint.currentTaskCard;
-      attemptCount = Number.isFinite(checkpoint.attempt) ? checkpoint.attempt : 0;
+      normalAttempts = Number.isFinite(checkpoint.normalAttempts)
+        ? checkpoint.normalAttempts
+        : (Number.isFinite(checkpoint.attempt) ? checkpoint.attempt : 0);
+      escalationAttempts = Number.isFinite(checkpoint.escalationAttempts)
+        ? checkpoint.escalationAttempts
+        : 0;
+      escalationActive = Boolean(checkpoint.escalationActive);
+      if (humanAnswer && (normalAttempts >= maxAttemptsPerTask || escalationActive)) {
+        escalationActive = true;
+      }
+      attemptCount = normalAttempts + escalationAttempts;
       latestReviewResult = checkpoint.latestReviewResult ?? null;
       claudeManager = createClaudeSessionManager({ taskId: currentTaskCard.task_id });
       reviewerSession = createReviewerSession();
       reviewerCreated = false;
-      log(`loop checkpoint restored: task=${currentTaskCard.task_id} attempt=${attemptCount} completed=${history.length}`);
+      log(`loop checkpoint restored: task=${currentTaskCard.task_id} attempt=${attemptCount} (normal=${normalAttempts}, escalation=${escalationAttempts}, escalationActive=${escalationActive}) completed=${history.length}`);
     } else {
       log(`loop checkpoint restored: completed=${history.length} (no mid-flight task)`);
     }
@@ -384,6 +733,46 @@ export async function runAutomatedWorkflow({
     }
   }
 
+  // Resolve — and, when persistence is available, persist — the immutable
+  // acceptance version chain for a freshly selected task, then stamp the
+  // current active acceptance onto the card. Every consumer downstream
+  // (Executor prompt, Gate verification, Reviewer payload) then reads that
+  // exact active version rather than a raw, Executor-mutable criteria array.
+  async function bindActiveAcceptance(card) {
+    // A Supervisor-issued Task Card is not structurally required to carry
+    // acceptance_criteria (the older NEXT_TASK contract omits it entirely).
+    // Only build and stamp an immutable acceptance version chain when the
+    // card actually declares non-empty criteria; otherwise pass it through
+    // untouched so verification still runs off verification_commands.
+    const declaredCriteria = Array.isArray(card.acceptance_criteria)
+      ? card.acceptance_criteria.filter((item) => String(item).trim().length > 0)
+      : [];
+    if (declaredCriteria.length === 0) {
+      return card;
+    }
+    let chain = null;
+    const hasStore = persistence && typeof persistence.writeAcceptanceChain === 'function';
+    if (hasStore) {
+      try {
+        const stored = await persistence.readAcceptanceChain(workflowId, card.task_id);
+        if (stored) chain = deserializeAcceptanceChain(stored);
+      } catch {
+        /* unreadable stored chain — fall back to a fresh version-1 chain */
+      }
+    }
+    if (!chain) {
+      chain = createAcceptanceChain(card.acceptance_criteria);
+      if (hasStore) {
+        try {
+          await persistence.writeAcceptanceChain(workflowId, serializeAcceptanceChain(chain), card.task_id);
+        } catch {
+          /* non-fatal: the in-memory chain still stamps the card for this run */
+        }
+      }
+    }
+    return stampActiveAcceptance(card, chain);
+  }
+
   // Runs exactly one Claude execute() -> gate.run() -> (lazy Reviewer
   // create) -> Reviewer.review() round for currentTaskCard. Returns
   // { done: false } to let the outer loop go back to the Supervisor with
@@ -391,6 +780,10 @@ export async function runAutomatedWorkflow({
   // maxAttemptsPerTask guard tripped or an environment blocker occurred.
   async function runAttempt() {
     throwIfAborted();
+
+    // Workflow cost ceiling: stop before spending another Executor call.
+    const costGate = enforceWorkflowCost();
+    if (costGate) return costGate;
 
     // 1. DETERMINISTIC PREFLIGHT CHECK (Zero model tokens)
     log(`preflight started: task=${currentTaskCard.task_id}`);
@@ -451,13 +844,12 @@ export async function runAutomatedWorkflow({
       currentTaskCard.auxiliary_snapshots = preflight.snapshots;
     }
 
-    attemptCount += 1;
-    if (attemptCount > maxAttemptsPerTask) {
+    if (maxAttemptsPerTask <= 0) {
       const maxAttemptEvidence = buildHumanRequiredEvidence({
         workflowId,
         taskCard: currentTaskCard,
-        attempt: maxAttemptsPerTask,
-        stage: WORKFLOW_STAGES.REVIEWER,
+        attempt: 0,
+        stage: WORKFLOW_STAGES.PREFLIGHT,
         blockerCategory: FAILURE_CATEGORIES.IMPLEMENTATION,
         rootCause: `Task "${currentTaskCard.task_id}" reached maxAttemptsPerTask (${maxAttemptsPerTask}) without a PASS.`,
         latestGateResult: latestGateEvidence ?? null,
@@ -479,7 +871,51 @@ export async function runAutomatedWorkflow({
       };
     }
 
-    log(`claude attempt started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
+    if (!escalationActive) {
+      if (normalAttempts >= maxAttemptsPerTask) {
+        escalationActive = true;
+        escalationAttempts += 1;
+        attemptCount = normalAttempts + escalationAttempts;
+      } else {
+        normalAttempts += 1;
+        attemptCount = normalAttempts;
+      }
+    } else {
+
+      if (escalationAttempts >= maxEscalationAttempts) {
+        const maxEscalationEvidence = buildHumanRequiredEvidence({
+          workflowId,
+          taskCard: currentTaskCard,
+          attempt: normalAttempts + escalationAttempts,
+          stage: WORKFLOW_STAGES.REVIEWER,
+          blockerCategory: FAILURE_CATEGORIES.IMPLEMENTATION,
+          rootCause: `Task "${currentTaskCard.task_id}" exhausted escalation attempts (${maxEscalationAttempts}) without a PASS.`,
+          latestGateResult: latestGateEvidence ?? null,
+          latestReviewerDecision: latestReviewResult?.decision ?? null,
+          latestReviewerRequiredChanges: latestReviewResult?.required_changes ?? null,
+          history,
+        });
+        return {
+          done: true,
+          result: {
+            status: 'HUMAN_REQUIRED',
+            reason: `Task "${currentTaskCard.task_id}" exhausted escalation attempts (${maxEscalationAttempts}) without a PASS.`,
+            question: `Task "${currentTaskCard.task_id}" exhausted maximum escalation attempts (${maxEscalationAttempts}). Latest Reviewer required changes: ${JSON.stringify(latestReviewResult?.required_changes || [])}. How should this be handled?`,
+            taskId: currentTaskCard.task_id,
+            evidence: maxEscalationEvidence,
+            blockerCategory: FAILURE_CATEGORIES.IMPLEMENTATION,
+            history,
+          },
+        };
+      }
+      escalationAttempts += 1;
+      attemptCount = normalAttempts + escalationAttempts;
+    }
+
+    // A committed attempt opens a fresh review round; any Review Result this
+    // attempt produces is stamped with it for stale-REWORK isolation on resume.
+    reviewRound += 1;
+    log(`claude attempt started: task=${currentTaskCard.task_id} attempt=${attemptCount} round=${reviewRound} (normal=${normalAttempts}, escalation=${escalationAttempts})`);
     workflowStateManager?.startStage(WORKFLOW_STAGES.EXECUTOR, {
       taskId: currentTaskCard.task_id,
       taskName: currentTaskCard.goal,
@@ -501,30 +937,390 @@ export async function runAutomatedWorkflow({
             },
           }
         : {}),
+      ...(supervisorGuidance ? { supervisor_guidance: supervisorGuidance, repair_guidance: supervisorGuidance } : {}),
+      ...(unauthorizedProbeGuidance ? { unauthorized_probe_guidance: unauthorizedProbeGuidance } : {}),
     };
-    const executionReport = await claudeManager.execute(executorTaskCard, { signal });
+    // One-shot: the guidance is baked into this attempt's payload; a later
+    // clean attempt must not keep re-sending it.
+    unauthorizedProbeGuidance = null;
+
+    // Mechanical fuse: stop BEFORE this Executor dispatch if the Task has
+    // already reached its physical-call ceiling or its cumulative
+    // usage-volume ceiling. Counted from the deduplicated UsageTracker log,
+    // so attemptCount / normalAttempts bookkeeping cannot bypass it.
+    const executorTaskGate = enforceExecutorTaskCeilings(currentTaskCard.task_id, attemptCount);
+    if (executorTaskGate) return executorTaskGate;
+
+    // § Global New Information Policy / Wiring Card 2 — this dispatch's
+    // evidenceIds depend on which attempt this is:
+    //   - the task's very first normal attempt (attemptCount is set to 1
+    //     exactly once per task, above, the first time normalAttempts
+    //     advances past 0 — never on an escalation attempt): the NEW_TASK_CARD
+    //     evidence registered at NEXT_TASK time (Fast Path's pre-registered
+    //     fastPathExecutorEvidenceIds, or Full Path's freshly registered
+    //     currentTaskCardEvidenceIds — see the NEXT_TASK branch below).
+    //   - a rework attempt reached via a deterministic CONTINUE_REWORK
+    //     decision (Gate FAIL or ordinary Reviewer REWORK): the single
+    //     NEW_GATE_FINGERPRINT / NEW_REVIEW_FINDINGS evidence registered for
+    //     it just before this runAttempt() call — see the CONTINUE_REWORK
+    //     branch below.
+    //   - an escalation attempt (Model Supervisor escalation, or a
+    //     deterministically-auto-continued round once escalation is already
+    //     active): the SAME NEW_GATE_FINGERPRINT / NEW_REVIEW_FINDINGS
+    //     evidence registered for it in the CONTINUE_REWORK branch below,
+    //     just like an ordinary rework — escalation is a bounded-retry
+    //     policy decision, not an exemption from evidence gating.
+    const isFirstExecutorAttempt = attemptCount === 1 && !escalationActive;
+    const executorEvidenceIds = isFirstExecutorAttempt
+      ? (fastPathExecutorEvidenceIds ?? currentTaskCardEvidenceIds ?? undefined)
+      : (pendingReworkEvidenceIds ?? undefined);
+    let executionReport;
+    try {
+      executionReport = await claudeManager.execute(executorTaskCard, {
+        signal,
+        attempt: attemptCount,
+        physicalCallReason: 'PRIMARY',
+        ...(executorEvidenceIds ? { evidenceIds: executorEvidenceIds } : {}),
+      });
+    } catch (err) {
+      if (isCancellation(err, signal)) throw err;
+      // § Global New Information Policy / Wiring Card 2 — a Token Safety
+      // AuthorizationError (including NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED
+      // and MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE) is an orchestrator
+      // decision, never an "Executor infrastructure failure": it must reach
+      // the SINGLE centralized Token-Safety terminalization below (the outer
+      // catch's isAuthorizationFailure branch — see its own comment), never
+      // be reclassified as FAILURE_CATEGORIES.INFRASTRUCTURE here, and never
+      // trigger another Executor attempt.
+      if (isAuthorizationFailure(err)) throw err;
+      // A post-send budget / duplicate-call failure still consumed a real
+      // provider call. Record its usage before surfacing the blocker so the
+      // dashboard never shows executor.calls = 0 for a call that happened.
+      if (usageTracker && err?.details?.usage) {
+        try {
+          usageTracker.record({
+            workflowId,
+            role: 'executor',
+            callId: err.details.callId ?? err.details.usage?.callId ?? null,
+            physicalCallReason: err.details.physicalCallReason ?? 'PRIMARY',
+            taskId: err.details.taskId ?? currentTaskCard.task_id,
+            attempt: err.details.attempt ?? attemptCount,
+            provider: 'claude',
+            model: err.details.model || 'sonnet',
+            usage: err.details.usage,
+            costUsd: err.details.costUsd ?? null,
+            providerMetadata: err.details.budgetExceededReason
+              ? { budgetExceededReason: err.details.budgetExceededReason, numTurns: err.details.numTurns ?? null }
+              : null,
+          });
+          if (workflowStateManager) {
+            workflowStateManager.setTokenUsage(
+              usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout })
+            );
+          }
+        } catch (recordErr) {
+          log(`executor budget-failure usage recording failed: ${recordErr.message}`);
+        }
+      }
+      // User-visible safety event: a token/duplicate guard tripped and the
+      // workflow cannot safely continue (it ends HUMAN_REQUIRED below). This
+      // MUST reach the terminal result, not just the log.
+      if (workflowStateManager
+        && (err?.code === ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED
+          || err?.code === ADAPTER_ERROR_CODES.EXECUTOR_DUPLICATE_CALL_REJECTED)) {
+        try {
+          workflowStateManager.recordSafetyEvent({
+            code: err.code,
+            severity: 'BLOCKING',
+            role: 'executor',
+            taskId: err?.details?.taskId ?? currentTaskCard.task_id,
+            attempt: err?.details?.attempt ?? attemptCount,
+            reason: err?.details?.budgetExceededReason ?? err.message,
+            actionTaken: 'workflow halted — HUMAN_REQUIRED; no further executor call made',
+          });
+        } catch (seErr) {
+          log(`safety event record failed: ${seErr.message}`);
+        }
+      }
+      log(`executor infrastructure failure: task=${currentTaskCard.task_id} attempt=${attemptCount} error=${err.message}`);
+      const failureCategory = FAILURE_CATEGORIES.INFRASTRUCTURE;
+      const reason = `Executor failed: ${err.message}`;
+      const humanEvidence = buildHumanRequiredEvidence({
+        workflowId,
+        taskCard: currentTaskCard,
+        attempt: attemptCount,
+        stage: WORKFLOW_STAGES.EXECUTOR,
+        blockerCategory: failureCategory,
+        rootCause: reason,
+        stderrTail: err?.details?.stderr || err.message,
+        history,
+      });
+      if (workflowStateManager) {
+        workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+          reason,
+          question: `All executor provider candidates failed or timed out (${err.message}). Check model providers, network, and CLI configuration, then resume.`,
+          evidence: humanEvidence,
+          blockerCategory: failureCategory,
+        });
+      }
+      return {
+        done: true,
+        result: {
+          status: 'HUMAN_REQUIRED',
+          reason,
+          question: `All executor provider candidates failed or timed out (${err.message}). Check model providers, network, and CLI configuration, then resume.`,
+          taskId: currentTaskCard.task_id,
+          evidence: humanEvidence,
+          blockerCategory: failureCategory,
+          history,
+        },
+      };
+    }
     throwIfAborted();
     log(`claude attempt completed: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
-
-    if (executionReport?.usage && usageTracker) {
+    if (usageTracker) {
       usageTracker.record({
+        workflowId,
         role: 'executor',
-        callId: executionReport.callId ?? executionReport.usage?.callId,
+        callId: executionReport?.callId ?? executionReport?.usage?.callId,
+        physicalCallReason: executionReport?.physicalCallReason ?? 'PRIMARY',
         taskId: currentTaskCard.task_id,
         attempt: attemptCount,
-        model: executionReport.model,
-        usage: executionReport.usage,
-        costUsd: executionReport.costUsd,
+        provider: executionReport?.provider ?? (executionReport?.model?.startsWith('claude') ? 'claude' : (executionReport?.model?.startsWith('codex') ? 'codex' : 'claude')),
+        model: executionReport?.model || 'sonnet',
+        usage: executionReport?.usage ?? null,
+        inputBreakdown: executionReport?.inputBreakdown ?? null,
+        costUsd: executionReport?.costUsd ?? null,
       });
     }
     if (workflowStateManager) {
-      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
       if (executionReport?.model) {
         workflowStateManager.setRouting({
           model: executionReport.model,
           escalated: executionReport.modelEscalated,
           escalationReason: executionReport.escalationReason,
         });
+      }
+    }
+
+    if (executionReport?.status === 'BLOCKED') {
+      // Deterministic, whole-string verbatim reconciliation of the Executor's
+      // permission_denials against THIS Task Card's approved
+      // verification_commands.
+      // EXACT string equality is enforced: do NOT use .trim() or normalization,
+      // so non-identical or whitespace-altered commands are recognized as probes.
+      const denials = Array.isArray(executionReport.permissionDenials)
+        ? executionReport.permissionDenials
+        : [];
+      const deniedCommands = denials
+        .map((d) => (d && d.tool_input && typeof d.tool_input.command === 'string'
+          ? d.tool_input.command
+          : null))
+        .filter((c) => c !== null);
+      if (deniedCommands.length > 0) {
+        const approvedCommands = new Set(
+          (currentTaskCard.verification_commands ?? []).map((c) => String(c))
+        );
+        // Exact verbatim match only — no prefix, substring, glob, or trim expansion.
+        const deniedApproved = deniedCommands.filter((c) => approvedCommands.has(c));
+        const deniedProbes = deniedCommands.filter((c) => !approvedCommands.has(c));
+
+        // The adapter flags `verificationBlocked` when the same command was
+        // denied >= 2 times in one invocation (turn burn). Project it as a
+        // user-visible safety event: WARNING when another approved
+        // verification path is still open, BLOCKING when every approved
+        // verification command is denied.
+        if (workflowStateManager && executionReport.verificationBlocked) {
+          const { severity, hasAltPath, remainingApprovedCommands } = classifyVerificationPermissionBlocked({
+            approvedCommands: [...approvedCommands],
+            deniedCommands,
+          });
+          try {
+            workflowStateManager.recordSafetyEvent({
+              code: 'VERIFICATION_PERMISSION_BLOCKED',
+              severity,
+              role: 'executor',
+              taskId: currentTaskCard.task_id,
+              attempt: attemptCount,
+              repeatCount: executionReport.verificationBlocked.repeatCount ?? null,
+              reason: `verification command repeatedly permission-denied: ${executionReport.verificationBlocked.command ?? '(unknown)'}`,
+              actionTaken: hasAltPath
+                ? `other approved verification path still available (${remainingApprovedCommands.length}); workflow continues`
+                : 'no approved verification path remains; workflow halts for human input',
+            });
+          } catch (seErr) {
+            log(`safety event record failed: ${seErr.message}`);
+          }
+        }
+
+        if (deniedApproved.length === 0 && deniedProbes.length > 0) {
+          unauthorizedProbeRetries += 1;
+          log(
+            `executor unauthorized probe denied (not an approved verification command): ` +
+              `task=${currentTaskCard.task_id} attempt=${attemptCount} ` +
+              `commands=${JSON.stringify(deniedProbes)} retry=${unauthorizedProbeRetries}/${MAX_UNAUTHORIZED_PROBE_RETRIES}`
+          );
+          if (unauthorizedProbeRetries > MAX_UNAUTHORIZED_PROBE_RETRIES) {
+            log(`executor exceeded maximum unauthorized probe retries (${MAX_UNAUTHORIZED_PROBE_RETRIES}): task=${currentTaskCard.task_id}`);
+            const failureCategory = FAILURE_CATEGORIES.IMPLEMENTATION;
+            const reason = `Executor exceeded maximum unauthorized probe retries (${MAX_UNAUTHORIZED_PROBE_RETRIES}) for unapproved commands: ${JSON.stringify(deniedProbes)}.`;
+            const humanEvidence = buildHumanRequiredEvidence({
+              workflowId,
+              taskCard: currentTaskCard,
+              attempt: attemptCount,
+              stage: WORKFLOW_STAGES.EXECUTOR,
+              blockerCategory: failureCategory,
+              rootCause: reason,
+              stderrTail: executionReport?.stderr || reason,
+              history,
+            });
+            if (workflowStateManager) {
+              workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+                reason,
+                question: `Executor repeatedly attempted unauthorized probe commands (${JSON.stringify(deniedProbes)}) instead of executing approved verification commands. How should this be handled?`,
+                evidence: humanEvidence,
+                blockerCategory: failureCategory,
+              });
+            }
+            return {
+              done: true,
+              result: {
+                status: 'HUMAN_REQUIRED',
+                reason,
+                question: `Executor repeatedly attempted unauthorized probe commands (${JSON.stringify(deniedProbes)}) instead of executing approved verification commands. How should this be handled?`,
+                taskId: currentTaskCard.task_id,
+                evidence: humanEvidence,
+                blockerCategory: failureCategory,
+                history,
+              },
+            };
+          }
+          // Does NOT consume an implementation retry.
+          if (escalationActive) {
+            escalationAttempts = Math.max(0, escalationAttempts - 1);
+          } else {
+            normalAttempts = Math.max(0, normalAttempts - 1);
+          }
+          attemptCount = normalAttempts + escalationAttempts;
+          unauthorizedProbeGuidance = {
+            denied_commands: [...deniedProbes],
+            approved_verification_commands: [...approvedCommands],
+            message:
+              'Run ONLY the exact, verbatim approved verification_commands. Do NOT add 2>&1, pipes, echo, git log, or other auxiliary probe commands.',
+          };
+          workflowStateManager?.recordProgress?.();
+          return await runAttempt();
+        }
+        // else: at least one denied command IS an approved verification
+        // command — fall through to the ENVIRONMENT classification below.
+      }
+
+      const issues = Array.isArray(executionReport.issues) ? executionReport.issues.join(' ') : String(executionReport.issues || '');
+      const nextRec = String(executionReport.next_recommendation || '');
+      const combined = `${issues} ${nextRec}`.toLowerCase();
+
+      // Check for nested-route / internal MCP launcher tool confusion:
+      // If the Executor refuses execution because of supergpt_route / supergpt_start / supergpt MCP tools,
+      // this is an internal protocol violation, NOT a host environment blocker.
+      // Must NOT transition to HUMAN_REQUIRED. Instead, feed back anti-nested-routing guidance and retry.
+      const isNestedRouteError = /supergpt_route|supergpt_start|supergpt_plan|supergpt mcp/i.test(combined);
+      if (isNestedRouteError) {
+        log(`executor internal protocol error (nested route attempt): task=${currentTaskCard.task_id} attempt=${attemptCount}`);
+        unauthorizedProbeRetries += 1;
+        if (unauthorizedProbeRetries > MAX_UNAUTHORIZED_PROBE_RETRIES) {
+          log(`executor exceeded maximum nested routing retries (${MAX_UNAUTHORIZED_PROBE_RETRIES}): task=${currentTaskCard.task_id}`);
+          const failureCategory = FAILURE_CATEGORIES.IMPLEMENTATION;
+          const reason = `Executor repeatedly confused internal role with front-agent launcher.`;
+          const humanEvidence = buildHumanRequiredEvidence({
+            workflowId,
+            taskCard: currentTaskCard,
+            attempt: attemptCount,
+            stage: WORKFLOW_STAGES.EXECUTOR,
+            blockerCategory: failureCategory,
+            rootCause: reason,
+            stderrTail: reason,
+            history,
+          });
+          if (workflowStateManager) {
+            workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+              reason,
+              question: `Executor repeatedly confused internal role with front-agent launcher. How should this be handled?`,
+              evidence: humanEvidence,
+              blockerCategory: failureCategory,
+            });
+          }
+          return {
+            done: true,
+            result: {
+              status: 'HUMAN_REQUIRED',
+              reason,
+              question: `Executor repeatedly confused internal role with front-agent launcher. How should this be handled?`,
+              taskId: currentTaskCard.task_id,
+              evidence: humanEvidence,
+              blockerCategory: failureCategory,
+              history,
+            },
+          };
+        }
+        if (escalationActive) {
+          escalationAttempts = Math.max(0, escalationAttempts - 1);
+        } else {
+          normalAttempts = Math.max(0, normalAttempts - 1);
+        }
+        attemptCount = normalAttempts + escalationAttempts;
+        unauthorizedProbeGuidance = {
+          denied_commands: [],
+          approved_verification_commands: [...(currentTaskCard.verification_commands ?? [])],
+          message:
+            'You are the internal Executor in an active SuperGPT workflow. Do NOT call supergpt_route, supergpt_start, or any supergpt launcher tools. Focus 100% on editing allowed_files and running the approved verification_commands.',
+        };
+        workflowStateManager?.recordProgress?.();
+        return await runAttempt();
+      }
+
+      const isEnvOrPerm = /permission|tool|install|configure|command not found|unavailable|path|node|npm|git|dependency/i.test(combined);
+
+      if (isEnvOrPerm) {
+        log(`executor BLOCKED by environment requirement: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
+        if (escalationActive) {
+          escalationAttempts = Math.max(0, escalationAttempts - 1);
+        } else {
+          normalAttempts = Math.max(0, normalAttempts - 1);
+        }
+        attemptCount = normalAttempts + escalationAttempts;
+        const blockerCategory = FAILURE_CATEGORIES.ENVIRONMENT;
+        const reason = `Executor blocked: ${executionReport.issues?.[0] || executionReport.next_recommendation || 'Environment/tool requirement'}`;
+        const humanEvidence = buildHumanRequiredEvidence({
+          workflowId,
+          taskCard: currentTaskCard,
+          attempt: attemptCount,
+          stage: WORKFLOW_STAGES.EXECUTOR,
+          blockerCategory,
+          rootCause: reason,
+          stderrTail: issues,
+          history,
+        });
+        if (workflowStateManager) {
+          workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+            reason,
+            question: `Executor is blocked by an environment requirement: ${reason}. Resolve the requirement on host, then resume.`,
+            evidence: humanEvidence,
+            blockerCategory,
+          });
+        }
+        return {
+          done: true,
+          result: {
+            status: 'HUMAN_REQUIRED',
+            reason,
+            question: `Executor is blocked by an environment requirement: ${reason}. Resolve the requirement on host, then resume.`,
+            taskId: currentTaskCard.task_id,
+            evidence: humanEvidence,
+            blockerCategory,
+            history,
+          },
+        };
       }
     }
 
@@ -569,6 +1365,7 @@ export async function runAutomatedWorkflow({
       (r) => !r.pass && (
         r.output?.includes('command not found') ||
         r.output?.includes('exit code 127') ||
+        r.output?.includes('COMMAND_TIMEOUT') ||
         /ENOENT|EACCES|No such file or directory/i.test(r.output || '')
       )
     );
@@ -627,6 +1424,59 @@ export async function runAutomatedWorkflow({
       };
     }
 
+    // BASELINE-DIFF GATE. Compare this attempt's failing-test identities
+    // against the pre-Executor baseline for this task. Pre-existing repository
+    // red tests are NOT this task's responsibility and must not drive REWORK.
+    const baselineDiff = (
+      baselineDiffEnabled
+      && taskBaselineTaskId === currentTaskCard.task_id
+    )
+      ? diffBaselineFailures(taskBaselineEvidence, evidence)
+      : null;
+    if (baselineDiff) {
+      evidence.baselineDiff = baselineDiff;
+      log(
+        `baseline-diff gate: task=${currentTaskCard.task_id} attempt=${attemptCount} verdict=${baselineDiff.verdict} `
+        + `baseline=${baselineDiff.baselineFailures.length} current=${baselineDiff.currentFailures.length} `
+        + `new=${baselineDiff.newFailures.length} ignored=${baselineDiff.ignoredBaselineFailures.length}`
+      );
+    }
+
+    // PASS_WITH_BASELINE_FAILURES: the Gate found failures, but every one was
+    // already failing before this task ran. Treat as PASS for this task —
+    // route to the Reviewer, not to REWORK — while keeping the pre-existing
+    // repository failures visible as a WARNING and in the Gate evidence.
+    if (baselineDiff && baselineDiff.verdict === BASELINE_DIFF_VERDICTS.PASS_WITH_BASELINE_FAILURES) {
+      log(
+        `gate PASS (baseline-diff): task=${currentTaskCard.task_id} attempt=${attemptCount} — `
+        + `${baselineDiff.ignoredBaselineFailures.length} pre-existing verification failure(s) ignored, `
+        + `0 introduced by this task`
+      );
+      if (workflowStateManager) {
+        try {
+          workflowStateManager.recordSafetyEvent({
+            code: SAFETY_EVENT_CODES.PREEXISTING_VERIFICATION_FAILURES,
+            severity: SAFETY_SEVERITY.WARNING,
+            role: 'gate',
+            taskId: currentTaskCard.task_id,
+            attempt: attemptCount,
+            reason:
+              `${baselineDiff.ignoredBaselineFailures.length} verification failure(s) were already failing `
+              + `before task "${currentTaskCard.task_id}" ran and were not introduced by it: `
+              + `${baselineDiff.ignoredBaselineFailures.slice(0, 10).join('; ')}`,
+            actionTaken:
+              'task PASSed on baseline-diff (introduced no new failure); pre-existing repository failures left intact',
+          });
+        } catch (seErr) {
+          log(`preexisting-verification-failures safety event record failed: ${seErr.message}`);
+        }
+      }
+      return runReviewStep({
+        executionReport,
+        evidence: { ...evidence, pass: true, baselineDiff },
+      });
+    }
+
     // STATE_MACHINE.md §2: VERIFYING FAIL -> REWORK (never REVIEWING).
     // A non-environment Gate failure routes deterministically back to a fresh
     // Executor attempt and consumes ZERO Reviewer calls — a Reviewer PASS
@@ -634,21 +1484,35 @@ export async function runAutomatedWorkflow({
     // are carried forward as actionable Executor rework feedback.
     if (evidence.pass !== true) {
       const failingResults = (evidence.results || []).filter((r) => !r.pass);
+      // NEW_FAILURES: only the failures this task actually introduced are its
+      // responsibility. Everything else keeps the original per-command shape.
+      const attributeToNewFailures = baselineDiff
+        && baselineDiff.verdict === BASELINE_DIFF_VERDICTS.NEW_FAILURES
+        && baselineDiff.newFailures.length > 0;
       const failureSummary =
-        failingResults.map((r) => `${r.command}: ${r.output || 'failed'}`).join('; ') ||
+        (attributeToNewFailures
+          ? `new failures introduced by this task: ${baselineDiff.newFailures.join('; ')}`
+          : failingResults.map((r) => `${r.command}: ${r.output || 'failed'}`).join('; ')) ||
         'Gate verification did not pass';
       log(
         `gate FAIL (non-environment): routing task=${currentTaskCard.task_id} attempt=${attemptCount} ` +
-          `to REWORK without invoking the Reviewer`
+          `to REWORK without invoking the Reviewer` +
+          (attributeToNewFailures ? ` (baseline-diff: ${baselineDiff.newFailures.length} new failure(s))` : '')
       );
 
       latestReviewResult = {
         task_id: currentTaskCard.task_id,
         decision: 'REWORK',
-        findings: failingResults.map((r) => `Gate command failed: ${r.command}`),
-        required_changes: failingResults.map((r) => `Fix failing verification command: ${r.command}`),
+        findings: attributeToNewFailures
+          ? baselineDiff.newFailures.map((id) => `New verification failure introduced by this task: ${id}`)
+          : failingResults.map((r) => `Gate command failed: ${r.command}`),
+        required_changes: attributeToNewFailures
+          ? baselineDiff.newFailures.map((id) => `Fix newly failing test/assertion introduced by this task: ${id}`)
+          : failingResults.map((r) => `Fix failing verification command: ${r.command}`),
         rationale: `Gate verification failed on this attempt: ${failureSummary}`,
         source: 'GATE',
+        round: reviewRound,
+        ...(baselineDiff ? { baselineDiff } : {}),
       };
 
       if (workflowStateManager) {
@@ -679,6 +1543,7 @@ export async function runAutomatedWorkflow({
           reviewerModel: null,
           requiredChanges: latestReviewResult.required_changes,
           evidence,
+          round: reviewRound,
           nonConvergence: false,
         });
       } catch {
@@ -693,8 +1558,17 @@ export async function runAutomatedWorkflow({
         });
       }
 
+      taskAttemptHistory.push({
+        attempt: attemptCount,
+        gateResult: 'FAIL',
+        reviewerDecision: 'REWORK',
+        findings: latestReviewResult.findings,
+        executionReport: executionReport ?? null,
+      });
+
       await persistCheckpoint();
       return { done: false };
+
     }
 
     return runReviewStep({ executionReport, evidence });
@@ -705,6 +1579,10 @@ export async function runAutomatedWorkflow({
   // the Executor or the Gate (P2-1).
   async function runReviewStep({ executionReport, evidence }) {
     latestGateEvidence = evidence;
+
+    // Workflow cost ceiling: stop before spending another Reviewer call.
+    const costGate = enforceWorkflowCost();
+    if (costGate) return costGate;
 
     if (!reviewerCreated) {
       const reviewerIdentity = await reviewerSession.create(currentTaskCard.task_id, { windowId });
@@ -717,6 +1595,35 @@ export async function runAutomatedWorkflow({
     await activateReviewerTab();
     log(`review started: task=${currentTaskCard.task_id} attempt=${attemptCount}`);
     workflowStateManager?.startStage(WORKFLOW_STAGES.REVIEWER);
+
+    // § Global New Information Policy / Wiring Card 2 — Part I/J. The
+    // reviewable implementation state IS this task-scoped diff: the same
+    // deterministic taskDiffHash() the pre-existing Supervisor no-new-info
+    // heuristic already uses (deterministicSupervisorPolicy.js). Registration
+    // is idempotent — the SAME diff (identical changed_files + normalized
+    // patch) always resolves to the SAME CHANGED_TASK_DIFF evidenceId, so a
+    // repeated Reviewer call against an unchanged diff finds it already
+    // consumed and is denied; a genuinely changed diff authorizes one fresh
+    // Reviewer call. Registration failure fails closed via the SAME
+    // centralized Token-Safety terminalization the outer catch already
+    // applies to every AuthorizationError.
+    let reviewerEvidenceIds;
+    if (informationLedger) {
+      try {
+        const diffHash = taskDiffHash(evidence, null);
+        const diffEvidence = await registerTaskDiffEvidence(informationLedger, {
+          workflowId, taskId: currentTaskCard.task_id, diffHash,
+        });
+        reviewerEvidenceIds = [diffEvidence.evidenceId];
+      } catch (err) {
+        throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+          AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+          `New Information evidence for the Reviewer could not be durably registered: ${err?.message ?? err}`,
+          { workflowId, taskId: currentTaskCard.task_id },
+        );
+      }
+    }
+
     let reviewResult;
     try {
       reviewResult = await runWithRateLimitRecovery({
@@ -725,6 +1632,7 @@ export async function runAutomatedWorkflow({
         run: (retry) =>
           reviewerSession.review(currentTaskCard.task_id, currentTaskCard, executionReport, evidence, {
             reuseAttempt: retry > 0,
+            ...(reviewerEvidenceIds ? { evidenceIds: reviewerEvidenceIds } : {}),
           }),
         reactivate: activateReviewerTab,
       });
@@ -762,20 +1670,21 @@ export async function runAutomatedWorkflow({
       throw err;
     }
     log(`review completed: task=${currentTaskCard.task_id} attempt=${attemptCount} decision=${reviewResult.decision}`);
-
-    if (reviewResult?.usage && usageTracker) {
+    if (usageTracker) {
       usageTracker.record({
-        role: 'reviewer',
-        callId: reviewResult.callId ?? reviewResult.usage?.callId,
+        workflowId,
+        role: 'internalReviewer',
+        callId: reviewResult?.callId ?? reviewResult?.usage?.callId,
         taskId: currentTaskCard.task_id,
         attempt: attemptCount,
-        model: reviewResult.model,
-        usage: reviewResult.usage,
-        durationMs: reviewResult.durationMs,
+        provider: reviewResult?.provider,
+        model: reviewResult?.model,
+        usage: reviewResult?.usage ?? null,
+        durationMs: reviewResult?.durationMs,
       });
     }
     if (workflowStateManager) {
-      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+      if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
       workflowStateManager.state.stageStatuses.reviewer = reviewResult.decision;
       workflowStateManager.setDecision(reviewResult.decision);
       workflowStateManager.recordTaskAttempt({
@@ -802,6 +1711,7 @@ export async function runAutomatedWorkflow({
         reviewerModel: reviewResult.model ?? null,
         requiredChanges: reviewResult.required_changes ?? [],
         evidence,
+        round: reviewRound,
         nonConvergence: reviewerReworkNonConvergence(latestReviewResult, reviewResult, evidence),
       });
     } catch {
@@ -820,10 +1730,58 @@ export async function runAutomatedWorkflow({
       log(`REVIEWER_REWORK_NONCONVERGENCE task=${currentTaskCard.task_id} attempt=${attemptCount}`);
       workflowStateManager?.recordProgress({ diagnostic: 'REVIEWER_REWORK_NONCONVERGENCE' });
     }
+    reviewResult.round = reviewRound;
+
+    // OUT_OF_SCOPE auto-closure. The Reviewer has judged that a required change
+    // lies outside this Task Card's declared scope/allowed_files. That is a
+    // deterministic terminal outcome for THIS task — not a defect to rework and
+    // not a human ambiguity — so the task lifecycle closes here, is recorded in
+    // history (distinct from PASS, so it stays auditable), and the loop returns
+    // to the Supervisor for the next task. This never fires for a REWORK, a
+    // Gate FAIL, or a HUMAN_REQUIRED: those keep their own handling above.
+    if (reviewResult.decision === 'OUT_OF_SCOPE') {
+      latestReviewResult = reviewResult;
+      const outOfScopeChanges = Array.isArray(reviewResult.required_changes)
+        ? reviewResult.required_changes
+        : reviewResult.required_changes && reviewResult.required_changes !== 'none'
+          ? [reviewResult.required_changes]
+          : [];
+      log(`review OUT_OF_SCOPE: task=${currentTaskCard.task_id} attempt=${attemptCount} — closing task lifecycle deterministically`);
+      history.push({
+        task_id: currentTaskCard.task_id,
+        decision: 'OUT_OF_SCOPE',
+        attempts: normalAttempts + escalationAttempts,
+        out_of_scope_changes: outOfScopeChanges,
+      });
+      workflowStateManager?.recordCompletedTask?.({
+        taskId: currentTaskCard.task_id,
+        decision: 'OUT_OF_SCOPE',
+        attempts: normalAttempts + escalationAttempts,
+      });
+      await persistCheckpoint();
+      return { done: false };
+    }
+
+    taskAttemptHistory.push({
+      attempt: attemptCount,
+      gateResult: evidence?.pass ? 'PASS' : 'FAIL',
+      reviewerDecision: reviewResult.decision,
+      findings: reviewResult.findings ?? reviewResult.required_changes ?? [],
+      executionReport: executionReport ?? null,
+    });
+
     latestReviewResult = reviewResult;
     if (reviewResult.decision === 'PASS') {
-      history.push({ task_id: currentTaskCard.task_id, decision: 'PASS', attempts: attemptCount });
-      workflowStateManager?.recordCompletedTask({ taskId: currentTaskCard.task_id, decision: 'PASS', attempts: attemptCount });
+      history.push({
+        task_id: currentTaskCard.task_id,
+        decision: 'PASS',
+        attempts: normalAttempts + escalationAttempts,
+      });
+      workflowStateManager?.recordCompletedTask({
+        taskId: currentTaskCard.task_id,
+        decision: 'PASS',
+        attempts: normalAttempts + escalationAttempts,
+      });
       if (typeof onTaskCompleted === 'function') {
         // A failure here (e.g. a real task-baseline commit error) corrupts
         // task-scoped evidence for every following task — it must abort the
@@ -833,6 +1791,7 @@ export async function runAutomatedWorkflow({
     }
     await persistCheckpoint();
     return { done: false };
+
   }
 
   try {
@@ -906,64 +1865,160 @@ export async function runAutomatedWorkflow({
     }
 
     for (;;) {
-      await activateSupervisorTab();
-      workflowStateManager?.startStage(WORKFLOW_STAGES.SUPERVISOR);
+      // Workflow cost ceiling: stop before spending another Supervisor call.
+      const costGate = enforceWorkflowCost();
+      if (costGate) return costGate.result;
+
+      const decisionContext = {
+        workflowGoal,
+        repositoryContext,
+        history,
+        currentTaskCard,
+        taskCard: currentTaskCard,
+        latestReviewResult,
+        latestGateEvidence,
+        attemptHistory: taskAttemptHistory,
+        executionReports: taskAttemptHistory.map((a) => a.executionReport).filter(Boolean),
+        gitChanges: latestGateEvidence?.diff || null,
+        normalAttempts,
+        escalationAttempts,
+        escalationActive,
+        maxAttemptsPerTask,
+        maxEscalationAttempts,
+        plannedTasks,
+        planSummary,
+        isEscalating: normalAttempts >= maxAttemptsPerTask && !escalationActive,
+      };
+
       let decision;
-      try {
-        decision = await runWithRateLimitRecovery({
-          label: 'supervisor decision',
-          subject: `task=${currentTaskCard ? currentTaskCard.task_id : 'none'}`,
-          run: () =>
-            supervisorSession.decide({
-              workflowGoal,
-              repositoryContext,
-              history,
-              latestReviewResult,
-            }),
-          reactivate: activateSupervisorTab,
-        });
-      } catch (err) {
-        if (err instanceof RateLimitStopError) {
-          // Same contract as the Reviewer case: nothing is closed, nothing
-          // is rerun, the Supervisor conversation and any open Reviewer
-          // session/tab are preserved for a resumed run.
-          workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
-            reason: err.message,
-            question: 'ChatGPT rate-limiting is blocking the Supervisor decision.',
-          });
-          return {
-            status: 'HUMAN_REQUIRED',
-            reason: err.message,
-            question:
-              'ChatGPT rate-limiting is blocking the Supervisor decision. Wait for the limit to clear, then resume this workflow.',
-            history,
-            ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
-            tokenUsage: usageTracker?.summary() ?? null,
-          };
+      const deterministic = decideDeterministically({
+        context: decisionContext,
+        plannedTasks,
+        planSummary,
+        reworkMemory: loopReworkMemory,
+      });
+
+      if (deterministic.handled) {
+        decision = deterministic.decision;
+        log(`deterministic supervisor decision: ${decision.action} (${deterministic.reason})`);
+      } else {
+        // § Global New Information Policy / Wiring Card 3 — PART A. A model
+        // Supervisor escalation is the ONLY path here that reaches a real
+        // physical Supervisor call (decideDeterministically() above already
+        // handled every deterministic transition with zero tokens). Register
+        // the deterministic evidence that justifies it — the same latest
+        // Review Result / Task Card state decideDeterministically() itself
+        // just inspected to decide it could NOT resolve this locally — and
+        // forward it as `decisionContext.evidenceIds` so
+        // providerSelection.js#supervisorSession.decide() carries it into
+        // productionRoleRuntime.invoke('supervisor', ...). A replay of the
+        // IDENTICAL escalation state (same review/task-card fingerprint) can
+        // never mint a second physical Supervisor call; a genuinely changed
+        // one can mint exactly one fresh call. A registration failure fails
+        // closed via the SAME centralized AuthorizationError terminalization
+        // every other evidence-registration call site in this file already
+        // uses.
+        if (informationLedger) {
+          try {
+            const evidence = supervisorEscalationEvidence(decisionContext);
+            const registered = await informationLedger.registerEvidence({
+              workflowId,
+              type: evidence.type,
+              subject: evidence.subject,
+              fingerprint: evidence.fingerprint,
+              source: 'supervisor-escalation',
+            });
+            decisionContext.evidenceIds = [registered.evidenceId];
+          } catch (err) {
+            throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+              AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+              `New Information evidence for the Model Supervisor escalation could not be durably registered: ${err?.message ?? err}`,
+              { workflowId, taskId: currentTaskCard ? currentTaskCard.task_id : null },
+            );
+          }
         }
-        throw err;
+        await activateSupervisorTab();
+        workflowStateManager?.startStage(WORKFLOW_STAGES.SUPERVISOR);
+        try {
+          decision = await runWithRateLimitRecovery({
+            label: 'supervisor decision',
+            subject: `task=${currentTaskCard ? currentTaskCard.task_id : 'none'}`,
+            run: () => supervisorSession.decide(decisionContext),
+            reactivate: activateSupervisorTab,
+          });
+        } catch (err) {
+          if (err instanceof RateLimitStopError) {
+            // Same contract as the Reviewer case: nothing is closed, nothing
+            // is rerun, the Supervisor conversation and any open Reviewer
+            // session/tab are preserved for a resumed run.
+            workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+              reason: err.message,
+              question: 'ChatGPT rate-limiting is blocking the Supervisor decision.',
+            });
+            return {
+              status: 'HUMAN_REQUIRED',
+              reason: err.message,
+              question:
+                'ChatGPT rate-limiting is blocking the Supervisor decision. Wait for the limit to clear, then resume this workflow.',
+              history,
+              ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
+              tokenUsage: usageTracker?.summary() ?? null,
+            };
+          }
+          throw err;
+        }
       }
 
       log(`supervisor decision: ${decision.action}`);
 
-      if (decision?.usage && usageTracker) {
+      if (usageTracker) {
         usageTracker.record({
+          workflowId,
           role: 'supervisor',
-          callId: decision.callId ?? decision.usage?.callId,
-          model: decision.model,
-          usage: decision.usage,
-          durationMs: decision.durationMs,
+          callId: decision?.callId ?? decision?.usage?.callId,
+          provider: decision?.provider,
+          model: decision?.model,
+          usage: decision?.usage ?? null,
+          durationMs: decision?.durationMs,
         });
       }
       if (workflowStateManager) {
-        if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary());
+        if (usageTracker) workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
         workflowStateManager.setDecision(decision.action);
       }
 
-      const hasPendingRework = latestReviewResult !== null && latestReviewResult.decision !== 'PASS';
+      // OUT_OF_SCOPE closes the task exactly like PASS does — the task is no
+      // longer mid-flight, so NEXT_TASK / WORKFLOW_DONE / HUMAN_REQUIRED (not
+      // CONTINUE_REWORK) are the legal Supervisor transitions from here.
+      const hasPendingRework = latestReviewResult !== null
+        && latestReviewResult.decision !== 'PASS'
+        && latestReviewResult.decision !== 'OUT_OF_SCOPE';
       assertLegalTransition(decision, hasPendingRework);
 
       if (decision.action === 'HUMAN_REQUIRED') {
+        // NO NEW INFORMATION -> NO NEW MODEL CALL: the deterministic policy
+        // stopped a Gate-rework loop because the same failure repeated against
+        // an unchanged diff. Project it as a BLOCKING safety event so it
+        // survives to the terminal result the Front Agent shows the user.
+        if (decision.noNewInformation && workflowStateManager) {
+          try {
+            workflowStateManager.recordSafetyEvent({
+              code: SAFETY_EVENT_CODES.NO_NEW_INFORMATION_RETRY_BLOCKED,
+              severity: SAFETY_SEVERITY.BLOCKING,
+              role: 'supervisor',
+              taskId: decision.noNewInformation.taskId ?? currentTaskCard?.task_id ?? null,
+              attempt: attemptCount,
+              fingerprint: decision.noNewInformation.gateFingerprint ?? null,
+              diffHash: decision.noNewInformation.diffHash ?? null,
+              reason: decision.reason,
+              actionTaken:
+                'workflow halted — HUMAN_REQUIRED; no further Executor call dispatched '
+                + '(identical Gate failure + unchanged task diff on two consecutive attempts)',
+            });
+          } catch (seErr) {
+            log(`no-new-information safety event record failed: ${seErr.message}`);
+          }
+        }
         // Deliberately does not close anything: HUMAN_REQUIRED means "stop
         // and preserve enough state to continue later", and the whole point
         // of these being persistent conversations (inside a window that is
@@ -1103,9 +2158,12 @@ export async function runAutomatedWorkflow({
               const failingResults = (closeoutEvidence.results || []).filter((r) => !r.pass);
               const failureSummary = failingResults.map((r) => `${r.command}: ${r.output || 'failed'}`).join('; ');
               latestReviewResult = {
+                task_id: currentTaskCard.task_id,
                 decision: 'REWORK',
                 rationale: `Closeout Gate verification failed on final repository state: ${failureSummary}`,
                 required_changes: failingResults.map((r) => `Fix failure in closeout command: ${r.command}`),
+                source: 'GATE',
+                round: reviewRound,
               };
               if (workflowStateManager) {
                 workflowStateManager.state.stageStatuses.gate = 'FAIL';
@@ -1164,6 +2222,63 @@ export async function runAutomatedWorkflow({
       }
 
       if (decision.action === 'CONTINUE_REWORK') {
+        // § Global New Information Policy / Wiring Card 2 — Part C/E/F,
+        // extended to cover the escalation Executor dispatch (previously
+        // "Part Q, out of scope"): a CONTINUE_REWORK here — whether produced
+        // deterministically (Gate FAIL / ordinary Reviewer REWORK) or by the
+        // model Supervisor's own escalation decision — is always grounded in
+        // the SAME `latestReviewResult` (a genuine Gate or Reviewer finding);
+        // register the identical Gate-fingerprint / review-findings evidence
+        // for it regardless of escalation state, so the next Executor
+        // dispatch below — including the FIRST escalation attempt and every
+        // deterministically-auto-continued escalation round after it — is
+        // never unconditionally denied by ModelSpendAuthority merely for
+        // having been reached via escalation. This does not change what
+        // counts as evidence, only ensures every CONTINUE_REWORK Executor
+        // dispatch (escalating or not) presents it.
+        if (informationLedger && latestReviewResult) {
+          try {
+            if (latestReviewResult.source === 'GATE') {
+              const fingerprint = gateFailureFingerprint(latestReviewResult, latestGateEvidence);
+              const gateEvidence = await registerGateFingerprintEvidence(informationLedger, {
+                workflowId, taskId: currentTaskCard.task_id, fingerprint,
+              });
+              pendingReworkEvidenceIds = [gateEvidence.evidenceId];
+            } else {
+              const signature = reworkSignature(latestReviewResult);
+              if (signature) {
+                const findingsEvidence = await registerReviewFindingsEvidence(informationLedger, {
+                  workflowId, taskId: currentTaskCard.task_id, signature,
+                });
+                pendingReworkEvidenceIds = [findingsEvidence.evidenceId];
+              } else {
+                // No normalizable required_changes to fingerprint — never
+                // manufacture evidence from nothing; the next Executor
+                // dispatch below simply gets no evidenceIds (unmigrated).
+                pendingReworkEvidenceIds = null;
+              }
+            }
+          } catch (err) {
+            throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+              AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+              `New Information evidence for the Executor rework could not be durably registered: ${err?.message ?? err}`,
+              { workflowId, taskId: currentTaskCard.task_id },
+            );
+          }
+        } else {
+          pendingReworkEvidenceIds = null;
+        }
+        if (normalAttempts >= maxAttemptsPerTask) {
+          escalationActive = true;
+        }
+        if (decision.guidance || decision.repair_guidance || decision.strategy) {
+          supervisorGuidance = decision.guidance || decision.repair_guidance || decision.strategy;
+        }
+        if (decision.executor_model || decision.model) {
+          currentTaskCard.executor_model = decision.executor_model || decision.model;
+        } else if (escalationActive) {
+          currentTaskCard.executor_model = currentTaskCard.executor_model || 'opus';
+        }
         workflowStateManager?.startStage(WORKFLOW_STAGES.REWORK);
         if (workflowStateManager) {
           const reqStr = Array.isArray(latestReviewResult?.required_changes)
@@ -1180,10 +2295,26 @@ export async function runAutomatedWorkflow({
         continue;
       }
 
+      if (decision.action === 'OUT_OF_SCOPE') {
+        log(`supervisor decision OUT_OF_SCOPE: task=${currentTaskCard.task_id} attempt=${attemptCount} — closing task lifecycle deterministically`);
+        history.push({
+          task_id: currentTaskCard.task_id,
+          decision: 'OUT_OF_SCOPE',
+          attempts: normalAttempts + escalationAttempts,
+        });
+        workflowStateManager?.recordCompletedTask?.({
+          taskId: currentTaskCard.task_id,
+          decision: 'OUT_OF_SCOPE',
+          attempts: normalAttempts + escalationAttempts,
+        });
+        await persistCheckpoint();
+        continue;
+      }
+
       // decision.action === 'NEXT_TASK'
       await closeReviewer(); // closes the PREVIOUS task's reviewer tab, if any — conversation itself is left in the account, not deleted
-      currentTaskCard = { ...decision.task_card };
-      log(`task selected: ${currentTaskCard.task_id}`);
+      currentTaskCard = await bindActiveAcceptance({ ...decision.task_card });
+      log(`task selected: ${currentTaskCard.task_id} (acceptance v${currentTaskCard.acceptance_version})`);
       // reviewerSession is instantiated now but its create(taskId) — the
       // call that actually opens the background ChatGPT tab, INSIDE the
       // same automation window — is deferred to runAttempt(), right before
@@ -1191,12 +2322,58 @@ export async function runAutomatedWorkflow({
       reviewerSession = createReviewerSession();
       reviewerCreated = false;
       claudeManager = createClaudeSessionManager({ taskId: currentTaskCard.task_id });
+      normalAttempts = 0;
+      escalationAttempts = 0;
+      escalationActive = false;
+      supervisorGuidance = null;
+      taskAttemptHistory = [];
+      unauthorizedProbeRetries = 0;
+      unauthorizedProbeGuidance = null;
       attemptCount = 0;
       latestReviewResult = null;
+      pendingReworkEvidenceIds = null;
+
+      // § Global New Information Policy / Wiring Card 2 — Full Path first
+      // Executor (Part A/B). Fast Path already durably registered
+      // NEW_TASK_CARD evidence for its one frozen task at the supergpt.js
+      // boundary BEFORE runAutomatedWorkflow was ever called — reuse it
+      // verbatim rather than re-registering. Full Path registers it HERE,
+      // for every planned task's own NEXT_TASK selection, against the exact
+      // materialized task_card this Executor call will receive. Registration
+      // is idempotent (newInformation.js#registerEvidence): the SAME
+      // semantic task contract (task_id + full card content, timestamps/
+      // provider/attempt excluded) always resolves to the SAME evidenceId.
+      // A registration failure fails closed via the SAME centralized
+      // Token-Safety terminalization the outer catch already applies to every
+      // other AuthorizationError (isAuthorizationFailure branch, below).
+      if (fastPathExecutorEvidenceIds) {
+        currentTaskCardEvidenceIds = fastPathExecutorEvidenceIds;
+      } else if (informationLedger) {
+        try {
+          const cardEvidence = await registerTaskCardEvidence(informationLedger, {
+            workflowId, taskId: currentTaskCard.task_id, taskCard: currentTaskCard,
+          });
+          currentTaskCardEvidenceIds = [cardEvidence.evidenceId];
+        } catch (err) {
+          throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+            `New Information evidence for the Full Path Executor could not be durably registered: ${err?.message ?? err}`,
+            { workflowId, taskId: currentTaskCard.task_id },
+          );
+        }
+      } else {
+        currentTaskCardEvidenceIds = null;
+      }
+
+      // BASELINE-DIFF GATE: capture the pre-existing verification failures now,
+      // before the Executor's first edit, while this is still a clean baseline.
+      await captureTaskBaseline();
+
       await persistCheckpoint();
 
       const outcome = await runAttempt();
       if (outcome.done) return outcome.result;
+
     }
   } catch (err) {
     if (signal?.aborted) {
@@ -1208,6 +2385,34 @@ export async function runAutomatedWorkflow({
         await windowSession.close(windowId).catch(() => {});
       }
       throw err;
+    }
+    // Token-Safety orchestrator decision (ModelSpendAuthority /
+    // ReservationLedger — see modelSpendAuthority.js / modelSpendReservation.js).
+    // This is the SINGLE centralized point (not a Planner/Supervisor/
+    // Executor/Reviewer-specific check) where such a decision — from ANY
+    // role's call site above — is recognised and turned into the workflow's
+    // terminal status: HUMAN_REQUIRED, never an ordinary FAILED "task went
+    // wrong" outcome, and never allowed to fall through to normal
+    // state-machine progression (another Supervisor decision, Gate, Reviewer,
+    // or delivery). An UNRESOLVED reservation's own BLOCKING safety event was
+    // already recorded by the Reservation layer itself (markUnresolved());
+    // this is only the terminal-status projection of that decision.
+    if (isAuthorizationFailure(err)) {
+      const reason = err.message;
+      const question = `${reason} Review the workflow's model spend reservation state, then resume.`;
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+      if (!keepOpenOnFailure) {
+        await closeReviewer().catch(() => {});
+        await supervisorSession.close().catch(() => {});
+        await windowSession.close(windowId).catch(() => {});
+      }
+      return {
+        status: 'HUMAN_REQUIRED',
+        reason,
+        question,
+        history,
+        ...(currentTaskCard ? { taskId: currentTaskCard.task_id } : {}),
+      };
     }
     workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: err.message });
     if (workflowStateManager) {

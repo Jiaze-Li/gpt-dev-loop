@@ -2,7 +2,7 @@
 // in read-only sandbox mode and returns structured Review Result.
 
 import { randomUUID } from "node:crypto";
-import { buildAgyReviewPrompt, parseReviewJson } from "./agyReviewerProvider.js";
+import { assembleReviewerPrompt, parseReviewJson } from "./agyReviewerProvider.js";
 import { callCodex } from "./codexSupervisorProvider.js";
 import { AdapterError, ADAPTER_ERROR_CODES } from "../errors.js";
 
@@ -11,7 +11,7 @@ export function createCodexReviewerProvider({ call = callCodex, model = null, ti
     provider: "codex",
     model,
     async review(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
-      const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
+      const { prompt } = assembleReviewerPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
       const result = await call({ prompt, model, timeoutMs, executable, spawn, signal });
       let obj;
       try {

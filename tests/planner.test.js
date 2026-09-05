@@ -116,6 +116,27 @@ test('parsePlannerJson: valid READY object -> normalized plan', () => {
   assert.equal(parsed.summary, READY_OBJ.summary);
   assert.equal(parsed.tasks.length, 1);
   assert.deepEqual(parsed.tasks[0].allowed_files, ['src/mw/rateLimit.js', 'tests/rateLimit.test.js']);
+  assert.deepEqual(parsed.closeoutVerificationCommands, ['npm test']);
+});
+
+test('parsePlannerJson: automatically falls back to unique tasks verification_commands if closeout_verification_commands is omitted', () => {
+  const parsed = parsePlannerJson({
+    status: 'READY',
+    summary: 'Create tmp/file.txt',
+    plan_text: 'Task 1: Create tmp/file.txt with exact content',
+    tasks: [
+      {
+        task_id: 'create-file',
+        goal: 'Create tmp/file.txt with PROMPT-A-DONE',
+        allowed_files: ['tmp/file.txt'],
+        verification_commands: ["node -e 'assert.equal(fs.readFileSync(\"tmp/file.txt\", \"utf8\").trim(), \"PROMPT-A-DONE\")'"],
+      },
+    ],
+  });
+  assert.equal(parsed.status, 'READY');
+  assert.deepEqual(parsed.closeoutVerificationCommands, [
+    "node -e 'assert.equal(fs.readFileSync(\"tmp/file.txt\", \"utf8\").trim(), \"PROMPT-A-DONE\")'",
+  ]);
 });
 
 test('parsePlannerJson: AMBIGUOUS requires a question', () => {
@@ -140,6 +161,54 @@ test('parsePlannerJson: fail closed on unknown status / missing fields', () => {
     () => parsePlannerJson({ ...READY_OBJ, tasks: [{ task_id: 'x', goal: 'y', allowed_files: [], verification_commands: ['t'] }] }),
     (e) => e.code === 'PLANNER_INVALID_OUTPUT',
   );
+});
+
+// --- parsePlannerJson: workspace path normalization -----------------
+
+const readyWithAllowed = (allowed) => ({ ...READY_OBJ, tasks: [{ ...READY_OBJ.tasks[0], allowed_files: allowed }] });
+
+test('parsePlannerJson: normal relative paths pass through unchanged', () => {
+  const parsed = parsePlannerJson(readyWithAllowed(['src/a.js', 'tests/a.test.js']));
+  assert.deepEqual(parsed.tasks[0].allowed_files, ['src/a.js', 'tests/a.test.js']);
+});
+
+test('parsePlannerJson: unstable representations normalize to stable workspace-relative paths', () => {
+  const parsed = parsePlannerJson(readyWithAllowed(['./src/./a.js', 'src/lib/../a.js', 'tests//a.test.js']));
+  assert.deepEqual(parsed.tasks[0].allowed_files, ['src/a.js', 'tests/a.test.js']);
+});
+
+test('parsePlannerJson: post-normalization duplicates collapse to one entry', () => {
+  const parsed = parsePlannerJson(readyWithAllowed(['src/a.js', './src/a.js', 'src/./a.js']));
+  assert.deepEqual(parsed.tasks[0].allowed_files, ['src/a.js']);
+});
+
+test('parsePlannerJson: absolute allowed_files fail closed', () => {
+  assert.throws(
+    () => parsePlannerJson(readyWithAllowed(['/etc/passwd'])),
+    (e) => e.code === 'PLANNER_INVALID_OUTPUT' && /absolute/.test(e.message),
+  );
+});
+
+test('parsePlannerJson: path escape in allowed_files fails closed', () => {
+  assert.throws(
+    () => parsePlannerJson(readyWithAllowed(['../../secrets.txt'])),
+    (e) => e.code === 'PLANNER_INVALID_OUTPUT' && /escapes/.test(e.message),
+  );
+});
+
+test('parsePlannerJson: workspace-root reference is not a valid allowed_file', () => {
+  assert.throws(
+    () => parsePlannerJson(readyWithAllowed(['src/..'])),
+    (e) => e.code === 'PLANNER_INVALID_OUTPUT',
+  );
+});
+
+test('parsePlannerJson: closeout_policy_sources normalize and drop unsafe entries', () => {
+  const parsed = parsePlannerJson({
+    ...READY_OBJ,
+    closeout_policy_sources: ['./docs/x.md', 'docs/x.md', '/abs/policy.md', '../escape.md'],
+  });
+  assert.deepEqual(parsed.closeoutPolicySources, ['docs/x.md']);
 });
 
 // --- generatePlan ---------------------------------------------------

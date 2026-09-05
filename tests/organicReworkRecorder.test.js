@@ -236,6 +236,76 @@ test('OrganicReworkRecorder: non-convergence flag prevents LIVE VERIFIED marking
   }
 });
 
+test('OrganicReworkRecorder: a newer-round initial REWORK supersedes a stale in-flight sequence for the same task', async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'rework-rec-test-'));
+  try {
+    const recorder = new OrganicReworkRecorder({ root: tmpDir, fileName: 'evidence.jsonl' });
+
+    // Round 3: REWORK opens an in-flight sequence.
+    recorder.observeAttempt({
+      workflowId: 'wf-1', taskId: 'task-1', attempt: 1, round: 3,
+      executorCallId: 'call-exe-old', gateResult: 'PASS',
+      reviewerDecision: 'REWORK', reviewerCallId: 'call-rev-old',
+      requiredChanges: ['stale ask'],
+    });
+
+    // The same task is re-run under a fresh round 7 and emits a new initial REWORK.
+    recorder.observeAttempt({
+      workflowId: 'wf-1', taskId: 'task-1', attempt: 1, round: 7,
+      executorCallId: 'call-exe-new', gateResult: 'PASS',
+      reviewerDecision: 'REWORK', reviewerCallId: 'call-rev-new',
+      requiredChanges: ['current ask'],
+    });
+
+    const records = recorder._readAllRecords();
+    assert.equal(records.length, 2);
+    assert.equal(records[0].superseded, true);
+    assert.equal(records[1].round, 7);
+    assert.deepEqual(records[1].initialAttempt.requiredChanges, ['current ask']);
+
+    // A convergence on the fresh sequence still verifies; the stale one never does.
+    recorder.observeAttempt({
+      workflowId: 'wf-1', taskId: 'task-1', attempt: 2, round: 8,
+      executorCallId: 'call-exe-new-2', gateResult: 'PASS',
+      reviewerDecision: 'PASS', reviewerCallId: 'call-rev-new-2', requiredChanges: [],
+    });
+    const status = recorder.getVerificationStatus();
+    assert.equal(status.status, REWORK_VERIFICATION_STATUSES.LIVE_VERIFIED);
+    assert.equal(status.verifiedRecord.convergence.finalAttempt, 2);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('OrganicReworkRecorder: OUT_OF_SCOPE closes the sequence without marking LIVE VERIFIED', async () => {
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'rework-rec-test-'));
+  try {
+    const recorder = new OrganicReworkRecorder({ root: tmpDir, fileName: 'evidence.jsonl' });
+
+    recorder.observeAttempt({
+      workflowId: 'wf-1', taskId: 'task-1', attempt: 1, round: 1,
+      executorCallId: 'call-exe-1', gateResult: 'PASS',
+      reviewerDecision: 'REWORK', reviewerCallId: 'call-rev-1',
+      requiredChanges: ['fix in-scope thing'],
+    });
+
+    recorder.observeAttempt({
+      workflowId: 'wf-1', taskId: 'task-1', attempt: 2, round: 2,
+      executorCallId: 'call-exe-2', gateResult: 'PASS',
+      reviewerDecision: 'OUT_OF_SCOPE', reviewerCallId: 'call-rev-2',
+      requiredChanges: ['needs a change outside allowed_files'],
+    });
+
+    const status = recorder.getVerificationStatus();
+    assert.equal(status.status, REWORK_VERIFICATION_STATUSES.NOT_YET_OBSERVED);
+    const records = recorder._readAllRecords();
+    assert.equal(records[0].reworkLiveVerified, false);
+    assert.equal(records[0].closedOutOfScope, true);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('OrganicReworkRecorder: duplicate/reused executorCallId fails closed (does not mark LIVE VERIFIED)', async () => {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'rework-rec-test-'));
   try {

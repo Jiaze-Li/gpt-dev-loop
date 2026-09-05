@@ -15,25 +15,65 @@
 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { execSync as nodeExecSync } from 'node:child_process';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 
 import { runAutomatedWorkflow } from './automatedLoop.js';
 import { selectProviders } from './providerSelection.js';
 import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
+import { ModelSpendAuthority } from './modelSpendAuthority.js';
+import { ReservationLedger, ReservationStore } from './modelSpendReservation.js';
+import { ExternalModelTriggerAuthority, ExternalTriggerStore } from './externalModelTriggerAuthority.js';
+import { AuthorizationError, AUTHORIZATION_ERROR_CODES, isAuthorizationFailure } from './errors.js';
+import {
+  registerUserInputEvidence, registerTaskCardEvidence, registerExternalResultEvidence, sha256 as newInformationSha256,
+} from './newInformation.js';
 import { createGateRunner } from './adapters/gateRunner.js';
 import { createGitEvidenceCollector } from '../adapters/gate/git-evidence/index.js';
 import { Persistence } from './persistence.js';
 import { deliverWorkflowResult, createResultDelivery } from './resultDelivery.js';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
-import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
+import { validateWorkflowId, assertPathWithinRoot, isTestWorkflowId } from './workflowId.js';
 import { establishIsolatedWorkspace, resolveWorkflowPlan } from '../../scripts/run-agy-workflow.js';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import { UsageTracker } from './usageTracker.js';
+import {
+  resolveWorkflowCostCeilingUsd,
+  workflowCostExceeded,
+  formatWorkflowCostReason,
+  rehydrateUsageFromState,
+  assertResumeCostStateReconstructable,
+  resolveWorkflowUsageVolumeCeiling,
+  resolveTaskExecutorUsageVolumeCeiling,
+  resolveExecutorPhysicalCallCeiling,
+  anyTokenCeilingActive,
+  workflowUsageVolumeExceeded,
+  formatWorkflowUsageVolumeReason,
+  taskExecutorCeilingExceeded,
+  formatTaskExecutorCeilingReason,
+} from './workflowCostGuard.js';
+import {
+  summarizeSafetyEvents,
+  formatBlockingSafetyReason,
+  safetyCodeForAdapterError,
+  SAFETY_EVENT_CODES,
+} from './safetyEvents.js';
 import { loadWorkspaceConfig, resolveApprovedExternalRoots, loadAndValidateExternalRoots, ExternalReadRootConfigError } from './workspaceConfig.js';
 import { getCurrentRuntimeIdentity, compareRuntimeIdentity } from './runtimeIdentity.js';
-import { supergptVerify, hashCommandSet, computeWorktreeFingerprint, isValidWorktreeFingerprint, CLOSEOUT_VERIFICATION_ID } from './hostVerification.js';
+import {
+  supergptVerify,
+  hashCommandSet,
+  computeWorktreeFingerprint,
+  isValidWorktreeFingerprint,
+  CLOSEOUT_VERIFICATION_ID,
+  CONTROLLED_ACCEPTANCE_APPROVERS,
+  buildControlledHostAcceptance,
+  persistControlledHostAcceptance,
+  readControlledHostAcceptance,
+  readWorktreeHead,
+  validateControlledHostAcceptance,
+} from './hostVerification.js';
 import {
   WorkflowStateManager,
   readLiveWorkflowState,
@@ -44,6 +84,9 @@ import {
   WORKFLOW_STAGES,
   WORKFLOW_STATUSES,
 } from './workflowState.js';
+import { runPrCloseoutLoop, PR_CLOSEOUT_LOOP_STATUS } from './prCloseoutLoop.js';
+import { initialCloseoutState, DEFAULT_MAX_REPAIR_ROUNDS, resolveReviewerFallbackOrder } from './prCloseoutPolicy.js';
+import { createGithubPrReviewAdapter, GITHUB_REVIEW_FAILURES } from './adapters/githubPrReviewAdapter.js';
 import { renderGenericProgress } from '../renderers/genericTextRenderer.js';
 import {
   WorkflowLifecycleManager,
@@ -85,6 +128,14 @@ import {
   clearControl,
 } from './workflowControl.js';
 import { advanceTaskBaseline } from './taskBaseline.js';
+import {
+  selectWorkflowPath,
+  serializePathDecision,
+  pathProgressFields,
+  fastPathResolvedPlan,
+  WORKFLOW_PATHS,
+} from './pathSelection.js';
+import { recordDashboardFocus } from '../dashboard/focus.js';
 
 // The complete typed-event vocabulary emitted through onEvent. Every event
 // object is { type, timestamp, ...payload }.
@@ -105,6 +156,7 @@ export const SUPERGPT_EVENTS = Object.freeze({
   REVIEW_FINISHED: 'review_finished',
   REWORK_REQUESTED: 'rework_requested',
   HUMAN_REQUIRED: 'human_required',
+  CONTROLLED_ACCEPTANCE_RECORDED: 'controlled_acceptance_recorded',
   DELIVERY_STARTED: 'delivery_started',
   DELIVERY_SUCCEEDED: 'delivery_succeeded',
   DELIVERY_FAILED: 'delivery_failed',
@@ -191,6 +243,7 @@ const EMPTY_RESULT = () => ({
   reason: null,
   question: null,
   tokenUsage: null,
+  path: null,
 });
 
 // Resume metadata is written by buildWorkspaceMetadata() in
@@ -296,6 +349,15 @@ export async function runSuperGPT({
   answer = null,
   externalReadRoots = [],
   approvedExternalRoots = [],
+  boundedTask = null,
+  explicitFullPath = false,
+  // V2-C — injected PR closeout adapters (getPrHead, requestTrustedReview,
+  // runRepairTask, pushRepair, escalateSupervisor). Absent by default, so the
+  // closeout loop only runs when a caller wires real PR/reviewer adapters and
+  // the workspace config opts in.
+  kind,
+  parentWorkflowId = null,
+  prCloseoutAdapters = null,
   _pipeline = defaultPipeline,
   _resolveWorkflowPlan,
   _selectProviders,
@@ -303,6 +365,7 @@ export async function runSuperGPT({
   _execSync,
   _computeWorktreeFingerprint,
   _afterOwnershipAcquired,
+  _readLiveWorkflowState = readLiveWorkflowState,
 } = {}) {
   const workflowId = explicitWorkflowId ?? `wf-agy-${randomUUID()}`;
   validateWorkflowId(workflowId);
@@ -410,10 +473,24 @@ export async function runSuperGPT({
   let usageTracker;
   try {
     if (typeof _afterOwnershipAcquired === 'function') _afterOwnershipAcquired({ workflowId, ownerToken: ownershipToken });
-    workflowStateManager = new WorkflowStateManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
+    workflowStateManager = new WorkflowStateManager({
+      workflowId,
+      kind,
+      parentWorkflowId,
+      root: SUPERGPT_WORKTREE_ROOT,
+    });
     workflowStateManager.startHeartbeat(1000);
     lifecycleManager = new WorkflowLifecycleManager({ workflowId, root: SUPERGPT_WORKTREE_ROOT, sourceCwd: cwd });
     usageTracker = new UsageTracker();
+
+    if (!isResume) {
+      // Authoritative zero-spend snapshot from the very first moment of a
+      // fresh run: a later resume must be able to tell "this workflow
+      // genuinely made zero prior model calls" (tokenUsage.records === [])
+      // apart from "the prior cost state was lost". See the resume fail-closed
+      // check below and workflowCostGuard.assertResumeCostStateReconstructable.
+      try { workflowStateManager.setTokenUsage(usageTracker.summary()); } catch { /* best effort */ }
+    }
   } catch (initErr) {
     releaseOwnershipIfHeld('pre-pipeline-init');
     if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
@@ -442,6 +519,67 @@ export async function runSuperGPT({
     cwd,
     isResume,
   });
+
+  // ── Resume: restore whole-workflow cumulative model cost ──────────────
+  // The cost ceiling (workflowCostGuard.js) is a WHOLE-WORKFLOW limit, not a
+  // per-process one. A resumed run gets a fresh UsageTracker, so it must fold
+  // in the usage snapshot the prior process persisted into
+  // <workflowId>.state.json. UsageTracker.merge() dedupes by immutable callId
+  // / invocation identity, so replaying persisted records never inflates the
+  // restored total, and genuinely new calls this process makes add on top.
+  //
+  // FAIL CLOSED: when the ceiling is enabled (WORKFLOW_MAX_COST_USD > 0) and
+  // the prior cost cannot be reconstructed (state missing / unreadable /
+  // malformed / no tokenUsage.records), do NOT resume with a fresh $0 budget
+  // — halt through the existing HUMAN_REQUIRED + BLOCKING safety path,
+  // dispatching zero model calls and doing no provider failover.
+  if (isResume) {
+    let priorState = null;
+    let priorReadFailed = false;
+    try {
+      priorState = _readLiveWorkflowState({ workflowId, root: SUPERGPT_WORKTREE_ROOT });
+    } catch {
+      priorReadFailed = true;
+    }
+    const resumeCeilingUsd = resolveWorkflowCostCeilingUsd(env ?? process.env);
+    const resumeCeilingsActive = anyTokenCeilingActive(env ?? process.env);
+    const reconstructable = assertResumeCostStateReconstructable(
+      priorReadFailed ? null : priorState,
+      { ceilingUsd: resumeCeilingUsd, guardActive: resumeCeilingsActive },
+    );
+    if (!reconstructable.ok) {
+      const reason = `A workflow token ceiling (cost $${resumeCeilingUsd.toFixed(2)} and/or a cumulative usage-volume / Executor-call ceiling) is enabled but prior spend cannot be reconstructed on resume: ${reconstructable.reason}. Refusing to resume with a fresh zero budget.`;
+      const question = `${reason} Restore ${workflowId}.state.json from a backup, or start a new workflow.`;
+      try {
+        workflowStateManager.recordSafetyEvent({
+          code: SAFETY_EVENT_CODES.WORKFLOW_COST_STATE_UNAVAILABLE,
+          severity: 'BLOCKING',
+          role: 'workflow',
+          reason,
+          actionTaken: 'workflow halted — HUMAN_REQUIRED; no Planner/Supervisor/Executor/Reviewer/PR-closeout model call made',
+        });
+      } catch { /* never let safety-event recording mask the stop */ }
+      workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+      workflowStateManager.stopHeartbeat();
+      emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+      emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'HUMAN_REQUIRED', reason });
+      releaseOwnershipIfHeld('resume-cost-state-unavailable');
+      if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
+      result.status = 'HUMAN_REQUIRED';
+      result.reason = reason;
+      result.question = question;
+      try {
+        const projection = summarizeSafetyEvents(workflowStateManager.getSafetyEvents());
+        result.safetyEvents = projection.safetyEvents;
+        result.blockingSafetyEvent = projection.blockingSafetyEvent;
+      } catch { /* best effort projection */ }
+      return result;
+    }
+    // Reconstructable (records array present — possibly empty === proven zero
+    // prior spend) OR the ceiling is disabled (best-effort). Either way,
+    // fold in whatever prior records exist.
+    try { rehydrateUsageFromState(usageTracker, priorState); } catch { /* best effort */ }
+  }
 
   internalAbort = new AbortController();
   let onAbort;
@@ -566,8 +704,11 @@ export async function runSuperGPT({
           usageTracker,
           isResume,
           answer,
+          boundedTask,
+          explicitFullPath,
           externalReadRoots: resolvedExternalRoots,
           approvedExternalRoots: resolvedExternalRoots,
+          prCloseoutAdapters,
           _resolveWorkflowPlan,
           _selectProviders,
           _createGateRunner,
@@ -634,6 +775,22 @@ export async function runSuperGPT({
     }
     result.status = 'FAILED';
     result.reason = err?.message ?? String(err);
+    // A reviewer / supervisor context-budget guard that fails the run is a
+    // user-visible BLOCKING safety event — record it before the terminal
+    // transition so it is projected into the returned result.
+    const safetyCode = safetyCodeForAdapterError(err);
+    if (safetyCode === SAFETY_EVENT_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED
+      || safetyCode === SAFETY_EVENT_CODES.SUPERVISOR_CONTEXT_BUDGET_EXCEEDED) {
+      try {
+        workflowStateManager.recordSafetyEvent({
+          code: safetyCode,
+          severity: 'BLOCKING',
+          role: safetyCode === SAFETY_EVENT_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED ? 'reviewer' : 'supervisor',
+          reason: result.reason,
+          actionTaken: 'workflow halted — FAILED; no further model call made',
+        });
+      } catch { /* never let safety-event recording mask the original failure */ }
+    }
     workflowStateManager.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: result.reason });
     emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: result.status, reason: result.reason });
     return result;
@@ -646,6 +803,22 @@ export async function runSuperGPT({
     // completionPromise sees teardown actually finished.
     finalizeActiveWorkflow();
     if (ownershipReleaseWarning) result.ownershipReleaseWarning = ownershipReleaseWarning;
+    // Expose the selected path consistently on every terminal result.
+    result.path = result.path ?? workflowStateManager?.state?.workflowPath ?? null;
+    // Project accumulated user-visible safety events onto every terminal
+    // result (success, FAILED, CANCELLED alike). The blocking event is the
+    // one a Front Agent must surface.
+    try {
+      const projection = summarizeSafetyEvents(workflowStateManager?.getSafetyEvents?.() ?? []);
+      result.safetyEvents = projection.safetyEvents;
+      result.blockingSafetyEvent = projection.blockingSafetyEvent;
+      if (projection.blockingSafetyEvent) {
+        const line = formatBlockingSafetyReason(projection.blockingSafetyEvent);
+        if (line && !(result.reason ?? '').includes(projection.blockingSafetyEvent.code)) {
+          result.reason = result.reason ? `${result.reason} | ${line}` : line;
+        }
+      }
+    } catch { /* best effort projection */ }
   }
 
   // A fully delivered workflow needs no durable control record any more.
@@ -658,16 +831,602 @@ export async function runSuperGPT({
   return result;
 }
 
+export function supersedeWorkflow({ targetWorkflowId, supersededBy, root = SUPERGPT_WORKTREE_ROOT } = {}) {
+  if (!targetWorkflowId || !supersededBy) return false;
+  validateWorkflowId(targetWorkflowId);
+  validateWorkflowId(supersededBy);
+  if (!existsSync(root)) return false;
+  const statePath = path.join(root, `${targetWorkflowId}.state.json`);
+  if (!existsSync(statePath)) return false;
+  try {
+    const raw = readFileSync(statePath, 'utf8');
+    const state = JSON.parse(raw);
+    state.workflowStatus = WORKFLOW_STATUSES.STOPPED;
+    state.stage = WORKFLOW_STAGES.STOPPED;
+    state.superseded = true;
+    state.supersededBy = supersededBy;
+    state.supersededAt = new Date().toISOString();
+    state.reason = `Superseded by workflow ${supersededBy}`;
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Start is intentionally separate from run: Core retains the promise and all
 // lifecycle ownership while callers get a durable id without waiting for work.
 export function startSuperGPT(options = {}) {
   const workflowId = options.workflowId ?? `wf-agy-${randomUUID()}`;
   validateWorkflowId(workflowId);
+  const root = options.root ?? SUPERGPT_WORKTREE_ROOT;
+  
+  // Explicit replacement binding ONLY: starting a new workflow NEVER indiscriminately
+  // closes or supersedes unrelated workflows. Only an explicit supersedesWorkflowId targets a workflow.
+  const supersedesWorkflowId = options.supersedesWorkflowId ?? options.supersedes ?? null;
+  if (supersedesWorkflowId) {
+    supersedeWorkflow({ targetWorkflowId: supersedesWorkflowId, supersededBy: workflowId, root });
+  }
+
+  recordDashboardFocus({ workflowId, kind: options.kind, root });
   const run = runSuperGPT({ ...options, workflowId });
   // runSuperGPT converts workflow failures into durable terminal state/result;
   // this final catch is only a last-resort guard against an unhandled rejection.
   run.catch(() => {});
   return { status: WORKFLOW_STATUSES.RUNNING, workflowId };
+}
+
+// § Pending external review must never project to a synthetic internal clean
+// review. Once a "@codex review" / "@claude review" trigger for this exact
+// HEAD has crossed the External Model Trigger Authority's dispatch boundary
+// (DISPATCHING or later — see externalModelTriggerAuthority.js), the
+// external model has already been paid for / may already be running: a
+// mechanical timeout or an authority-blocked duplicate for that SAME head is
+// NEVER reinterpreted as "no review happened" and must NEVER be reported as
+// an ordinary reviewer failure. `createRealGithubPrCloseoutAdapters().
+// requestTrustedReview` is the only caller; exported so the closeout-loop
+// projection (-> HUMAN_REQUIRED, never DONE) is directly testable against
+// real githubPrReviewAdapter.js results without a live GitHub call.
+export function pendingTrustedReview(reviewerKey, res, prHead) {
+  return {
+    pending: true,
+    reviewer: res.originalReviewer || reviewerKey,
+    headSha: res.head || prHead || null,
+    reason: res.failure === GITHUB_REVIEW_FAILURES.TIMEOUT
+      ? 'external_review_posted_trigger_timeout'
+      : 'external_review_trigger_already_dispatched',
+    triggerState: res.triggerState ?? null,
+    triggerReused: res.triggerReused === true,
+    authorityCode: res.authorityCode ?? null,
+  };
+}
+
+export function createRealGithubPrCloseoutAdapters({
+  repoRoot,
+  cwd,
+  prNumber,
+  selection,
+  createGateRunner,
+  baseline,
+  signal,
+  workflowId,
+  workflowStateManager,
+  usageTracker = null,
+  workflowCostCeilingUsd = 0,
+  workflowUsageVolumeCeiling = 0,
+  taskExecutorUsageVolumeCeiling = 0,
+  executorPhysicalCallCeiling = 0,
+  // Optional: the SAME workflow-scoped Persistence instance the primary
+  // pipeline uses (persistence.js). When supplied, the fallback repair
+  // Executor's Persistent Model Spend Reservation survives the same
+  // restart/resume path as the rest of the workflow; when omitted the
+  // reservation ledger for this fallback path is in-memory only.
+  persistence = null,
+  // Test seam only: overrides the fallback Executor session manager used when
+  // `selection` has no role runtime. Production always passes the real
+  // `selection` and takes the runtime-backed primary path.
+  _createClaudeSessionManager = null,
+} = {}) {
+  const prNum = Number(prNumber);
+  const createFallbackExecutorManager = _createClaudeSessionManager || createClaudeSessionManager;
+
+  const getPrHead = async () => {
+    try {
+      const out = nodeExecSync(`gh pr view ${prNum} --json headRefOid`, {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const parsed = JSON.parse(out);
+      if (parsed.headRefOid) return parsed.headRefOid.trim();
+    } catch {}
+    return nodeExecSync('git rev-parse HEAD', {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  };
+
+  const githubClient = {
+    getPrHead,
+    isReviewerAvailable: async () => true,
+    postReviewTrigger: async ({ prNumber: p, body }) => {
+      const out = nodeExecSync(`gh pr comment ${p} --body ${JSON.stringify(body)}`, {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+      let commentId = null;
+      const match = out.match(/#issuecomment-(\d+)/) || out.match(/(\d+)$/);
+      if (match) commentId = match[1];
+      if (!commentId) {
+        try {
+          const commentsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/issues/${p}/comments`, {
+            cwd: repoRoot,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          const comments = JSON.parse(commentsJson);
+          if (Array.isArray(comments) && comments.length > 0) {
+            commentId = String(comments[comments.length - 1].id);
+          }
+        } catch {}
+      }
+      return { id: commentId || String(Date.now()), createdAt: new Date().toISOString() };
+    },
+    listReviewResults: async ({ prNumber: p, sinceId, since }) => {
+      const results = [];
+      try {
+        const reviewsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/pulls/${p}/reviews`, {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const reviews = JSON.parse(reviewsJson);
+        if (Array.isArray(reviews)) {
+          for (const r of reviews) {
+            results.push({
+              id: r.id,
+              reviewer: r.user?.login || 'unknown',
+              author: r.user?.login || 'unknown',
+              headSha: r.commit_id,
+              submittedAt: r.submitted_at,
+              body: r.body || '',
+              findings: [],
+            });
+          }
+        }
+      } catch {}
+
+      try {
+        const commentsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/pulls/${p}/comments`, {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        const comments = JSON.parse(commentsJson);
+        if (Array.isArray(comments)) {
+          for (const c of comments) {
+            const author = c.user?.login || 'unknown';
+            const headSha = c.commit_id;
+            const body = c.body || '';
+
+            let severity = 'OTHER';
+            if (/P1 Badge|badge\/P1|\[P1\]|\bP1\b|critical|blocker/i.test(body)) {
+              severity = 'P1';
+            } else if (/P2 Badge|badge\/P2|\[P2\]|\bP2\b|major/i.test(body)) {
+              severity = 'P2';
+            }
+
+            let title = '';
+            const headerMatch = body.match(/\*\*([^*]+)\*\*/);
+            if (headerMatch) {
+              title = headerMatch[1].replace(/!\[.*?\]\(.*?\)/g, '').trim();
+            } else {
+              title = body.split('\n')[0].slice(0, 120).trim();
+            }
+
+            const finding = {
+              id: String(c.id),
+              file: c.path,
+              line: c.line || c.original_line || c.start_line,
+              severity,
+              title: title || 'Review finding',
+              description: body,
+            };
+
+            let bucket = null;
+            if (c.pull_request_review_id) {
+              bucket = results.find((r) => String(r.id) === String(c.pull_request_review_id));
+            }
+            if (!bucket) {
+              bucket = results.find((r) => r.author === author && r.headSha === headSha);
+            }
+            if (!bucket) {
+              bucket = {
+                id: c.pull_request_review_id || c.id,
+                reviewer: author,
+                author,
+                headSha,
+                submittedAt: c.created_at,
+                findings: [],
+              };
+              results.push(bucket);
+            }
+            bucket.findings.push(finding);
+          }
+        }
+      } catch {}
+
+      if (sinceId) {
+        try {
+          const reactionsJson = nodeExecSync(`gh api /repos/{owner}/{repo}/issues/comments/${sinceId}/reactions`, {
+            cwd: repoRoot,
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          const reactions = JSON.parse(reactionsJson);
+          if (Array.isArray(reactions)) {
+            const thumbsUp = reactions.find((rx) => (rx.content === '+1' || rx.content === 'thumbs_up' || rx.content === 'heart') && /codex/i.test(rx.user?.login || ''));
+            if (thumbsUp) {
+              const headSha = getPrHead();
+              let bucket = results.find((r) => r.headSha === headSha && /codex/i.test(r.author));
+              if (!bucket) {
+                results.push({
+                  id: Number(sinceId) + 1,
+                  reviewer: thumbsUp.user?.login || 'chatgpt-codex-connector[bot]',
+                  author: thumbsUp.user?.login || 'chatgpt-codex-connector[bot]',
+                  headSha,
+                  submittedAt: thumbsUp.created_at,
+                  body: 'Clean review 👍',
+                  findings: [],
+                });
+              }
+            }
+          }
+        } catch {}
+      }
+
+      return results;
+    },
+  };
+
+  // Single, workflow-scoped External Model Trigger Authority — the ONE
+  // deterministic boundary every "@codex review" / "@claude review" comment
+  // this closeout run posts must cross (see externalModelTriggerAuthority.js
+  // / githubPrReviewAdapter.js). Shared across the codex/claude adapters
+  // below so a trigger already DISPATCHING/TRIGGERED under one reviewer
+  // durably blocks the other from triggering the SAME PR head. Backed by the
+  // SAME workflow-scoped persistence as the primary pipeline when available,
+  // so it survives the same restart/resume path as the rest of the workflow.
+  const triggerAuthority = new ExternalModelTriggerAuthority({
+    store: persistence ? new ExternalTriggerStore(persistence) : null,
+    recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+  });
+
+  return {
+    getPrHead,
+    requestTrustedReview: async ({ prNumber: p, prHead }) => {
+      const codexAdapter = createGithubPrReviewAdapter({
+        github: githubClient,
+        reviewer: 'codex',
+        workflowId,
+        triggerAuthority,
+        pollIntervalMs: 5_000,
+        maxWaitMs: 30_000,
+      });
+      const res = await codexAdapter.requestReview({ prNumber: p, prHead });
+      if (res.ok) return res.review;
+      if (res.externalTriggerDispatched) return pendingTrustedReview('codex', res, prHead);
+
+      const claudeAdapter = createGithubPrReviewAdapter({
+        github: githubClient,
+        reviewer: 'claude',
+        workflowId,
+        triggerAuthority,
+        pollIntervalMs: 5_000,
+        maxWaitMs: 30_000,
+      });
+      const claudeRes = await claudeAdapter.requestReview({ prNumber: p, prHead });
+      if (claudeRes.ok) return claudeRes.review;
+      if (claudeRes.externalTriggerDispatched) return pendingTrustedReview('claude', claudeRes, prHead);
+
+      // Neither reviewer ever crossed the dispatch boundary (both proven
+      // mechanically unavailable pre-dispatch) — zero external spend
+      // occurred, so an empty internal review is a truthful "nothing to
+      // report", never a mask over an unresolved external trigger.
+      return {
+        reviewer: 'internal',
+        headSha: prHead || getPrHead(),
+        reviewedAt: new Date().toISOString(),
+        findings: [],
+      };
+    },
+    runRepairTask: async (card) => {
+      const repairTaskId = card.task_id || 'pr-closeout-repair';
+      const persistTokenUsage = () => {
+        if (usageTracker && workflowStateManager) {
+          workflowStateManager.setTokenUsage(
+            usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }),
+          );
+        }
+      };
+      const recordRepairExecutorUsage = ({ usage, callId, model, costUsd, inputBreakdown, physicalCallReason }) => {
+        if (!usageTracker || !usage) return;
+        try {
+          usageTracker.record({
+            workflowId,
+            role: 'executor',
+            callId: callId ?? usage?.callId ?? null,
+            physicalCallReason: physicalCallReason ?? 'PRIMARY',
+            taskId: repairTaskId,
+            provider: model?.startsWith?.('codex') ? 'codex' : 'claude',
+            model: model || 'sonnet',
+            usage,
+            inputBreakdown: inputBreakdown ?? null,
+            costUsd: costUsd ?? null,
+          });
+          persistTokenUsage();
+        } catch (recErr) {
+          // Never let accounting failure mask the repair outcome.
+        }
+      };
+
+      // Mechanical token ceilings: stop before spending another repair
+      // Executor call. Cost, then whole-workflow usage volume, then this
+      // Task's Executor call-count / cumulative usage volume.
+      const preCost = workflowCostExceeded(usageTracker, workflowCostCeilingUsd);
+      const preVol = preCost ? null : workflowUsageVolumeExceeded(usageTracker, workflowUsageVolumeCeiling);
+      const preTask = (preCost || preVol) ? null : taskExecutorCeilingExceeded(usageTracker, repairTaskId, {
+        volumeLimit: taskExecutorUsageVolumeCeiling,
+        callLimit: executorPhysicalCallCeiling,
+      });
+      if (preCost || preVol || preTask) {
+        let code;
+        let reason;
+        let evidence = {};
+        if (preCost) {
+          code = SAFETY_EVENT_CODES.WORKFLOW_COST_BUDGET_EXCEEDED;
+          reason = formatWorkflowCostReason(preCost);
+          evidence = { limit: preCost.limitUsd };
+        } else if (preVol) {
+          code = SAFETY_EVENT_CODES.WORKFLOW_USAGE_VOLUME_EXCEEDED;
+          reason = formatWorkflowUsageVolumeReason(preVol);
+          evidence = { usageVolume: preVol.totalUsageVolume, limit: preVol.limit };
+        } else {
+          code = preTask.kind === 'CALLS'
+            ? SAFETY_EVENT_CODES.EXECUTOR_CALL_CEILING_EXCEEDED
+            : SAFETY_EVENT_CODES.TASK_EXECUTOR_USAGE_VOLUME_EXCEEDED;
+          reason = formatTaskExecutorCeilingReason(repairTaskId, preTask);
+          evidence = { physicalCalls: preTask.physicalCalls, usageVolume: preTask.usageVolume, limit: preTask.limit };
+        }
+        try {
+          workflowStateManager?.recordSafetyEvent({
+            code,
+            severity: 'BLOCKING',
+            role: preTask ? 'executor' : 'workflow',
+            taskId: repairTaskId,
+            reason,
+            ...evidence,
+            actionTaken: 'PR Closeout repair halted — no further Executor call made',
+          });
+        } catch { /* best effort */ }
+        return { status: 'FAILED', gateResult: 'FAIL', error: reason, safetyCode: code, safetyBlocking: true };
+      }
+
+      let executionReport = null;
+      try {
+        // § Global New Information Policy / Wiring Card 3 — PART B. Register
+        // the deterministic external-result evidence prCloseoutLoop.js
+        // attached to `card.new_information` (PR head + normalized, sorted
+        // actionable finding signatures) against the SAME informationLedger
+        // the production ModelSpendAuthority enforces, BEFORE the repair
+        // Executor is invoked. Idempotent: replaying the identical
+        // head+findings resolves to the SAME evidenceId, so
+        // ModelSpendAuthority.authorize() finds it already consumed and
+        // denies a second physical repair call for it. A registration
+        // failure fails closed via the SAME isAuthorizationFailure branch
+        // below every other authorization/permit failure in this function
+        // already uses — no physical Executor call is ever attempted.
+        let repairEvidenceIds;
+        const informationLedger = selection?.informationLedger ?? null;
+        if (informationLedger && card?.new_information) {
+          try {
+            const evidence = await registerExternalResultEvidence(informationLedger, {
+              workflowId,
+              subject: card.new_information.subject ?? null,
+              fingerprint: newInformationSha256(JSON.stringify({
+                headSha: card.new_information.headSha ?? null,
+                signatures: card.new_information.signatures ?? [],
+              })),
+            });
+            repairEvidenceIds = [evidence.evidenceId];
+          } catch (err) {
+            throw isAuthorizationFailure(err) ? err : new AuthorizationError(
+              AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+              `New Information evidence for the PR-closeout repair Executor could not be durably registered: ${err?.message ?? err}`,
+              { workflowId, taskId: repairTaskId },
+            );
+          }
+        }
+        let runExecution;
+        if (typeof selection?.createExecutorSessionManager === 'function') {
+          // Primary path: the executor session manager routes through
+          // productionRoleRuntime.invoke('executor'), which already obtains
+          // and consumes a PhysicalCallPermit per physical attempt.
+          const executorManager = selection.createExecutorSessionManager({ taskId: repairTaskId, cwd: repoRoot });
+          runExecution = () => executorManager.execute(card, { signal, evidenceIds: repairEvidenceIds });
+        } else {
+          // Fallback path: no role runtime available, so this internal
+          // Claude physical model call would otherwise bypass the authority.
+          // Apply the SAME ModelSpendAuthority contract here — build a
+          // CallIntent, authorize it, and run the provider dispatch only
+          // through spendAuthority.dispatch(). Permit single-use / intent
+          // binding / default-deny stay entirely inside the authority.
+          //
+          // § PR-repair fallback audit (default-deny hardening): this branch
+          // is MECHANICALLY UNREACHABLE in production. `selection` above is
+          // always the real selectProviders() output (see this function's
+          // `const selection = (_selectProviders || selectProviders)({...})`
+          // — `_selectProviders` is a test-only seam never wired in
+          // production), and selectProviders() always returns
+          // `createExecutorSessionManager` as a function, so the `if` branch
+          // above is always taken for real. Only a test that deliberately
+          // constructs a stripped-down `selection` stand-in (see
+          // tests/prCloseoutRepairPermit.test.js) reaches here — see
+          // tests/prCloseoutFallbackAuthorityAudit.test.js for the mechanical
+          // proof. Even so, the `new ModelSpendAuthority(...)` just below
+          // still always receives the SAME `informationLedger` this adapter
+          // registered evidence against when one is available (§ PART C) —
+          // never `null` while a production-shaped ledger exists — so this
+          // path was never a silent New Information bypass either way.
+          // Persistent Model Spend Reservation for this fallback authority:
+          // reuse the SAME workflow-scoped persistence as the primary path
+          // when one is available, so a reservation created here survives
+          // the identical restart/resume path as the rest of the workflow.
+          const reservationLedger = new ReservationLedger({
+            store: persistence ? new ReservationStore(persistence) : null,
+            recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+          });
+          const spendAuthority = selection?.runtime?.spendAuthority
+            ?? new ModelSpendAuthority({
+              reservationLedger,
+              recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+              // § PART C — production must never construct a ModelSpendAuthority
+              // without the information ledger; reuse the SAME one this
+              // adapter just registered evidence against when `selection`
+              // did not already provide a fully-wired runtime.
+              informationLedger,
+            });
+          const executorManager = createFallbackExecutorManager({ taskId: repairTaskId, cwd: repoRoot });
+          const callIntent = {
+            role: 'executor',
+            family: 'claude:sonnet',
+            provider: 'claude',
+            operationId: workflowId ?? repairTaskId,
+            attempt: 1,
+            workflowId,
+            evidenceIds: repairEvidenceIds,
+          };
+          const permit = await spendAuthority.authorize(callIntent);
+          runExecution = () => spendAuthority.dispatch(permit, callIntent, () => executorManager.execute(card, { signal }));
+        }
+        executionReport = await runExecution();
+      } catch (err) {
+        // An authorization / permit failure is an orchestrator decision, not
+        // a provider failure: the physical Claude call did not happen. Do not
+        // run it through the adapter-error / safety-event classification, do
+        // not record provider usage, do not retry or fail over — return a
+        // structured authorization failure immediately.
+        if (isAuthorizationFailure(err)) {
+          return {
+            status: 'FAILED',
+            gateResult: 'FAIL',
+            error: err.message,
+            authorizationFailure: true,
+            authorizationCode: err.code ?? null,
+          };
+        }
+        // A post-send token-safety guard (budget / duplicate call) still
+        // consumed a real provider call: record its usage, surface a
+        // user-visible BLOCKING safety event, and return a STRUCTURED
+        // failure — never a bare generic FAILED. No retry / failover: the
+        // repair round simply ends here.
+        const safetyCode = safetyCodeForAdapterError(err);
+        if (err?.details?.usage) {
+          recordRepairExecutorUsage({
+            usage: err.details.usage,
+            callId: err.details.callId ?? err.details.usage?.callId ?? null,
+            model: err.details.model || 'sonnet',
+            costUsd: err.details.costUsd ?? null,
+            inputBreakdown: err.details.inputBreakdown ?? null,
+            physicalCallReason: err.details.physicalCallReason ?? 'PRIMARY',
+          });
+        }
+        if (safetyCode) {
+          try {
+            workflowStateManager?.recordSafetyEvent({
+              code: safetyCode,
+              severity: 'BLOCKING',
+              role: 'executor',
+              taskId: err?.details?.taskId ?? repairTaskId,
+              attempt: err?.details?.attempt ?? null,
+              reason: err?.details?.budgetExceededReason ?? err.message,
+              actionTaken: 'PR Closeout repair halted — no further Executor call made',
+            });
+          } catch { /* best effort */ }
+        }
+        return {
+          status: 'FAILED',
+          gateResult: 'FAIL',
+          error: err.message,
+          ...(safetyCode ? { safetyCode, safetyBlocking: true } : {}),
+          usage: err?.details?.usage ?? null,
+        };
+      }
+
+      // Successful repair Executor call — meter it exactly like the primary
+      // Executor path does.
+      recordRepairExecutorUsage({
+        usage: executionReport?.usage ?? null,
+        callId: executionReport?.callId ?? executionReport?.usage?.callId ?? null,
+        model: executionReport?.model || 'sonnet',
+        costUsd: executionReport?.costUsd ?? null,
+        inputBreakdown: executionReport?.inputBreakdown ?? null,
+        physicalCallReason: executionReport?.physicalCallReason ?? 'PRIMARY',
+      });
+
+      // Real Gate contract per docs/workflow/ADAPTER_INTERFACE.md §3:
+      // run(verification_commands) -> evidence — the SAME `.run()` shape the
+      // primary pipeline's own Gate rerun uses (see the `rerunGate.run(...)`
+      // call above in this file). `runGate(card)` was never a real adapter
+      // method (the production gateRunner.js — adapters/gateRunner.js — only
+      // ever exported `.run`); every existing test exercising this repair
+      // path supplied a fake gate runner shaped to match, so the mismatch
+      // against the REAL gate runner went uncaught. `gitEvidenceCollector` is
+      // likewise required by the real runner's `.run()` (it hands the
+      // pass/fail summary to it to build the evidence object) and was
+      // previously omitted here.
+      const runner = (createGateRunner || _createGateRunner)({
+        gitEvidenceCollector: createGitEvidenceCollector(),
+        cwd: repoRoot,
+        signal,
+        baseline,
+      });
+      const gateResult = await runner.run(card.verification_commands, { signal });
+      const isComplete = executionReport?.status === 'COMPLETE' && gateResult?.pass;
+      return {
+        status: isComplete ? 'COMPLETE' : (executionReport?.status || 'FAILED'),
+        gateResult: gateResult?.pass ? 'PASS' : 'FAIL',
+        executionReport,
+        gateEvidence: gateResult,
+      };
+    },
+    pushRepair: async ({ prNumber: p, expectedHead, force, forcePush }) => {
+      if (force === true || forcePush === true) {
+        throw new Error('Force push is strictly forbidden in PR Closeout');
+      }
+      let headRefName = null;
+      try {
+        const prViewOut = nodeExecSync(`gh pr view ${p} --json headRefName`, {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        headRefName = JSON.parse(prViewOut).headRefName;
+      } catch {}
+
+      if (headRefName) {
+        nodeExecSync(`git push origin HEAD:${headRefName}`, { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      } else {
+        nodeExecSync('git push origin HEAD', { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+      }
+      return nodeExecSync('git rev-parse HEAD', { cwd: repoRoot, encoding: 'utf8' }).trim();
+    },
+    escalateSupervisor: async (payload) => {
+      return null;
+    },
+  };
 }
 
 // The real end-to-end pipeline. Mirrors scripts/run-agy-workflow.js's main()
@@ -686,8 +1445,11 @@ async function defaultPipeline({
   usageTracker,
   isResume = false,
   answer = null,
+  boundedTask = null,
+  explicitFullPath = false,
   externalReadRoots = [],
   approvedExternalRoots = [],
+  prCloseoutAdapters = null,
   _resolveWorkflowPlan,
   _selectProviders,
   _createGateRunner,
@@ -696,6 +1458,109 @@ async function defaultPipeline({
 }) {
   workflowStateManager?.startStage(WORKFLOW_STAGES.INIT);
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'workspace' });
+
+  // Hard aggregate workflow ceilings (0 = disabled for each). Every metered
+  // internal AI call — Planner, Supervisor, Executor, internal Reviewer, and
+  // the PR Closeout repair Executor — is checked against these before the next
+  // dispatch. See workflowCostGuard.js.
+  const workflowCostCeilingUsd = resolveWorkflowCostCeilingUsd(env ?? process.env);
+  const workflowUsageVolumeCeiling = resolveWorkflowUsageVolumeCeiling(env ?? process.env);
+  const taskExecutorUsageVolumeCeiling = resolveTaskExecutorUsageVolumeCeiling(env ?? process.env);
+  const executorPhysicalCallCeiling = resolveExecutorPhysicalCallCeiling(env ?? process.env);
+  // Route a crossed workflow ceiling (cost OR cumulative usage volume) through
+  // the existing HUMAN_REQUIRED + BLOCKING safety path. Returns a terminal
+  // result to `return`, or null. Used at the Planner boundary (before AND
+  // after the Planner call) — the state-machine roles have their own copy of
+  // this guard inside automatedLoop.js.
+  const guardWorkflowCeilings = ({ taskId = null } = {}) => {
+    const costHit = workflowCostExceeded(usageTracker, workflowCostCeilingUsd);
+    const volHit = costHit ? null : workflowUsageVolumeExceeded(usageTracker, workflowUsageVolumeCeiling);
+    if (!costHit && !volHit) return null;
+    const code = costHit
+      ? SAFETY_EVENT_CODES.WORKFLOW_COST_BUDGET_EXCEEDED
+      : SAFETY_EVENT_CODES.WORKFLOW_USAGE_VOLUME_EXCEEDED;
+    const reason = costHit ? formatWorkflowCostReason(costHit) : formatWorkflowUsageVolumeReason(volHit);
+    const question = `${reason}. No further model call will be made. Review the task scope / budget, then resume the workflow.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code,
+        severity: 'BLOCKING',
+        role: 'workflow',
+        taskId,
+        reason,
+        ...(volHit ? { usageVolume: volHit.totalUsageVolume, limit: volHit.limit } : { limit: costHit.limitUsd }),
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further model call made',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    if (usageTracker && workflowStateManager) {
+      workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question };
+  };
+
+  // § Phase 0A — reusable local helper: an AuthorizationError raised at the
+  // Full Path Planner boundary terminalizes the workflow's DURABLE status as
+  // HUMAN_REQUIRED (never RUNNING, never FAILED), records a BLOCKING
+  // user-visible safety event, and returns a structured HUMAN_REQUIRED
+  // result — mirroring guardWorkflowCeilings' terminalization shape so the
+  // caller (Front Agent / MCP) sees the same contract for every safety halt.
+  // No Supervisor / Executor / Reviewer / delivery step follows this return.
+  const terminalizePlannerAuthorizationDenied = (err) => {
+    const reason = `Planner physical model call was denied by Token Safety: ${err?.message ?? String(err)}`;
+    const question = `${reason} Review the workflow's model-spend / information-safety state, then resume once cleared.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.PLANNER_AUTHORIZATION_DENIED,
+        severity: 'BLOCKING',
+        role: 'planner',
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no Supervisor/Executor/Reviewer call made, nothing delivered',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    if (usageTracker && workflowStateManager) {
+      try {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      } catch { /* best effort */ }
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, tokenUsage: usageTracker?.summary?.() ?? null };
+  };
+
+  // § Global New Information Policy / Wiring Card 2 — mirror of
+  // terminalizePlannerAuthorizationDenied for the Fast Path first Executor
+  // call: used ONLY when the frozen Fast Path task-card's NEW_TASK_CARD
+  // evidence could not be durably registered BEFORE runAutomatedWorkflow /
+  // the Executor is ever invoked — i.e. zero physical Executor calls, zero
+  // reservation. A genuine authorize()-time denial (no fresh evidence, e.g.
+  // an exact replay) is intentionally NOT routed through this helper: it
+  // surfaces from INSIDE automatedLoop.js's own centralized
+  // isAuthorizationFailure terminalization (§ Phase 0A's sibling — see
+  // automatedLoop.js's outer catch), which already halts HUMAN_REQUIRED with
+  // zero further calls using the SAME safety-event code the Authority itself
+  // records (NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED).
+  const terminalizeFastPathExecutorAuthorizationDenied = (err) => {
+    const reason = `Fast Path Executor physical model call was denied by Token Safety: ${err?.message ?? String(err)}`;
+    const question = `${reason} Review the workflow's model-spend / information-safety state, then resume once cleared.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.NO_NEW_INFORMATION_MODEL_SPEND_BLOCKED,
+        severity: 'BLOCKING',
+        role: 'executor',
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no Executor call made, nothing delivered',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    if (usageTracker && workflowStateManager) {
+      try {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      } catch { /* best effort */ }
+    }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, tokenUsage: usageTracker?.summary?.() ?? null };
+  };
 
   validateWorkflowId(workflowId);
   const metadataPath = assertPathWithinRoot(SUPERGPT_WORKTREE_ROOT, path.join(SUPERGPT_WORKTREE_ROOT, `${workflowId}.workspace.json`), 'workspace metadata');
@@ -805,6 +1670,50 @@ async function defaultPipeline({
     } catch { return []; }
   };
 
+  // Active acceptance versions as persisted by the automated loop's immutable
+  // acceptance chains. `version` is the workflow-wide binding recorded in the
+  // controlled acceptance bundle: any later AMEND/SUPERSEDE moves it and so
+  // invalidates evidence cut against the previous version.
+  const readActiveAcceptanceVersions = () => {
+    const fallback = { version: 1, byTask: null };
+    try {
+      const workflowJson = path.join(workflowRuntimeDirectory(workflowId), workflowId, 'workflow.json');
+      if (!existsSync(workflowJson)) return fallback;
+      const parsed = JSON.parse(readFileSync(workflowJson, 'utf8'));
+      const byTask = {};
+      for (const [taskId, chain] of Object.entries(parsed?.acceptanceChains ?? {})) {
+        if (Number.isInteger(chain?.activeVersion)) byTask[taskId] = chain.activeVersion;
+      }
+      const taskVersions = Object.values(byTask);
+      const version = Number.isInteger(parsed?.acceptanceChain?.activeVersion)
+        ? parsed.acceptanceChain.activeVersion
+        : (taskVersions.length > 0 ? Math.max(...taskVersions) : 1);
+      return { version, byTask: taskVersions.length > 0 ? byTask : null };
+    } catch {
+      return fallback;
+    }
+  };
+
+  // Reviewer outcome for the acceptance bundle. Reaching the delivery tail
+  // already implies every task was accepted, so an absent attempt record is
+  // not evidence of a failure; a RECORDED non-PASS final decision is, and it
+  // blocks the bundle from being minted at all.
+  const latestReviewerOutcome = (state) => {
+    const attempts = Array.isArray(state?.taskAttempts) ? state.taskAttempts : [];
+    const finalByTask = new Map();
+    for (const att of attempts) {
+      if (!att?.taskId || !att.reviewerDecision) continue;
+      const prior = finalByTask.get(att.taskId);
+      if (!prior || (att.attempt ?? 1) >= (prior.attempt ?? 1)) finalByTask.set(att.taskId, att);
+    }
+    const decisions = [...finalByTask.values()];
+    if (decisions.length === 0) return { pass: true, decision: 'PASS' };
+    const failing = decisions.find((d) => String(d.reviewerDecision).toUpperCase() !== 'PASS');
+    return failing
+      ? { pass: false, decision: String(failing.reviewerDecision).toUpperCase(), attempt: failing.attempt ?? 1 }
+      : { pass: true, decision: 'PASS', attempt: Math.max(...decisions.map((d) => d.attempt ?? 1)) };
+  };
+
   // Shared delivery tail — used by both the normal end-of-loop path and the
   // delivery-ready resume fast path below. Defined here so it closes over the
   // restored `worktree`.
@@ -856,11 +1765,133 @@ async function defaultPipeline({
         worktree_fingerprint: postGateFingerprint, captured_at: new Date().toISOString(), workflow_id: workflowId, verification_identity: CLOSEOUT_VERIFICATION_ID,
       }});
     }
+
+    // V2-C — trusted PR Closeout Loop. Runs only when the workspace config opts
+    // in AND the caller wired real PR/reviewer adapters; otherwise this is
+    // inert and delivery proceeds unchanged. The task queue and closeout
+    // verification have both completed at this point, so the PR head is a
+    // legitimate review target. A non-DONE outcome (P1/P2 unresolved after the
+    // bounded repair loop, a fork with no safe write path) stops before
+    // delivery and surfaces HUMAN_REQUIRED.
+    if (prCloseoutAdapters) {
+      let closeoutCfg = null;
+      try { closeoutCfg = loadWorkspaceConfig(cwd)?.prCloseout ?? null; } catch { closeoutCfg = null; }
+      if (closeoutCfg?.enabled === true) {
+        throwIfAborted(signal);
+        emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'pr_closeout' });
+        const outcome = await runPrCloseoutLoop({
+          state: workflowStateManager?.getState()?.prCloseout ?? null,
+          init: {
+            prNumber: closeoutCfg.prNumber ?? null,
+            configuredReviewer: closeoutCfg.configuredReviewer ?? null,
+            maxRepairRounds: closeoutCfg.maxRepairRounds,
+            isFork: closeoutCfg.isFork === true,
+            safeForkWritePath: closeoutCfg.safeForkWritePath === true,
+          },
+          adapters: prCloseoutAdapters,
+          config: {
+            configuredReviewer: resolveReviewerFallbackOrder(closeoutCfg.configuredReviewer ?? 'codex'),
+            allowMerge: closeoutCfg.allowMerge === true,
+            repositoryContext: closeoutCfg.repositoryContext ?? {},
+            verificationCommands: commands,
+          },
+          persist: (s) => workflowStateManager?.recordCloseoutState(s),
+        });
+        if (outcome.status !== PR_CLOSEOUT_LOOP_STATUS.DONE) {
+          const reason = `PR closeout loop stopped: ${outcome.reason}`;
+          workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+            reason,
+            question: reason,
+          });
+          return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
+        }
+      }
+    }
+
+    // ---- Controlled Host Acceptance ------------------------------------
+    // Bind the delivery decision to one immutable evidence bundle: the
+    // workflow identity, the exact worktree HEAD + content fingerprint the
+    // proof was cut from, the frozen closeout verification commands, the Gate
+    // result, the Reviewer result, and the approved active acceptance version.
+    // The bundle is minted here (after closeout verification and any PR
+    // closeout repair rounds, so it describes the bytes that will actually be
+    // delivered) and re-validated inside deliverWorkflowResult against the live
+    // context. On a resume the persisted bundle must still match, otherwise
+    // delivery fails closed.
+    const deliveryHead = readWorktreeHead(worktree.worktree_path, _execSync);
+    const deliveryFingerprint = getFingerprint(worktree.worktree_path);
+    const acceptanceVersions = readActiveAcceptanceVersions();
+    const reviewerOutcome = latestReviewerOutcome(workflowStateManager?.getState?.() ?? null);
+    const acceptanceContext = {
+      workflowId,
+      head: deliveryHead,
+      worktreeFingerprint: deliveryFingerprint,
+      acceptanceVersion: acceptanceVersions.version,
+      verificationCommands: commands,
+    };
+
+    let controlledAcceptance = null;
+    let acceptanceBlockReason = null;
+    const persisted = readControlledHostAcceptance({ root: SUPERGPT_WORKTREE_ROOT, workflowId });
+    if (persisted) {
+      // Never re-mint over a persisted decision: an existing bundle that no
+      // longer matches the live worktree/acceptance is drift, and drift may
+      // only be cleared by a controlled re-approval, never by this process
+      // quietly issuing itself fresh evidence.
+      const revalidated = validateControlledHostAcceptance({ bundle: persisted, ...acceptanceContext });
+      if (revalidated.valid) controlledAcceptance = persisted;
+      else acceptanceBlockReason = revalidated.reason;
+    } else {
+      try {
+        controlledAcceptance = persistControlledHostAcceptance({
+          root: SUPERGPT_WORKTREE_ROOT,
+          workflowId,
+          bundle: buildControlledHostAcceptance({
+            workflowId,
+            worktree: worktree.worktree_path,
+            head: deliveryHead,
+            worktreeFingerprint: deliveryFingerprint,
+            verificationCommands: commands,
+            gate: { pass: true, decision: 'PASS' },
+            reviewer: reviewerOutcome,
+            acceptanceVersion: acceptanceVersions.version,
+            acceptanceVersions: acceptanceVersions.byTask,
+            approvedBy: CONTROLLED_ACCEPTANCE_APPROVERS.CONTROLLED_ORCHESTRATOR,
+            reason: 'Closeout host verification passed on the delivered worktree bytes.',
+          }),
+        });
+      } catch (err) {
+        acceptanceBlockReason = err?.code ?? err?.message ?? 'CONTROLLED_ACCEPTANCE_UNAVAILABLE';
+      }
+    }
+
+    if (!controlledAcceptance) {
+      const reason = `CONTROLLED_ACCEPTANCE_INVALID: ${acceptanceBlockReason}. SuperGPT will not deliver without valid host acceptance evidence.`;
+      emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: acceptanceBlockReason });
+      await lifecycleManager?.onWorkflowSuspended('controlled_acceptance_invalid');
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason,
+        question: reason,
+        actionCode: 'CONTROLLED_ACCEPTANCE_INVALID',
+      });
+      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
+    }
+
+    workflowStateManager?.recordControlledAcceptance?.(controlledAcceptance);
+    emit(SUPERGPT_EVENTS.CONTROLLED_ACCEPTANCE_RECORDED, {
+      acceptanceId: controlledAcceptance.acceptanceId,
+      status: controlledAcceptance.status,
+      acceptanceVersion: controlledAcceptance.acceptanceVersion,
+    });
+
     let delivery;
     try {
       throwIfAborted(signal);
       delivery = await deliverWorkflowResult({
         worktree,
+        controlledAcceptance,
+        expectedAcceptanceContext: acceptanceContext,
+        requireControlledAcceptance: true,
         // Persisted BEFORE worktree cleanup: once the source workspace is
         // mutated, a later cleanup failure must never re-run delivery (P2-2).
         onDelivered: ({ changed_files }) => recordDeliveryCompleted({
@@ -872,6 +1903,19 @@ async function defaultPipeline({
       await lifecycleManager?.onWorkflowSuspended('delivery_failed');
       workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, { reason: `delivery failed: ${err.message}` });
       throw err;
+    }
+    if (delivery.status === 'HUMAN_REQUIRED' && delivery.blocked_reason) {
+      // Evidence went stale between minting and applying (a concurrent worktree
+      // mutation). Nothing was written to the invocation workspace.
+      const reason = `CONTROLLED_ACCEPTANCE_INVALID: ${delivery.blocked_reason}. SuperGPT will not deliver without valid host acceptance evidence.`;
+      emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: delivery.blocked_reason });
+      await lifecycleManager?.onWorkflowSuspended('controlled_acceptance_invalid');
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason,
+        question: reason,
+        actionCode: 'CONTROLLED_ACCEPTANCE_INVALID',
+      });
+      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations };
     }
     if (delivery.status === 'HUMAN_REQUIRED') {
       emit(SUPERGPT_EVENTS.DELIVERY_FAILED, { reason: 'conflict', conflicts: delivery.conflicts });
@@ -969,19 +2013,311 @@ async function defaultPipeline({
   // Keeping it outside the isolated worktree prevents it being interpreted as
   // an untracked change and delivered into the invocation workspace.
   const persistence = new Persistence(workflowRuntimeDirectory(workflowId));
-  const selection = (_selectProviders || selectProviders)({ env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal, onEvent: (event) => emit(event.type, event) });
+  // Resume reconciliation (Persistent Model Spend Reservation, §10): any
+  // reservation that crossed the durable DISPATCHING boundary with no
+  // settlement conservatively becomes UNRESOLVED — a crash may have
+  // dispatched the physical call before this process restarted. A RESERVED
+  // reservation that never reached DISPATCHING is safely closed as
+  // CANCELLED_PRE_DISPATCH. Runs once, before the first invoke() of this
+  // process; every ModelSpendAuthority constructed below (primary runtime,
+  // PR-closeout fallback) reads the SAME persisted, now-reconciled ledger.
+  // Reconciliation is safety-critical, not best-effort (§ Failure 3): if the
+  // persisted Reservation ledger cannot be reliably read/reconciled, this
+  // process must not assume it is safe to spend. Fail closed through the
+  // existing HUMAN_REQUIRED + BLOCKING safety path — the same one used for
+  // every other unresolved-spend halt — rather than silently continuing with
+  // an unreconciled (and therefore untrustworthy) ledger.
+  try {
+    await new ReservationLedger({
+      store: new ReservationStore(persistence),
+      recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+    }).reconcileOnResume(workflowId);
+  } catch (err) {
+    const reason = `Model spend reservation reconciliation failed on resume: ${err?.message ?? err}`;
+    const question = `${reason}. No further model call will be made. Review the workflow's persisted reservation state, then resume.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.MODEL_SPEND_RECONCILIATION_FAILED,
+        severity: 'BLOCKING',
+        role: 'workflow',
+        taskId: null,
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further model call made',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'HUMAN_REQUIRED', reason });
+    return {
+      ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, conversations: null, tokenUsage: usageTracker?.summary() ?? null,
+    };
+  }
+  // Resume reconciliation for the External Model Trigger Authority (see
+  // externalModelTriggerAuthority.js), same fail-closed discipline as the
+  // Persistent Model Spend Reservation reconciliation just above: a trigger
+  // that crossed the durable DISPATCHING boundary with no settlement
+  // conservatively becomes UNRESOLVED (a crash may have posted the GitHub
+  // comment before this process restarted); a RESERVED trigger that never
+  // reached DISPATCHING is safely closed as CANCELLED_PRE_DISPATCH. A no-op
+  // for any workflow that never used the PR-closeout review adapters.
+  try {
+    await new ExternalModelTriggerAuthority({
+      store: new ExternalTriggerStore(persistence),
+      recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+    }).reconcileOnResume(workflowId);
+  } catch (err) {
+    const reason = `External model trigger reconciliation failed on resume: ${err?.message ?? err}`;
+    const question = `${reason}. No further external review trigger will be posted. Review the workflow's persisted trigger state, then resume.`;
+    try {
+      workflowStateManager?.recordSafetyEvent({
+        code: SAFETY_EVENT_CODES.EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE,
+        severity: 'BLOCKING',
+        role: 'workflow',
+        taskId: null,
+        reason,
+        actionTaken: 'workflow halted — HUMAN_REQUIRED; no further external model trigger posted',
+      });
+    } catch { /* never let safety-event recording mask the stop */ }
+    workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question });
+    emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'HUMAN_REQUIRED', reason });
+    return {
+      ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question, conversations: null, tokenUsage: usageTracker?.summary() ?? null,
+    };
+  }
+  const selection = (_selectProviders || selectProviders)({
+    env, callAgy: defaultCallAgy, persistence, workflowId, usageTracker, signal,
+    onEvent: (event) => emit(event.type, event),
+    recordSafetyEvent: (event) => workflowStateManager?.recordSafetyEvent(event),
+  });
+
+  // ---- Fast Path vs Full Path selection (deterministic, zero model tokens) ----
+  // Selected once here, before the first model invocation. Persisted into the
+  // frozen workspace metadata so a resume restores the exact same path and
+  // bounded scope instead of silently reclassifying.
+  const metaExists = existsSync(metadataPath);
+  let frozenPathDecision = null;
+  if (metaExists) {
+    try {
+      frozenPathDecision = JSON.parse(readFileSync(metadataPath, 'utf8')).path_selection ?? null;
+    } catch { frozenPathDecision = null; }
+  }
+  const pathDecision = selectWorkflowPath(
+    frozenPathDecision ? { frozenDecision: frozenPathDecision } : { goal, cwd: repoRoot, boundedTask, explicitFullPath },
+  );
+  if (!frozenPathDecision && metaExists && !isResume) {
+    try {
+      const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      meta.path_selection = serializePathDecision(pathDecision);
+      meta.workflow_path = pathDecision.path;
+      writeFileSync(metadataPath, `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+    } catch (err) {
+      if (lifecycleManager) await lifecycleManager.onInitFailed();
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.FAILED, {
+        reason: `Failed to persist path selection: ${err.message}`,
+      });
+      throw err;
+    }
+  }
+  workflowStateManager?.recordProgress(pathProgressFields(pathDecision));
+  emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'path_selection', path: pathDecision.path, reason: pathDecision.reason });
+
+  // ---- PR Closeout dedicated workflow mode (bypasses generic Planner-first loop) ----
+  if (pathDecision.path === WORKFLOW_PATHS.PR_CLOSEOUT) {
+    throwIfAborted(signal);
+    emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'pr_closeout' });
+    workflowStateManager?.startStage(WORKFLOW_STAGES.EXECUTOR, {
+      taskId: `pr-closeout-${pathDecision.prNumber}`,
+      taskName: `PR #${pathDecision.prNumber} Closeout Loop`,
+      attempt: 1,
+    });
+
+    const closeoutInit = {
+      prNumber: pathDecision.prNumber,
+      prHead: null,
+      configuredReviewer: 'codex',
+      maxRepairRounds: DEFAULT_MAX_REPAIR_ROUNDS,
+      isFork: false,
+      safeForkWritePath: false,
+    };
+    const closeoutState = workflowStateManager?.getState()?.prCloseout
+      ?? initialCloseoutState(closeoutInit);
+    workflowStateManager?.recordCloseoutState(closeoutState);
+
+    const effectiveAdapters = prCloseoutAdapters || createRealGithubPrCloseoutAdapters({
+      repoRoot,
+      cwd,
+      prNumber: pathDecision.prNumber,
+      selection,
+      createGateRunner: _createGateRunner || createGateRunner,
+      baseline,
+      signal,
+      workflowId,
+      workflowStateManager,
+      usageTracker,
+      workflowCostCeilingUsd,
+      workflowUsageVolumeCeiling,
+      taskExecutorUsageVolumeCeiling,
+      executorPhysicalCallCeiling,
+      persistence,
+    });
+
+    const outcome = await runPrCloseoutLoop({
+      state: workflowStateManager?.getState()?.prCloseout ?? closeoutState,
+      init: closeoutInit,
+      adapters: effectiveAdapters,
+      config: {
+        configuredReviewer: resolveReviewerFallbackOrder('codex'),
+        allowMerge: false,
+        verificationCommands: readFrozenCloseoutCommands(),
+      },
+      persist: (s) => workflowStateManager?.recordCloseoutState(s),
+    });
+
+    if (outcome.status === PR_CLOSEOUT_LOOP_STATUS.DONE) {
+      const summary = `PR #${pathDecision.prNumber} closeout loop succeeded: review is clean (${outcome.rounds} repair rounds).`;
+      if (usageTracker && workflowStateManager) {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      }
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.DONE, {
+        summary,
+        deliveredFiles: [],
+      });
+      emit(SUPERGPT_EVENTS.WORKFLOW_FINISHED, { status: 'DONE', summary });
+      return { ...EMPTY_RESULT(), status: 'WORKFLOW_DONE', summary, conversations: null, tokenUsage: usageTracker?.summary({ prCloseout: workflowStateManager?.getState()?.prCloseout }) ?? null };
+    } else {
+      const reason = `PR closeout loop stopped: ${outcome.reason}`;
+      if (usageTracker && workflowStateManager) {
+        workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+      }
+      workflowStateManager?.transitionTerminal(WORKFLOW_STATUSES.HUMAN_REQUIRED, {
+        reason,
+        question: reason,
+      });
+      emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason, question: reason });
+      return { ...EMPTY_RESULT(), status: 'HUMAN_REQUIRED', reason, question: reason, conversations: null, tokenUsage: usageTracker?.summary({ prCloseout: workflowStateManager?.getState()?.prCloseout }) ?? null };
+    }
+  }
 
   emit(SUPERGPT_EVENTS.STAGE_CHANGED, { stage: 'planning' });
   emit(SUPERGPT_EVENTS.PLANNING_STARTED);
   workflowStateManager?.startStage(WORKFLOW_STAGES.PLANNING);
-  let planArg = planPath ?? goal;
-  if (answer && !planPath) {
-    planArg = `${planArg}\n\n[User Clarification / Answer]:\n${answer}`;
+  let resolved;
+  let fastPathFirstExecutorEvidenceIds = null;
+  if (pathDecision.path === WORKFLOW_PATHS.FAST) {
+    // Fast Path bypasses the Planner and the model Supervisor. The frozen
+    // single-task contract becomes the plan directly; Executor -> deterministic
+    // Gate -> independent Reviewer -> DONE | ordinary REWORK still runs below.
+    resolved = fastPathResolvedPlan(pathDecision, { goal });
+    // § Global New Information Policy / Wiring Card 2 — Fast Path first
+    // Executor. `pathDecision.taskContract` is the frozen, deterministic
+    // single-task contract (see pathSelection.js) — the exact semantic
+    // artifact this physical Executor call is justified by. Registration is
+    // idempotent: the SAME frozen contract always resolves to the SAME
+    // evidenceId, so a legitimate replay (same workflow, same task, same
+    // contract) finds it already consumed and is denied — never a second
+    // physical Executor call for the same task card. Registered here, BEFORE
+    // runAutomatedWorkflow / the Executor is ever invoked, so a registration
+    // failure halts with zero physical Executor calls and zero reservation.
+    // Backward compatible with any caller/test whose (possibly injected
+    // `_selectProviders`) provider selection predates this feature and
+    // exposes no `informationLedger` at all: registration/enforcement is
+    // simply skipped, exactly like "no informationLedger wired" everywhere
+    // else in this policy (see modelSpendAuthority.js's constructor doc).
+    if (selection.informationLedger) {
+      try {
+        const evidence = await registerTaskCardEvidence(selection.informationLedger, {
+          workflowId, taskId: pathDecision.taskContract.task_id, taskCard: pathDecision.taskContract,
+        });
+        fastPathFirstExecutorEvidenceIds = [evidence.evidenceId];
+      } catch (err) {
+        return terminalizeFastPathExecutorAuthorizationDenied(
+          isAuthorizationFailure(err) ? err : new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+            `New Information evidence for the Fast Path Executor could not be durably registered: ${err?.message ?? err}`,
+            { workflowId, taskId: pathDecision.taskContract.task_id },
+          ),
+        );
+      }
+    }
+  } else {
+    let planArg = planPath ?? goal;
+    if (answer && !planPath) {
+      planArg = `${planArg}\n\n[User Clarification / Answer]:\n${answer}`;
+    }
+    // PRE-Planner check: a resume rehydrates prior spend BEFORE this point, so a
+    // workflow that is already over a ceiling must not get to run the Planner
+    // (an expensive model call) at all. Fresh runs sit at zero and pass.
+    const prePlannerStop = guardWorkflowCeilings();
+    if (prePlannerStop) return prePlannerStop;
+
+    const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
+    // § Global New Information Policy / Wiring Card 2 — Full Path initial
+    // Planner. `planArg` (above) is exactly the semantic input actually
+    // presented to planning: the goal or plan-path content, plus a genuine
+    // user clarification/answer appended when one is present — never a
+    // timestamp, provider, attempt, or session id. Registration is
+    // idempotent (newInformation.js#registerEvidence): re-registering the
+    // EXACT SAME planArg in the same workflow resolves to the SAME
+    // evidenceId, so a legitimate replay of this call finds it already
+    // consumed and is denied by ModelSpendAuthority — never a second
+    // physical Planner call. A genuinely different planArg (a real new
+    // clarification) fingerprints differently and authorizes the Planner
+    // once more.
+    //
+    // Registration happens BEFORE invoke() and its own failure is treated
+    // exactly like a Token Safety AuthorizationError: zero physical Planner
+    // calls, HUMAN_REQUIRED, via the SAME terminalizePlannerAuthorizationDenied
+    // helper used for every other Planner-boundary denial (§ Phase 0A).
+    // Backward compatible with any caller/test whose (possibly injected
+    // `_selectProviders`) provider selection predates this feature and
+    // exposes no `informationLedger` at all: registration/enforcement is
+    // simply skipped, exactly like "no informationLedger wired" everywhere
+    // else in this policy (see modelSpendAuthority.js's constructor doc).
+    let plannerEvidenceIds;
+    if (selection.informationLedger) {
+      try {
+        const evidence = await registerUserInputEvidence(selection.informationLedger, {
+          workflowId, interactionId: 'planner-initial-input', text: planArg,
+        });
+        plannerEvidenceIds = [evidence.evidenceId];
+      } catch (err) {
+        return terminalizePlannerAuthorizationDenied(
+          isAuthorizationFailure(err) ? err : new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+            `New Information evidence for the Planner could not be durably registered: ${err?.message ?? err}`,
+            { workflowId },
+          ),
+        );
+      }
+    }
+    try {
+      resolved = (await selection.runtime.invoke('planner', {
+        resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
+      }, { operationId: workflowId, workflowId, evidenceIds: plannerEvidenceIds })).value;
+    } catch (err) {
+      // § Phase 0A — a Token Safety AuthorizationError at the Planner
+      // boundary is an orchestrator decision, never a cancellation and never
+      // a provider failure. It must stop immediately (no Supervisor, no
+      // Executor, no Reviewer, no delivery) and terminalize the workflow's
+      // DURABLE status as HUMAN_REQUIRED — never leave it at RUNNING/FAILED —
+      // so a resume/status read sees the same terminal state the caller does.
+      // Cancellation semantics are untouched: only an AuthorizationError is
+      // intercepted here; every other error (including CancellationError /
+      // AbortSignal) propagates exactly as before.
+      if (isAuthorizationFailure(err)) {
+        return terminalizePlannerAuthorizationDenied(err);
+      }
+      throw err;
+    }
+    if (usageTracker && workflowStateManager) {
+      workflowStateManager.setTokenUsage(usageTracker.summary({ prCloseout: workflowStateManager.getState()?.prCloseout }));
+    }
+    // POST-Planner check: the Planner call itself may have crossed a ceiling.
+    // Stop before dispatching Supervisor / Executor.
+    const plannerCostStop = guardWorkflowCeilings();
+    if (plannerCostStop) return plannerCostStop;
   }
-  const plannerResolver = _resolveWorkflowPlan ?? resolveWorkflowPlan;
-  const resolved = (await selection.runtime.invoke('planner', {
-    resolve: (call) => plannerResolver({ planArg, cwd: repoRoot, callAgy: call, log: () => {} }),
-  }, { operationId: workflowId })).value;
   if (resolved.status === 'AMBIGUOUS') {
     emit(SUPERGPT_EVENTS.HUMAN_REQUIRED, { reason: 'plan_ambiguous', question: resolved.question });
     await lifecycleManager?.onWorkflowSuspended('plan_ambiguous');
@@ -999,14 +2335,20 @@ async function defaultPipeline({
   }
   emit(SUPERGPT_EVENTS.PLANNING_COMPLETED, { tasksCount: resolved.tasks?.length ?? 1 });
 
-  // If this is a new workflow (not a resume) and the planner identified closeout commands, update workflow metadata to freeze them durably
-  if (!isResume && Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0) {
+  // If this is a new workflow (not a resume) and closeout commands exist, update workflow metadata to freeze them durably
+  const closeoutToPersist = Array.isArray(resolved.closeoutVerificationCommands) && resolved.closeoutVerificationCommands.length > 0
+    ? resolved.closeoutVerificationCommands
+    : (Array.isArray(resolved.tasks)
+      ? [...new Set(resolved.tasks.flatMap((t) => (Array.isArray(t.verification_commands) ? t.verification_commands : [])).map(String).map((c) => c.trim()).filter(Boolean))]
+      : []);
+
+  if (!isResume && closeoutToPersist.length > 0) {
     try {
       if (existsSync(metadataPath)) {
         const meta = JSON.parse(readFileSync(metadataPath, 'utf8'));
         const mergedCloseout = [...new Set([
           ...(meta.closeout_verification_commands || []),
-          ...resolved.closeoutVerificationCommands,
+          ...closeoutToPersist,
         ])];
         meta.closeout_verification_commands = mergedCloseout;
         if (resolved.closeoutPolicySources?.length > 0) {
@@ -1062,6 +2404,14 @@ async function defaultPipeline({
       return evidence;
     },
   };
+  // BASELINE-DIFF GATE: the pre-Executor baseline verification uses the same
+  // deterministic command runner against the (still clean) isolated worktree,
+  // but is not a "verification finished" milestone for the user-facing stream.
+  const baselineGateRunner = {
+    async run(commands) {
+      return baseGate.run(commands);
+    },
+  };
 
   const frozenCloseoutCommands = readFrozenCloseoutCommands();
 
@@ -1076,6 +2426,7 @@ async function defaultPipeline({
       onProcessExited: (details) => workflowStateManager?.recordProviderProcessExit(details),
     }),
     gateRunner,
+    baselineGateRunner,
     windowSession,
     persistence,
     workflowGoal: plan,
@@ -1089,7 +2440,20 @@ async function defaultPipeline({
     externalReadRoots: resolvedApprovedRoots,
     approvedExternalRoots: resolvedApprovedRoots,
     maxAttemptsPerTask: Number(env.AGY_MAX_ATTEMPTS) || 3,
+    maxEscalationAttempts: Number(env.AGY_MAX_ESCALATION_ATTEMPTS) || 2,
+    humanAnswer: answer,
     closeoutVerificationCommands: frozenCloseoutCommands,
+    workflowCostCeilingUsd,
+    workflowUsageVolumeCeiling,
+    taskExecutorUsageVolumeCeiling,
+    executorPhysicalCallCeiling,
+    fastPathExecutorEvidenceIds: fastPathFirstExecutorEvidenceIds,
+    // § Global New Information Policy / Wiring Card 2 — the SAME ledger
+    // instance `selection.spendAuthority` (constructed inside
+    // providerSelection.js#selectProviders) actually enforces against, so
+    // Full Path first Executor / Executor rework / Reviewer registrations
+    // made inside runAutomatedWorkflow are genuinely load-bearing.
+    informationLedger: selection.informationLedger,
     onCloseoutPass: async (proof) => {
       const fingerprint = getFingerprint(worktree.worktree_path);
       if (isValidWorktreeFingerprint(fingerprint)) {
@@ -1104,6 +2468,8 @@ async function defaultPipeline({
       }
     },
     taskTotal: resolved.tasks?.length ?? 1,
+    plannedTasks: resolved.tasks ?? null,
+    planSummary: resolved.summary ?? null,
     workflowStateManager,
     usageTracker,
     signal,
@@ -1247,11 +2613,13 @@ function watchedWorkflowIsKnown({ workflowId, root }) {
   return false;
 }
 
+const SUPERGPT_WATCH_TIMEOUT_MS = 45000;
+
 export async function supergptWatch({
   workflowId,
   root = SUPERGPT_WORKTREE_ROOT,
   intervalMs = 1000,
-  timeoutMs = Infinity,
+  timeoutMs = SUPERGPT_WATCH_TIMEOUT_MS,
   startupGraceMs = 15000,
   signal = null,
   onProgress = null,
@@ -1262,7 +2630,9 @@ export async function supergptWatch({
 } = {}) {
   validateWorkflowId(workflowId);
 
-  const effectiveTimeout = timeoutMs === null || timeoutMs === undefined ? Infinity : timeoutMs;
+  const effectiveTimeout = Number.isFinite(timeoutMs) && timeoutMs >= 0
+    ? timeoutMs
+    : (timeoutMs === Infinity ? Infinity : SUPERGPT_WATCH_TIMEOUT_MS);
   const grace = Number.isFinite(startupGraceMs) && startupGraceMs >= 0 ? startupGraceMs : 15000;
   const startTime = _now();
   let progressSeq = 1;
@@ -1574,6 +2944,7 @@ export async function supergptResume({
   _createGateRunner,
   _execSync,
   _computeWorktreeFingerprint,
+  _readLiveWorkflowState,
 } = {}) {
   validateWorkflowId(workflowId);
 
@@ -1644,6 +3015,7 @@ export async function supergptResume({
     _createGateRunner,
     _execSync,
     _computeWorktreeFingerprint,
+    ...(_readLiveWorkflowState ? { _readLiveWorkflowState } : {}),
   });
 }
 
@@ -1696,6 +3068,7 @@ export async function supergptPlan({
 }
 
 export {
+  SUPERGPT_WATCH_TIMEOUT_MS,
   WorkflowStateManager,
   WorkflowLifecycleManager,
   UsageTracker,

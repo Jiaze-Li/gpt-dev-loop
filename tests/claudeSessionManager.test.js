@@ -162,3 +162,33 @@ test('claude session manager: third call is session #3 and still reflects the la
   assert.match(executors[2][0].context, /Claude session #3/);
   assert.match(executors[2][0].context, /verification failed/);
 });
+
+test('claude session manager: refuses a second physical provider run in one task attempt', async () => {
+  let calls = 0;
+  const manager = createClaudeSessionManager({
+    workflowId: 'wf-1',
+    taskId: 'demo-task',
+    persistence: makeFakePersistence({ attempt_count: 0, last_error: null }),
+    createExecutor: () => ({ async execute() { calls += 1; return demoReport(); } }),
+    spawn: makeFakeGitSpawn(),
+  });
+  const task = demoTaskCard();
+  await manager.execute(task, { attempt: 1, physicalCallReason: 'PRIMARY' });
+  await assert.rejects(
+    () => manager.execute(task, { attempt: 1, physicalCallReason: 'RETRY' }),
+    (err) => err.code === 'EXECUTOR_DUPLICATE_CALL_REJECTED'
+  );
+  assert.equal(calls, 1);
+});
+
+test('claude session manager: a different task gets a separate manager and cannot inherit task A identity', async () => {
+  const managerA = createClaudeSessionManager({
+    workflowId: 'wf-1', taskId: 'task-a', createExecutor: () => ({ async execute() { return demoReport({ task_id: 'task-a' }); } }), spawn: makeFakeGitSpawn(),
+  });
+  const managerB = createClaudeSessionManager({
+    workflowId: 'wf-1', taskId: 'task-b', createExecutor: () => ({ async execute() { return demoReport({ task_id: 'task-b' }); } }), spawn: makeFakeGitSpawn(),
+  });
+  await managerA.execute(demoTaskCard({ task_id: 'task-a' }), { attempt: 1 });
+  await assert.rejects(() => managerB.execute(demoTaskCard({ task_id: 'task-a' }), { attempt: 1 }), /cannot execute task/);
+  await managerB.execute(demoTaskCard({ task_id: 'task-b' }), { attempt: 1 });
+});

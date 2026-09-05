@@ -18,4 +18,4 @@ Review output rules:
 
 ## Project context
 
-This repository orchestrates an automated development loop: a Task Card is executed by Claude, verified by deterministic gates, then reviewed by a GPT reviewer; REWORK loops back into a fresh execution session. Operating rules live in `.agents/rules/supergpt.md`.
+This repository orchestrates an automated development loop: a Task Card is executed by Claude, verified by deterministic gates, then reviewed by a GPT reviewer; REWORK loops back into a fresh execution session. Operating rules live in `agent-policy/COMMON.md`.

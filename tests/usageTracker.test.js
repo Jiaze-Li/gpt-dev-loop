@@ -119,3 +119,122 @@ test('usageTracker: tracks callId and propagates to records', () => {
   assert.equal(rec.callId, 'call-sup-test-123');
   assert.equal(tracker.records[0].callId, 'call-sup-test-123');
 });
+
+test('usageTracker: reconciles Executor input composition without double-counting cached tokens', () => {
+  const tracker = new UsageTracker();
+  const rec = tracker.record({
+    role: 'executor',
+    usage: { input_tokens: 101, output_tokens: 3, cache_read_tokens: 50 },
+    inputBreakdown: { categories: {
+      taskCard: { bytes: 40, estimatedTokens: 10 }, repoContext: { bytes: 20, estimatedTokens: 5 },
+      history: { bytes: 20, estimatedTokens: 5 }, evidence: { bytes: 10, estimatedTokens: 3 }, other: { bytes: 10, estimatedTokens: 3 },
+    } },
+  });
+  assert.equal(rec.inputBreakdown.componentTokens, 101);
+  assert.equal(rec.inputBreakdown.unattributedTokens, 0);
+  assert.equal(rec.cachedTokens, 50);
+  assert.equal(tracker.summary().executorInputBreakdown.length, 1);
+  const aggregate = tracker.summary().executorInputBreakdownAggregate;
+  assert.equal(aggregate.providerInputTokens, 101);
+  assert.equal(aggregate.cachedTokens, 50);
+  assert.equal(aggregate.componentTokens, 101);
+  assert.match(aggregate.semantics, /not added/);
+});
+
+test('usageTracker: exposes cache read, cache creation and non-billable usage volume separately', () => {
+  const tracker = new UsageTracker();
+  const rec = tracker.record({
+    role: 'executor',
+    taskId: 'small-task',
+    attempt: 1,
+    physicalCallReason: 'PRIMARY',
+    usage: { input_tokens: 100, output_tokens: 25, cache_read_tokens: 3_500_000, cache_creation_tokens: 10 },
+  });
+  const executor = tracker.summary().executor;
+  assert.equal(rec.physicalCallReason, 'PRIMARY');
+  assert.equal(executor.cacheReadTokens, 3_500_000);
+  assert.equal(executor.cacheCreationTokens, 10);
+  assert.equal(executor.usageVolume, 3_500_135);
+  assert.equal(executor.totalTokens, 125, 'legacy total remains input + output, not a billing claim');
+  assert.equal(rec.membershipUsageAvailable, false);
+});
+
+test('usageTracker: legacy Executor records remain present with unavailable breakdown', () => {
+  const tracker = UsageTracker.fromJSON({ records: [{ role: 'executor', inputTokens: 77, cachedTokens: 12, outputTokens: 4 }] });
+  const summary = tracker.summary();
+  assert.equal(summary.executorInputBreakdownCalls[0].legacy, true);
+  assert.equal(summary.executorInputBreakdownAggregate.legacyCalls, 1);
+  assert.match(tracker.formatSummary(), /Unavailable for 1 legacy call/);
+});
+
+test('usageTracker: tracks provider failover model breakdown and external PR reviewer', () => {
+  const tracker = new UsageTracker();
+
+  // 1. Planner
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'planner',
+    provider: 'claude',
+    model: 'opus',
+    usage: { input_tokens: 1200, output_tokens: 300, total_tokens: 1500 },
+  });
+
+  // 2. Executor failover sequence: sonnet -> codex -> opus
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'executor',
+    taskId: 'task-1',
+    attempt: 1,
+    provider: 'claude',
+    model: 'sonnet',
+    usage: { input_tokens: 3000, output_tokens: 200, total_tokens: 3200 },
+  });
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'executor',
+    taskId: 'task-1',
+    attempt: 1,
+    provider: 'codex',
+    model: 'default',
+    usage: { input_tokens: 2500, output_tokens: 150, total_tokens: 2650 },
+  });
+  tracker.record({
+    workflowId: 'wf-test-accounting-1',
+    role: 'executor',
+    taskId: 'task-1',
+    attempt: 1,
+    provider: 'claude',
+    model: 'opus',
+    usage: { input_tokens: 4000, output_tokens: 600, total_tokens: 4600 },
+  });
+
+  // 3. Summary with PR closeout
+  const sum = tracker.summary({
+    prCloseout: { configuredReviewer: 'codex', reviewedPrHead: 'abc1234' },
+  });
+
+  assert.equal(sum.planner.totalTokens, 1500);
+  assert.equal(sum.executor.calls, 3);
+  assert.equal(sum.executor.totalTokens, 10450);
+  assert.equal(sum.executor.byModel['claude:sonnet'].totalTokens, 3200);
+  assert.equal(sum.executor.byModel['codex:default'].totalTokens, 2650);
+  assert.equal(sum.executor.byModel['claude:opus'].totalTokens, 4600);
+
+  // Supervisor was not called -> 0
+  assert.equal(sum.supervisor.calls, 0);
+  assert.equal(sum.supervisor.totalTokens, 0);
+
+  // Internal Reviewer was not called -> 0
+  assert.equal(sum.internalReviewer.calls, 0);
+  assert.equal(sum.internalReviewer.totalTokens, 0);
+
+  // Measured Total is exact sum: 1500 + 10450 = 11950
+  assert.equal(sum.measuredTotal.totalTokens, 11950);
+  assert.equal(sum.total.totalTokens, 11950);
+
+  // External PR Reviewer
+  assert.equal(sum.externalPrReviewer.reviewer, 'codex');
+  assert.equal(sum.externalPrReviewer.usageAvailable, false);
+  assert.equal(sum.externalPrReviewer.reviewed, true);
+  assert.match(sum.externalPrReviewer.note, /unavailable \/ external/);
+});

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 
 import { runAutomatedWorkflow } from '../src/orchestrator/automatedLoop.js';
 import { selectProviders } from '../src/orchestrator/providerSelection.js';
-import { ADAPTER_ERROR_CODES } from '../src/orchestrator/errors.js';
+import { ADAPTER_ERROR_CODES, AUTHORIZATION_ERROR_CODES } from '../src/orchestrator/errors.js';
 import { AgyConversationResumeError } from '../src/agy/agyClient.js';
 import { evaluateResume, extractNumTurns } from '../scripts/test-agy-conversations-live.js';
 import { makeFakeCallAgy, validTaskCardObject } from './fixtures/fakeAgy.mjs';
@@ -33,11 +33,22 @@ function fakeClaudeFactory(onExecute, onFactory) {
   };
 }
 
-const fakeGate = {
-  async run() {
-    return { status: 'CHANGED', head: 'h', base: 'b', diff: '+x', pass: true, results: [] };
-  },
-};
+// Each rework attempt produces a genuinely different diff (a real Gate would
+// too, since the Executor actually changed something) — a fixed literal diff
+// across attempts would make CHANGED_TASK_DIFF evidence (§ Global New
+// Information Policy) collide with itself and deny the second Reviewer call.
+function makeFakeGate() {
+  let n = 0;
+  return {
+    async run() {
+      n += 1;
+      return {
+        status: 'CHANGED', head: `h${n}`, base: 'b', diff: `+x${n}`, pass: true, results: [],
+      };
+    },
+  };
+}
+const fakeGate = makeFakeGate();
 
 // In-memory Persistence-shaped fake with the real workflow-state semantics.
 function makeFakePersistence() {
@@ -113,6 +124,14 @@ function run(callAgy, extra = {}) {
     gateRunner: fakeGate,
     windowSession: sel.windowSession,
     persistence,
+    // Wire the SAME informationLedger selectProviders() constructed onto the
+    // ONE ModelSpendAuthority these fakes' Supervisor/Reviewer calls route
+    // through — without it, automatedLoop.js never registers the deterministic
+    // NEW_TASK_CARD / NEW_GATE_FINGERPRINT / NEW_REVIEW_FINDINGS evidence that
+    // justifies those calls, and the (now-unconditional) New Information
+    // enforcement in modelSpendAuthority.js denies every physical Supervisor/
+    // Reviewer call with zero eligible evidence.
+    informationLedger: sel.informationLedger,
     workflowGoal: 'PLAN: make work/auto-a.txt then finish.',
     repositoryContext: { repository_name: 'gpt-dev-loop', repository_url: null, branch: 'x', commit_sha: 'y' },
     maxAttemptsPerTask: 3,
@@ -154,14 +173,53 @@ test('fail closed: malformed Reviewer output aborts the workflow', async () => {
     'not-json-at-all',
   ]);
   const malformedCall = async () => ({ text: 'not-json-at-all', usage: null, durationMs: 1 });
-  await assert.rejects(() => run(callAgy, { codexCall: malformedCall, claudeCall: malformedCall }), (err) => err.code === ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+  // The agy Reviewer's own malformed reply carries known (if empty) usage —
+  // see agyReviewerProvider.js — so its reservation settles SETTLED_KNOWN and
+  // failover to codex/claude proceeds; those fakes then fail with genuinely
+  // UNKNOWN usage (no response at all), which correctly blocks further
+  // internal spend for this workflow (Persistent Model Spend Reservation —
+  // see modelSpendReservation.js). An UNRESOLVED reservation is itself an
+  // IMMEDIATE Token Safety halt (the final Reservation rework — see
+  // modelSpendAuthority.js#dispatch), so automatedLoop.js resolves the
+  // workflow HUMAN_REQUIRED rather than rejecting the promise; a plain
+  // REVIEWER_INVALID_OUTPUT (no Reservation involvement) still surfaces as a
+  // rejection via the pre-existing failure path. Either terminal reason
+  // still proves the real invariant: the workflow aborts and the malformed
+  // output never reaches Executor.
+  let rejected = null;
+  const result = await run(callAgy, { codexCall: malformedCall, claudeCall: malformedCall }).catch((err) => { rejected = err; return null; });
+  if (rejected) {
+    assert.equal(rejected.code, ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT);
+  } else {
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.match(result.reason, /usage could not be reliably settled|unresolved model spend/i);
+  }
 });
 
 test('invalid Supervisor protocol output is treated as a provider failure and never executes the bad task', async () => {
   const bad = validTaskCardObject();
   delete bad.acceptance_criteria;
   const callAgy = makeFakeCallAgy([{ action: 'NEXT_TASK', task_card: bad }]);
-  await assert.rejects(() => run(callAgy), (err) => /INVALID_OUTPUT/.test(err.code));
+  // The agy Supervisor's own invalid-shape reply is classified as a
+  // (retryable-looking) provider failure, so productionRoleRuntime.invoke()
+  // attempts failover to the next candidate — carrying the SAME escalation
+  // evidenceIds attempt 1 already durably consumed (§ Global New Information
+  // Policy: evidence consumption is keyed on (role, operationId, evidenceId),
+  // never on physical attempt number or provider family). That failover
+  // attempt is therefore denied by ModelSpendAuthority BEFORE any second
+  // physical call — a strictly earlier, more precise fail-closed halt than
+  // the previous Persistent Model Spend Reservation path (which would only
+  // have discovered "no more candidates with known usage" after actually
+  // dispatching to codex/claude/agy:gpt-oss). Either terminal reason still
+  // proves the real invariant: the malformed task card is never executed.
+  let rejected = null;
+  const result = await run(callAgy).catch((err) => { rejected = err; return null; });
+  if (rejected) {
+    assert.match(rejected.code, /INVALID_OUTPUT/);
+  } else {
+    assert.equal(result.status, 'HUMAN_REQUIRED');
+    assert.match(result.reason, /usage could not be reliably settled|unresolved model spend|no fresh, unconsumed, eligible new information/i);
+  }
 });
 
 test('Supervisor and Reviewer run on different models in one workflow; neither leaks into Claude', async () => {

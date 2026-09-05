@@ -76,6 +76,40 @@ test('gate runner: an empty verification_commands list still calls the git evide
   assert.equal(calls.length, 1);
 });
 
+test('gate runner: blank and whitespace-only commands are skipped, pass, and spawn no process', async () => {
+  const { spawn, calls } = makeFakeSpawn({});
+  const { collector } = fakeGitEvidenceCollector();
+  const gateRunner = createGateRunner({ gitEvidenceCollector: collector, cwd: '/repo', spawn });
+
+  const evidence = await gateRunner.run(['', '   ', '\t\n ']);
+
+  assert.equal(evidence.pass, true);
+  assert.deepEqual(evidence.results, [
+    { command: '', pass: true, output: 'skipped (blank command)' },
+    { command: '   ', pass: true, output: 'skipped (blank command)' },
+    { command: '\t\n ', pass: true, output: 'skipped (blank command)' },
+  ]);
+  assert.equal(calls.length, 0);
+});
+
+test('gate runner: blank commands are skipped while real commands still run', async () => {
+  const { spawn, calls } = makeFakeSpawn({
+    'npm test': { code: 0, stdout: 'ok\n' },
+  });
+  const { collector } = fakeGitEvidenceCollector();
+  const gateRunner = createGateRunner({ gitEvidenceCollector: collector, cwd: '/repo', spawn });
+
+  const evidence = await gateRunner.run(['', 'npm test', '   ']);
+
+  assert.equal(evidence.pass, true);
+  assert.deepEqual(evidence.results, [
+    { command: '', pass: true, output: 'skipped (blank command)' },
+    { command: 'npm test', pass: true, output: 'ok' },
+    { command: '   ', pass: true, output: 'skipped (blank command)' },
+  ]);
+  assert.deepEqual(calls, ['npm test']);
+});
+
 test('gate runner: all commands passing yields overall pass', async () => {
   const { spawn } = makeFakeSpawn({
     'npm test': { code: 0, stdout: 'ok\n' },

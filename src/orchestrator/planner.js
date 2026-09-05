@@ -36,6 +36,7 @@ import {
 } from '../agy/agyClient.js';
 import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../agy/agyJson.js';
 import { AGY_SUPERVISOR_DEFAULT_MODEL } from '../agy/agyConfig.js';
+import { normalizeWorkspaceRelativePaths, resolveRepoRelativePaths, WorkspacePathError } from './workspaceConfig.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -208,6 +209,7 @@ export async function collectRepositoryContext({
     top_level_entries: topLevel,
     file_count: files.length,
     files: files.slice(0, maxFilesListed),
+    all_files: files,
     files_truncated: files.length > maxFilesListed,
     config_files: configFiles,
     policy_contexts: policyContexts,
@@ -280,7 +282,7 @@ Reply with ONLY one JSON object, no prose, no code fence. Shape:
       "verification_commands": ["<shell command that exits non-zero on failure>", "..."]
     }
   ],
-  "closeout_verification_commands": ["<final suite command such as 'swift test' or 'npm test'>"], // OPTIONAL
+  "closeout_verification_commands": ["<final suite command or overall verification command>"], // REQUIRED iff status == "READY"
   "closeout_policy_sources": ["<path to policy file such as 'docs/architecture/TESTING_STRATEGY.md'>"], // OPTIONAL
   "question": "<the single most important question a human must answer>"  // REQUIRED iff status == "AMBIGUOUS"
 }
@@ -288,8 +290,10 @@ Reply with ONLY one JSON object, no prose, no code fence. Shape:
 Rules:
 - The "status" property must be exactly "READY" or "AMBIGUOUS" (never "SUCCESS", "DONE", or other strings).
 - Use AMBIGUOUS only for a genuine architecture / product / scope decision you cannot responsibly make from the repository context. A merely underspecified detail you can reasonably choose is NOT ambiguous.
+- NEVER return status "AMBIGUOUS" merely because the user did not supply a ready-made shell verification command.
+- For tasks with deterministic requirements (e.g. creating/editing files, matching specific text/regex, JSON parsing, function return values, running tests), you MUST synthesize precise, deterministic, safe verification commands (e.g. test -f <path>, node -e "...", grep -q "...", pytest, npm test, etc.).
 - Every READY task must name concrete allowed_files and at least one verification command that exits non-zero on failure.
-- If repository testing policy specifies full closeout testing (e.g. full swift test or comprehensive suite only at closeout), emit them in closeout_verification_commands and keep earlier tasks focused on targeted verification.
+- closeout_verification_commands must contain the final verification command(s) that confirm the user's overall goal is met (or repository test suites if applicable).
 - Keep the plan bounded: the smallest set of tasks that satisfies the instruction.
 - plan_text must stand alone — the Supervisor sees only plan_text, never this prompt or the repository context below.
 
@@ -302,7 +306,7 @@ ${userIntent}
 Reply with the JSON object now.`;
 }
 
-export function parsePlannerJson(obj) {
+export function parsePlannerJson(obj, { repoFiles } = {}) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
     throw invalidPlan('planner output was not a JSON object');
   }
@@ -340,22 +344,42 @@ export function parsePlannerJson(obj) {
     if (!Array.isArray(t.verification_commands) || t.verification_commands.length === 0) {
       throw invalidPlan(`planner tasks[${i}].verification_commands must be a non-empty array`);
     }
+    let allowedFiles;
+    try {
+      allowedFiles = resolveRepoRelativePaths(t.allowed_files.map(String), { repoFiles }).paths;
+    } catch (err) {
+      if (err instanceof WorkspacePathError) {
+        throw invalidPlan(`planner tasks[${i}].allowed_files: ${err.message}`);
+      }
+      throw err;
+    }
+    if (allowedFiles.length === 0) {
+      throw invalidPlan(`planner tasks[${i}].allowed_files must be a non-empty array`);
+    }
     return {
       task_id: t.task_id.trim(),
       goal: t.goal.trim(),
       scope: isNonEmptyString(t.scope) ? t.scope.trim() : null,
-      allowed_files: t.allowed_files.map(String),
+      allowed_files: allowedFiles,
       verification_commands: t.verification_commands.map(String),
     };
   });
 
-  const closeoutVerificationCommands = Array.isArray(obj.closeout_verification_commands)
+  let closeoutVerificationCommands = Array.isArray(obj.closeout_verification_commands)
     ? obj.closeout_verification_commands.map(String).map((c) => c.trim()).filter(Boolean)
     : [];
 
-  const closeoutPolicySources = Array.isArray(obj.closeout_policy_sources)
-    ? obj.closeout_policy_sources.map(String).map((s) => s.trim()).filter(Boolean)
-    : [];
+  if (closeoutVerificationCommands.length === 0 && tasks.length > 0) {
+    const taskCommands = tasks.flatMap((t) => (Array.isArray(t.verification_commands) ? t.verification_commands : []));
+    closeoutVerificationCommands = [...new Set(taskCommands.map((c) => String(c).trim()).filter(Boolean))];
+  }
+
+  const closeoutPolicySources = resolveRepoRelativePaths(
+    Array.isArray(obj.closeout_policy_sources)
+      ? obj.closeout_policy_sources.map(String).map((s) => s.trim()).filter(Boolean)
+      : [],
+    { repoFiles, throwOnInvalid: false },
+  ).paths;
 
   return {
     status: 'READY',
@@ -427,5 +451,7 @@ export async function generatePlan({
     if (err instanceof AgyStructuredOutputError) throw invalidPlan(err.message);
     throw err;
   }
-  return parsePlannerJson(obj);
+  const repoFiles = repoContext?.all_files || repoContext?.files || (Array.isArray(repoContext) ? repoContext : null);
+  return parsePlannerJson(obj, { repoFiles });
 }
+

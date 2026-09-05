@@ -24,6 +24,7 @@
 
 import { createAgyReviewerProvider } from '../src/orchestrator/adapters/agyReviewerProvider.js';
 import { resolveAgyReviewerModel } from '../src/agy/agyConfig.js';
+import { assertRealProviderCallsAuthorized, REAL_PROVIDER_CALL_FLAG } from '../src/orchestrator/realProviderCallGuard.js';
 
 // Tiny synthetic Reviewer inputs — just enough structure for the provider's
 // existing renderers. No real repository state is read.
@@ -66,6 +67,9 @@ const EVIDENCE = Object.freeze({
 });
 
 async function main() {
+  const explicitLiveIntent = process.argv.slice(2).includes(REAL_PROVIDER_CALL_FLAG);
+  assertRealProviderCallsAuthorized({ explicitLiveIntent, entrypoint: 'scripts/test-agy-reviewer-live.js' });
+
   const model = resolveAgyReviewerModel(process.env);
   console.log('model              :', model);
 
@@ -94,5 +98,8 @@ async function main() {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main();
+  main().catch((err) => {
+    console.error(err.message);
+    process.exit(err.exitCode ?? 1);
+  });
 }

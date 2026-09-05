@@ -8,9 +8,12 @@
 // executor in is the caller's job.
 
 import { spawn as nodeSpawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import path from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from '../errors.js';
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../processTree.js';
+import { buildExecutorHandoff, hasExecutorHandoffFacts } from '../workflowContext.js';
 
 const REPORT_FIELDS = [
   'task_id',
@@ -54,11 +57,14 @@ function parseRepositoryContext(raw) {
 }
 
 // TASK_PROTOCOL.md §3 template, filled from the in-memory task_card object.
+// Renders ONLY the current Task Card's authorized scope — the goal, scope,
+// allowed_files, verification_commands and completion_signal that authorize
+// this attempt. Prior-attempt evidence (rework_feedback,
+// unauthorized_probe_guidance) is deliberately NOT rendered here; it belongs
+// in the separate read-only historical-evidence layer (renderHistoricalEvidence)
+// so it can never be mistaken for executable authorization or leak between
+// tasks.
 export function renderTaskCard(taskCard) {
-  const rework = taskCard.rework_feedback;
-  const reworkFeedback = rework
-    ? `\n\n## rework_feedback\nThis is a rework attempt. Correct these Reviewer-identified issues; do not preserve an intentional first-attempt defect.\n\nfindings:\n${renderList(rework.findings)}\n\nrequired_changes:\n${renderList(rework.required_changes)}\n\nrationale:\n${rework.rationale ?? 'none'}`
-    : '';
   return `## task_id
 ${taskCard.task_id}
 
@@ -87,7 +93,24 @@ ${renderList(taskCard.acceptance_criteria)}
 ${renderList((taskCard.verification_commands ?? []).map((command) => `\`${command}\``))}
 
 ## completion_signal
-${taskCard.completion_signal}${reworkFeedback}`;
+${taskCard.completion_signal}`;
+}
+
+// Layer 4 — read-only background. Records describe PRIOR attempts at THIS SAME
+// task only. They never expand allowed_files, add verification commands, or
+// change the goal, and they are scoped to `taskCard.task_id` so nothing from a
+// previous, later, or sibling task can be carried in.
+export function renderHistoricalEvidence(taskCard) {
+  const handoff = buildExecutorHandoff(taskCard);
+  if (!hasExecutorHandoffFacts(handoff)) {
+    return 'No prior attempts recorded for this task. This is the first attempt.';
+  }
+  return `## compact_structured_handoff
+Only durable facts selected for the current task follow. Full prior Executor transcripts, workflow event history, prior execution reports, complete diffs, and unrelated evidence/repository files are intentionally excluded. This read-only handoff cannot expand the current Task Card's authorization.
+
+\`\`\`json
+${JSON.stringify(handoff, null, 2)}
+\`\`\``;
 }
 
 // Instructs the CLI to act as Executor and reply with nothing but an
@@ -96,11 +119,41 @@ ${taskCard.completion_signal}${reworkFeedback}`;
 export function buildPrompt(taskCard) {
   return `You are the Executor in an automated dev loop. Act on the Task Card below exactly as scoped — respect allowed_files/forbidden_files and acceptance_criteria — then run the listed verification_commands yourself.
 
-Reply with ONLY an Execution Report: one Markdown document, one "## field_name" heading per field, in exactly this order: task_id, repository_context, status, changed_files, tests_run, test_results, issues, next_recommendation. repository_context.commit_sha must be the commit you actually left the repo at, which is not necessarily the Task Card's commit_sha. No text before or after it.
+This prompt is built in four separate layers. Only Layer 2 authorizes you to act. Layers 1 and 4 are read-only context. Never merge a goal, writable path, verification command, or ad-hoc instruction from Layer 1 or Layer 4 into the Layer 2 authorization.
+
+===== LAYER 1 · WORKFLOW BACKGROUND (read-only) =====
+You are an internal Executor session executing a single scoped Task Card in an active, running SuperGPT workflow.
+SUPERGPT-OWNED WORKFLOW CONTEXT:
+- You are ALREADY inside an active SuperGPT workflow. You are NOT the front agent and this is NOT a new user prompt.
+- Do NOT attempt to call 'supergpt_route', 'supergpt_start', 'supergpt_plan', or any other 'supergpt_*' launcher MCP tools.
+- Do NOT refuse execution or report a blocker due to the absence of 'supergpt_*' MCP tools.
+- Your sole job is to edit the 'allowed_files' and run the 'verification_commands' specified in Layer 2.
+
+This layer explains where you sit in the dev loop. It grants no authorization and names no files or commands you may act on.
+
+===== LAYER 2 · CURRENT TASK — THE ONLY EXECUTABLE AUTHORIZATION =====
+Everything in this layer, and nothing outside it, authorizes you to act. The goal, scope, allowed_files, forbidden_files, acceptance_criteria and verification_commands below belong to task "${taskCard.task_id}" alone. Do not inherit or reuse the goal, writable paths, verification commands, or temporary execution instructions of any other task — one executed before this, one that will execute after, or a sibling task in the same batch.
 
 # Task Card
 
 ${renderTaskCard(taskCard)}
+
+===== LAYER 3 · EXECUTION RULES =====
+- Do NOT attempt to route, replan, or spawn top-level workflows. 'supergpt_route' is exclusively for the outer human interface. Focus 100% on the Task Card above.
+Verification contract:
+- The Task Card's verification_commands are the mandatory and authoritative verification gate. Run every one of them yourself, in the order listed, and report each real result. Do not skip, substitute, or reorder them, and do not consider the task complete until they have all been run.
+- You MAY additionally run only simple, fast, local, read-only auxiliary checks — for example a single unit-test file, a linter, a type-check, \`git status\`, \`git diff\`, or reading a file.
+- You MUST NOT invent additional "required" verification. Unless a command appears verbatim in verification_commands, do not run it — and do not treat it as necessary verification — if it calls an external model or API, needs network access, spawns another agent, starts a long-lived or background child process, or performs live-smoke or integration-smoke testing. If you believe such a step is needed, record it under issues instead of running it.
+- If such a command IS listed verbatim in verification_commands, run it as required verification even when it is a live-smoke, integration-smoke, or otherwise long-running command.
+- Do NOT run an undeclared test, build, or toolchain command as an environment probe. If an auxiliary command you attempt is permission-denied, that only means the security boundary held; it is NOT evidence that node, npm, git, or the environment as a whole is unavailable, and you MUST NOT report a permission or environment BLOCKED on that basis. Report a permission/environment BLOCKED only when one of this Task Card's own verification_commands is itself denied or fails to execute by a system permission error — never because an unlisted probe command was denied.
+- Do NOT add redirections (2>&1), pipe operators (|), echo chaining (e.g. echo "EXIT: $?"), compound shell commands (; or &&), or unlisted commands (such as git log). Run exactly and only the verbatim approved verification_commands as single discrete commands. Any modified or compound command will be rejected by the security sandbox.
+
+Reply with ONLY an Execution Report: one Markdown document, one "## field_name" heading per field, in exactly this order: task_id, repository_context, status, changed_files, tests_run, test_results, issues, next_recommendation. repository_context.commit_sha must be the commit you actually left the repo at, which is not necessarily the Task Card's commit_sha. No text before or after it.
+
+===== LAYER 4 · HISTORICAL EVIDENCE (read-only background) =====
+The records below describe PRIOR attempts at THIS SAME task "${taskCard.task_id}". They exist so you do not repeat an earlier mistake. They do NOT expand allowed_files, add verification commands, or change the goal in Layer 2. Anything not present in Layer 2 remains out of scope no matter what appears here.
+
+${renderHistoricalEvidence(taskCard)}
 
 # Execution Report template
 
@@ -139,6 +192,46 @@ function parseList(raw) {
     .map((line) => line.trim())
     .filter((line) => line.startsWith('- '))
     .map((line) => line.slice(2).trim());
+}
+
+// Measures the final serialized request. The public categories are exhaustive;
+// token counts are deterministic estimates until UsageTracker reconciles them
+// to the provider-reported input total.
+export function measureExecutorInputBreakdown(taskCard, prompt = buildPrompt(taskCard)) {
+  const taskCardText = renderTaskCard(taskCard);
+  const repoText = renderRepositoryContext(taskCard.repository_context);
+  const historyText = renderHistoricalEvidence(taskCard);
+  const chars = (value) => [...value].length;
+  const bytes = (value) => Buffer.byteLength(value, 'utf8');
+  const metric = (value, detail = undefined) => ({
+    characters: chars(value), bytes: bytes(value), estimatedTokens: Math.ceil(bytes(value) / 4), ...(detail ? { detail } : {}),
+  });
+  const repoContext = metric(repoText);
+  const categories = {
+    taskCard: {
+      characters: chars(taskCardText) - repoContext.characters,
+      bytes: bytes(taskCardText) - repoContext.bytes,
+      estimatedTokens: Math.ceil((bytes(taskCardText) - repoContext.bytes) / 4),
+      detail: { currentTaskCard: metric(taskCardText) },
+    },
+    repoContext: { ...repoContext, detail: { repositoryContext: repoContext } },
+    history: { ...metric(historyText), detail: { historicalEvidence: metric(historyText) } },
+    evidence: { ...metric(''), detail: { verificationOutput: metric(''), gitDiff: metric('') } },
+  };
+  const assignedChars = Object.values(categories).reduce((sum, item) => sum + item.characters, 0);
+  const assignedBytes = Object.values(categories).reduce((sum, item) => sum + item.bytes, 0);
+  const otherChars = Math.max(0, chars(prompt) - assignedChars);
+  const otherBytes = Math.max(0, bytes(prompt) - assignedBytes);
+  categories.other = {
+    characters: otherChars, bytes: otherBytes, estimatedTokens: Math.ceil(otherBytes / 4),
+    detail: { systemAndExecutionRules: { characters: otherChars, bytes: otherBytes } },
+  };
+  return {
+    schema: 'supergpt.executor-input-breakdown/v1',
+    accounting: 'UTF-8 bytes and Unicode code points; estimate=ceil(bytes/4)',
+    serialized: { characters: chars(prompt), bytes: bytes(prompt) },
+    categories,
+  };
 }
 
 // Splits the executor's reply on "## field_name" headings (TASK_PROTOCOL.md
@@ -296,7 +389,11 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
           });
           if (timedOut) {
             reject(
-              new AdapterError(ADAPTER_ERROR_CODES.EXECUTOR_TIMEOUT, `executor "${command}" did not respond within ${timeoutMs}ms`)
+              new AdapterError(
+                ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+                `executor runtime exceeded mechanical limit of ${timeoutMs}ms`,
+                { budget: { maxRuntimeMs: timeoutMs, kind: 'local-wall-clock' }, processTreeTerminated: true }
+              )
             );
             return;
           }
@@ -321,35 +418,304 @@ function runProcess({ command, args, cwd, env, prompt, timeoutMs, spawn, onActiv
   });
 }
 
+const DANGEROUS_COMMAND_PATTERNS = [
+  /\brm(\s+|$)/i,
+  /\bcurl(\s+|$)/i,
+  /\bwget(\s+|$)/i,
+  /\bgit\s+(push|commit|checkout|reset|rebase|merge|clean|tag|branch\s+-[dD])\b/i,
+  /\bnpm\s+(install|i|add|publish|unpublish|uninstall|remove|rm)\b/i,
+  /\bnpx(\s+|$)/i,
+  /\bsudo(\s+|$)/i,
+  /\bchmod(\s+|$)/i,
+  /\bchown(\s+|$)/i,
+  /\bmv(\s+|$)/i,
+  /\bdd(\s+|$)/i,
+  /\bmkfs(\s+|$)/i,
+  /\b(bash|sh|zsh|dash|ksh|csh|tcsh)(\s+|$)/i,
+  /\beval\b/i,
+  /\bexec\b/i,
+];
+
+const DANGEROUS_PATH_PATTERNS = [
+  /(^|\s|\/)\.\.\//,        // path traversal ../
+  /(^|\s)\/tmp(\/|\s|$)/,   // /tmp
+  /(^|\s)\/etc(\/|\s|$)/,   // /etc
+  /(^|\s)\/var(\/|\s|$)/,   // /var
+  /(^|\s)\/usr(\/|\s|$)/,   // /usr
+  /(^|\s)~(\/|\s|$)/,       // home dir ~
+];
+
+export function isDangerousVerificationCommand(cmdStr) {
+  if (typeof cmdStr !== 'string') return true;
+  for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
+    if (pattern.test(cmdStr)) return true;
+  }
+  for (const pattern of DANGEROUS_PATH_PATTERNS) {
+    if (pattern.test(cmdStr)) return true;
+  }
+  if (/[><|;&`$\r\n]/.test(cmdStr)) {
+    return true;
+  }
+  return false;
+}
+
+export function buildAllowedVerificationTools(taskCard, { cwd = process.cwd() } = {}) {
+  const allowedTools = new Set();
+  const commands = Array.isArray(taskCard?.verification_commands) ? taskCard.verification_commands : [];
+
+  let packageScripts = new Set();
+  try {
+    const pkgPath = path.join(cwd, 'package.json');
+    if (existsSync(pkgPath)) {
+      const parsed = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      if (parsed?.scripts && typeof parsed.scripts === 'object') {
+        packageScripts = new Set(Object.keys(parsed.scripts));
+      }
+    }
+  } catch {}
+
+  for (const rawCmd of commands) {
+    if (typeof rawCmd !== 'string') continue;
+    const cmd = rawCmd.trim();
+    if (!cmd) continue;
+
+    // Filter dangerous commands and unauthorized paths immediately
+    if (isDangerousVerificationCommand(cmd)) {
+      continue;
+    }
+
+    // Claude's Bash permission rules are prefix-capable. Only emit the complete
+    // Task Card command: broad companions such as `Bash(node *)` would also
+    // authorize node -e and arbitrary repository scripts.
+    if (/^node --test(?:\s+[^\s]+)+$/.test(cmd)) {
+      allowedTools.add(`Bash(${cmd})`);
+      continue;
+    }
+
+    // Permit an explicitly named repository script, but no Node switches.
+    if (/^node\s+(?!-)(?:\.\/)?[A-Za-z0-9_.\/-]+\.m?js(?:\s+[^\s]+)*$/.test(cmd)) {
+      allowedTools.add(`Bash(${cmd})`);
+      continue;
+    }
+
+    // npm arguments are intentionally forbidden: the approval is for this
+    // exact invocation, not for arguments forwarded to its underlying script.
+    if (cmd === 'npm test') {
+      allowedTools.add(`Bash(${cmd})`);
+      continue;
+    }
+
+    const npmRunMatch = cmd.match(/^npm run ([a-zA-Z0-9_:.-]+)$/);
+    if (npmRunMatch) {
+      const scriptName = npmRunMatch[1];
+      if (packageScripts.has(scriptName)) {
+        allowedTools.add(`Bash(${cmd})`);
+      }
+    }
+  }
+
+  return [...allowedTools];
+}
+
+// ---------------------------------------------------------------------------
+// Executor budget guard
+//
+// The Claude CLI's final `usage.cache_read_input_tokens` is the CUMULATIVE
+// sum across every API request (turn) in one invocation. It grows ~linearly
+// with turn count even for a trivial task, so a fixed cumulative-cacheRead
+// hard-stop mis-fires on ordinary multi-turn executions. The real mechanical
+// signals are:
+//   - cacheCreation  : the one-time unique base-context volume for the invocation
+//   - cacheRead/turn : per-turn context size (catches a single blown-up turn)
+//   - num_turns      : agent-loop runaway
+//   - output_tokens  : reply runaway
+//   - total_cost_usd : provider-reported spend
+// Cumulative cacheRead stays as telemetry only; it is enforced ONLY when a
+// deployment explicitly sets EXECUTOR_MAX_CACHE_READ_TOKENS > 0.
+// ---------------------------------------------------------------------------
+export function resolveExecutorBudgetLimits(env = {}, { maxBudgetUsd = 0.5, maxTurns = 30 } = {}) {
+  const num = (value, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  return {
+    // One-time unique base context (system prompt + tool schemas + policy +
+    // Task Card). Real trivial smoke ~24k; historical explosions ~50k-75k.
+    maxCacheCreationTokens: num(env.EXECUTOR_MAX_CACHE_CREATION_TOKENS, 200_000),
+    // Per-turn cached context. Real trivial smoke ~36k/turn; 150k leaves ~4x
+    // headroom while still catching a single turn that drags a huge context.
+    maxCacheReadPerTurn: num(env.EXECUTOR_MAX_CACHE_READ_PER_TURN, 150_000),
+    maxOutputTokens: num(env.EXECUTOR_MAX_OUTPUT_TOKENS, 20_000),
+    maxTurns: num(env.EXECUTOR_MAX_TURNS, maxTurns),
+    maxCostUsd: num(env.EXECUTOR_MAX_COST_USD, maxBudgetUsd),
+    // Telemetry-only by default (0 = disabled). Honoured if explicitly set > 0.
+    maxCacheReadTokens: num(env.EXECUTOR_MAX_CACHE_READ_TOKENS, 0),
+  };
+}
+
+// Pure post-run budget evaluation. `usage` is the adapter-normalised usage
+// object; `costUsd` the provider-reported total. Returns every tripped metric
+// so the failure record can name exactly what happened.
+export function evaluateExecutorBudget({ usage = null, costUsd = null, limits = {} } = {}) {
+  const cacheRead = Number(usage?.cache_read_tokens ?? 0) || 0;
+  const cacheCreation = Number(usage?.cache_creation_tokens ?? 0) || 0;
+  const output = Number(usage?.output_tokens ?? 0) || 0;
+  const numTurns = Number.isFinite(usage?.num_turns) ? usage.num_turns : null;
+  const cacheReadPerTurn = Number.isFinite(numTurns) && numTurns > 0
+    ? Math.round(cacheRead / numTurns)
+    : cacheRead;
+  const cost = Number.isFinite(costUsd) ? costUsd : null;
+
+  const active = (value) => Number.isFinite(value) && value > 0;
+  const checks = [];
+  if (active(limits.maxCacheCreationTokens) && cacheCreation > limits.maxCacheCreationTokens) {
+    checks.push({ metric: 'cacheCreation', value: cacheCreation, limit: limits.maxCacheCreationTokens });
+  }
+  if (active(limits.maxCacheReadPerTurn) && cacheReadPerTurn > limits.maxCacheReadPerTurn) {
+    checks.push({ metric: 'cacheReadPerTurn', value: cacheReadPerTurn, limit: limits.maxCacheReadPerTurn });
+  }
+  if (active(limits.maxTurns) && Number.isFinite(numTurns) && numTurns > limits.maxTurns) {
+    checks.push({ metric: 'numTurns', value: numTurns, limit: limits.maxTurns });
+  }
+  if (active(limits.maxOutputTokens) && output > limits.maxOutputTokens) {
+    checks.push({ metric: 'outputTokens', value: output, limit: limits.maxOutputTokens });
+  }
+  if (active(limits.maxCostUsd) && cost !== null && cost > limits.maxCostUsd) {
+    checks.push({ metric: 'costUsd', value: cost, limit: limits.maxCostUsd });
+  }
+  if (active(limits.maxCacheReadTokens) && cacheRead > limits.maxCacheReadTokens) {
+    checks.push({ metric: 'cumulativeCacheRead', value: cacheRead, limit: limits.maxCacheReadTokens });
+  }
+
+  return {
+    exceeded: checks.length > 0,
+    reason: checks.length ? checks.map((c) => `${c.metric}=${c.value}/${c.limit}`).join(', ') : null,
+    checks,
+    observed: { cacheRead, cacheCreation, output, numTurns, cacheReadPerTurn, costUsd: cost },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Permission-denial de-duplication
+//
+// From outside the CLI the adapter cannot intercept an in-session permission
+// prompt, but the final JSON's `permission_denials` array does expose when the
+// model burned turns re-requesting the SAME command after it was already
+// denied. Collapse those to one structured entry with a repeatCount and a
+// deterministic fingerprint, and flag a verification-blocked state when a
+// single command was denied repeatedly.
+// ---------------------------------------------------------------------------
+export const DENIAL_REPEAT_THRESHOLD = 2;
+
+export function normalizeDeniedCommand(command) {
+  if (typeof command !== 'string') return '';
+  return command.trim().replace(/\s+/g, ' ');
+}
+
+export function denialFingerprint(denial, cwd = '') {
+  const tool = typeof denial?.tool_name === 'string' ? denial.tool_name : 'unknown';
+  const rawCommand = denial?.tool_input && typeof denial.tool_input.command === 'string'
+    ? denial.tool_input.command
+    : (typeof denial?.tool_input === 'string' ? denial.tool_input : JSON.stringify(denial?.tool_input ?? null));
+  const normalized = normalizeDeniedCommand(rawCommand);
+  const basis = `${tool} ${cwd ?? ''} ${normalized}`;
+  return createHash('sha256').update(basis).digest('hex').slice(0, 16);
+}
+
+export function dedupePermissionDenials(denials, cwd = '') {
+  const list = Array.isArray(denials) ? denials : [];
+  const byFingerprint = new Map();
+  const order = [];
+  for (const denial of list) {
+    const fingerprint = denialFingerprint(denial, cwd);
+    if (!byFingerprint.has(fingerprint)) {
+      byFingerprint.set(fingerprint, { ...denial, fingerprint, repeatCount: 1 });
+      order.push(fingerprint);
+    } else {
+      byFingerprint.get(fingerprint).repeatCount += 1;
+    }
+  }
+  const deduped = order.map((fp) => byFingerprint.get(fp));
+  const repeated = deduped.filter((d) => d.repeatCount >= DENIAL_REPEAT_THRESHOLD);
+  const maxRepeat = deduped.reduce((max, d) => Math.max(max, d.repeatCount), 0);
+  return {
+    deduped,
+    maxRepeat,
+    repeatedFingerprints: repeated.map((d) => d.fingerprint),
+    threshold: DENIAL_REPEAT_THRESHOLD,
+    verificationBlocked: repeated.length > 0
+      ? {
+          fingerprint: repeated[0].fingerprint,
+          tool: repeated[0].tool_name ?? null,
+          command: repeated[0].tool_input?.command ?? null,
+          cwd: cwd ?? null,
+          repeatCount: repeated[0].repeatCount,
+        }
+      : null,
+  };
+}
+
 export function createClaudeExecutorAdapter({
   command = 'claude',
   // Runs non-interactively with no TTY to approve prompts, so file edits
   // must be pre-authorized or every task reports BLOCKED before it can
   // touch allowed_files. acceptEdits still leaves Bash and other
   // permission classes gated normally — only file edits are auto-accepted.
+  // Approved verification_commands from the Task Card and project npm test scripts
+  // are pre-authorized via --allowedTools without exposing arbitrary shell permissions.
   args,
   model = 'sonnet',
   cwd = process.cwd(),
   env = process.env,
-  timeoutMs = 10 * 60 * 1000,
+  // The CLI exposes no supported per-tool/turn limit or real-time usage
+  // telemetry in this JSON print-mode transport. Bound the entire local
+  // process instead, so a hung invocation is stopped even when final usage
+  // telemetry never arrives. This is a terminal budget brake, not a provider
+  // transport timeout: retrying it on Opus would start another full execution.
+  timeoutMs = Number(env?.EXECUTOR_MAX_RUNTIME_MS ?? 5 * 60 * 1000),
+  // The installed CLI's print mode also supports a hard agentic-turn cap.
+  // Thirty turns leaves ordinary edit + test tasks ample room (a realistic
+  // scoped task lands well under 25) while containing accidental tool/agent
+  // loops far sooner than the old 60. Set <=0 to leave the CLI default
+  // unbounded.
+  maxTurns = Number(env?.EXECUTOR_MAX_TURNS ?? 30),
+  // Claude Code's print-mode budget is the only supported in-process hard
+  // stop exposed by the installed CLI. Keep it deliberately small; callers
+  // may tune it per deployment without changing a Task Card.
+  maxBudgetUsd = Number(env?.EXECUTOR_MAX_BUDGET_USD ?? 0.50),
   spawn = nodeSpawn,
   onActivity,
   onProcessStarted,
   onProcessExited,
 } = {}) {
-  const resolvedArgs = args ?? [
-    '-p',
-    '--output-format',
-    'json',
-    '--permission-mode',
-    'acceptEdits',
-    ...(model ? ['--model', model] : []),
-  ];
-
   return {
     model,
     async execute(taskCard, { signal } = {}) {
+      const allowedTools = buildAllowedVerificationTools(taskCard, { cwd });
+      const resolvedArgs = args ? [...args] : [
+        '-p',
+        '--output-format',
+        'json',
+        // Each Task Card is a disposable process/session. This prevents a
+        // later CLI invocation from being resumed accidentally from disk.
+        '--no-session-persistence',
+        // Scoped Executor: load ONLY MCP servers passed via --mcp-config
+        // (none are), so the user's global SuperGPT MCP server and its ~14
+        // tool schemas are never injected into this session. The Executor is
+        // already forbidden from every supergpt_* tool; this stops paying to
+        // serialize their schemas on every turn. Built-in CLI tools (Bash,
+        // Edit, Read, Write, Glob, Grep, ...) are unaffected — they are not
+        // MCP — and --allowedTools restrictions below still apply.
+        '--strict-mcp-config',
+        '--permission-mode',
+        'acceptEdits',
+        ...(model ? ['--model', model] : []),
+        ...(Number.isFinite(maxTurns) && maxTurns > 0 ? ['--max-turns', String(Math.floor(maxTurns))] : []),
+        ...(Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0 ? ['--max-budget-usd', String(maxBudgetUsd)] : []),
+        ...(allowedTools.length > 0 ? ['--allowedTools', ...allowedTools] : []),
+      ];
       const prompt = buildPrompt(taskCard);
+      const inputBreakdown = measureExecutorInputBreakdown(taskCard, prompt);
       const result = await runProcess({
         command,
         args: resolvedArgs,
@@ -365,9 +731,18 @@ export function createClaudeExecutorAdapter({
       });
 
       if (result.code !== 0) {
+        const diagnostic = (result.stderr || result.stdout).trim();
+        if (/budget|spend limit|max[- ]budget/i.test(diagnostic)) {
+          throw new AdapterError(
+            ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+            `executor budget exceeded (${maxBudgetUsd} USD): ${diagnostic}`,
+            { budget: { maxBudgetUsd, kind: 'provider-reported-cost' } }
+          );
+        }
         throw new AdapterError(
           ADAPTER_ERROR_CODES.EXECUTOR_UNAVAILABLE,
-          `executor "${command}" exited with code ${result.code}: ${(result.stderr || result.stdout).trim()}`
+          `executor "${command}" exited with code ${result.code}: ${diagnostic}`,
+          { providerFailure: 'PROVIDER_UNAVAILABLE' }
         );
       }
 
@@ -375,6 +750,7 @@ export function createClaudeExecutorAdapter({
       let usage = null;
       let costUsd = null;
       let modelUsed = model;
+      let permissionDenials = [];
 
       try {
         const parsed = JSON.parse(result.stdout.trim());
@@ -383,12 +759,14 @@ export function createClaudeExecutorAdapter({
             reportText = parsed.result;
           }
           if (parsed.usage && typeof parsed.usage === 'object') {
+            const rawTurns = Number(parsed.num_turns ?? parsed.usage.num_turns);
             usage = {
               input_tokens: parsed.usage.input_tokens ?? 0,
               output_tokens: parsed.usage.output_tokens ?? 0,
               cache_read_tokens: parsed.usage.cache_read_input_tokens ?? 0,
               cache_creation_tokens: parsed.usage.cache_creation_input_tokens ?? 0,
               total_tokens: (parsed.usage.input_tokens ?? 0) + (parsed.usage.output_tokens ?? 0),
+              num_turns: Number.isFinite(rawTurns) ? rawTurns : null,
             };
           }
           if (Number.isFinite(parsed.total_cost_usd)) {
@@ -398,13 +776,71 @@ export function createClaudeExecutorAdapter({
             const keys = Object.keys(parsed.modelUsage);
             if (keys.length > 0) modelUsed = keys[0];
           }
+          if (Array.isArray(parsed.permission_denials)) {
+            permissionDenials = [...parsed.permission_denials];
+          }
         }
       } catch {
         /* plain text fallback */
       }
 
       const report = parseExecutionReport(taskCard.task_id, reportText);
+
+      // Stable id first: a post-run budget failure still consumed a real
+      // provider call, and its usage record must carry the same callId the
+      // successful path would have used.
       const callId = `call-claude-exe-${randomUUID()}`;
+      if (usage) {
+        try {
+          Object.defineProperty(usage, 'callId', {
+            value: callId, writable: true, configurable: true, enumerable: false,
+          });
+        } catch {
+          usage.callId = callId;
+        }
+      }
+
+      const denialAnalysis = dedupePermissionDenials(permissionDenials, cwd);
+      const budgetLimits = resolveExecutorBudgetLimits(env ?? {}, { maxBudgetUsd, maxTurns });
+      const budget = evaluateExecutorBudget({ usage, costUsd, limits: budgetLimits });
+      if (budget.exceeded) {
+        throw new AdapterError(
+          ADAPTER_ERROR_CODES.EXECUTOR_BUDGET_EXCEEDED,
+          `executor usage exceeded hard budget (${budget.reason})`,
+          {
+            budget: budgetLimits,
+            budgetExceededReason: budget.reason,
+            budgetChecks: budget.checks,
+            budgetObserved: budget.observed,
+            usage,
+            costUsd,
+            numTurns: usage?.num_turns ?? null,
+            model: modelUsed,
+            callId,
+            permissionDenials: denialAnalysis.deduped,
+          }
+        );
+      }
+      Object.defineProperty(report, 'permissionDenials', {
+        value: denialAnalysis.deduped,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
+      Object.defineProperty(report, 'permissionDenialAnalysis', {
+        value: {
+          maxRepeat: denialAnalysis.maxRepeat,
+          repeatedFingerprints: denialAnalysis.repeatedFingerprints,
+          threshold: denialAnalysis.threshold,
+        },
+        enumerable: false,
+      });
+      if (denialAnalysis.verificationBlocked) {
+        Object.defineProperty(report, 'verificationBlocked', {
+          value: denialAnalysis.verificationBlocked,
+          enumerable: false,
+        });
+      }
       try {
         Object.defineProperty(report, 'callId', {
           value: callId,
@@ -416,18 +852,9 @@ export function createClaudeExecutorAdapter({
         report.callId = callId;
       }
       if (usage) {
-        try {
-          Object.defineProperty(usage, 'callId', {
-            value: callId,
-            writable: true,
-            configurable: true,
-            enumerable: false,
-          });
-        } catch {
-          usage.callId = callId;
-        }
         report.usage = usage;
       }
+      Object.defineProperty(report, 'inputBreakdown', { value: inputBreakdown, enumerable: false });
       if (costUsd !== null) report.costUsd = costUsd;
       if (usage || costUsd !== null) report.model = modelUsed;
       return report;

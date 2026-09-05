@@ -48,6 +48,14 @@ try {
     out({ acquired: r.acquired, code: r.code, ownerToken: r.ownerToken, ownerPid: r.ownerPid });
     if (r.acquired && mode === 'acquire') { const t = Date.now(); while (Date.now() - t < 800) { /* hold live lease */ } }
   } else {
+    // This contender exercises ownership / lease semantics with a marker
+    // pipeline, not the token ceilings, and it fabricates no persisted usage
+    // snapshot. Disable every aggregate token ceiling so the resume
+    // fail-closed check does not pre-empt the ownership race under test.
+    process.env.WORKFLOW_MAX_COST_USD = '0';
+    process.env.WORKFLOW_MAX_USAGE_VOLUME = '0';
+    process.env.TASK_MAX_EXECUTOR_USAGE_VOLUME = '0';
+    process.env.MAX_EXECUTOR_PHYSICAL_CALLS_PER_TASK = '0';
     const { runSuperGPT } = await import(new URL('../../src/orchestrator/supergpt.js', import.meta.url));
     const res = await runSuperGPT({
       workflowId,

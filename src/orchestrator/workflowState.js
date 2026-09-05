@@ -12,10 +12,17 @@
 
 import path from 'node:path';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
 import { SUPERGPT_WORKTREE_ROOT } from './workflowWorktree.js';
+import { readOwnerLease, isLeaseOwnerAlive } from './workflowOwnership.js';
 import { appendProviderProcessDiagnostic } from './providerProcessTelemetry.js';
-import { validateWorkflowId, assertPathWithinRoot } from './workflowId.js';
+import { validateWorkflowId, assertPathWithinRoot, isTestWorkflowId } from './workflowId.js';
+import { makeSafetyEvent } from './safetyEvents.js';
+
+export const WORKFLOW_KINDS = Object.freeze({
+  USER: 'USER',
+  INTERNAL_TEST: 'INTERNAL_TEST',
+});
 
 export const WORKFLOW_STAGES = Object.freeze({
   INIT: 'INIT',
@@ -69,6 +76,8 @@ function formatDuration(ms) {
 export class WorkflowStateManager {
   constructor({
     workflowId,
+    kind,
+    parentWorkflowId = null,
     root = SUPERGPT_WORKTREE_ROOT,
     onStateChange,
   } = {}) {
@@ -79,9 +88,12 @@ export class WorkflowStateManager {
     this.onStateChange = onStateChange;
     this.heartbeatTimer = null;
 
+    const resolvedKind = kind || (isTestWorkflowId(workflowId) ? WORKFLOW_KINDS.INTERNAL_TEST : WORKFLOW_KINDS.USER);
     const now = new Date().toISOString();
     this.state = {
       workflowId,
+      kind: resolvedKind,
+      parentWorkflowId: parentWorkflowId ?? null,
       workflowStatus: WORKFLOW_STATUSES.STARTING,
       taskIndex: null,
       taskTotal: null,
@@ -108,11 +120,22 @@ export class WorkflowStateManager {
       routing: { planner: null, supervisor: null, executor: null, reviewer: null, quotaPools: [] },
       taskHistory: [], // completed tasks history with { taskId, decision, attempts }
       taskAttempts: [], // task-scoped attempt history with { taskId, attempt, executorCallId, gateResult, reviewerDecision, requiredChanges, reviewerCallId }
+      stageHistory: [], // chronological stage transition history with { stage, startedAt, taskId, taskName, attempt }
       error: null,
       question: null,
       summary: null,
       evidence: null,
       blockers: [],
+      // User-visible cost / safety events (see safetyEvents.js). Accumulated
+      // live; projected verbatim into every terminal channel so an anomaly is
+      // never left only in internal logs.
+      safetyEvents: [],
+      // V2-C durable PR closeout loop state (round count, reviewed head,
+      // finding signatures, last action) — null until the closeout loop runs.
+      prCloseout: null,
+      // Controlled Host Acceptance evidence bundle (sanitized projection) —
+      // null until host verification supersedes local acceptance for delivery.
+      controlledAcceptance: null,
     };
   }
 
@@ -168,6 +191,15 @@ export class WorkflowStateManager {
     if (details.taskIndex !== undefined) this.state.taskIndex = details.taskIndex;
     if (details.taskTotal !== undefined) this.state.taskTotal = details.taskTotal;
     if (details.attempt !== undefined) this.state.attempt = details.attempt;
+
+    if (!this.state.stageHistory) this.state.stageHistory = [];
+    this.state.stageHistory.push({
+      stage,
+      startedAt: now,
+      taskId: details.taskId ?? this.state.taskId ?? null,
+      taskName: details.taskName ?? this.state.taskName ?? null,
+      attempt: details.attempt ?? this.state.attempt ?? null,
+    });
 
     if (stage === WORKFLOW_STAGES.EXECUTOR) {
       this.state.stageStatuses.executor = 'running';
@@ -242,13 +274,22 @@ export class WorkflowStateManager {
 
   recordTaskAttempt(attemptRecord = {}) {
     if (!this.state.taskAttempts) this.state.taskAttempts = [];
+    const now = new Date().toISOString();
     const index = this.state.taskAttempts.findIndex(
       (a) => a.taskId === attemptRecord.taskId && a.attempt === attemptRecord.attempt
     );
     if (index >= 0) {
-      this.state.taskAttempts[index] = { ...this.state.taskAttempts[index], ...attemptRecord };
+      this.state.taskAttempts[index] = {
+        ...this.state.taskAttempts[index],
+        ...attemptRecord,
+        updatedAt: now,
+      };
     } else {
-      this.state.taskAttempts.push({ ...attemptRecord });
+      this.state.taskAttempts.push({
+        createdAt: now,
+        updatedAt: now,
+        ...attemptRecord,
+      });
     }
     this.persist();
   }
@@ -257,6 +298,60 @@ export class WorkflowStateManager {
     if (!this.state.taskHistory) this.state.taskHistory = [];
     this.state.taskHistory.push({ ...taskSummary });
     this.persist();
+  }
+
+  // V2-C — persist the durable PR closeout loop state after every transition
+  // so a crashed or suspended closeout loop resumes from the last decision.
+  // Pass null to clear it.
+  recordCloseoutState(closeoutState) {
+    this.state.prCloseout = closeoutState
+      ? JSON.parse(JSON.stringify(closeoutState))
+      : null;
+    this.state.lastProgressAt = new Date().toISOString();
+    this.notify();
+    this.persist();
+  }
+
+  // Records the controlled Host Acceptance milestone. Only the auditable,
+  // non-sensitive fields of the evidence bundle are projected into live state;
+  // the authoritative bundle stays in the host evidence store.
+  recordControlledAcceptance(bundle) {
+    this.state.controlledAcceptance = bundle
+      ? {
+        status: bundle.status ?? null,
+        acceptanceId: bundle.acceptanceId ?? null,
+        acceptanceVersion: bundle.acceptanceVersion ?? null,
+        head: bundle.head ?? null,
+        worktreeFingerprint: bundle.worktreeFingerprint ?? null,
+        commandsHash: bundle.commandsHash ?? null,
+        verificationCommands: Array.isArray(bundle.verificationCommands) ? [...bundle.verificationCommands] : [],
+        gate: bundle.gate ?? null,
+        reviewer: bundle.reviewer ?? null,
+        approvedBy: bundle.approvedBy ?? null,
+        approvedAt: bundle.approvedAt ?? null,
+        reason: bundle.reason ?? null,
+      }
+      : null;
+    this.state.lastProgressAt = new Date().toISOString();
+    this.notify();
+    this.persist();
+  }
+
+  // Append a user-visible cost / safety event. Zero model tokens. The event
+  // is persisted immediately so it survives a crash between here and the
+  // terminal transition.
+  recordSafetyEvent(event) {
+    const normalized = makeSafetyEvent(event);
+    if (!Array.isArray(this.state.safetyEvents)) this.state.safetyEvents = [];
+    this.state.safetyEvents.push(normalized);
+    this.state.lastProgressAt = new Date().toISOString();
+    this.notify();
+    this.persist();
+    return normalized;
+  }
+
+  getSafetyEvents() {
+    return Array.isArray(this.state.safetyEvents) ? [...this.state.safetyEvents] : [];
   }
 
   setDecision(decision) {
@@ -427,6 +522,172 @@ export function readLiveWorkflowState({
 }
 
 /**
+ * V2-C — read the persisted PR closeout loop state for a workflow, or null.
+ * Consumes zero model tokens.
+ */
+export function readCloseoutState({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+} = {}) {
+  const live = readLiveWorkflowState({ workflowId, root });
+  return live?.prCloseout ?? null;
+}
+
+/**
+ * PR Closeout — the reviewer the workflow is (or would be) using, plus the
+ * durable repair-round budget. Reads only persisted state; zero model tokens.
+ * Returns null when no closeout loop state has been recorded yet.
+ */
+export function readCloseoutReviewer({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+  state = null,
+} = {}) {
+  const closeout = state ?? readCloseoutState({ workflowId, root });
+  if (!closeout || typeof closeout !== 'object') return null;
+  const order = Array.isArray(closeout.reviewerCandidateOrder)
+    ? closeout.reviewerCandidateOrder
+    : [];
+  const active = closeout.reviewerLocked && closeout.activeReviewer
+    ? closeout.activeReviewer
+    : (order[closeout.reviewerCandidateIndex ?? 0] ?? closeout.prReviewer ?? null);
+  return {
+    reviewer: active,
+    locked: Boolean(closeout.reviewerLocked),
+    candidateOrder: order,
+    candidateIndex: closeout.reviewerCandidateIndex ?? 0,
+    failovers: Array.isArray(closeout.reviewerFailovers) ? closeout.reviewerFailovers : [],
+    repairRounds: closeout.repairRounds ?? 0,
+    maxRepairRounds: closeout.maxRepairRounds ?? null,
+  };
+}
+
+export const HEARTBEAT_STALE_TIMEOUT_MS = 2 * 60_000; // 2 minutes
+
+/**
+ * Check if a workflow is actively alive (owner process running or fresh heartbeat).
+ * Consumes zero model tokens.
+ */
+export function checkWorkflowLiveness({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+  state = null,
+  now = Date.now(),
+  staleTimeoutMs = HEARTBEAT_STALE_TIMEOUT_MS,
+} = {}) {
+  const rawState = state ?? readLiveWorkflowState({ workflowId, root });
+  if (!rawState) return { isAlive: false, isZombie: false, reason: 'state_not_found' };
+
+  const s = String(rawState.stage || '').toUpperCase();
+  const w = String(rawState.workflowStatus || '').toUpperCase();
+  const term = [
+    WORKFLOW_STATUSES.DONE,
+    WORKFLOW_STATUSES.HUMAN_REQUIRED,
+    WORKFLOW_STATUSES.FAILED,
+    WORKFLOW_STATUSES.TIMEOUT,
+    WORKFLOW_STATUSES.STALLED,
+    WORKFLOW_STATUSES.STOPPED,
+    'SUPERSEDED',
+    'DISMISSED',
+  ];
+  if (term.includes(w)) {
+    return { isAlive: true, isZombie: false, reason: 'resolved_status' };
+  }
+
+  // 1. Check ownership lease
+  const lease = readOwnerLease({ root, workflowId });
+  if (lease) {
+    const ownerAlive = isLeaseOwnerAlive(lease);
+    if (ownerAlive) {
+      return { isAlive: true, isZombie: false, ownerPid: lease.pid, lease };
+    }
+    // Owner lease was published with a recorded local PID that is demonstrably dead -> zombie!
+    return {
+      isAlive: false,
+      isZombie: true,
+      reason: 'owner_pid_dead',
+      ownerPid: lease.pid,
+      lease,
+    };
+  }
+
+  // 2. No lease directory: check heartbeat
+  if (rawState.heartbeatAt) {
+    const lastHeartbeat = Date.parse(rawState.heartbeatAt);
+    if (Number.isFinite(lastHeartbeat) && (now - lastHeartbeat) > staleTimeoutMs) {
+      return {
+        isAlive: false,
+        isZombie: true,
+        reason: 'heartbeat_expired',
+        ageMs: now - lastHeartbeat,
+      };
+    }
+  } else if (rawState.startedAt) {
+    const startedMs = Date.parse(rawState.startedAt);
+    if (Number.isFinite(startedMs) && (now - startedMs) > 24 * 60 * 60_000) {
+      return {
+        isAlive: false,
+        isZombie: true,
+        reason: 'started_long_ago_no_lease',
+        ageMs: now - startedMs,
+      };
+    }
+  }
+
+  // Within initialization / test grace window
+  return { isAlive: true, isZombie: false, reason: 'within_grace_window' };
+}
+
+/**
+ * Reconcile stale/zombie workflow state to STOPPED and requiresAttention=false.
+ * Preserves all checkpoints, events, evidence, and worktrees.
+ */
+export function reconcileStaleWorkflowState({
+  workflowId,
+  root = SUPERGPT_WORKTREE_ROOT,
+  state = null,
+  now = Date.now(),
+  staleTimeoutMs = HEARTBEAT_STALE_TIMEOUT_MS,
+} = {}) {
+  validateWorkflowId(workflowId);
+  const statePath = assertPathWithinRoot(root, path.join(root, `${workflowId}.state.json`), 'state file');
+  const rawState = state ?? readLiveWorkflowState({ workflowId, root });
+  if (!rawState) return null;
+
+  const liveness = checkWorkflowLiveness({
+    workflowId,
+    root,
+    state: rawState,
+    now,
+    staleTimeoutMs,
+  });
+
+  if (!liveness.isZombie) {
+    return rawState;
+  }
+
+  const reconciled = { ...rawState };
+  reconciled.workflowStatus = WORKFLOW_STATUSES.STOPPED;
+  reconciled.stage = WORKFLOW_STAGES.STOPPED;
+  reconciled.stoppedAt = rawState.heartbeatAt || rawState.lastProgressAt || new Date(now).toISOString();
+  reconciled.stoppedReason = `zombie_reconciled:${liveness.reason}`;
+  reconciled.requiresAttention = false;
+  reconciled.reconciledAt = new Date(now).toISOString();
+
+  try {
+    const tmpPath = `${statePath}.tmp.${Date.now()}`;
+    writeFileSync(tmpPath, `${JSON.stringify(reconciled, null, 2)}\n`, 'utf8');
+    renameSync(tmpPath, statePath);
+  } catch {
+    try {
+      writeFileSync(statePath, `${JSON.stringify(reconciled, null, 2)}\n`, 'utf8');
+    } catch {}
+  }
+
+  return reconciled;
+}
+
+/**
  * Programmatic local state waiter (PHASE B5).
  * Consumes zero model tokens.
  */
@@ -518,6 +779,54 @@ export function formatTransitionEvent(event) {
   }
 }
 
+export function formatCanonicalUsage(rawUsage, prCloseout = null) {
+  const emptyRole = () => ({
+    calls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedTokens: 0,
+    totalTokens: 0,
+    costUsd: 0,
+    byModel: {},
+  });
+
+  const u = rawUsage && typeof rawUsage === 'object' ? rawUsage : {};
+  const planner = u.planner ? { ...emptyRole(), ...u.planner } : emptyRole();
+  const executor = u.executor ? { ...emptyRole(), ...u.executor } : emptyRole();
+  const supervisor = u.supervisor ? { ...emptyRole(), ...u.supervisor } : emptyRole();
+  const internalReviewer = u.internalReviewer ?? u.reviewer ? { ...emptyRole(), ...(u.internalReviewer ?? u.reviewer) } : emptyRole();
+
+  const measuredTotal = u.measuredTotal ?? u.total ?? {
+    calls: planner.calls + executor.calls + supervisor.calls + internalReviewer.calls,
+    inputTokens: planner.inputTokens + executor.inputTokens + supervisor.inputTokens + internalReviewer.inputTokens,
+    outputTokens: planner.outputTokens + executor.outputTokens + supervisor.outputTokens + internalReviewer.outputTokens,
+    cachedTokens: planner.cachedTokens + executor.cachedTokens + supervisor.cachedTokens + internalReviewer.cachedTokens,
+    totalTokens: planner.totalTokens + executor.totalTokens + supervisor.totalTokens + internalReviewer.totalTokens,
+    costUsd: planner.costUsd + executor.costUsd + supervisor.costUsd + internalReviewer.costUsd,
+  };
+
+  const reviewerName = prCloseout?.configuredReviewer || prCloseout?.activeReviewer || u.externalPrReviewer?.reviewer || null;
+  const externalPrReviewer = {
+    reviewer: reviewerName,
+    usageAvailable: false,
+    note: reviewerName ? 'Token usage: unavailable / external' : 'Not configured',
+    reviewed: Boolean(prCloseout?.reviewedPrHead),
+  };
+
+  return {
+    planner,
+    executor,
+    supervisor,
+    internalReviewer,
+    reviewer: internalReviewer, // alias
+    measuredTotal,
+    total: measuredTotal, // alias
+    externalPrReviewer,
+    hasUsageData: measuredTotal.totalTokens > 0 || measuredTotal.calls > 0,
+    records: Array.isArray(u.records) ? u.records : [],
+  };
+}
+
 /**
  * Convert any live or persisted workflow state object into canonical progress format (PART 2).
  * Consumes zero model tokens.
@@ -526,9 +835,28 @@ export function toCanonicalProgress(rawState, now = Date.now()) {
   if (!rawState) return null;
   const currentNow = typeof now === 'number' ? now : (now instanceof Date ? now.getTime() : Date.now());
   const elapsedMs = rawState.startedAt ? Math.max(0, currentNow - new Date(rawState.startedAt).getTime()) : 0;
+
+  const s = String(rawState.stage || '').toUpperCase();
+  const w = String(rawState.workflowStatus || '').toUpperCase();
+  let canonicalStatus;
+  if (w === 'DONE') canonicalStatus = 'DONE';
+  else if (w === 'HUMAN_REQUIRED') canonicalStatus = 'HUMAN_REQUIRED';
+  else if (w === 'FAILED' || w === 'TIMEOUT' || w === 'STALLED') canonicalStatus = 'FAILED';
+  else if (w === 'STOPPED') canonicalStatus = 'STOPPED';
+  else if (['EXECUTOR', 'GATE', 'REVIEWER', 'REWORK', 'ESCALATION', 'SUPERVISOR', 'APPLYING'].includes(s) || ['EXECUTOR', 'GATE', 'REVIEWER', 'REWORK', 'ESCALATION', 'SUPERVISOR', 'APPLYING'].includes(w)) canonicalStatus = 'RUNNING';
+  else if (['STARTING', 'PLANNING', 'INIT', 'PREFLIGHT'].includes(s) || ['STARTING', 'PLANNING', 'INIT', 'PREFLIGHT'].includes(w) || w === 'STARTING') canonicalStatus = 'STARTING';
+  else canonicalStatus = 'STARTING';
+
   return {
     workflowId: rawState.workflowId ?? null,
+    kind: rawState.kind ?? (isTestWorkflowId(rawState.workflowId) ? WORKFLOW_KINDS.INTERNAL_TEST : WORKFLOW_KINDS.USER),
+    parentWorkflowId: rawState.parentWorkflowId ?? null,
     workflowStatus: rawState.workflowStatus ?? 'UNKNOWN',
+    rawStatus: rawState.workflowStatus ?? 'UNKNOWN',
+    status: canonicalStatus,
+    canonicalStatus,
+    path: rawState.workflowPath ?? null,
+    pathSelectionReason: rawState.pathSelectionReason ?? null,
     task: {
       current: rawState.taskIndex ?? null,
       total: rawState.taskTotal ?? null,
@@ -558,7 +886,7 @@ export function toCanonicalProgress(rawState, now = Date.now()) {
       lastProgressAt: rawState.lastProgressAt ?? null,
       lastActivityAt: rawState.lastActivityAt ?? null,
     },
-    usage: rawState.tokenUsage ?? null,
+    usage: formatCanonicalUsage(rawState.tokenUsage, rawState.prCloseout),
     routing: rawState.routing ?? { planner: null, supervisor: null, executor: null, reviewer: null, quotaPools: [] },
     terminal: [
       WORKFLOW_STATUSES.HUMAN_REQUIRED,
@@ -576,6 +904,7 @@ export function toCanonicalProgress(rawState, now = Date.now()) {
     blockerCategory: rawState.blockerCategory ?? null,
     deliveredFiles: rawState.deliveredFiles ?? [],
     activeProcesses: rawState.activeProcesses ?? [],
+    prCloseout: rawState.prCloseout ?? null,
   };
 }
 
@@ -719,13 +1048,51 @@ export function captureTerminalSnapshot({
 }
 
 /**
+ * Resolves the controlled Host Acceptance evidence for a terminal judgement.
+ *
+ * `controlledAcceptance` is either a validation result ({ valid, reason }) or a
+ * resolver function evaluated lazily. Returns a normalized
+ * { present, valid, reason, bundle } view; `present: false` means the workflow
+ * never used controlled acceptance and is judged on its own attempt evidence.
+ */
+export function resolveControlledAcceptanceEvidence(controlledAcceptance) {
+  if (controlledAcceptance === null || controlledAcceptance === undefined) {
+    return { present: false, valid: false, reason: null, bundle: null };
+  }
+  let resolved = controlledAcceptance;
+  if (typeof controlledAcceptance === 'function') {
+    try {
+      resolved = controlledAcceptance();
+    } catch (err) {
+      return { present: true, valid: false, reason: err?.message ?? 'CONTROLLED_ACCEPTANCE_UNREADABLE', bundle: null };
+    }
+  }
+  if (!resolved || typeof resolved !== 'object') {
+    return { present: true, valid: false, reason: 'CONTROLLED_ACCEPTANCE_MALFORMED', bundle: null };
+  }
+  return {
+    present: true,
+    valid: resolved.valid === true,
+    reason: resolved.valid === true ? null : (resolved.reason ?? 'CONTROLLED_ACCEPTANCE_MALFORMED'),
+    bundle: resolved.bundle ?? null,
+  };
+}
+
+/**
  * Generate a validated acceptance report strictly from an immutable terminal snapshot.
+ *
+ * When controlled Host Acceptance evidence is supplied it becomes part of the
+ * terminal judgement and fails closed: drifted, tampered, or missing evidence
+ * yields ACCEPTANCE_EVIDENCE_INCONSISTENT (never a PASS), while valid evidence
+ * reports ACCEPTANCE_SUPERSEDED_BY_HOST_VERIFICATION on an otherwise accepted
+ * workflow.
  */
 export function generateTerminalAcceptanceReport({
   workflowId,
   root = SUPERGPT_WORKTREE_ROOT,
   state = null,
   usageTracker = null,
+  controlledAcceptance = null,
 } = {}) {
   const result = captureTerminalSnapshot({ workflowId, root, state, usageTracker });
   if (result.status === 'ACCEPTANCE_NOT_TERMINAL') {
@@ -750,10 +1117,33 @@ export function generateTerminalAcceptanceReport({
   const attempts = Array.isArray(s.taskAttempts) ? s.taskAttempts : [];
   const usage = s.tokenUsage ?? {};
 
+  const evidence = resolveControlledAcceptanceEvidence(controlledAcceptance);
+  if (evidence.present && !evidence.valid) {
+    return {
+      acceptance: 'ACCEPTANCE_EVIDENCE_INCONSISTENT',
+      valid: false,
+      violations: [`Controlled Host Acceptance evidence is not valid: ${evidence.reason}`],
+      controlledAcceptance: { valid: false, reason: evidence.reason },
+      report: null,
+    };
+  }
+
   const accepted = s.workflowStatus === WORKFLOW_STATUSES.DONE;
   return {
-    acceptance: accepted ? 'PASS' : 'NOT_ACCEPTED',
+    acceptance: evidence.present && accepted
+      ? 'ACCEPTANCE_SUPERSEDED_BY_HOST_VERIFICATION'
+      : (accepted ? 'PASS' : 'NOT_ACCEPTED'),
     valid: accepted,
+    ...(evidence.present
+      ? {
+        controlledAcceptance: {
+          valid: true,
+          reason: null,
+          acceptanceId: evidence.bundle?.acceptanceId ?? null,
+          acceptanceVersion: evidence.bundle?.acceptanceVersion ?? null,
+        },
+      }
+      : {}),
     workflowId: s.workflowId,
     workflowStatus: s.workflowStatus,
     summary: s.summary,

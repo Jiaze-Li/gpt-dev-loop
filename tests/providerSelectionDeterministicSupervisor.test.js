@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { selectProviders } from '../src/orchestrator/providerSelection.js';
 import { makeFakeCallAgy } from './fixtures/fakeAgy.mjs';
+import { registerUserInputEvidence, registerReviewFindingsEvidence } from '../src/orchestrator/newInformation.js';
 
 const planned = {
   status: 'READY',
@@ -39,11 +40,14 @@ test('Planner task queue makes Supervisor happy path zero-token', async () => {
     onEvent: (event) => events.push(event),
   });
 
+  const plannerEvidence = await registerUserInputEvidence(selection.informationLedger, {
+    workflowId: 'wf-deterministic-supervisor', interactionId: 'planner-initial-input', text: planned.plan,
+  });
   // The planner adapter receives the already-parsed Planner resolution from
   // resolveWorkflowPlan; capture it without invoking the transport in this test.
   const plannerResult = await selection.runtime.invoke('planner', {
     resolve: async () => planned,
-  }, { operationId: 'wf-deterministic-supervisor' });
+  }, { operationId: 'wf-deterministic-supervisor', workflowId: 'wf-deterministic-supervisor', evidenceIds: [plannerEvidence.evidenceId] });
   assert.equal(plannerResult.value, planned);
 
   const first = await selection.supervisorSession.decide(decisionContext());
@@ -88,14 +92,27 @@ test('ordinary rework is local once; repeated identical rework escalates', async
     callAgy,
     onEvent: (event) => events.push(event),
   });
-  await selection.runtime.invoke('planner', { resolve: async () => planned }, { operationId: 'wf-deterministic-rework' });
+  const plannerEvidence = await registerUserInputEvidence(selection.informationLedger, {
+    workflowId: 'wf-deterministic-rework', interactionId: 'planner-initial-input', text: planned.plan,
+  });
+  await selection.runtime.invoke('planner', { resolve: async () => planned }, {
+    operationId: 'wf-deterministic-rework', workflowId: 'wf-deterministic-rework', evidenceIds: [plannerEvidence.evidenceId],
+  });
 
   const review = { task_id: 'one', decision: 'REWORK', findings: ['race'], required_changes: ['Fix the race'], rationale: 'still races' };
   const first = await selection.supervisorSession.decide(decisionContext({ latestReviewResult: review }));
   assert.equal(first.action, 'CONTINUE_REWORK');
   assert.equal(callAgy.calls.length, 0);
 
-  const second = await selection.supervisorSession.decide(decisionContext({ latestReviewResult: review }));
+  // The non-convergent Reviewer verdict is the deterministic evidence that
+  // justifies the ONE physical Supervisor escalation call below — exactly
+  // like automatedLoop.js's own escalation branch registers it in production.
+  const escalationEvidence = await registerReviewFindingsEvidence(selection.informationLedger, {
+    workflowId: 'wf-deterministic-rework', taskId: review.task_id, signature: review.required_changes.join('\n'),
+  });
+  const second = await selection.supervisorSession.decide(decisionContext({
+    latestReviewResult: review, evidenceIds: [escalationEvidence.evidenceId],
+  }));
   assert.equal(second.action, 'CONTINUE_REWORK');
   assert.equal(callAgy.calls.length, 1);
   assert.ok(events.some((e) => e.type === 'SUPERVISOR_ESCALATED' && e.reason === 'reviewer_rework_nonconvergence'));

@@ -308,6 +308,11 @@ export class TokenAnomalyMonitor {
     }
 
     const records = tracker.records || [];
+    // Records the UsageTracker has already classified as replays / resumes /
+    // cross-process duplicates or as zero-token deterministic decisions are not
+    // real additional invocations: analyse only the deduplicated set so a replay
+    // neither double-counts nor raises a second alert for the same call.
+    const activeRecords = records.filter((r) => r && !r.duplicate && !r.deterministic);
     const summary = typeof tracker.summary === 'function' ? tracker.summary() : tracker;
 
     // 1. Detect duplicate accounting in records (callId primary + timestamp fallback)
@@ -317,7 +322,7 @@ export class TokenAnomalyMonitor {
     this.detectUnexpectedCallCounts(summary, workflowContext, anomalies);
 
     // 3. Detect abnormal turn-over-turn prompt inflation
-    this.detectPromptInflation(records, anomalies);
+    this.detectPromptInflation(activeRecords, anomalies);
 
     // 4. Detect regressions relative to baseline (and environment changes)
     if (baseline) {

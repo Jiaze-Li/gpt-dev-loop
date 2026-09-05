@@ -11,19 +11,21 @@
 //   { action: 'WORKFLOW_DONE', summary }
 //   { action: 'HUMAN_REQUIRED', reason, question }
 //
-// MVP is STATELESS: every decide() is one fresh `agy` invocation. The prompt
-// therefore carries all current authoritative state the loop knows —
-// plan.txt contents (context.workflowGoal), repository context, the full
-// task history (per-task decisions + attempt counts), and the latest Review
-// Result (the current task's state when a rework is in progress). No
-// persistent agy conversation is used.
+// ── Token-budget control ────────────────────────────────────────────
 //
-// Structured output only: Gemini is asked for a bare JSON object and the
-// reply is parsed with parseAgyJsonObject (fail-closed, no Markdown
-// prose-parsing). The Task Card inside a NEXT_TASK decision is rendered to
-// the canonical "## field_name" document and validated by taskCard.js's
-// existing parseTaskCard — there is still exactly one Task Card schema in
-// this codebase.
+// The Supervisor prompt is built from a *compact deterministic checkpoint*,
+// NOT by echoing full workflow history.  Goals, history entries, and review
+// results are mechanically projected down to the minimum fields needed for
+// the next decision.
+//
+// Budget constants:
+//   GOAL_CHAR_LIMIT   —  max chars of workflowGoal kept (first N + marker)
+//   RATIONALE_LIMIT   —  max chars of reviewer rationale per entry
+//   NORMAL_TARGET     —  soft budget; prompt should stay below this
+//   HARD_LIMIT        —  absolute max; exceeding → SUPERVISOR_CONTEXT_BUDGET_EXCEEDED
+//
+// If the fully-assembled prompt exceeds HARD_LIMIT after all compaction, the
+// provider throws SUPERVISOR_CONTEXT_BUDGET_EXCEEDED without calling the model.
 
 import { randomUUID } from 'node:crypto';
 import { callAgy as defaultCallAgy } from '../../agy/agyClient.js';
@@ -39,23 +41,61 @@ import { AGY_SUPERVISOR_DEFAULT_MODEL } from '../../agy/agyConfig.js';
 import { parseTaskCard, REQUIRED_FIELDS } from '../taskCard.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
 
-const ACTIONS = new Set(['NEXT_TASK', 'CONTINUE_REWORK', 'WORKFLOW_DONE', 'HUMAN_REQUIRED']);
+const ACTIONS = new Set(['NEXT_TASK', 'CONTINUE_REWORK', 'WORKFLOW_DONE', 'HUMAN_REQUIRED', 'OUT_OF_SCOPE']);
 const SCALAR_TASK_FIELDS = ['task_id', 'goal', 'context', 'scope', 'completion_signal'];
 const LIST_TASK_FIELDS = ['allowed_files', 'forbidden_files', 'acceptance_criteria', 'verification_commands'];
+
+// ── Budget constants (exported for tests) ───────────────────────────
+export const GOAL_CHAR_LIMIT = 2000;
+export const RATIONALE_LIMIT = 500;
+export const FINDING_LIMIT = 300;
+export const NORMAL_TARGET = 15_000;
+export const HARD_LIMIT = 25_000;
 
 function invalid(message) {
   return new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT, message);
 }
 
-function renderRepositoryContext(ctx) {
-  const c = ctx ?? {};
-  return `repository_name: ${c.repository_name ?? 'unknown'}
-repository_url: ${c.repository_url ?? 'none'}
-branch: ${c.branch ?? 'unknown'}
-commit_sha: ${c.commit_sha ?? 'unknown'}`;
+
+// ── Compact projection helpers (deterministic, no model calls) ──────
+
+/**
+ * Deterministically truncate the workflowGoal to at most GOAL_CHAR_LIMIT chars.
+ * Returns the original text if it's already short enough, otherwise the first
+ * N chars plus a stable marker.
+ *
+ * When truncation occurs and `plannedTasks` is available, a compact task index
+ * is appended so the Supervisor never loses task IDs / goals that appear past
+ * the truncation boundary.
+ */
+export function buildCompactGoal(workflowGoal, limit = GOAL_CHAR_LIMIT, plannedTasks = null) {
+  if (!isNonEmptyString(workflowGoal)) return '(none provided)';
+  if (workflowGoal.length <= limit) return workflowGoal;
+
+  let result = workflowGoal.slice(0, limit)
+    + `\n[… truncated from ${workflowGoal.length} to ${limit} chars — full goal in workflow state]`;
+
+  // Append a compact task index so tail-of-plan tasks are never invisible.
+  if (Array.isArray(plannedTasks) && plannedTasks.length > 0) {
+    const taskIndex = plannedTasks
+      .map((t) => {
+        const id = t.task_id ?? t.id ?? '?';
+        const goal = t.goal ? truncField(t.goal, 120) : '';
+        return goal ? `- ${id}: ${goal}` : `- ${id}`;
+      })
+      .join('\n');
+    result += `\n\nPlanned tasks (complete index):\n${taskIndex}`;
+  }
+
+  return result;
 }
 
-function renderHistory(history) {
+/**
+ * Project the history array into compact one-line summaries.
+ * Each entry: "taskId: STATUS (N attempts)" — no execution reports, no
+ * evidence blobs, no reviewer prose.
+ */
+export function buildCompactHistory(history) {
   if (!Array.isArray(history) || history.length === 0) return 'none';
   return history
     .map((entry, i) => {
@@ -68,19 +108,110 @@ function renderHistory(history) {
     .join('\n');
 }
 
-function renderReviewResult(reviewResult) {
+/**
+ * Truncate a single string field to `limit` chars.
+ */
+function truncField(value, limit) {
+  if (typeof value !== 'string') return value;
+  if (value.length <= limit) return value;
+  return value.slice(0, limit) + '…';
+}
+
+/**
+ * Clean and cap rationale text: strip internal Node test runner frames, then
+ * truncate to RATIONALE_LIMIT.
+ */
+function cleanRationale(rationale) {
+  if (!rationale || typeof rationale !== 'string') return '';
+  const cleaned = rationale
+    .split('\n')
+    .filter((line) => {
+      // Drop internal node test runner frames and async hooks
+      if (/^\s*at\s+(?:TestContext|Test\.run|Test\.start|startSubtest|processTicksAndRejections|node:internal|node:async_hooks)/.test(line)) {
+        return false;
+      }
+      return true;
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return truncField(cleaned, RATIONALE_LIMIT);
+}
+
+/**
+ * Project a finding (from structured reviewer output) to a compact one-liner.
+ * Keeps: severity, file/path, concise issue text.
+ */
+function compactFinding(finding) {
+  if (typeof finding === 'string') return truncField(finding, FINDING_LIMIT);
+  if (finding && typeof finding === 'object') {
+    const parts = [];
+    if (finding.severity) parts.push(`[${finding.severity}]`);
+    if (finding.file || finding.path) parts.push(finding.file || finding.path);
+    if (finding.issue || finding.message || finding.description) {
+      parts.push(truncField(finding.issue || finding.message || finding.description, FINDING_LIMIT));
+    }
+    return parts.join(' ') || JSON.stringify(finding).slice(0, FINDING_LIMIT);
+  }
+  return String(finding).slice(0, FINDING_LIMIT);
+}
+
+/**
+ * Build a compact review result block that keeps only the fields needed for
+ * the Supervisor to decide CONTINUE_REWORK vs HUMAN_REQUIRED.
+ *
+ * Preserved: decision, task_id, required_changes (compacted), rationale (capped).
+ * Dropped: full evidence, execution reports, verbose prose.
+ */
+export function buildCompactReviewResult(reviewResult) {
   if (!reviewResult) return 'none';
   if (reviewResult.decision === 'PASS') {
     return 'Previous task PASSED. No task currently in rework.';
   }
-  const changes = Array.isArray(reviewResult.required_changes)
-    ? reviewResult.required_changes.map((c) => `- ${c}`).join('\n')
-    : String(reviewResult.required_changes ?? 'none');
-  return `decision: ${reviewResult.decision}
-task_id: ${reviewResult.task_id ?? 'current'}
-required_changes:
-${changes}${reviewResult.rationale ? `\nrationale: ${reviewResult.rationale}` : ''}`;
+
+  const lines = [`decision: ${reviewResult.decision}`];
+  lines.push(`task_id: ${reviewResult.task_id ?? 'current'}`);
+
+  // Required changes — keep as compact list
+  if (Array.isArray(reviewResult.required_changes)) {
+    lines.push('required_changes:');
+    for (const c of reviewResult.required_changes) {
+      lines.push(`- ${compactFinding(c)}`);
+    }
+  } else if (reviewResult.required_changes && reviewResult.required_changes !== 'none') {
+    lines.push(`required_changes:\n- ${truncField(String(reviewResult.required_changes), FINDING_LIMIT)}`);
+  } else {
+    lines.push('required_changes: none');
+  }
+
+  // Findings — structured severity/file/issue if available
+  if (Array.isArray(reviewResult.findings) && reviewResult.findings.length > 0) {
+    lines.push('findings:');
+    for (const f of reviewResult.findings) {
+      lines.push(`- ${compactFinding(f)}`);
+    }
+  }
+
+  // Rationale — capped
+  const capped = cleanRationale(reviewResult.rationale);
+  if (capped) lines.push(`rationale: ${capped}`);
+
+  // Source and round — small, useful for debugging
+  if (reviewResult.source) lines.push(`source: ${reviewResult.source}`);
+  if (reviewResult.round !== undefined) lines.push(`round: ${reviewResult.round}`);
+
+  return lines.join('\n');
 }
+
+
+function renderRepositoryContext(ctx) {
+  const c = ctx ?? {};
+  return `repository_name: ${c.repository_name ?? 'unknown'}
+repository_url: ${c.repository_url ?? 'none'}
+branch: ${c.branch ?? 'unknown'}
+commit_sha: ${c.commit_sha ?? 'unknown'}`;
+}
+
 
 function renderCheckpoint(checkpoint) {
   if (!checkpoint || typeof checkpoint !== 'object') return '';
@@ -96,8 +227,64 @@ This Supervisor session was rotated for context efficiency. The orchestrator mai
 \n`;
 }
 
+
+// ── Prompt budget enforcement ───────────────────────────────────────
+
+/**
+ * If the prompt exceeds the hard limit, deterministically trim the history
+ * section first (oldest entries removed), then the goal section.  If still
+ * over, return { budgetExceeded: true }.
+ */
+export function enforcePromptBudget(prompt, limit = HARD_LIMIT) {
+  const len = typeof prompt === 'string' ? prompt.length : 0;
+  if (len <= limit) {
+    return { prompt, budgetExceeded: false, originalLength: len, limit };
+  }
+
+  // Hard truncate to limit chars (last resort)
+  const truncated = prompt.slice(0, limit);
+  const marker = `\n\n[SUPERVISOR_CONTEXT_BUDGET_EXCEEDED — prompt truncated from ${len} to ${limit} chars]`;
+  return {
+    prompt: truncated + marker,
+    budgetExceeded: true,
+    originalLength: len,
+    limit,
+  };
+}
+
+
+// ── Central prompt assembly + hard budget enforcement ───────────────
+//
+// The single enforcement point for the Supervisor 25k-char context hard
+// limit. EVERY Supervisor provider (agy, codex, claude) MUST build its
+// prompt through this function so the limit and its
+// SUPERVISOR_CONTEXT_BUDGET_EXCEEDED classification are identical on every
+// provider and an oversized prompt can never reach a physical model call.
+// Compaction still happens inside buildAgySupervisorPrompt; this is the
+// last-resort backstop after compaction.
+export function assembleSupervisorPrompt(context = {}) {
+  const rawPrompt = buildAgySupervisorPrompt(context);
+  const budget = enforcePromptBudget(rawPrompt);
+  if (budget.budgetExceeded) {
+    throw new AdapterError(
+      ADAPTER_ERROR_CODES.SUPERVISOR_CONTEXT_BUDGET_EXCEEDED,
+      `Supervisor prompt exceeded hard limit: ${budget.originalLength} chars > ${budget.limit} char budget. ` +
+      `Context must be compacted further before calling the model.`,
+      {
+        role: 'supervisor',
+        originalLength: budget.originalLength,
+        limit: budget.limit,
+      },
+    );
+  }
+  return { prompt: budget.prompt, originalLength: budget.originalLength, limit: budget.limit };
+}
+
+
+// ── Main prompt builder ─────────────────────────────────────────────
+
 export function buildAgySupervisorPrompt(context = {}) {
-  const { workflowGoal, repositoryContext, history, latestReviewResult, checkpoint } = context;
+  const { workflowGoal, repositoryContext, history, latestReviewResult, checkpoint, plannedTasks } = context;
   const reworkInProgress = latestReviewResult && latestReviewResult.decision && latestReviewResult.decision !== 'PASS';
 
   const shapeBlock = reworkInProgress
@@ -125,6 +312,11 @@ export function buildAgySupervisorPrompt(context = {}) {
   "question": "<the specific question for the human>"  // REQUIRED iff action == "HUMAN_REQUIRED"
 }`;
 
+  // ── Compact projections (deterministic, no model calls) ───────────
+  const compactGoal = buildCompactGoal(workflowGoal, GOAL_CHAR_LIMIT, plannedTasks);
+  const compactHistory = buildCompactHistory(history);
+  const compactReview = buildCompactReviewResult(latestReviewResult);
+
   return `You are the Supervisor in an automated development loop. Decide the single next step.
 
 Reply with ONLY one JSON object, no prose, no code fence. Shape:
@@ -142,16 +334,16 @@ Rules:
 - When every task in the plan has a PASS in the history, reply WORKFLOW_DONE.
 ${renderCheckpoint(checkpoint)}
 # Plan (authoritative)
-${isNonEmptyString(workflowGoal) ? workflowGoal : '(none provided)'}
+${compactGoal}
 
 # Repository context (copy into task_card.repository_context)
 ${renderRepositoryContext(repositoryContext)}
 
 # Task history (each entry: task_id, decision, attempts)
-${renderHistory(history)}
+${compactHistory}
 
 # Latest Review Result
-${renderReviewResult(latestReviewResult)}
+${compactReview}
 
 Reply with the JSON object now.`;
 }
@@ -216,11 +408,25 @@ ${tc.completion_signal}`;
 export function parseSupervisorJson(obj) {
   const action = obj.action;
   if (!ACTIONS.has(action)) {
-    throw invalid(`supervisor JSON "action" must be one of NEXT_TASK, CONTINUE_REWORK, WORKFLOW_DONE, HUMAN_REQUIRED — got: ${JSON.stringify(action)}`);
+    throw invalid(`supervisor JSON "action" must be one of NEXT_TASK, CONTINUE_REWORK, WORKFLOW_DONE, HUMAN_REQUIRED, OUT_OF_SCOPE — got: ${JSON.stringify(action)}`);
   }
 
   if (action === 'CONTINUE_REWORK') {
-    return { action };
+    const res = { action };
+    if (isNonEmptyString(obj.guidance)) res.guidance = obj.guidance.trim();
+    if (isNonEmptyString(obj.repair_guidance)) res.repair_guidance = obj.repair_guidance.trim();
+    if (isNonEmptyString(obj.strategy)) res.strategy = obj.strategy.trim();
+    if (isNonEmptyString(obj.executor_model)) res.executor_model = obj.executor_model.trim();
+    if (isNonEmptyString(obj.model)) res.model = obj.model.trim();
+    if (isNonEmptyString(obj.provider)) res.provider = obj.provider.trim();
+    return res;
+  }
+
+  if (action === 'OUT_OF_SCOPE') {
+    return {
+      action: 'OUT_OF_SCOPE',
+      reason: isNonEmptyString(obj.reason) ? obj.reason.trim() : 'Supervisor judged finding as OUT_OF_SCOPE',
+    };
   }
   if (action === 'WORKFLOW_DONE') {
     if (!isNonEmptyString(obj.summary)) throw invalid('WORKFLOW_DONE decision must include a non-empty "summary"');
@@ -242,6 +448,7 @@ export function parseSupervisorJson(obj) {
   }
   return { action, task_card: taskCard };
 }
+
 
 function mapAgyError(err, model) {
   const isTimeout = err instanceof AgyTimeoutError;
@@ -285,7 +492,7 @@ export function createAgySupervisorProvider({
     // (newly created on the first call, echoed back on every resume) — so
     // the caller can capture it once and reuse it thereafter.
     async decide(context = {}, { conversationId, effort } = {}) {
-      const prompt = buildAgySupervisorPrompt(context);
+      const { prompt } = assembleSupervisorPrompt(context);
 
       let result;
       try {
@@ -303,8 +510,23 @@ export function createAgySupervisorProvider({
         throw err;
       }
       const callId = `call-agy-sup-${randomUUID()}`;
+      // The provider DID respond (result.usage is known at this point) even
+      // when its content fails the decision-shape validator below — a
+      // reliably-known-usage business/protocol failure, not an unknown-spend
+      // one (see modelSpendReservation.js §6). Attach usage to any
+      // SUPERVISOR_INVALID_OUTPUT thrown here so the reservation settles
+      // SETTLED_KNOWN instead of UNRESOLVED.
+      let parsedDecision;
+      try {
+        parsedDecision = parseSupervisorJson(obj);
+      } catch (err) {
+        if (err instanceof AdapterError && !err.details?.usage) {
+          err.details = { ...(err.details ?? {}), usage: result.usage ? { ...result.usage, callId } : { callId } };
+        }
+        throw err;
+      }
       const decision = {
-        ...parseSupervisorJson(obj),
+        ...parsedDecision,
         conversationId: result.conversationId ?? null,
       };
       const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };

@@ -20,6 +20,16 @@ import { randomUUID } from 'node:crypto';
 import { createFailoverSupervisorSession } from './supervisorFailover.js';
 import { createProductionRoleRuntime } from './productionRoleRuntime.js';
 import { PRODUCTION_ROLE_CAPABILITIES } from './roleRouting.js';
+import { ModelSpendAuthority } from './modelSpendAuthority.js';
+import { ReservationLedger, ReservationStore } from './modelSpendReservation.js';
+import { NewInformationLedger, InformationStore } from './newInformation.js';
+import { createExecutorBudgetPolicy } from './executorBudgetPolicy.js';
+import {
+  resolveWorkflowCostCeilingUsd,
+  resolveWorkflowUsageVolumeCeiling,
+  resolveTaskExecutorUsageVolumeCeiling,
+  resolveExecutorPhysicalCallCeiling,
+} from './workflowCostGuard.js';
 import { createClaudeSessionManager } from './adapters/claudeSessionManager.js';
 import { createAgyReviewerProvider } from './adapters/agyReviewerProvider.js';
 import {
@@ -90,6 +100,10 @@ export function selectProviders({
   providerHealth,
   onEvent,
   signal,
+  // Optional: forwarded onto the ModelSpendAuthority's ReservationLedger so
+  // an UNRESOLVED reservation's BLOCKING safety event reaches the workflow's
+  // user-visible terminal result (workflowState.js#recordSafetyEvent).
+  recordSafetyEvent,
 } = {}) {
   // One shared persistent-conversation store for this workflow: the
   // Supervisor session and every per-task Reviewer session created below
@@ -119,7 +133,27 @@ export function selectProviders({
     }
     return resolved;
   };
-  const resolveAndCapture = async (resolve, call) => capturePlannerResolution(await resolve(call));
+  // `resolve` decides internally whether the real transport (`call`) is
+  // actually invoked — the documented "Planner happy path is zero-token"
+  // contract (a deterministic/local resolution, e.g. an already-complete
+  // plan) never calls it at all. That is the one case Token Safety's own
+  // rule already carves out (see modelSpendAuthority.js's
+  // extractSettlementUsage doc): usage is mechanically, provably zero only
+  // when the call type cannot have billed anything — never estimated, never
+  // assumed from a bare successful return. Tracking whether `call` was
+  // physically invoked lets this attach that mechanical zero rather than
+  // leaving a genuinely zero-spend local resolution UNRESOLVED and blocking
+  // the workflow. Any resolution that DID reach the transport is untouched:
+  // its own usage (or lack of it) stands, subject to the general rule.
+  const resolveAndCapture = async (resolve, call) => {
+    let transportInvoked = false;
+    const trackedCall = async (...args) => { transportInvoked = true; return call(...args); };
+    const resolved = await resolve(trackedCall);
+    if (!transportInvoked && resolved && typeof resolved === 'object' && resolved.usage == null) {
+      resolved.usage = { input_tokens: 0, output_tokens: 0 };
+    }
+    return capturePlannerResolution(resolved);
+  };
 
   const getSupervisor = (family) => {
     if (!sessions.has(family)) {
@@ -139,8 +173,59 @@ export function selectProviders({
     }
     return sessions.get(family);
   };
+  // Re-checked fresh at EVERY physical dispatch attempt (ModelSpendAuthority
+  // .authorize() runs once per physical attempt, including a future
+  // re-enabled failover's 2nd/3rd candidate inside one invoke()) — reuses
+  // the same env-resolved ceilings and the same usageTracker as the
+  // pre-invoke() checks in automatedLoop.js / supergpt.js, so it agrees with
+  // them in the common single-attempt case and only ever adds a stop that
+  // those pre-checks could not see (a second physical attempt after the
+  // first one's usage was recorded).
+  const executorBudgetPolicy = createExecutorBudgetPolicy({
+    usageTracker,
+    workflowCostCeilingUsd: resolveWorkflowCostCeilingUsd(env),
+    workflowUsageVolumeCeiling: resolveWorkflowUsageVolumeCeiling(env),
+    taskExecutorUsageVolumeCeiling: resolveTaskExecutorUsageVolumeCeiling(env),
+    executorPhysicalCallCeiling: resolveExecutorPhysicalCallCeiling(env),
+  });
+  // Persistent Model Spend Reservation: reuses the SAME workflow-scoped
+  // persistence as every other durable orchestrator state (persistence.js /
+  // workflow.json), so a reservation survives the identical restart/resume
+  // path as the rest of the workflow. Without a `persistence` instance (rare
+  // — some tests construct the runtime directly), the ledger stays
+  // in-memory-only for the process lifetime.
+  const reservationLedger = new ReservationLedger({
+    store: persistence ? new ReservationStore(persistence) : null,
+    onEvent,
+    recordSafetyEvent,
+  });
+  // § Global New Information Policy / Wiring Card 3 — ONE shared durable
+  // ledger, backed by the SAME workflow-scoped persistence as the
+  // ReservationLedger above, wired onto the ONE production ModelSpendAuthority
+  // every role (Planner, Supervisor, Executor, Reviewer, PR-closeout repair)
+  // shares. Enforcement in ModelSpendAuthority.authorize() is gated
+  // per-CallIntent on whether the caller explicitly supplied `evidenceIds`
+  // (see modelSpendAuthority.js's detailed comment at that check) — as of
+  // Wiring Card 3, EVERY production internal physical model call site
+  // supplies it: Full Path Planner (supergpt.js), Fast Path + Full Path first
+  // Executor and Executor rework (automatedLoop.js / this file's
+  // createExecutorSessionManager().execute()), Executor Reviewer rework and
+  // ordinary Reviewer calls (createReviewerSession().review() below),
+  // Supervisor escalation (supervisorSession.decide() below), and the
+  // PR-closeout repair Executor (supergpt.js's runRepairTask). Production
+  // construction of ModelSpendAuthority is therefore never "optional" about
+  // the information ledger in practice — only low-level unit tests that
+  // construct their own Authority directly (never through this factory) may
+  // omit one. Without a `persistence` instance the ledger stays in-memory
+  // only for the process lifetime, exactly like ReservationLedger above.
+  const informationLedger = new NewInformationLedger({
+    store: persistence ? new InformationStore(persistence) : null,
+  });
+  const spendAuthority = new ModelSpendAuthority({
+    policy: executorBudgetPolicy, onEvent, reservationLedger, recordSafetyEvent, informationLedger,
+  });
   const runtime = createProductionRoleRuntime({
-    router, rolePolicy, quotaRegistry, providerHealth, onEvent, signal,
+    router, rolePolicy, quotaRegistry, providerHealth, onEvent, signal, spendAuthority,
     resolveFamily: (family) => ({
       requestedFamily: family,
       resolvedModel: family === 'codex:default' ? codexModel : family === 'agy:gpt-oss' ? gptOssModel : family === 'agy:gemini' ? geminiModel : family.split(':')[1],
@@ -224,12 +309,27 @@ export function selectProviders({
         return local.decision;
       }
       onEvent?.({ type: 'SUPERVISOR_ESCALATED', workflowId, reason: local.reason });
-      return (await runtime.invoke('supervisor', context, { signals: context?.signals, operationId: workflowId })).value;
+      // `evidenceIds` (§ Global New Information Policy / Wiring Card 3) is
+      // OPTIONAL and forwarded verbatim into the CallIntent exactly like the
+      // Reviewer's own `opts.evidenceIds` above — see
+      // productionRoleRuntime.invoke()'s doc. automatedLoop.js registers the
+      // deterministic escalation evidence (Gate fingerprint / review findings
+      // / task card) BEFORE calling decide() and supplies it as
+      // `context.evidenceIds`; any other caller/test that predates this
+      // feature omits it and is completely unaffected.
+      return (await runtime.invoke('supervisor', context, { signals: context?.signals, operationId: workflowId, workflowId, evidenceIds: context?.evidenceIds })).value;
     },
   };
   const createReviewerSession = () => ({
     create: async () => ({}), close: async () => {},
-    review: async (taskId, taskCard, executionReport, evidence, opts = {}) => (await runtime.invoke('reviewer', { taskId, taskCard, executionReport, evidence, opts }, { signals: { reworkCycles: Math.max(0, (opts.attempt ?? 1) - 1) }, operationId: `${workflowId}:${taskId}` })).value,
+    // `evidenceIds` (§ Global New Information Policy / Wiring Card 2) is
+    // OPTIONAL and forwarded verbatim into the CallIntent exactly like the
+    // Executor's own `evidenceIds` option above — see
+    // productionRoleRuntime.invoke()'s doc. automatedLoop.js's
+    // runReviewStep() supplies the CHANGED_TASK_DIFF evidence for every
+    // Reviewer call; any other caller/test that predates this feature omits
+    // `opts.evidenceIds` and is completely unaffected.
+    review: async (taskId, taskCard, executionReport, evidence, opts = {}) => (await runtime.invoke('reviewer', { taskId, taskCard, executionReport, evidence, opts }, { signals: { reworkCycles: Math.max(0, (opts.attempt ?? 1) - 1) }, operationId: `${workflowId}:${taskId}`, workflowId, evidenceIds: opts.evidenceIds })).value,
   });
 
   return {
@@ -241,10 +341,25 @@ export function selectProviders({
     windowSession: nullWindowSession,
     sessionStore,
     runtime,
+    // § Global New Information Policy / Wiring Card 2 — exposed so the two
+    // migrated call sites (supergpt.js's Planner invocation and Fast Path
+    // task-card registration) can register evidence against the SAME ledger
+    // instance `spendAuthority` actually enforces against. Never used to
+    // bypass anything: registering evidence here still requires
+    // ModelSpendAuthority.authorize() to find it eligible/unconsumed before
+    // any permit is minted.
+    informationLedger,
     createExecutorSessionManager: ({ taskId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited }) => ({
-      async execute(taskCard, { signal: executionSignal } = {}) {
+      // `evidenceIds` (§ Global New Information Policy / Wiring Card 2) is
+      // OPTIONAL and forwarded verbatim into the CallIntent exactly like
+      // productionRoleRuntime.invoke()'s own `evidenceIds` option. Only the
+      // Fast Path first Executor call site (automatedLoop.js) ever supplies
+      // it; every other Executor call (Full Path, rework, escalation, resume
+      // rework) omits it and is completely unaffected — see
+      // modelSpendAuthority.js's evidence-aware gating.
+      async execute(taskCard, { signal: executionSignal, evidenceIds } = {}) {
         if (executionSignal?.aborted) throw new Error('executor cancelled');
-        const result = await runtime.invoke('executor', { taskId, workflowId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited, taskCard }, { signals: { reasoningFailures: 0 }, operationId: `${workflowId}:${taskId}` });
+        const result = await runtime.invoke('executor', { taskId, workflowId, persistence, cwd, onRoutingDecision, onProcessStarted, onProcessExited, taskCard }, { signals: { reasoningFailures: 0 }, operationId: `${workflowId}:${taskId}`, workflowId, evidenceIds });
         if (executionSignal?.aborted) throw new Error('executor cancelled');
         return result.value;
       },

@@ -36,8 +36,13 @@ import {
 import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../../agy/agyJson.js';
 import { AGY_REVIEWER_DEFAULT_MODEL } from '../../agy/agyConfig.js';
 import { AdapterError, ADAPTER_ERROR_CODES } from '../errors.js';
+import {
+  compactEvidence,
+  enforcePromptBudget,
+  REVIEWER_PROMPT_HARD_LIMIT,
+} from './reviewerEvidence.js';
 
-const DECISIONS = new Set(['PASS', 'REWORK', 'HUMAN_REQUIRED']);
+const DECISIONS = new Set(['PASS', 'REWORK', 'HUMAN_REQUIRED', 'OUT_OF_SCOPE']);
 
 // This production provider must not import the legacy browser adapter just
 // to render review input. Keep the rendering local and dependency-free so a
@@ -47,7 +52,7 @@ function renderContext(ctx = {}) {
   return `repository_name: ${ctx.repository_name}\nrepository_url: ${ctx.repository_url ?? 'none'}\nbranch: ${ctx.branch}\ncommit_sha: ${ctx.commit_sha}`;
 }
 function renderTaskCard(card) {
-  return `## task_id\n${card.task_id}\n\n## repository_context\n${renderContext(card.repository_context)}\n\n## goal\n${card.goal}\n\n## context\n${card.context}\n\n## scope\n${card.scope}\n\n## allowed_files\n${renderList(card.allowed_files)}\n\n## forbidden_files\n${renderList(card.forbidden_files)}\n\n## acceptance_criteria\n${renderList(card.acceptance_criteria)}\n\n## verification_commands\n${renderList((card.verification_commands ?? []).map((command) => `\`${command}\``))}\n\n## completion_signal\n${card.completion_signal}`;
+  return `## task_id\n${card.task_id}\n\n## repository_context\n${renderContext(card.repository_context)}\n\n## goal\n${card.goal}\n\n## context\n${card.context}\n\n## scope\n${card.scope}\n\n## allowed_files\n${renderList(card.allowed_files)}\n\n## forbidden_files\n${renderList(card.forbidden_files)}\n\n## acceptance_criteria\n${renderList(card.acceptance_criteria)}\n\n## acceptance_version\n${card.acceptance_version ?? 1}\n\n## verification_commands\n${renderList((card.verification_commands ?? []).map((command) => `\`${command}\``))}\n\n## completion_signal\n${card.completion_signal}`;
 }
 function renderExecutionReport(report) {
   const issues = Array.isArray(report.issues) ? renderList(report.issues) : report.issues ?? 'none';
@@ -72,6 +77,33 @@ function invalid(message) {
   return new AdapterError(ADAPTER_ERROR_CODES.REVIEWER_INVALID_OUTPUT, message);
 }
 
+// ── Central prompt assembly + hard budget enforcement ───────────────
+//
+// The single enforcement point for the Reviewer 40k-char context hard
+// limit. EVERY Reviewer provider (agy, codex, claude) MUST build its
+// prompt through this function so compaction, the limit, and its
+// REVIEWER_CONTEXT_BUDGET_EXCEEDED classification are identical on every
+// provider and an oversized prompt can never reach a physical model call.
+export function assembleReviewerPrompt(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
+  const {
+    evidence: compactEv,
+    fullEvidenceRef,
+    truncated: evidenceTruncated,
+  } = compactEvidence(evidence, taskCard, executionReport);
+
+  const rawPrompt = buildAgyReviewPrompt(taskCard, executionReport, compactEv, { attempt, checkpoint });
+
+  const { prompt, budgetExceeded, originalLength } = enforcePromptBudget(rawPrompt);
+  if (budgetExceeded) {
+    throw new AdapterError(
+      ADAPTER_ERROR_CODES.REVIEWER_CONTEXT_BUDGET_EXCEEDED,
+      `Reviewer prompt exceeds hard limit: ${originalLength} chars > ${REVIEWER_PROMPT_HARD_LIMIT} char budget (after compact projection)`,
+      { role: 'reviewer', originalLength, limit: REVIEWER_PROMPT_HARD_LIMIT, fullEvidenceRef },
+    );
+  }
+  return { prompt, fullEvidenceRef, evidenceTruncated };
+}
+
 export function buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint } = {}) {
   const checkpointBlock = checkpoint && Array.isArray(checkpoint.prior_required_changes)
     ? `\n## Structured Prior Finding (continuity only)
@@ -86,13 +118,14 @@ ${checkpointBlock}
 Reply with ONLY one JSON object, no prose, no code fence. Shape:
 
 {
-  "decision": "PASS" | "REWORK" | "HUMAN_REQUIRED",
+  "decision": "PASS" | "REWORK" | "HUMAN_REQUIRED" | "OUT_OF_SCOPE",
   "findings": ["<specific observation tied to a file/criterion/behavior>", "..."],
-  "required_changes": ["<specific actionable change>", "..."],   // MUST be non-empty when decision == "REWORK"; use [] for PASS
+  "required_changes": ["<specific actionable change>", "..."],   // MUST be non-empty when decision == "REWORK" or "OUT_OF_SCOPE"; use [] for PASS
   "rationale": "<why this decision, tied to acceptance_criteria>"
 }
 
 Use HUMAN_REQUIRED only for a genuine ambiguity a human must resolve, not for a fixable defect (that is REWORK).
+Use OUT_OF_SCOPE only when the change the acceptance_criteria would require lies outside this Task Card's declared scope or allowed_files — list those out-of-scope changes in required_changes. Do NOT use OUT_OF_SCOPE to wave through an in-scope defect.
 
 ${renderReviewInputs(taskCard, executionReport, evidence)}
 
@@ -102,7 +135,7 @@ Reply with the JSON object now.`;
 export function parseReviewJson(taskId, obj, repositoryContext) {
   const decision = obj.decision;
   if (!DECISIONS.has(decision)) {
-    throw invalid(`reviewer JSON "decision" must be one of PASS, REWORK, HUMAN_REQUIRED — got: ${JSON.stringify(decision)}`);
+    throw invalid(`reviewer JSON "decision" must be one of PASS, REWORK, HUMAN_REQUIRED, OUT_OF_SCOPE — got: ${JSON.stringify(decision)}`);
   }
 
   const findings = Array.isArray(obj.findings) ? obj.findings.map(String) : [];
@@ -110,6 +143,9 @@ export function parseReviewJson(taskId, obj, repositoryContext) {
 
   if (decision === 'REWORK' && rawChanges.length === 0) {
     throw invalid('reviewer REWORK decision must include a non-empty "required_changes" array');
+  }
+  if (decision === 'OUT_OF_SCOPE' && rawChanges.length === 0) {
+    throw invalid('reviewer OUT_OF_SCOPE decision must list the out-of-scope changes in a non-empty "required_changes" array');
   }
   if (!isNonEmptyString(obj.rationale)) {
     throw invalid('reviewer JSON must include a non-empty "rationale"');
@@ -181,7 +217,11 @@ export function createAgyReviewerProvider({
     // id agy actually used — so the caller can capture it on the first
     // review() and reuse it for every rework of the same task.
     async review(taskCard, executionReport, evidence, { attempt, conversationId, checkpoint } = {}) {
-      const prompt = buildAgyReviewPrompt(taskCard, executionReport, evidence, { attempt, checkpoint });
+      // ── Compact projection + hard budget guard (deterministic, zero
+      //    model calls) — shared by every Reviewer provider ──────────────
+      const { prompt, fullEvidenceRef, evidenceTruncated } = assembleReviewerPrompt(
+        taskCard, executionReport, evidence, { attempt, checkpoint },
+      );
 
       let result;
       try {
@@ -199,16 +239,29 @@ export function createAgyReviewerProvider({
         throw err;
       }
       const callId = `call-agy-rev-${randomUUID()}`;
+      const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };
+      // The provider DID respond (usage known) even when its content fails
+      // the review-shape validator — attach usage to REVIEWER_INVALID_OUTPUT
+      // so the reservation settles SETTLED_KNOWN, not UNRESOLVED (see
+      // modelSpendReservation.js §6).
+      let parsedReview;
+      try {
+        parsedReview = parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null);
+      } catch (err) {
+        if (err instanceof AdapterError && !err.details?.usage) err.details = { ...(err.details ?? {}), usage: usageWithCallId };
+        throw err;
+      }
       const reviewResult = {
-        ...parseReviewJson(taskCard.task_id, obj, taskCard.repository_context ?? null),
+        ...parsedReview,
         conversationId: result.conversationId ?? null,
       };
-      const usageWithCallId = result.usage ? { ...result.usage, callId } : { callId };
       try {
         Object.defineProperties(reviewResult, {
           callId: { value: callId, writable: true, configurable: true, enumerable: false },
           usage: { value: usageWithCallId, writable: true, configurable: true, enumerable: false },
           durationMs: { value: result.durationMs ?? null, writable: true, configurable: true, enumerable: false },
+          fullEvidenceRef: { value: fullEvidenceRef, writable: true, configurable: true, enumerable: false },
+          evidenceTruncated: { value: evidenceTruncated, writable: true, configurable: true, enumerable: false },
         });
       } catch {
         /* best effort */

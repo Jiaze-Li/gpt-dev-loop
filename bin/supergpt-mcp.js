@@ -6,9 +6,17 @@ import {
   createSuperGptMcpServer,
   startSuperGptMcpServer,
   readWorkflowStatus,
+  checkPollingRegression,
+  FRONT_AGENT_CONTRACT_VERSION,
 } from '../src/mcp/supergptMcpServer.js';
 
-export { createSuperGptMcpServer, startSuperGptMcpServer, readWorkflowStatus };
+export {
+  createSuperGptMcpServer,
+  startSuperGptMcpServer,
+  readWorkflowStatus,
+  checkPollingRegression,
+  FRONT_AGENT_CONTRACT_VERSION,
+};
 
 const invokedDirectly =
   process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);

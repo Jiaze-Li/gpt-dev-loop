@@ -41,9 +41,15 @@
 // then clean up.
 
 import { spawn as nodeSpawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import nodeFs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+import {
+  CONTROLLED_ACCEPTANCE_INVALID_REASONS,
+  validateControlledHostAcceptance,
+} from './hostVerification.js';
 
 export class ResultDeliveryError extends Error {
   constructor(code, message, details) {
@@ -434,11 +440,121 @@ export function createResultDelivery({
   };
 }
 
+export const DELIVERY_BLOCK_REASONS = Object.freeze({
+  ACCEPTANCE_EVIDENCE_MISSING: CONTROLLED_ACCEPTANCE_INVALID_REASONS.MISSING,
+  ...CONTROLLED_ACCEPTANCE_INVALID_REASONS,
+});
+
+/**
+ * Deterministic identity of one delivery attempt. Two attempts that carry the
+ * same workflow, the same controlled acceptance evidence and the same baseline
+ * are the SAME delivery — a resume must recognise it and never re-apply.
+ */
+export function computeDeliveryId({ workflowId, acceptanceHash = null, baselineHead = null } = {}) {
+  const payload = JSON.stringify({
+    workflowId: workflowId ?? null,
+    acceptanceHash: acceptanceHash ?? null,
+    baselineHead: baselineHead ?? null,
+  });
+  return `dlv-${crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16)}`;
+}
+
+/**
+ * Fail-closed delivery admission check.
+ *
+ * `controlledAcceptance` is the persisted evidence bundle; `expected` is the
+ * live context (workflow id, worktree HEAD/fingerprint, active acceptance
+ * version, closeout verification commands) observed at delivery time. Delivery
+ * is admitted only when the bundle re-validates against that live context —
+ * so any drift, tampering, non-PASS Gate/Reviewer, or a missing bundle blocks.
+ */
+export function evaluateDeliveryReadiness({
+  controlledAcceptance = null,
+  expected = {},
+  requireControlledAcceptance = true,
+} = {}) {
+  if (!requireControlledAcceptance) {
+    return { deliverable: true, reason: null, acceptance: null };
+  }
+  if (!controlledAcceptance) {
+    return {
+      deliverable: false,
+      reason: DELIVERY_BLOCK_REASONS.ACCEPTANCE_EVIDENCE_MISSING,
+      acceptance: null,
+    };
+  }
+  const validation = validateControlledHostAcceptance({
+    bundle: controlledAcceptance,
+    workflowId: expected.workflowId ?? null,
+    ...(Object.hasOwn(expected, 'head') ? { head: expected.head } : {}),
+    worktreeFingerprint: expected.worktreeFingerprint ?? null,
+    acceptanceVersion: expected.acceptanceVersion ?? null,
+    verificationCommands: Array.isArray(expected.verificationCommands) ? expected.verificationCommands : null,
+  });
+  return {
+    deliverable: validation.valid,
+    reason: validation.valid ? null : validation.reason,
+    acceptance: validation.valid ? controlledAcceptance : null,
+  };
+}
+
 // End-to-end fail-closed policy for a WORKFLOW_DONE result. Returns a plain
 // report object; never throws for a conflict (that is a normal outcome).
 // A thrown ResultDeliveryError from git/fs propagates to the caller, which
 // treats it the same as a conflict — HUMAN_REQUIRED, worktree preserved.
-export async function deliverWorkflowResult({ worktree, delivery = createResultDelivery(), onDelivered = null } = {}) {
+//
+// When `requireControlledAcceptance` is set, the controlled Host Acceptance
+// bundle is re-validated against the live context BEFORE the source workspace
+// is touched; invalid or drifted evidence blocks delivery with HUMAN_REQUIRED
+// and preserves the worktree. `priorDelivery` makes the operation idempotent:
+// a delivery record whose delivery_id matches this attempt is reported as
+// already delivered instead of being applied a second time.
+export async function deliverWorkflowResult({
+  worktree,
+  delivery = createResultDelivery(),
+  onDelivered = null,
+  controlledAcceptance = null,
+  expectedAcceptanceContext = null,
+  requireControlledAcceptance = false,
+  priorDelivery = null,
+} = {}) {
+  const expected = expectedAcceptanceContext ?? {};
+  const readiness = evaluateDeliveryReadiness({
+    controlledAcceptance,
+    expected,
+    requireControlledAcceptance,
+  });
+  const deliveryId = computeDeliveryId({
+    workflowId: expected.workflowId ?? controlledAcceptance?.workflowId ?? worktree?.workflow_id ?? null,
+    acceptanceHash: controlledAcceptance?.hash ?? null,
+    baselineHead: worktree?.baseline_head ?? null,
+  });
+
+  // Idempotency first: an already-applied delivery must never be re-applied,
+  // not even to re-check evidence — the approved bytes are already in the
+  // invocation workspace.
+  if (priorDelivery && priorDelivery.delivery_id && priorDelivery.delivery_id === deliveryId) {
+    return {
+      status: 'ALREADY_DELIVERED',
+      delivery_id: deliveryId,
+      changed_files: priorDelivery.changed_files ?? [],
+      worktree_preserved: priorDelivery.cleanup?.status !== 'OK',
+      idempotent: true,
+    };
+  }
+
+  if (!readiness.deliverable) {
+    return {
+      status: 'HUMAN_REQUIRED',
+      delivery_id: deliveryId,
+      blocked_reason: readiness.reason,
+      acceptance_status: controlledAcceptance?.status ?? null,
+      conflicts: [],
+      changed_files: [],
+      worktree_preserved: true,
+    };
+  }
+
   const delta = await delivery.calculateApprovedDelta({
     worktreePath: worktree.worktree_path,
     baselineHead: worktree.baseline_head,
@@ -449,6 +565,7 @@ export async function deliverWorkflowResult({ worktree, delivery = createResultD
   if (!conflictReport.safe) {
     return {
       status: 'HUMAN_REQUIRED',
+      delivery_id: deliveryId,
       conflicts: conflictReport.conflicts,
       changed_files: delta.changedPaths,
       worktree_preserved: true,
@@ -467,7 +584,7 @@ export async function deliverWorkflowResult({ worktree, delivery = createResultD
     // proceed to resource cleanup. The applied bytes are already in the source
     // workspace; tearing down the worktree now would leave a resume unable to
     // tell an applied delivery from a conflicting one, risking redelivery.
-    await onDelivered({ changed_files: delta.changedPaths });
+    await onDelivered({ changed_files: delta.changedPaths, delivery_id: deliveryId });
   }
 
   // Phase 3 — RESOURCE CLEANUP: a distinct, retryable phase. Its failure is a
@@ -487,6 +604,7 @@ export async function deliverWorkflowResult({ worktree, delivery = createResultD
 
   return {
     status: 'DELIVERED',
+    delivery_id: deliveryId,
     changed_files: delta.changedPaths,
     worktree_preserved: cleanupStatus !== 'OK',
     cleanup_status: cleanupStatus,

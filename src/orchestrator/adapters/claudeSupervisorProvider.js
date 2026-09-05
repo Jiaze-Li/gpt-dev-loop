@@ -8,7 +8,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawn as nodeSpawn } from "node:child_process";
-import { buildAgySupervisorPrompt, parseSupervisorJson } from "./agySupervisorProvider.js";
+import { assembleSupervisorPrompt, parseSupervisorJson } from "./agySupervisorProvider.js";
 import { AdapterError, ADAPTER_ERROR_CODES, ProviderCancelledError } from "../errors.js";
 import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from "../processTree.js";
 
@@ -165,8 +165,14 @@ export function createClaudeSupervisorProvider({ call = callClaude, model = "opu
     provider: "claude",
     model,
     async decide(context = {}, { effort } = {}) {
-      const result = await call({ prompt: buildAgySupervisorPrompt(context), model, timeoutMs, executable, spawn, effort, signal });
+      const { prompt } = assembleSupervisorPrompt(context);
+      const result = await call({ prompt, model, timeoutMs, executable, spawn, effort, signal });
+      const callId = `call-claude-sup-${randomUUID()}`;
+      const usage = result.usage ? { ...result.usage, callId } : { callId };
       let raw;
+      // The provider DID respond (usage known) even when its reply fails
+      // decoding/shape validation — attach usage so the reservation settles
+      // SETTLED_KNOWN, not UNRESOLVED (see modelSpendReservation.js §6).
       try {
         const trimmed = result.text.trim().replace(/^\`\`\`(?:json)?\s*/i, "").replace(/\s*\`\`\`$/, "");
         raw = JSON.parse(trimmed);
@@ -174,11 +180,17 @@ export function createClaudeSupervisorProvider({ call = callClaude, model = "opu
         throw new AdapterError(ADAPTER_ERROR_CODES.SUPERVISOR_INVALID_OUTPUT, "Claude Supervisor did not return a JSON decision", {
           providerFailure: "PROVIDER_PROTOCOL_ERROR",
           model,
+          usage,
         });
       }
-      const callId = `call-claude-sup-${randomUUID()}`;
-      const decision = { ...parseSupervisorJson(raw), conversationId: null };
-      const usage = result.usage ? { ...result.usage, callId } : { callId };
+      let parsedDecision;
+      try {
+        parsedDecision = parseSupervisorJson(raw);
+      } catch (err) {
+        if (err instanceof AdapterError && !err.details?.usage) err.details = { ...(err.details ?? {}), usage };
+        throw err;
+      }
+      const decision = { ...parsedDecision, conversationId: null };
       Object.defineProperties(decision, {
         callId: { value: callId, enumerable: false },
         usage: { value: usage, enumerable: false },

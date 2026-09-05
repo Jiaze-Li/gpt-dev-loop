@@ -2,6 +2,13 @@
 
 export { SuperGptControlService, defaultControlService } from './controlService.js';
 export {
+  supergptRoute,
+  decideAutoRoute,
+  ROUTE_DECISION,
+  ROUTE_RULE,
+  AUTO_ROUTE,
+} from './autoRoutePolicy.js';
+export {
   renderGenericProgress,
   renderGenericCompletion,
   renderGenericPlan,

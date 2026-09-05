@@ -7,7 +7,7 @@ import os from "node:os";
 import { runAutomatedWorkflow } from "../src/orchestrator/automatedLoop.js";
 import { supergptWatch } from "../src/orchestrator/supergpt.js";
 import { FAILURE_CATEGORIES } from "../src/orchestrator/preflight.js";
-import { WorkflowStateManager, WORKFLOW_STATUSES, WORKFLOW_STAGES } from "../src/orchestrator/workflowState.js";
+import { WorkflowStateManager, WORKFLOW_STATUSES, WORKFLOW_STAGES, WORKFLOW_KINDS } from "../src/orchestrator/workflowState.js";
 
 function makeFakeWindowSession() {
   let windowCount = 0;
@@ -30,7 +30,7 @@ function makeFakeWindowSession() {
 
 test("Gate verification ownership: Gate executes verification in isolated worktree even without Claude bash permission", async () => {
   const windowSession = makeFakeWindowSession();
-  const stateManager = new WorkflowStateManager({ workflowId: "wf-gate-test" });
+  const stateManager = new WorkflowStateManager({ workflowId: "wf-test-gate-test", kind: WORKFLOW_KINDS.INTERNAL_TEST });
 
   let gateExecuted = false;
   let executorExecuted = false;
@@ -115,7 +115,7 @@ test("Gate verification ownership: Gate executes verification in isolated worktr
 
 test("Preflight environment blocker halts immediately to HUMAN_REQUIRED without burning rework attempts", async () => {
   const windowSession = makeFakeWindowSession();
-  const stateManager = new WorkflowStateManager({ workflowId: "wf-blocker-dedup" });
+  const stateManager = new WorkflowStateManager({ workflowId: "wf-test-blocker-dedup", kind: WORKFLOW_KINDS.INTERNAL_TEST });
 
   let executorAttemptCalls = 0;
   let reviewerCalls = 0;
@@ -158,7 +158,7 @@ test("Preflight environment blocker halts immediately to HUMAN_REQUIRED without 
   };
 
   const result = await runAutomatedWorkflow({
-    workflowId: "wf-blocker-dedup",
+    workflowId: "wf-test-blocker-dedup",
     supervisorSession: fakeSupervisorSession,
     createReviewerSession: () => fakeReviewerSession,
     createClaudeSessionManager: () => fakeClaudeManager,
@@ -196,7 +196,7 @@ test("Preflight environment blocker halts immediately to HUMAN_REQUIRED without 
 
 test("Gate environment failure classifies as ENVIRONMENT and enters HUMAN_REQUIRED with evidence", async () => {
   const windowSession = makeFakeWindowSession();
-  const stateManager = new WorkflowStateManager({ workflowId: "wf-gate-env" });
+  const stateManager = new WorkflowStateManager({ workflowId: "wf-test-gate-env", kind: WORKFLOW_KINDS.INTERNAL_TEST });
 
   let reviewerCalls = 0;
 
@@ -265,7 +265,7 @@ test("Gate environment failure classifies as ENVIRONMENT and enters HUMAN_REQUIR
   assert.equal(result.evidence.exitCode, 127);
 });
 
-test("supergptWatch default timeout is Infinity and delivers terminal evidence", async () => {
+test("supergptWatch delivers terminal evidence within default timeout", async () => {
   const notifications = [];
   let pollCount = 0;
 
@@ -281,7 +281,7 @@ test("supergptWatch default timeout is Infinity and delivers terminal evidence",
   const result = await supergptWatch({
     workflowId: "wf-watch-test",
     intervalMs: 1,
-    // timeoutMs is omitted (defaults to Infinity)
+    // timeoutMs is omitted (defaults to SUPERGPT_WATCH_TIMEOUT_MS)
     onProgress: (p) => notifications.push(p),
     _sleep: async () => {},
     _now: () => Date.now(),

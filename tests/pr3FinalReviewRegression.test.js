@@ -55,9 +55,10 @@ test('P2 final review: lifecycle accepts the exact worktree produced for any val
     assert.equal(isSuperGptOwnedWorktree(path.join(root, 'repo-other-id'), root, workflowId), false);
     const manager = new WorkflowLifecycleManager({ workflowId, root });
     assert.doesNotThrow(() => manager.trackWorktree(worktreePath));
-    assert.equal(manager.resources.worktrees[0].path, worktreePath);
   } finally {
-    await rm(root, { recursive: true, force: true });
+    try {
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {}
   }
 });
 

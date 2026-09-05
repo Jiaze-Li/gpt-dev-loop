@@ -29,7 +29,7 @@ export class GateCancelledError extends Error {
   }
 }
 
-function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 }) {
+function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000, timeoutMs = Number(process.env.SUPERGPT_COMMAND_TIMEOUT_MS) || 120000 }) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new GateCancelledError());
@@ -52,6 +52,7 @@ function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 
     const stdoutChunks = [];
     const stderrChunks = [];
     let settled = false;
+    let timedOut = false;
     let treeTermination = null;
     let onAbort = null;
 
@@ -62,7 +63,16 @@ function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 
       return treeTermination;
     };
 
+    let timer = null;
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        try { tearDownTree(); } catch {}
+      }, timeoutMs);
+    }
+
     const cleanup = () => {
+      if (timer) clearTimeout(timer);
       if (onAbort && signal) signal.removeEventListener('abort', onAbort);
     };
 
@@ -81,7 +91,7 @@ function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
     child.on('error', (err) => {
-      void finish(() => reject(err), { awaitTree: Boolean(signal?.aborted) });
+      void finish(() => reject(err), { awaitTree: Boolean(signal?.aborted || timedOut) });
     });
     child.stdout?.on('data', (chunk) => stdoutChunks.push(chunk));
     child.stderr?.on('data', (chunk) => stderrChunks.push(chunk));
@@ -92,13 +102,22 @@ function runShellCommand(command, { cwd, env, spawn, signal, killGraceMs = 2000 
             reject(new GateCancelledError(`gate command terminated by cancellation (${closeSignal || code})`));
             return;
           }
+          if (timedOut) {
+            resolve({
+              code: 124,
+              stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+              stderr: `${Buffer.concat(stderrChunks).toString('utf8')}\nCOMMAND_TIMEOUT: command "${command}" timed out after ${timeoutMs}ms`,
+              timedOut: true,
+            });
+            return;
+          }
           resolve({
             code,
             stdout: Buffer.concat(stdoutChunks).toString('utf8'),
             stderr: Buffer.concat(stderrChunks).toString('utf8'),
           });
         },
-        { awaitTree: Boolean(signal?.aborted) }
+        { awaitTree: Boolean(signal?.aborted || timedOut) }
       );
     });
   });
@@ -111,14 +130,22 @@ export function createGateRunner({
   spawn = nodeSpawn,
   baseline = null,
   signal = null,
+  timeoutMs = Number(process.env.SUPERGPT_COMMAND_TIMEOUT_MS) || 120000,
 } = {}) {
   return {
-    async run(verificationCommands, { signal: runSignal = signal } = {}) {
+    async run(verificationCommands, { signal: runSignal = signal, timeoutMs: callTimeoutMs = timeoutMs } = {}) {
       const commands = verificationCommands ?? [];
       const results = [];
       for (const command of commands) {
         if (runSignal?.aborted) throw new GateCancelledError();
-        const { code, stdout, stderr } = await runShellCommand(command, { cwd, env, spawn, signal: runSignal });
+        if (typeof command === 'string' && command.trim() === '') {
+          // Blank/whitespace-only command: nothing to verify. Skip it without
+          // spawning a shell and treat it as a pass, keeping the per-command
+          // result contract identical to a command that exited 0.
+          results.push({ command, pass: true, output: 'skipped (blank command)' });
+          continue;
+        }
+        const { code, stdout, stderr } = await runShellCommand(command, { cwd, env, spawn, signal: runSignal, timeoutMs: callTimeoutMs });
         const pass = code === 0;
         const raw = (stdout + stderr).trim() || (pass ? 'ok' : `exit code ${code}`);
         const output = raw.length > 4000

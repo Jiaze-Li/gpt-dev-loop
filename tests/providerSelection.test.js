@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { selectProviders } from '../src/orchestrator/providerSelection.js';
 import { nullWindowSession } from '../src/orchestrator/agyProviderSessions.js';
 import { makeFakeCallAgy, validTaskCardObject } from './fixtures/fakeAgy.mjs';
+import { registerUserInputEvidence, registerTaskCardEvidence } from '../src/orchestrator/newInformation.js';
 
 const BOTH_AGY = { SUPERVISOR_PROVIDER: 'agy', REVIEWER_PROVIDER: 'agy' };
 
@@ -78,14 +79,22 @@ test('Supervisor and Reviewer provider calls receive their OWN resolved model id
     AGY_SUPERVISOR_MODEL: 'gemini-3.7-flash-high',
     AGY_REVIEWER_MODEL: 'gpt-oss-120b-medium',
   };
-  const sup = selectProviders({ env, callAgy: supCall });
-  await sup.supervisorSession.decide({ workflowGoal: 'p', repositoryContext: {}, history: [] });
+  const sup = selectProviders({ env, workflowId: 'wf-model-id-sup', callAgy: supCall });
+  const supEvidence = await registerUserInputEvidence(sup.informationLedger, {
+    workflowId: 'wf-model-id-sup', interactionId: 'initial-input', text: 'p',
+  });
+  await sup.supervisorSession.decide({
+    workflowGoal: 'p', repositoryContext: {}, history: [], evidenceIds: [supEvidence.evidenceId],
+  });
   assert.equal(supCall.calls[0].model, 'gemini-3.7-flash-high');
 
-  const rev = selectProviders({ env, callAgy: revCall });
+  const rev = selectProviders({ env, workflowId: 'wf-model-id-rev', callAgy: revCall });
+  const revEvidence = await registerTaskCardEvidence(rev.informationLedger, {
+    workflowId: 'wf-model-id-rev', taskId: 'auto-a', taskCard: validTaskCardObject(),
+  });
   const rs = rev.createReviewerSession();
   await rs.create();
-  await rs.review('auto-a', validTaskCardObject(), { status: 'DONE' }, { pass: true, results: [] });
+  await rs.review('auto-a', validTaskCardObject(), { status: 'DONE' }, { pass: true, results: [] }, { evidenceIds: [revEvidence.evidenceId] });
   assert.equal(revCall.calls[0].model, 'gpt-oss-120b-medium');
 });
 
@@ -102,8 +111,10 @@ test('role routing has safe defaults when legacy provider variables are absent',
 test('Planner physical invocation records native usage exactly once with immutable call identity', async () => {
   const { UsageTracker } = await import('../src/orchestrator/usageTracker.js');
   const usageTracker = new UsageTracker();
+  const workflowId = 'wf-planner-usage-identity';
   const selected = selectProviders({
     env: { SUPERGPT_CODEX_MODEL: 'codex-planner-test' },
+    workflowId,
     usageTracker,
     codexCall: async () => ({
       text: JSON.stringify({ status: 'READY' }),
@@ -111,10 +122,13 @@ test('Planner physical invocation records native usage exactly once with immutab
       durationMs: 7,
     }),
   });
+  const evidence = await registerUserInputEvidence(selected.informationLedger, {
+    workflowId, interactionId: 'planner-initial-input', text: 'plan the work',
+  });
 
   await selected.runtime.invoke('planner', {
     resolve: async (call) => call({ prompt: 'plan the work' }),
-  });
+  }, { operationId: workflowId, workflowId, evidenceIds: [evidence.evidenceId] });
 
   assert.equal(usageTracker.records.length, 1);
   const [record] = usageTracker.records;

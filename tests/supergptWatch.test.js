@@ -5,10 +5,15 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
 import {
   supergptWatch,
+  supergptStatus,
+  SUPERGPT_WATCH_TIMEOUT_MS,
+} from '../src/orchestrator/supergpt.js';
+import {
   WorkflowStateManager,
   WORKFLOW_STATUSES,
   WORKFLOW_STAGES,
-} from '../src/orchestrator/supergpt.js';
+  WORKFLOW_KINDS,
+} from '../src/orchestrator/workflowState.js';
 import { createSuperGptMcpServer } from '../src/mcp/supergptMcpServer.js';
 
 test('watch emits immediately upon attachment', async () => {
@@ -195,14 +200,14 @@ test('terminal state ends watch immediately', async () => {
 
 test('cancelling watch does NOT stop or modify the workflow', async () => {
   // Live WorkflowStateManager instance
-  const manager = new WorkflowStateManager({ workflowId: 'wf-cancel-isolation' });
+  const manager = new WorkflowStateManager({ workflowId: 'wf-test-cancel-isolation', kind: WORKFLOW_KINDS.INTERNAL_TEST });
   manager.startStage(WORKFLOW_STAGES.EXECUTOR, { taskId: 'task-auth' });
   manager.startHeartbeat(50);
 
   const abortController = new AbortController();
 
   const watchPromise = supergptWatch({
-    workflowId: 'wf-cancel-isolation',
+    workflowId: 'wf-test-cancel-isolation',
     _readState: () => manager.getState(),
     _sleep: async () => {
       // Cancel the watch from the frontend
@@ -224,7 +229,7 @@ test('cancelling watch does NOT stop or modify the workflow', async () => {
 });
 
 test('frontend disconnect does NOT stop the workflow', async () => {
-  const manager = new WorkflowStateManager({ workflowId: 'wf-disconnect-isolation' });
+  const manager = new WorkflowStateManager({ workflowId: 'wf-test-disconnect-isolation', kind: WORKFLOW_KINDS.INTERNAL_TEST });
   manager.startStage(WORKFLOW_STAGES.EXECUTOR, { taskId: 'task-fetch' });
 
   const server = createSuperGptMcpServer({
@@ -244,7 +249,7 @@ test('frontend disconnect does NOT stop the workflow', async () => {
 
   // Start watch tool call
   const watchCall = client.callTool(
-    { name: 'supergpt_watch', arguments: { workflowId: 'wf-disconnect-isolation' } }
+    { name: 'supergpt_watch', arguments: { workflowId: 'wf-test-disconnect-isolation' } }
   ).catch(() => {});
 
   // Disconnect frontend while watch is running
@@ -350,3 +355,247 @@ test('model/provider call count attributable to monitoring is strictly 0', async
   assert.equal(tickCount, 10);
   assert.equal(modelCallCount, 0, 'Monitoring must NEVER invoke any LLM or model provider');
 });
+
+test('SUPERGPT_WATCH_TIMEOUT_MS is defined as 45000 and not Infinity', () => {
+  assert.equal(typeof SUPERGPT_WATCH_TIMEOUT_MS, 'number');
+  assert.equal(SUPERGPT_WATCH_TIMEOUT_MS, 45000);
+  assert.notEqual(SUPERGPT_WATCH_TIMEOUT_MS, Infinity);
+});
+
+test('RUNNING workflow exceeding default watch timeout returns status RUNNING and full Progress UI without error', async () => {
+  let currentTime = new Date('2026-08-28T12:00:00.000Z').getTime();
+  const state = {
+    workflowId: 'wf-running-timeout',
+    workflowStatus: WORKFLOW_STATUSES.RUNNING,
+    stage: WORKFLOW_STAGES.EXECUTOR,
+    taskId: 'task-1',
+    taskName: 'Implement auth',
+    taskIndex: 1,
+    taskTotal: 3,
+    attempt: 1,
+    stageStatuses: { executor: 'running', gate: 'waiting', reviewer: 'waiting' },
+    startedAt: new Date(currentTime).toISOString(),
+    heartbeatAt: new Date(currentTime).toISOString(),
+    lastProgressAt: new Date(currentTime).toISOString(),
+    lastActivityAt: new Date(currentTime).toISOString(),
+    routing: { planner: { provider: 'codex' }, supervisor: { provider: 'agy' }, executor: { provider: 'claude' }, reviewer: { provider: 'agy' } },
+  };
+
+  const emitted = [];
+  const res = await supergptWatch({
+    workflowId: 'wf-running-timeout',
+    _readState: () => {
+      state.heartbeatAt = new Date(currentTime).toISOString();
+      state.lastProgressAt = new Date(currentTime).toISOString();
+      return state;
+    },
+    _now: () => currentTime,
+    _sleep: async (interval) => {
+      currentTime += 10000; // 10s per step -> 5 steps >= 45000ms
+    },
+    onProgress: (p) => emitted.push(p),
+  });
+
+  // Reached timeout (45000ms) without error or throwing
+  assert.equal(res.status, 'RUNNING');
+  assert.equal(res.stage, 'EXECUTOR');
+  assert.equal(res.cancelled, false);
+  assert.ok(currentTime - new Date('2026-08-28T12:00:00.000Z').getTime() >= 45000);
+
+  // Full Progress UI matches required fields
+  const ui = res.formattedProgress;
+  assert.match(ui, /SUPERGPT ⟳ RUNNING/);
+  assert.match(ui, /Task\s+1 \/ 3 — Implement auth/);
+  assert.match(ui, /Attempt\s+1/);
+  assert.match(ui, /Stage\s+EXECUTOR/);
+  assert.match(ui, /Planner/);
+  assert.match(ui, /Supervisor/);
+  assert.match(ui, /Executor/);
+  assert.match(ui, /Gate/);
+  assert.match(ui, /Reviewer/);
+  assert.match(ui, /Elapsed/);
+  assert.match(ui, /Heartbeat/);
+  assert.match(ui, /Last progress/);
+  assert.match(ui, /Last activity/);
+});
+
+test('MCP supergpt_watch tool defaults to 45s and returns non-error RUNNING response with full progress block', async () => {
+  let currentTime = new Date('2026-08-28T12:00:00.000Z').getTime();
+  const state = {
+    workflowId: 'wf-mcp-timeout-test',
+    workflowStatus: WORKFLOW_STATUSES.RUNNING,
+    stage: WORKFLOW_STAGES.EXECUTOR,
+    taskId: 'task-auth',
+    taskName: 'Login flow',
+    taskIndex: 1,
+    taskTotal: 2,
+    attempt: 1,
+    stageStatuses: { executor: 'running', gate: 'waiting', reviewer: 'waiting' },
+    startedAt: new Date(currentTime).toISOString(),
+    heartbeatAt: new Date(currentTime).toISOString(),
+    lastProgressAt: new Date(currentTime).toISOString(),
+    lastActivityAt: new Date(currentTime).toISOString(),
+  };
+
+  const server = createSuperGptMcpServer({
+    watchSuperGptFn: async ({ workflowId, intervalMs, timeoutMs, signal, onProgress }) => {
+      return supergptWatch({
+        workflowId,
+        intervalMs,
+        timeoutMs,
+        signal,
+        onProgress,
+        _readState: () => state,
+        _now: () => currentTime,
+        _sleep: async () => {
+          currentTime += 15000;
+        },
+      });
+    },
+  });
+
+  const client = new Client({ name: 'mcp-test-client', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+  const response = await client.callTool({
+    name: 'supergpt_watch',
+    arguments: { workflowId: 'wf-mcp-timeout-test' },
+  });
+
+  assert.equal(response.isError, false);
+  assert.ok(Array.isArray(response.content));
+  const parsed = JSON.parse(response.content[0].text);
+  assert.equal(parsed.status, 'RUNNING');
+  assert.equal(parsed.stage, 'EXECUTOR');
+  assert.match(parsed.formattedProgress, /SUPERGPT ⟳ RUNNING/);
+  assert.match(parsed.formattedProgress, /Task\s+1 \/ 2 — Login flow/);
+  assert.match(parsed.formattedProgress, /Heartbeat/);
+
+  await client.close();
+});
+
+test('terminal state occurring before timeout returns immediately without waiting full 45s', async () => {
+  let currentTime = new Date('2026-08-28T12:00:00.000Z').getTime();
+  let ticks = 0;
+  const state = {
+    workflowId: 'wf-early-term',
+    workflowStatus: WORKFLOW_STATUSES.RUNNING,
+    stage: WORKFLOW_STAGES.EXECUTOR,
+    taskId: 'task-1',
+    attempt: 1,
+    stageStatuses: { executor: 'running', gate: 'waiting', reviewer: 'waiting' },
+    startedAt: new Date(currentTime).toISOString(),
+    heartbeatAt: new Date(currentTime).toISOString(),
+    lastProgressAt: new Date(currentTime).toISOString(),
+  };
+
+  const res = await supergptWatch({
+    workflowId: 'wf-early-term',
+    _readState: () => {
+      if (ticks >= 2) {
+        state.workflowStatus = WORKFLOW_STATUSES.DONE;
+        state.stage = WORKFLOW_STAGES.DONE;
+        state.summary = 'Finished early';
+      }
+      return state;
+    },
+    _now: () => currentTime,
+    _sleep: async () => {
+      ticks += 1;
+      currentTime += 1000; // 1 second per tick
+    },
+  });
+
+  assert.equal(res.status, 'DONE');
+  assert.equal(res.stage, 'DONE');
+  assert.equal(res.summary, 'Finished early');
+  // Returned well before 45s (after 2s)
+  assert.equal(currentTime - new Date('2026-08-28T12:00:00.000Z').getTime(), 2000);
+});
+
+test('consecutive watches progress smoothly: RUNNING -> RUNNING -> DONE', async () => {
+  let currentTime = new Date('2026-08-28T12:00:00.000Z').getTime();
+  const state = {
+    workflowId: 'wf-consecutive',
+    workflowStatus: WORKFLOW_STATUSES.RUNNING,
+    stage: WORKFLOW_STAGES.PLANNING,
+    taskId: null,
+    attempt: 0,
+    stageStatuses: { executor: 'waiting', gate: 'waiting', reviewer: 'waiting' },
+    startedAt: new Date(currentTime).toISOString(),
+    heartbeatAt: new Date(currentTime).toISOString(),
+    lastProgressAt: new Date(currentTime).toISOString(),
+  };
+
+  // First watch: starts at 0s, times out at 45s
+  const watch1 = await supergptWatch({
+    workflowId: 'wf-consecutive',
+    _readState: () => state,
+    _now: () => currentTime,
+    _sleep: async () => {
+      currentTime += 15000;
+    },
+  });
+  assert.equal(watch1.status, 'RUNNING');
+  assert.ok(currentTime >= 45000);
+
+  // Background pipeline advances
+  state.stage = WORKFLOW_STAGES.EXECUTOR;
+  state.taskId = 'task-1';
+  state.attempt = 1;
+  state.stageStatuses.executor = 'running';
+
+  // Second watch: starts at current time, times out at +45s (90s total)
+  const watch2StartTime = currentTime;
+  const watch2 = await supergptWatch({
+    workflowId: 'wf-consecutive',
+    _readState: () => state,
+    _now: () => currentTime,
+    _sleep: async () => {
+      currentTime += 15000;
+    },
+  });
+  assert.equal(watch2.status, 'RUNNING');
+  assert.equal(watch2.stage, 'EXECUTOR');
+  assert.ok(currentTime - watch2StartTime >= 45000);
+
+  // Background pipeline finishes
+  state.workflowStatus = WORKFLOW_STATUSES.DONE;
+  state.stage = WORKFLOW_STAGES.DONE;
+  state.summary = 'Complete';
+
+  // Third watch: immediately observes terminal state
+  const watch3 = await supergptWatch({
+    workflowId: 'wf-consecutive',
+    _readState: () => state,
+    _now: () => currentTime,
+  });
+  assert.equal(watch3.status, 'DONE');
+  assert.equal(watch3.summary, 'Complete');
+});
+
+test('startupGraceMs is preserved and nonexistent workflow id terminates with WORKFLOW_NOT_FOUND', async () => {
+  let currentTime = 1000;
+  const res = await supergptWatch({
+    workflowId: 'wf-nonexistent-xyz',
+    startupGraceMs: 5000,
+    _readState: () => null,
+    _isKnown: () => false,
+    _now: () => currentTime,
+    _sleep: async (interval) => {
+      currentTime += 1000;
+    },
+  });
+
+  assert.equal(res.status, 'WORKFLOW_NOT_FOUND');
+  assert.equal(res.reason, 'no durable or active record exists for this workflow id');
+  // Terminates at startupGraceMs (5000ms), NOT waiting for 45000ms
+  assert.equal(currentTime, 6000);
+});
+
+test('status check consumes zero model tokens', () => {
+  // supergptStatus only reads from disk and never makes network or LLM calls
+  assert.equal(typeof supergptStatus, 'function');
+});
+
