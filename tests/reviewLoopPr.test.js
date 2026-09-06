@@ -3,17 +3,24 @@ import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
-function mockPrBackend({ heads = ['H1'], existing = {}, results = {} } = {}) {
+// A raw review carries a trusted reviewer identity + the exact reviewed HEAD,
+// exactly as the real GitHub backend guarantees after checkPrReviewTrust().
+function stamp(raw, headSha, reviewer) {
+  if (!raw) return raw;
+  return { reviewer, headSha, head_sha: headSha, ...raw };
+}
+
+function mockPrBackend({ heads = ['H1'], existing = {}, results = {}, reviewer = 'codex' } = {}) {
   const state = { headIdx: 0, triggers: [], waits: 0 };
   return {
     state,
     async getPrHead() { return heads[Math.min(state.headIdx, heads.length - 1)]; },
     advanceHead() { state.headIdx += 1; },
-    async findExistingReview({ headSha }) { return existing[headSha] ?? null; },
-    async postReviewTrigger({ headSha, reviewer }) { state.triggers.push({ headSha, reviewer }); return { id: `comment-${headSha}` }; },
+    async findExistingReview({ headSha }) { return stamp(existing[headSha], headSha, reviewer); },
+    async postReviewTrigger({ headSha, reviewer: r }) { state.triggers.push({ headSha, reviewer: r }); return { id: `comment-${headSha}` }; },
     async waitForReview({ headSha }) {
       state.waits += 1;
-      return results[headSha] ?? null; // null => detach -> WAITING_FOR_REVIEW
+      return stamp(results[headSha], headSha, reviewer); // null => detach -> WAITING_FOR_REVIEW
     },
   };
 }
@@ -127,4 +134,26 @@ test('round 3 still blocking -> HUMAN_REQUIRED', async () => {
 test('ReviewLoop never pushes / merges — controller exposes no such op', async () => {
   const src = await import('node:fs').then((fs) => fs.promises.readFile(new URL('../src/reviewloop/prReviewController.js', import.meta.url), 'utf8'));
   assert.doesNotMatch(src, /git push|gh pr merge|forcePush|--force/);
+});
+
+// B9 — PR reviewer default is codex, never internal.
+test('reviewloop_begin({ prNumber }) with no reviewer defaults to codex', async () => {
+  const backend = mockPrBackend({ heads: ['H1'], results: { H1: { findings: [] } } });
+  const { controller, persistence } = build({ prBackend: backend });
+  const begun = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 }); // no reviewer
+  assert.equal(begun.reviewer, 'codex');
+  const state = await persistence.readWorkflowState(begun.loopId);
+  assert.equal(state.reviewLoop.objective.reviewer, 'codex');
+  await controller.review({ loopId: begun.loopId });
+  assert.deepEqual(backend.state.triggers.map((t) => t.reviewer), ['codex']);
+});
+
+test('an internal identity can never be a PR reviewer', async () => {
+  const { createReviewObjective } = await import('../src/reviewloop/objective.js');
+  assert.throws(() => createReviewObjective({ loopId: 'l', goal: 'g', mode: 'PR', prNumber: 4, reviewer: 'internal' }), /PR reviewer must be one of/);
+});
+
+test('PR mode with an unknown reviewer is rejected', async () => {
+  const { createReviewObjective } = await import('../src/reviewloop/objective.js');
+  assert.throws(() => createReviewObjective({ loopId: 'l', goal: 'g', mode: 'PR', prNumber: 4, reviewer: 'gpt-9' }), /PR reviewer must be one of/);
 });

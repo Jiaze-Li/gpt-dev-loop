@@ -56,6 +56,17 @@ test('any remaining "supergpt" occurrences in src/bin are migration/compat-only'
   }
 });
 
+test('no silent diff truncation and no unwired PR backend remain', () => {
+  assert.deepEqual(grep('slice\\(0, ?12000|no GitHub backend wired', 'src'), []);
+});
+
+test('the PR trust boundary reuses the V2 trusted-review primitives (no second impl)', async () => {
+  const src = readFileSync(new URL('../src/reviewloop/prTrust.js', import.meta.url), 'utf8');
+  assert.match(src, /from '\.\.\/orchestrator\/trustedPrReview\.js'/);
+  assert.match(src, /isTrustedReviewer/);
+  assert.match(src, /isReviewFresh/);
+});
+
 test('package.json is renamed to reviewloop with reviewloop bins', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(pkg.name, 'reviewloop');

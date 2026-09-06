@@ -12,8 +12,8 @@ test('every real Reviewer call crosses ModelSpendAuthority and settles known usa
     call: async () => ({ value: { findings: [] }, usage: { input_tokens: 5, output_tokens: 2 } }),
   });
   assert.deepEqual(value, { findings: [] });
-  assert.equal(spend.telemetry().reviewerCalls, 1);
-  assert.equal(spend.telemetry().unknownUsageCalls, 0);
+  assert.equal((await spend.telemetry()).reviewerCalls, 1);
+  assert.equal((await spend.telemetry()).unknownUsageCalls, 0);
 });
 
 test('missing post-dispatch usage -> UNRESOLVED (never treated as zero)', async () => {
