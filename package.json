@@ -13,7 +13,8 @@
     "test": "node --test tests/*.test.js",
     "install-global": "node ./bin/install-plugin.js",
     "uninstall-global": "node ./bin/install-plugin.js --uninstall",
-    "benchmark": "node ./scripts/benchmark-context-footprint.js"
+    "benchmark": "node ./scripts/benchmark-context-footprint.js",
+    "benchmark:transports": "node ./scripts/benchmark-review-transports.js"
   },
   "engines": {
     "node": ">=20"
