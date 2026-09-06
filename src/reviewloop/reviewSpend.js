@@ -67,8 +67,14 @@ const METERED_ROLES = new Set(['reviewer', 'supervisor']);
 // leaves a settled reservation without a matching spend record (no false
 // "unaccounted spend" block after a restart). Unified across the agy transport
 // (AGY_ENOENT / AGY_SPAWN_FAILED / AGY_BAD_INPUT) and the generic pool.
+// PROVIDER_AUTH_FAILED is mechanically pre-send zero: a CLI transport rejected
+// at its own auth check (`codex` / `claude` not logged in, no/invalid API key)
+// or the provider API returned 401/403 at the auth boundary — no prompt was
+// ever billed. The `!err.usage` guard in isMechanicallyZeroPreSend still
+// excludes any (impossible-by-construction) case where a transport attached
+// real usage alongside an auth error.
 export const PRE_SEND_ZERO_CODES = new Set([
-  'PROVIDER_UNAVAILABLE', 'PROVIDER_NOT_STARTED',
+  'PROVIDER_UNAVAILABLE', 'PROVIDER_NOT_STARTED', 'PROVIDER_AUTH_FAILED',
   'ENOENT', 'AGY_ENOENT', 'AGY_SPAWN_FAILED', 'AGY_BAD_INPUT',
 ]);
 

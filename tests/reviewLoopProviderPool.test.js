@@ -20,7 +20,7 @@ test('reviewer first candidate in cooldown -> next eligible family selected', ()
   quota.recordCooldown('agy-claude-gpt'); // the pool backing agy:gpt-oss
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}), quotaRegistry: quota });
   const sel = pool.route('reviewer');
-  assert.equal(sel.family, 'agy:gemini'); // codex:default is skipped (no wired transport)
+  assert.equal(sel.family, 'agy:gemini'); // codex:default skipped: runtime not probed -> UNAVAILABLE
 });
 
 test('supervisor first candidate unavailable -> next eligible selected', () => {
@@ -28,7 +28,7 @@ test('supervisor first candidate unavailable -> next eligible selected', () => {
   health.record('agy:gemini', 'UNAVAILABLE');
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}), providerHealth: health });
   const sel = pool.route('supervisor');
-  assert.equal(sel.family, 'agy:gpt-oss'); // codex:default + claude:opus have no wired transport
+  assert.equal(sel.family, 'agy:gpt-oss'); // codex:default + claude:opus: runtime not probed -> UNAVAILABLE
 });
 
 test('the pool never offers a planner or executor role', () => {

@@ -69,15 +69,22 @@ function requireProvider(name) {
 
 // Provider-failure codes that a bounded failover attempt may follow. All are
 // either "the call never reached the provider" (pre-send: unavailable, ENOENT,
-// spawn failure) or "reached it but produced no usable result and no
-// unresolved spend" (rate limit, quota, protocol error, timeout classified as
-// mechanically bounded). A mid-flight failure with unknown usage never lands
-// here — dispatch() has already turned it into a spend-blocking
+// spawn failure, CLI not authenticated) or "reached it but produced no usable
+// result and no unresolved spend" (rate limit, quota, protocol error, timeout
+// classified as mechanically bounded). A mid-flight failure with unknown usage
+// never lands here — dispatch() has already turned it into a spend-blocking
 // AuthorizationError.
+//
+// PROVIDER_AUTH_FAILED is retryable-via-failover on purpose: an unauthenticated
+// CLI transport (`codex` / `claude` not logged in) is a pre-send failure with
+// no spend, and RoleRouter.recordFailure already treats it as health-affecting
+// (family removed, AUTH_FAILED). Trying the next eligible family is exactly the
+// intended recovery; if every family is unauthenticated the loop still
+// exhausts and rethrows.
 const RETRYABLE = new Set([
   'PROVIDER_UNAVAILABLE', 'PROVIDER_TIMEOUT', 'PROVIDER_RATE_LIMITED',
-  'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_PROTOCOL_ERROR', 'EXECUTOR_TIMEOUT',
-  'AGY_ENOENT', 'AGY_SPAWN_FAILED',
+  'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_PROTOCOL_ERROR', 'PROVIDER_AUTH_FAILED',
+  'EXECUTOR_TIMEOUT', 'AGY_ENOENT', 'AGY_SPAWN_FAILED',
 ]);
 
 export function createReviewLoopController({
