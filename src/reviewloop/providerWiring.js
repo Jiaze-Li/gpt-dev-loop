@@ -12,7 +12,6 @@
 // normalizer fails it closed (FAILED -> HUMAN_REQUIRED).
 
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
-import { resolveAgyReviewerModel, resolveAgySupervisorModel } from '../agy/agyConfig.js';
 import {
   DEFAULT_ROLE_POLICY,
   PRODUCTION_ROLE_CAPABILITIES,
@@ -21,6 +20,7 @@ import {
   ProviderHealthRegistry,
   EffortPolicy,
 } from '../orchestrator/roleRouting.js';
+import { resolveModelFamily, MODEL_FAMILY_REGISTRY } from '../orchestrator/modelFamilyResolver.js';
 import { createGithubReviewBackend } from './githubBackend.js';
 
 export const ACTIVE_ROLE_POOLS = Object.freeze(Object.keys(DEFAULT_ROLE_POLICY));
@@ -168,21 +168,29 @@ export function createReviewLoopProviderPool({
   env = process.env,
   quotaRegistry = new QuotaPoolRegistry({ filePath: null }),
   providerHealth = new ProviderHealthRegistry(),
+  // `agy models` catalog (ids array / raw stdout) for runtime model-family
+  // resolution. null -> the provider-default path (transport omits --model).
+  // Deterministic tests leave it null; production wiring probes it once.
+  agyCatalog = null,
 } = {}) {
-  const reviewerModel = resolveAgyReviewerModel(env);
-  const supervisorModel = resolveAgySupervisorModel(env);
+  // Resolve every registered family to a concrete model (or null = provider
+  // default) at construction. Stable family identity in, concrete version out —
+  // a catalog bump changes `resolvedModel` here without any policy edit.
+  const resolution = {};
+  for (const family of Object.keys(MODEL_FAMILY_REGISTRY)) {
+    resolution[family] = resolveModelFamily(family, { env, agyCatalog });
+  }
+  const modelForFamily = Object.fromEntries(
+    Object.entries(resolution).map(([f, r]) => [f, r.resolvedModel]),
+  );
 
-  // Per-family transport. Only the agy families have a live adapter in this
-  // build; codex/claude remain capability-declared protocol targets but have
-  // no wired transport, so they are marked unavailable up front and the
-  // RoleRouter skips them (rather than pretending a call can be made).
-  const modelForFamily = {
-    'agy:gemini': supervisorModel,
-    'agy:gpt-oss': reviewerModel,
-  };
+  // Per-family transport. Only the agy families have a wired transport in this
+  // stage; codex/claude remain capability-declared protocol targets with no
+  // transport, so they are marked unavailable up front and the RoleRouter
+  // skips them (rather than pretending a call can be made).
   const transports = {
-    'agy:gemini': async (prompt) => callAgy({ prompt, model: supervisorModel }),
-    'agy:gpt-oss': async (prompt) => callAgy({ prompt, model: reviewerModel }),
+    'agy:gemini': async (prompt) => callAgy({ prompt, model: modelForFamily['agy:gemini'] ?? null }),
+    'agy:gpt-oss': async (prompt) => callAgy({ prompt, model: modelForFamily['agy:gpt-oss'] ?? null }),
   };
   for (const family of Object.keys(PRODUCTION_ROLE_CAPABILITIES)) {
     if (!transports[family]) providerHealth.record(family, 'UNAVAILABLE', 'no wired transport in this build');
@@ -193,16 +201,20 @@ export function createReviewLoopProviderPool({
     quotaRegistry,
     providerHealth,
     effortPolicy: new EffortPolicy(),
-    resolveFamily: (family) => ({
-      requestedFamily: family,
-      resolvedModel: modelForFamily[family] ?? family.split(':')[1] ?? null,
-      provider: family.startsWith('agy:') ? family.replace(':', '-') : family.split(':')[0],
-      capabilities: {
-        roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [],
-        supportsReasoningEffort: false,
-        supportedEfforts: ['medium'],
-      },
-    }),
+    resolveFamily: (family) => {
+      const r = resolution[family] ?? resolveModelFamily(family, { env, agyCatalog });
+      return {
+        requestedFamily: family,
+        resolvedModel: r.resolvedModel,
+        resolvedFrom: r.resolvedFrom,
+        provider: r.provider ?? (family.startsWith('agy:') ? family.replace(':', '-') : family.split(':')[0]),
+        capabilities: {
+          roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [],
+          supportsReasoningEffort: false,
+          supportedEfforts: ['medium'],
+        },
+      };
+    },
   });
 
   function route(role, signals = {}) {
@@ -213,6 +225,7 @@ export function createReviewLoopProviderPool({
       family: sel.requestedFamily,
       provider: sel.provider,
       model: sel.resolvedModel,
+      resolvedFrom: resolution[sel.requestedFamily]?.resolvedFrom ?? null,
       transport: transports[sel.requestedFamily] ?? null,
     };
   }
@@ -221,7 +234,7 @@ export function createReviewLoopProviderPool({
     router.recordFailure({ role: selection.role, requestedFamily: selection.family, provider: selection.provider }, failure);
   }
 
-  return { router, route, recordFailure, transports };
+  return { router, route, recordFailure, transports, resolution };
 }
 
 // ---- convenience Reviewer / Supervisor callables ------------------------
@@ -267,8 +280,14 @@ function buildSupervisorInvoke() {
   };
 }
 
-export function createProductionReviewLoopProviders({ env = process.env, callAgy, github } = {}) {
-  const pool = createReviewLoopProviderPool({ callAgy, env });
+export function createProductionReviewLoopProviders({
+  env = process.env, callAgy, github, agyCatalog = null,
+} = {}) {
+  // `agyCatalog` (ids array / raw `agy models` stdout) drives runtime
+  // model-family resolution. It is supplied by the MCP entrypoint, which
+  // probes it once; left null here so nothing is spawned in tests and the
+  // resolution falls back to the provider-default path.
+  const pool = createReviewLoopProviderPool({ callAgy, env, agyCatalog });
   const reviewerInvoke = buildReviewerInvoke();
   const supervisorInvoke = buildSupervisorInvoke();
 

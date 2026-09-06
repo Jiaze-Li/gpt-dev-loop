@@ -22,6 +22,7 @@ import { z } from 'zod';
 
 import { createReviewLoopController } from '../reviewloop/controller.js';
 import { createProductionReviewLoopProviders } from '../reviewloop/providerWiring.js';
+import { probeAgyModelCatalog } from '../agy/agyModelCatalog.js';
 
 export function createReviewLoopMcpServer({
   controller = null,
@@ -29,7 +30,12 @@ export function createReviewLoopMcpServer({
 } = {}) {
   const server = new McpServer({ name: 'reviewloop', version: '1.0.0' });
 
-  const ctl = controller ?? createReviewLoopController(createProductionReviewLoopProviders());
+  // Runtime model-family resolution: probe the local `agy models` catalog once
+  // at server start (metadata listing, not a model call; degrades to the
+  // provider-default path on any failure).
+  const ctl = controller ?? createReviewLoopController(
+    createProductionReviewLoopProviders({ agyCatalog: probeAgyModelCatalog() }),
+  );
 
   server.registerTool(
     'reviewloop_begin',

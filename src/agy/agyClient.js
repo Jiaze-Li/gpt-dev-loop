@@ -125,6 +125,18 @@ function extractText(json) {
   return null;
 }
 
+// Recover the concrete model id from the agy json envelope when the caller
+// omitted --model (dynamic provider-default resolution). Tolerant of field
+// naming; returns null when the envelope does not report one.
+function extractModel(json) {
+  if (!json || typeof json !== 'object') return null;
+  const candidates = [json.model, json.model_id, json.modelId, json.usage?.model, json.meta?.model];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim() !== '') return c.trim();
+  }
+  return null;
+}
+
 /**
  * Run one non-interactive `agy` prompt and return a normalized result.
  *
@@ -179,11 +191,14 @@ export async function callAgy({
   // (e.g. `--output-format`) as the prompt and silently ignores the real one.
   // Attaching it also means every other flag is an ordinary flag that cannot
   // be consumed as the prompt, regardless of ordering.
+  // `model` null / '' -> omit --model entirely so `agy` picks its own current
+  // default (dynamic family resolution's provider-default path). A concrete id
+  // is passed through verbatim.
   const args = [
     `--print=${prompt}`,
     '--output-format', 'json',
-    '--model', model,
   ];
+  if (typeof model === 'string' && model.trim() !== '') args.push('--model', model.trim());
   if (disableSlashCommands) args.push('--disable-slash-commands');
   if (typeof agent === 'string' && agent.trim() !== '') args.push('--agent', agent.trim());
   if (typeof jsonSchema === 'string' && jsonSchema.length > 0) {
@@ -322,7 +337,10 @@ export async function callAgy({
   const usage = json && typeof json === 'object' && json.usage && typeof json.usage === 'object' ? json.usage : null;
 
   return {
-    model,
+    // The concrete model actually used: the explicit id when one was passed,
+    // otherwise whatever the provider envelope reports it resolved to.
+    model: (typeof model === 'string' && model.trim() !== '' ? model.trim() : null) ?? extractModel(json),
+    requestedModel: (typeof model === 'string' && model.trim() !== '' ? model.trim() : null),
     exitCode: code,
     text: extractText(json),
     json,
