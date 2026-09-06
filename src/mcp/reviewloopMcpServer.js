@@ -23,18 +23,20 @@ import { z } from 'zod';
 import { createReviewLoopController } from '../reviewloop/controller.js';
 import { createProductionReviewLoopProviders } from '../reviewloop/providerWiring.js';
 import { probeAgyModelCatalog } from '../agy/agyModelCatalog.js';
+import { probeReviewTransportRuntime } from '../reviewloop/adapters/cliReviewTransports.js';
 
 export function createReviewLoopMcpServer({
   controller = null,
   cwd = process.cwd(),
+  // Runtime resolution inputs, probed once by startReviewLoopMcpServer (async).
+  // Left null here so a bare createReviewLoopMcpServer() spawns nothing.
+  agyCatalog = null,
+  transportRuntime = null,
 } = {}) {
   const server = new McpServer({ name: 'reviewloop', version: '1.0.0' });
 
-  // Runtime model-family resolution: probe the local `agy models` catalog once
-  // at server start (metadata listing, not a model call; degrades to the
-  // provider-default path on any failure).
   const ctl = controller ?? createReviewLoopController(
-    createProductionReviewLoopProviders({ agyCatalog: probeAgyModelCatalog() }),
+    createProductionReviewLoopProviders({ agyCatalog, transportRuntime }),
   );
 
   server.registerTool(
@@ -128,7 +130,14 @@ export function createReviewLoopMcpServer({
 }
 
 export async function startReviewLoopMcpServer(options = {}) {
-  const server = createReviewLoopMcpServer(options);
+  // Probe runtime resolution inputs once at startup: the `agy models` catalog
+  // (metadata listing, not a model call) and the CLI-transport availability
+  // (`codex --version` / `claude --version`). Both degrade safely on failure.
+  const [agyCatalog, transportRuntime] = await Promise.all([
+    Promise.resolve().then(() => probeAgyModelCatalog()),
+    probeReviewTransportRuntime(),
+  ]);
+  const server = createReviewLoopMcpServer({ agyCatalog, transportRuntime, ...options });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   return server;

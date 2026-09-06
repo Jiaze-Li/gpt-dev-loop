@@ -11,9 +11,6 @@
 // empty finding list — it is surfaced as { malformed: true, ... } so the
 // normalizer fails it closed (FAILED -> HUMAN_REQUIRED).
 
-import os from 'node:os';
-import path from 'node:path';
-import { mkdirSync } from 'node:fs';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import {
   DEFAULT_ROLE_POLICY,
@@ -24,25 +21,22 @@ import {
   EffortPolicy,
 } from '../orchestrator/roleRouting.js';
 import { resolveModelFamily, MODEL_FAMILY_REGISTRY } from '../orchestrator/modelFamilyResolver.js';
+import { narrowReviewTransportCwd } from './adapters/scratchCwd.js';
+import { makeCodexReviewTransport, makeClaudeReviewTransport } from './adapters/cliReviewTransports.js';
 import { createGithubReviewBackend } from './githubBackend.js';
 
 export const ACTIVE_ROLE_POOLS = Object.freeze(Object.keys(DEFAULT_ROLE_POLICY));
+export { narrowReviewTransportCwd };
 
-// The Reviewer / Supervisor are NARROW single-turn inference, not a second
-// coding Worker. The agy transport runs from an isolated empty scratch dir so
-// there is no repo, no GEMINI.md, no project/agent memory for the CLI to
-// preload; slash/skill expansion is disabled and no conversation is resumed.
-// This is the lightest mode `agy` offers — any residual transport context tax
-// is MEASURED (payloadMeta / contextOverheadTokens in the durable spend
-// record), never hidden.
-let narrowCwd;
-export function narrowReviewTransportCwd() {
-  if (narrowCwd) return narrowCwd;
-  const dir = path.join(os.tmpdir(), 'reviewloop-review-transport');
-  try { mkdirSync(dir, { recursive: true }); } catch { /* best effort; agy still runs */ }
-  narrowCwd = dir;
-  return dir;
-}
+// Each pool family is one of exactly two things (no "looks like fallback,
+// always skipped" phantoms):
+//   - a WIRED transport that can actually be selected and called, or
+//   - explicitly UNAVAILABLE (adapter present but runtime unavailable, or no
+//     adapter at all) — the RoleRouter skips it and the reason is recorded.
+const CLI_TRANSPORT_FACTORY = Object.freeze({
+  'codex:default': makeCodexReviewTransport,
+  'claude:opus': makeClaudeReviewTransport,
+});
 
 const SEVERITIES = new Set(['P1', 'P2', 'P3']);
 
@@ -191,6 +185,16 @@ export function createReviewLoopProviderPool({
   // resolution. null -> the provider-default path (transport omits --model).
   // Deterministic tests leave it null; production wiring probes it once.
   agyCatalog = null,
+  // { 'codex:default': { available, reason, version? }, 'claude:opus': {...} }
+  // Runtime availability of the CLI-backed transports. The MCP entrypoint
+  // probes it once at startup; deterministic tests inject it. Absent -> the
+  // CLI families are treated as "adapter present, runtime not probed" and
+  // marked UNAVAILABLE (never silently skipped as a phantom fallback).
+  transportRuntime = null,
+  // Per-family transport override (deterministic tests inject a fake).
+  transportOverrides = null,
+  // Injected into the codex/claude CLI transports (deterministic tests).
+  spawn = undefined,
 } = {}) {
   // Resolve every registered family to a concrete model (or null = provider
   // default) at construction. Stable family identity in, concrete version out —
@@ -203,10 +207,8 @@ export function createReviewLoopProviderPool({
     Object.entries(resolution).map(([f, r]) => [f, r.resolvedModel]),
   );
 
-  // Per-family transport. Only the agy families have a wired transport in this
-  // stage; codex/claude remain capability-declared protocol targets with no
-  // transport, so they are marked unavailable up front and the RoleRouter
-  // skips them (rather than pretending a call can be made).
+  // agy families: always wired here. Real agy availability surfaces at call
+  // time (AGY_ENOENT -> RETRYABLE -> failover), same as before.
   const narrow = (family) => async (prompt) => {
     const res = await callAgy({
       prompt,
@@ -220,8 +222,52 @@ export function createReviewLoopProviderPool({
     'agy:gemini': narrow('agy:gemini'),
     'agy:gpt-oss': narrow('agy:gpt-oss'),
   };
+
+  // adapterImplemented / runtimeAvailable / defaultModelResolution per family —
+  // consumed by doctor and the pool-composition tests.
+  const runtimeStatus = {};
+  for (const family of ['agy:gemini', 'agy:gpt-oss']) {
+    runtimeStatus[family] = {
+      adapterImplemented: true, runtimeAvailable: true, reason: 'wired (agy CLI; ENOENT -> failover at call time)',
+      defaultModelResolution: resolution[family].resolvedFrom,
+      concreteVersionPinnedByDefault: resolution[family].concreteVersionPinned,
+    };
+  }
+
+  // CLI families: the adapter always exists. Wire the transport only when the
+  // runtime is actually available; otherwise record it UNAVAILABLE with a
+  // reason that distinguishes "adapter present, CLI missing" from "no adapter".
+  for (const family of Object.keys(CLI_TRANSPORT_FACTORY)) {
+    const rt = transportRuntime?.[family];
+    const available = rt?.available === true;
+    runtimeStatus[family] = {
+      adapterImplemented: true,
+      runtimeAvailable: available,
+      reason: available ? (rt.reason ?? 'ok') : `adapter present; runtime unavailable: ${rt?.reason ?? 'not probed'}`,
+      defaultModelResolution: resolution[family].resolvedFrom,
+      concreteVersionPinnedByDefault: resolution[family].concreteVersionPinned,
+    };
+    if (available) {
+      transports[family] = CLI_TRANSPORT_FACTORY[family]({ model: modelForFamily[family] ?? null, env, spawn });
+    } else {
+      providerHealth.record(family, 'UNAVAILABLE', runtimeStatus[family].reason);
+    }
+  }
+
+  if (transportOverrides) {
+    for (const [family, fn] of Object.entries(transportOverrides)) {
+      if (typeof fn === 'function') {
+        transports[family] = fn;
+        if (runtimeStatus[family]) { runtimeStatus[family].runtimeAvailable = true; runtimeStatus[family].reason = 'test override'; }
+      }
+    }
+  }
+
   for (const family of Object.keys(PRODUCTION_ROLE_CAPABILITIES)) {
-    if (!transports[family]) providerHealth.record(family, 'UNAVAILABLE', 'no wired transport in this build');
+    if (!transports[family] && !runtimeStatus[family]) {
+      runtimeStatus[family] = { adapterImplemented: false, runtimeAvailable: false, reason: 'no adapter' };
+      providerHealth.record(family, 'UNAVAILABLE', 'no adapter for this family');
+    }
   }
 
   const router = new RoleRouter({
@@ -262,7 +308,7 @@ export function createReviewLoopProviderPool({
     router.recordFailure({ role: selection.role, requestedFamily: selection.family, provider: selection.provider }, failure);
   }
 
-  return { router, route, recordFailure, transports, resolution };
+  return { router, route, recordFailure, transports, resolution, runtimeStatus };
 }
 
 // ---- convenience Reviewer / Supervisor callables ------------------------
@@ -329,19 +375,20 @@ function buildSupervisorInvoke() {
 }
 
 export function createProductionReviewLoopProviders({
-  env = process.env, callAgy, github, agyCatalog = null,
+  env = process.env, callAgy, github, agyCatalog = null, transportRuntime = null,
 } = {}) {
-  // `agyCatalog` (ids array / raw `agy models` stdout) drives runtime
-  // model-family resolution. It is supplied by the MCP entrypoint, which
-  // probes it once; left null here so nothing is spawned in tests and the
-  // resolution falls back to the provider-default path.
-  const pool = createReviewLoopProviderPool({ callAgy, env, agyCatalog });
+  // `agyCatalog` + `transportRuntime` are supplied by the MCP entrypoint,
+  // which probes them once at startup; left null here so nothing is spawned in
+  // tests (resolution falls back to the provider-default path, and the CLI
+  // families report "adapter present, runtime not probed").
+  const pool = createReviewLoopProviderPool({ callAgy, env, agyCatalog, transportRuntime });
   const reviewerInvoke = buildReviewerInvoke();
   const supervisorInvoke = buildSupervisorInvoke();
 
   return {
     env,
     pool,
+    runtimeStatus: pool.runtimeStatus,
     routeReviewerFn: (signals) => pool.route('reviewer', signals),
     routeSupervisorFn: (signals) => pool.route('supervisor', signals),
     recordProviderFailure: pool.recordFailure,

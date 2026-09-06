@@ -15,6 +15,7 @@ import { existsSync, accessSync, constants, readFileSync } from 'node:fs';
 import { extractManagedPolicy, resolveGlobalConfigDir, hasLegacyManagedPolicy } from '../bin/install-plugin.js';
 import { REVIEWLOOP_RUNTIME_ROOT } from '../src/reviewloop/runtimeDir.js';
 import { DEFAULT_ROLE_POLICY, PRODUCTION_ROLE_CAPABILITIES, QuotaPoolRegistry } from '../src/orchestrator/roleRouting.js';
+import { createReviewLoopProviderPool } from '../src/reviewloop/providerWiring.js';
 
 const DEFAULT_POLICY_FILE = fileURLToPath(new URL('../agent-policy/COMMON.md', import.meta.url));
 const MCP_NAME = 'reviewloop';
@@ -134,6 +135,35 @@ export function checkReviewerSupervisorPools() {
   return { name: 'model_pools', ok: issues.length === 0, eligible, issues };
 }
 
+// Per-family Reviewer/Supervisor transport status. Distinguishes:
+//   - adapter implemented + runtime available  (wired, selectable, callable)
+//   - adapter implemented + runtime unavailable (CLI missing / not authed)
+//   - no adapter
+// plus the default model-resolution mode and whether a concrete version is
+// pinned by default (must be "no"). Zero model calls; the CLI probes are just
+// `--version` like the gh probe above.
+export function checkReviewTransportRuntime({ execSync, env } = {}) {
+  const exec = execSync || nodeExecSync;
+  const probeVersion = (bin) => {
+    try { probe(exec, `${bin} --version`); return { available: true, reason: 'ok' }; }
+    catch (err) {
+      const enoent = /ENOENT|not found/i.test(err.message);
+      return { available: false, reason: enoent ? 'CLI not installed' : 'probe failed' };
+    }
+  };
+  const transportRuntime = {
+    'codex:default': probeVersion('codex'),
+    'claude:opus': probeVersion('claude'),
+  };
+  let runtimeStatus = {};
+  try {
+    runtimeStatus = createReviewLoopProviderPool({ env: env || process.env, transportRuntime }).runtimeStatus;
+  } catch (err) {
+    return { name: 'review_transports', ok: true, error: err.message, families: {} };
+  }
+  return { name: 'review_transports', ok: true, families: runtimeStatus };
+}
+
 export function checkGithubCapability({ execSync } = {}) {
   const exec = execSync || nodeExecSync;
   try {
@@ -174,6 +204,12 @@ export function runDoctor({ execSync, log, env } = {}) {
   for (const i of pools.issues) write(`  warn  model_pools: ${i}`);
   write('  info  Worker = external / current coding agent (not selected, spawned, or budgeted by ReviewLoop)');
 
+  const transports = checkReviewTransportRuntime({ execSync: exec, env: environment });
+  for (const [family, s] of Object.entries(transports.families)) {
+    const rt = s.runtimeAvailable ? 'runtime available' : `runtime UNAVAILABLE (${s.reason})`;
+    write(`  info  transport ${family}: adapter=${s.adapterImplemented ? 'yes' : 'NO'}, ${rt}, model=${s.defaultModelResolution ?? 'n/a'}, versionPinnedByDefault=${s.concreteVersionPinnedByDefault ? 'YES' : 'no'}`);
+  }
+
   const gh = checkGithubCapability({ execSync: exec });
   write(`  info  github: gh ${gh.gh ? 'present' : 'absent'}${gh.gh ? `, ${gh.authenticated ? 'authenticated' : 'not authenticated'}` : ''} (PR-mode diagnostic; no real trigger)`);
 
@@ -192,7 +228,7 @@ export function runDoctor({ execSync, log, env } = {}) {
   return {
     ok,
     status: ok ? 'pass' : 'fail',
-    results: Object.fromEntries([...core, pools, policy, gh].map((r) => [r.name, r])),
+    results: Object.fromEntries([...core, pools, transports, policy, gh].map((r) => [r.name, r])),
   };
 }
 
