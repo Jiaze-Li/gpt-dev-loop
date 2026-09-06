@@ -1,45 +1,37 @@
-# SuperGPT Roadmap
+# ReviewLoop roadmap
 
-This file is intentionally short. Old browser-bridge phase plans and pre-V1
-role designs are retired; Git history and `docs/handoff/archive/` preserve that
-history.
+## Shipped (this migration)
 
-## V1 — foundation / historical baseline
+- Worker-owned execution architecture; Front Agent / Planner / Executor pool /
+  Sonnet-only chain / Fast-Full / taskCohesion removed.
+- Active model roles reduced to `reviewer` + `supervisor`.
+- ReviewLoop local review loop: baseline capture → Gate → Reviewer →
+  convergence policy → Supervisor (exception-only) → PASS / REWORK /
+  HUMAN_REQUIRED.
+- PR review controller: one `@codex/@claude review` per HEAD, zero-model local
+  wait, durable `WAITING_FOR_REVIEW`, exact-HEAD binding, duplicate-trigger
+  prevention.
+- Token Safety migrated to `REVIEWLOOP_*` limits, scoped to Reviewer +
+  Supervisor; `UNKNOWN != ZERO` and reservation-settlement invariants retained.
+- MCP surface reduced to `reviewloop_begin` + `reviewloop_review`.
+- CLI / MCP / package renamed to `reviewloop`.
+- Global installer migrates a legacy SuperGPT install transactionally
+  (managed block, MCP registration, AGY skill) with rollback; partial-agent
+  installs supported.
+- Deterministic/mock test suite for the new architecture.
 
-V1 established the production foundation:
+## Not yet run (needs real providers / real GitHub)
 
-- one canonical `runSuperGPT()` execution engine;
-- one global `COMMON.md` frontend contract for Claude, Codex, and AGY;
-- one `supergpt` MCP launch path for all frontends;
-- isolated workspace execution and safe delivery;
-- deterministic Gate and independent Reviewer;
-- Core-controlled normal task progression;
-- Supervisor exception-only;
-- durable status, stop, resume, provider failover, quota/health, and process cleanup.
+- ReviewLoop real-provider Reviewer/Supervisor E2E.
+- ReviewLoop real PR external-review loop (`@codex review` / `@claude review`).
+- A controlled `Worker + ReviewLoop` vs `Worker alone` wrapper benchmark
+  (ReviewLoop cannot observe Worker token usage through MCP, so active
+  telemetry must not manufacture an E2E multiplier).
 
-## V2 — current release candidate
+## Later
 
-`docs/V2_PLAN.md` records the agreed V2 design.
-
-- ✓ centralized deterministic zero-token `supergpt_route` (route-first frontend contract)
-- ✓ `supergpt_start_and_wait` single-call launch-and-block; no autonomous watch/wait loop
-- ✓ Fast Path / Full Path selection without weakening independent review
-- ✓ trusted PR review -> fix -> re-review closeout loop
-- ✓ bounded non-convergence / escalation handling
-- ✓ zero-token Dashboard + attention/history workflow lifecycle
-- ✓ Token Safety architecture — mock-certified
-- ✓ V2 unattended functional workflow — mock-certified
-- ✓ bounded real Fast-Path provider smoke — PASS (one bounded workflow only)
-
-Not live-certified: provider failover, escalation, PR closeout, and the full
-provider pools.
-
-## Optional / deferred future work
-
-- optional browser adviser (`V2-D`): only as an adviser/provider for unusually
-  difficult cases, never a workflow owner, Supervisor path, execution/review
-  dependency, or second frontend launch path. Deferred; not required for the V2
-  release.
-
-Rule: new active policy or entrypoints replace old ones. Do not create
-V1.1-style parallel frontend behavior or preserve obsolete fallback paths.
+- Production wiring of provider-specific Reviewer/Supervisor adapters through
+  `roleRouting` (currently a lean `callAgy` path).
+- PR backend wired to the `gh` CLI.
+- Optional read-only ReviewLoop dashboard (removed in this migration; re-add
+  only if it can stay zero-token and simple).

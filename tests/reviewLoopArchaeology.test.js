@@ -20,7 +20,7 @@ test('no active SuperGPT MCP tool / CLI / server names remain', () => {
 });
 
 test('active source has no Planner / Executor role, no Fast/Full path, no taskCohesion', () => {
-  const hits = grep("DEFAULT_ROLE_POLICY\\.planner|DEFAULT_ROLE_POLICY\\.executor|taskCohesion|pathSelection|FAST_PATH|FULL_PATH", 'src bin agent-policy');
+  const hits = grep("DEFAULT_ROLE_POLICY\\.planner|DEFAULT_ROLE_POLICY\\.executor|taskCohesion|pathSelection\\.js|createPathSelection|FAST_PATH|FULL_PATH", 'src bin agent-policy');
   assert.deepEqual(hits, [], hits.join('\n'));
 });
 
@@ -50,7 +50,7 @@ test('any remaining "supergpt" occurrences in src/bin are migration/compat-only'
   for (const line of hits) {
     assert.match(
       line,
-      /install-plugin\.js|LEGACY|legacy|migrat|SUPERGPT-GLOBAL-POLICY|\.supergpt|recordedBaselines|old runtime|auxiliary|worktree paths/i,
+      /install-plugin\.js|LEGACY|legacy|migrat|SUPERGPT-GLOBAL-POLICY|\.supergpt|supergpt\.\*|recordedBaselines|old runtime|auxiliary|worktree paths|V2 SuperGPT|those were V2/i,
       `unexpected active SuperGPT reference: ${line}`,
     );
   }
