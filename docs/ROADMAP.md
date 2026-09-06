@@ -36,6 +36,42 @@
 - Baseline Gate evidence captured at `begin` (0 model tokens).
 - PR reviewer default = `codex`; `internal` can never be a PR trigger identity.
 
+## Release-hardening pass (this change)
+
+Phased on top of the blocker passes; deterministic/mock `npm test` + `npm run
+doctor` green. NOT real-provider E2E.
+
+- Default reviewer allowlists are the exact REST bot logins
+  (`chatgpt-codex-connector[bot]` / `claude[bot]`); bare slugs untrusted.
+- PR review ingestion aggregates every trusted submission + inline comment per
+  HEAD; `COMMENTED` / unstructured / inline / `DISMISSED` can no longer read as
+  CLEAN; a later `APPROVED` cannot hide an earlier blocking finding.
+- Active evidence path: `lstat` before reading any untracked path (symlink /
+  special file fails closed); every baseline/diff/HEAD/ls-files git command
+  fails closed on a non-zero exit.
+- Verification plan frozen at `reviewloop_begin`; a post-`begin` edit to
+  `.reviewloop.json` / the `package.json` test script blocks the review.
+- One composite `(diff + gate)` evidenceId authorizes one physical dispatch
+  sequence; bounded failover reuses the one claim; crash/resume re-call →
+  exactly one dispatch.
+- Per-`loopId` in-process + cross-process lease around `reviewloop_review`.
+- Every settled physical attempt (success / known-usage failure /
+  mechanically-zero pre-send failure) writes a `reservationId`-tagged durable
+  accounting record; unified `AGY_ENOENT` / `AGY_SPAWN_FAILED` pre-send
+  classification; a normal failover no longer produces a false unaccounted
+  block.
+- `callAgy` envelope parsing fixed (parse `res.text`, not the transport
+  `res.json`); real `{json,text,usage}`-shape tests.
+- Unknown provider dollar cost → `costKnown: false` (never a real `$0`); cost
+  ceiling semantics adjusted.
+- Deterministic Gate FAIL → `gateRepairCount`, not a fresh Reviewer round.
+- All public `REVIEWLOOP_MAX_*` env knobs wired (`MAX_REVIEW_ROUNDS` →
+  objective; `MAX_EXTERNAL_REVIEW_TRIGGERS` → trigger authority).
+- Deterministic Gate command timeout + process-tree teardown.
+- Durable per-chunk review checkpoint / crash-resume.
+- `safetyEvents` isolated per invocation; early-return telemetry reports
+  durable cumulative spend.
+
 ## Not yet run (needs real providers / real GitHub)
 
 - ReviewLoop real-provider Reviewer/Supervisor E2E (only the `agy` families

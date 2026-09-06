@@ -107,7 +107,37 @@ it fails closed to `HUMAN_REQUIRED`.
 either in one bounded call or split into deterministic chunks that are EACH
 reviewed and metered; `PASS` requires every chunk to have been reviewed
 successfully. Evidence too large to chunk within the cap → `REVIEW_TOO_LARGE` →
-`HUMAN_REQUIRED`.
+`HUMAN_REQUIRED`. Each completed chunk's result is durably checkpointed
+(keyed to `sha(deltaFingerprint :: gateFingerprint)`); a crash mid-round
+resumes at the next unreviewed chunk without re-calling the model for the ones
+already done.
+
+**One logical review state → one dispatch sequence**: a chunk cites ONE
+composite evidenceId (`sha(diffChunkHash :: gateFingerprint)`). Attempt 1
+durably consumes it; bounded failover retries (`attempt > 1`) reuse that one
+claim; a first attempt on already-consumed evidence is denied — so a re-call
+on an identical `(diff+gate)` state across crash/resume yields exactly one
+physical Reviewer dispatch. `NO NEW INFORMATION → NO NEW MODEL CALL` holds.
+
+**Per-`loopId` serialization**: an in-process lock chain plus a durable
+cross-process lock file (`<runtime>/<loopId>/reviewloop.lock`) serialize every
+`reviewloop_review` for a loop. Overlapping calls run one after another (the
+second then hits the deterministic `NO_PROGRESS` guard — one dispatch, no lost
+update); a live foreign holder makes the call return `WAITING_FOR_REVIEW`
+without touching state; a stale/expired/dead-pid lock is reclaimed.
+
+**Gate FAIL is a repair cycle, not a Reviewer round**: a deterministic Gate
+FAIL increments `gateRepairCount`, never `round`, so Gate-repair loops never
+exhaust the objective's max fresh Reviewer rounds. Each Gate command has a
+deterministic timeout (`REVIEWLOOP_GATE_TIMEOUT_MS`) with whole-process-tree
+teardown.
+
+**Frozen verification plan**: `reviewloop_begin` resolves and freezes the Gate
+verification plan (`source`, exact `commands`, a `manifestFingerprint` of the
+`.reviewloop.json` / `package.json` test-script bytes) into the immutable
+objective. `reviewloop_review` runs those exact frozen commands; any manifest
+drift since `begin` blocks the review (REWORK) rather than trusting a Gate the
+Worker can edit mid-loop.
 
 **Baseline attribution**: `git stash create` snapshots the exact pre-Worker
 tracked state without touching the tree; the review diff is `baseline..current`
@@ -117,20 +147,54 @@ Worker change since `begin` → deterministic `NO_PROGRESS`, zero Reviewer calls
 
 **PR trust boundary** (`prTrust.js`, reusing `trustedPrReview.js`): a trusted
 external review must prove its **real GitHub login is in the EXACT allowlist**
-for the configured reviewer (exact string match — never substring/includes, so
-`evil-codex-bot` / `fake-claude` are rejected; override via
-`REVIEWLOOP_{CODEX,CLAUDE}_REVIEWER_LOGINS`), an explicit reviewed HEAD in the
-payload, and reviewed HEAD == current PR HEAD. Missing any → reject. The
-payload is never first rewritten to the configured reviewer name and then
-"verified" against itself; the normalizer never substitutes the current HEAD.
+for the configured reviewer. The defaults are the literal REST `user.login`
+strings a GitHub App produces on a PR — `chatgpt-codex-connector[bot]` /
+`claude[bot]` (the bare, suffix-less slug is never what REST returns and is not
+trusted). Exact string match — never substring/includes, so `evil-codex-bot` /
+`chatgpt-codex-connector` / `claude[bot]x` are rejected; override via
+`REVIEWLOOP_{CODEX,CLAUDE}_REVIEWER_LOGINS`. Also required: an explicit reviewed
+HEAD in the payload, and reviewed HEAD == current PR HEAD. The payload is never
+first rewritten to the configured reviewer name and then "verified" against
+itself; the normalizer never substitutes the current HEAD.
 
-**Unrecoverable spend fails closed**: if a crash leaves a `SETTLED_KNOWN`
-metered reservation with no matching spend-log record, its real usage/cost are
-gone — `UNKNOWN != ZERO`, so every further metered call is refused
-(`MODEL_SPEND_USAGE_UNRESOLVED`) until a human acknowledges it
+**PR review ingestion** aggregates EVERY trusted review submission and EVERY
+trusted inline review comment for the exact HEAD (exact bot login). Per-state
+semantics: `APPROVED` clears only with a structured empty findings list or a
+benign body; `CHANGES_REQUESTED` blocks; `COMMENTED` / any unstructured state
+blocks (never an empty findings list); `DISMISSED` is void and fails closed
+when nothing else clears the HEAD; `PENDING` is ignored. A later `APPROVED`
+cannot erase an earlier `CHANGES_REQUESTED` / `COMMENTED` finding on the same
+HEAD.
+
+**Complete physical-attempt accounting**: every settled metered attempt —
+success, known-usage failure, OR mechanically-zero pre-send failure
+(`PROVIDER_UNAVAILABLE` / `AGY_ENOENT` / `AGY_SPAWN_FAILED` / `AGY_BAD_INPUT`) —
+writes a durable spend-log record tagged with its `reservationId` before the
+business error propagates. A normal failover therefore never looks like
+unaccounted spend on the next load. If a crash still leaves a `SETTLED_KNOWN`
+reservation with no matching record (orphan by `reservationId`), its real
+usage/cost are gone — `UNKNOWN != ZERO`, so every further metered call is
+refused (`MODEL_SPEND_USAGE_UNRESOLVED`) until a human acknowledges it
 (`REVIEWLOOP_ACK_UNACCOUNTED_SPEND`).
+
+**Unknown dollar cost is never $0**: a provider that reports no cost yields
+`costKnown: false`; telemetry's `costUsd` is then a lower bound. The cost
+ceiling fires on the known sum, and also once the known sum passes half the
+ceiling while any unknown-cost call exists; `usageVolume` stays the hard
+runaway guard.
 
 **Untracked evidence** is never silently truncated: a Worker-touched untracked
 text file's full content reaches the Reviewer via the chunker; a binary or
 unreadable Worker-created file marks the evidence incomplete → `HUMAN_REQUIRED`;
-a deleted pre-existing untracked file is recognised as a Worker change.
+a deleted pre-existing untracked file is recognised as a Worker change. Every
+untracked path is `lstat`'d before it is read — a symlink, FIFO, socket, or
+device is never followed (it would fold an out-of-tree target's bytes into
+Reviewer evidence) and fails the evidence closed. Any git command that feeds
+baseline / diff / HEAD / untracked attribution fails closed on a non-zero exit
+— never absorbed as an empty diff, an empty set, or a fallback HEAD.
+
+**Per-invocation isolation**: `safetyEvents` in a result are scoped to that one
+`reviewloop_review` call (a long-lived controller shared by many `loopId`s
+never leaks one loop's events into another's). `NO_PROGRESS` /
+`WAITING_FOR_REVIEW` / `PUSH_REQUIRED` / terminal results report the durable
+cumulative spend, never zeros.
