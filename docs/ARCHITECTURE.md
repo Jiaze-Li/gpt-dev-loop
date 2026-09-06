@@ -116,6 +116,21 @@ never attributed to the Worker. Unattributable state → `HUMAN_REQUIRED`. No
 Worker change since `begin` → deterministic `NO_PROGRESS`, zero Reviewer calls.
 
 **PR trust boundary** (`prTrust.js`, reusing `trustedPrReview.js`): a trusted
-external review must prove reviewer identity == configured, an explicit reviewed
-HEAD in the payload, and reviewed HEAD == current PR HEAD. Missing any → reject.
-The normalizer never substitutes the current HEAD for a missing one.
+external review must prove its **real GitHub login is in the EXACT allowlist**
+for the configured reviewer (exact string match — never substring/includes, so
+`evil-codex-bot` / `fake-claude` are rejected; override via
+`REVIEWLOOP_{CODEX,CLAUDE}_REVIEWER_LOGINS`), an explicit reviewed HEAD in the
+payload, and reviewed HEAD == current PR HEAD. Missing any → reject. The
+payload is never first rewritten to the configured reviewer name and then
+"verified" against itself; the normalizer never substitutes the current HEAD.
+
+**Unrecoverable spend fails closed**: if a crash leaves a `SETTLED_KNOWN`
+metered reservation with no matching spend-log record, its real usage/cost are
+gone — `UNKNOWN != ZERO`, so every further metered call is refused
+(`MODEL_SPEND_USAGE_UNRESOLVED`) until a human acknowledges it
+(`REVIEWLOOP_ACK_UNACCOUNTED_SPEND`).
+
+**Untracked evidence** is never silently truncated: a Worker-touched untracked
+text file's full content reaches the Reviewer via the chunker; a binary or
+unreadable Worker-created file marks the evidence incomplete → `HUMAN_REQUIRED`;
+a deleted pre-existing untracked file is recognised as a Worker change.
