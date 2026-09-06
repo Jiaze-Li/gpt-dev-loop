@@ -11,6 +11,9 @@
 // empty finding list — it is surfaced as { malformed: true, ... } so the
 // normalizer fails it closed (FAILED -> HUMAN_REQUIRED).
 
+import os from 'node:os';
+import path from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
 import {
   DEFAULT_ROLE_POLICY,
@@ -24,6 +27,22 @@ import { resolveModelFamily, MODEL_FAMILY_REGISTRY } from '../orchestrator/model
 import { createGithubReviewBackend } from './githubBackend.js';
 
 export const ACTIVE_ROLE_POOLS = Object.freeze(Object.keys(DEFAULT_ROLE_POLICY));
+
+// The Reviewer / Supervisor are NARROW single-turn inference, not a second
+// coding Worker. The agy transport runs from an isolated empty scratch dir so
+// there is no repo, no GEMINI.md, no project/agent memory for the CLI to
+// preload; slash/skill expansion is disabled and no conversation is resumed.
+// This is the lightest mode `agy` offers — any residual transport context tax
+// is MEASURED (payloadMeta / contextOverheadTokens in the durable spend
+// record), never hidden.
+let narrowCwd;
+export function narrowReviewTransportCwd() {
+  if (narrowCwd) return narrowCwd;
+  const dir = path.join(os.tmpdir(), 'reviewloop-review-transport');
+  try { mkdirSync(dir, { recursive: true }); } catch { /* best effort; agy still runs */ }
+  narrowCwd = dir;
+  return dir;
+}
 
 const SEVERITIES = new Set(['P1', 'P2', 'P3']);
 
@@ -188,9 +207,18 @@ export function createReviewLoopProviderPool({
   // stage; codex/claude remain capability-declared protocol targets with no
   // transport, so they are marked unavailable up front and the RoleRouter
   // skips them (rather than pretending a call can be made).
+  const narrow = (family) => async (prompt) => {
+    const res = await callAgy({
+      prompt,
+      model: modelForFamily[family] ?? null,
+      cwd: narrowReviewTransportCwd(),
+      disableSlashCommands: true,
+    });
+    return { ...res, meta: { promptChars: String(prompt ?? '').length } };
+  };
   const transports = {
-    'agy:gemini': async (prompt) => callAgy({ prompt, model: modelForFamily['agy:gemini'] ?? null }),
-    'agy:gpt-oss': async (prompt) => callAgy({ prompt, model: modelForFamily['agy:gpt-oss'] ?? null }),
+    'agy:gemini': narrow('agy:gemini'),
+    'agy:gpt-oss': narrow('agy:gpt-oss'),
   };
   for (const family of Object.keys(PRODUCTION_ROLE_CAPABILITIES)) {
     if (!transports[family]) providerHealth.record(family, 'UNAVAILABLE', 'no wired transport in this build');
@@ -260,7 +288,17 @@ function buildReviewerInvoke() {
     const res = await transport(prompt);
     const { parsed, raw } = parseJsonish(res);
     const value = validateReviewerPayload(parsed, { raw });
-    return { value, usage: res?.usage ?? null, model: res?.model ?? model };
+    return {
+      value,
+      usage: res?.usage ?? null,
+      model: res?.model ?? model,
+      meta: {
+        promptChars: prompt.length,
+        diffChars: String(diff ?? '').length,
+        reviewPayloadChars: prompt.length,
+        ...(res?.meta ?? {}),
+      },
+    };
   };
 }
 
@@ -276,7 +314,17 @@ function buildSupervisorInvoke() {
     const res = await transport(prompt);
     const { parsed, raw } = parseJsonish(res);
     const value = validateSupervisorPayload(parsed, { raw });
-    return { value, usage: res?.usage ?? null, model: res?.model ?? model };
+    return {
+      value,
+      usage: res?.usage ?? null,
+      model: res?.model ?? model,
+      meta: {
+        promptChars: prompt.length,
+        diffChars: 0,
+        reviewPayloadChars: prompt.length,
+        ...(res?.meta ?? {}),
+      },
+    };
   };
 }
 

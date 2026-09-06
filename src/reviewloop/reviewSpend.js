@@ -115,6 +115,64 @@ export function usageVolumeOf(usage) {
     + f('cache_read_input_tokens', 'cacheReadInputTokens', 'cache_read_input');
 }
 
+// Provider-reported usage broken out per field. UNKNOWN != ZERO: a field the
+// provider did not report is `null`, never 0. Persisted per physical call so
+// transport-context overhead ("diff 20k chars, yet input 120k tokens") is
+// diagnosable after the fact — never estimated into a hard number.
+export function usageBreakdownOf(usage) {
+  if (!usage || typeof usage !== 'object') {
+    return {
+      inputTokens: null, outputTokens: null, thinkingTokens: null,
+      cacheReadTokens: null, cacheCreationTokens: null, totalTokens: null,
+    };
+  }
+  const g = (...keys) => {
+    for (const k of keys) {
+      const v = usage[k];
+      if (Number.isFinite(v)) return v;
+    }
+    return null;
+  };
+  const inputTokens = g('input_tokens', 'inputTokens', 'prompt_tokens');
+  const outputTokens = g('output_tokens', 'outputTokens', 'completion_tokens');
+  const thinkingTokens = g('thinking_tokens', 'thinkingTokens', 'reasoning_tokens', 'reasoningTokens');
+  const cacheReadTokens = g('cache_read_input_tokens', 'cacheReadInputTokens', 'cache_read_input', 'cache_read_tokens');
+  const cacheCreationTokens = g('cache_creation_input_tokens', 'cacheCreationInputTokens', 'cache_creation_input', 'cache_creation_tokens');
+  let totalTokens = g('total_tokens', 'totalTokens', 'total');
+  if (totalTokens == null) {
+    const parts = [inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens].filter((v) => Number.isFinite(v));
+    totalTokens = parts.length ? parts.reduce((a, b) => a + b, 0) : null;
+  }
+  return { inputTokens, outputTokens, thinkingTokens, cacheReadTokens, cacheCreationTokens, totalTokens };
+}
+
+// Mechanical payload-size metadata for a review/supervise physical call. Only
+// lengths and machine metadata — never prompt text. `estimatedPayloadTokens`
+// is a deliberately coarse chars/4 proxy so a caller can compare it to the
+// provider's reported input token count and see transport context tax.
+export function payloadMetaOf(meta) {
+  if (!meta || typeof meta !== 'object') return null;
+  const n = (v) => (Number.isFinite(v) ? v : null);
+  const promptChars = n(meta.promptChars);
+  const out = {
+    promptChars,
+    diffChars: n(meta.diffChars),
+    reviewPayloadChars: n(meta.reviewPayloadChars ?? meta.promptChars),
+    estimatedPayloadTokens: Number.isFinite(promptChars) ? Math.round(promptChars / 4) : null,
+  };
+  return out;
+}
+
+// input tokens the provider billed that are NOT explained by the payload we
+// sent — the transport context tax (system prompt, tools, workspace preload).
+// null when either side is UNKNOWN; never negative.
+export function contextOverheadTokens(breakdown, payloadMeta) {
+  const input = breakdown?.inputTokens;
+  const est = payloadMeta?.estimatedPayloadTokens;
+  if (!Number.isFinite(input) || !Number.isFinite(est)) return null;
+  return Math.max(0, input - est);
+}
+
 // Durable append-only spend log over the existing workflow-state snapshot,
 // keyed by loopId. No parallel database.
 export class ReviewLoopSpendStore {
@@ -150,6 +208,40 @@ function foldTotals(records) {
     unknownUsageCalls: acc.unknownUsageCalls + (r.usageKnown ? 0 : 1),
     unknownCostCalls: acc.unknownCostCalls + (r.costKnown === false ? 1 : 0),
   }), { reviewerCalls: 0, supervisorCalls: 0, usageVolume: 0, costUsd: 0, unknownUsageCalls: 0, unknownCostCalls: 0 });
+}
+
+// Aggregate provider usage breakdown + payload/overhead metadata across all
+// durable spend records. A field only sums where it was actually reported;
+// `*Unknown` counts the calls where it was not (UNKNOWN != 0).
+function foldBreakdown(records) {
+  const F = ['inputTokens', 'outputTokens', 'thinkingTokens', 'cacheReadTokens', 'cacheCreationTokens', 'totalTokens'];
+  const sums = Object.fromEntries(F.map((k) => [k, 0]));
+  const unknown = Object.fromEntries(F.map((k) => [`${k}Unknown`, 0]));
+  let promptChars = 0;
+  let diffChars = 0;
+  let estimatedPayloadTokens = 0;
+  let contextOverheadTokens = 0;
+  let contextOverheadKnownCalls = 0;
+  for (const r of records) {
+    const b = r.usageBreakdown ?? {};
+    for (const k of F) {
+      if (Number.isFinite(b[k])) sums[k] += b[k];
+      else unknown[`${k}Unknown`] += 1;
+    }
+    const p = r.payloadMeta ?? {};
+    if (Number.isFinite(p.promptChars)) promptChars += p.promptChars;
+    if (Number.isFinite(p.diffChars)) diffChars += p.diffChars;
+    if (Number.isFinite(p.estimatedPayloadTokens)) estimatedPayloadTokens += p.estimatedPayloadTokens;
+    if (Number.isFinite(r.contextOverheadTokens)) {
+      contextOverheadTokens += r.contextOverheadTokens;
+      contextOverheadKnownCalls += 1;
+    }
+  }
+  return {
+    ...sums, ...unknown,
+    promptChars, diffChars, estimatedPayloadTokens,
+    contextOverheadTokens, contextOverheadKnownCalls,
+  };
 }
 
 // Build the ReviewLoop spend surface. `persistence` (optional) makes the
@@ -395,6 +487,8 @@ export function createReviewLoopSpend({
           // Pass the provider cost through UNCHANGED (undefined when unknown) —
           // UNKNOWN != $0. The record layer marks costKnown accordingly.
           costUsd: out?.costUsd,
+          // Mechanical payload-size metadata (lengths only, never prompt text).
+          meta: out?.meta ?? null,
         };
       });
     } catch (err) {
@@ -413,10 +507,17 @@ export function createReviewLoopSpend({
         // failure's cost is only known if the error carried it.
         const failCost = err?.details?.costUsd;
         const costKnown = Number.isFinite(failCost) || isMechanicallyZeroPreSend(err);
+        const failMeta = payloadMetaOf(err?.details?.meta ?? null);
+        const failBreakdown = usageBreakdownOf(usage);
         await appendRecord({
           model: model ?? null,
+          family,
+          provider,
           usageKnown: usage != null,
           usageVolume: usageVolumeOf(usage),
+          usageBreakdown: failBreakdown,
+          payloadMeta: failMeta,
+          contextOverheadTokens: contextOverheadTokens(failBreakdown, failMeta),
           costUsd: Number.isFinite(failCost) ? failCost : 0,
           costKnown,
           businessOutcome: 'FAILURE',
@@ -426,10 +527,20 @@ export function createReviewLoopSpend({
       throw err;
     }
 
+    const okBreakdown = usageBreakdownOf(result?.usage);
+    const okMeta = payloadMetaOf(result?.meta);
     await appendRecord({
+      // requestedFamily -> resolvedModel: the concrete model actually used
+      // (recovered from the provider envelope when config asked for a family).
       model: result?.model ?? model ?? null,
+      requestedFamily: family,
+      family,
+      provider,
       usageKnown: result?.usage != null,
       usageVolume: usageVolumeOf(result?.usage),
+      usageBreakdown: okBreakdown,
+      payloadMeta: okMeta,
+      contextOverheadTokens: contextOverheadTokens(okBreakdown, okMeta),
       costUsd: Number.isFinite(result?.costUsd) ? result.costUsd : 0,
       costKnown: Number.isFinite(result?.costUsd),
       businessOutcome: 'SUCCESS',
@@ -439,7 +550,10 @@ export function createReviewLoopSpend({
 
   async function telemetry() {
     const t = await currentTotals();
+    const prior = await loadPriorRecords();
+    const breakdown = foldBreakdown([...prior, ...sessionRecords]);
     return {
+      usageBreakdown: breakdown,
       reviewerCalls: t.reviewerCalls,
       supervisorCalls: t.supervisorCalls,
       usageVolume: t.usageVolume,

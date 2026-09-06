@@ -428,7 +428,7 @@ export function createReviewLoopController({
           previousFindings: loopState.lastReview?.blockingFindings ?? [],
           selection,
         })).then((out) => ({
-          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd,
+          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
         })),
       });
       loopState.reviewerCalls += 1;
@@ -694,7 +694,7 @@ export function createReviewLoopController({
           objective, blockingFindings: review.blockingFindings, gate,
           round: loopState.round, priorSignatures: loopState.findingSignatureHistory, selection,
         })).then((out) => ({
-          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd,
+          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
         })),
       });
     } catch (err) {
