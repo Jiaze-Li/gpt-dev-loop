@@ -30,12 +30,15 @@ evidence.
 src/reviewloop/
   objective.js          immutable ReviewObjective (fingerprinted, never weakened)
   state.js              durable loop state + deterministic state machine
-  gitEvidence.js        pre-Worker baseline capture + Worker-delta attribution
-  gatePolicy.js         verification discovery + deterministic Gate
+  gitEvidence.js        pre-Worker baseline (git stash create) + exact Worker-delta attribution
+  gatePolicy.js         verification discovery + deterministic Gate + baseline-diff
+  diffChunker.js        deterministic diff chunking (no silent truncation)
   reviewPolicy.js       review normalization + convergence policy
-  reviewSpend.js        ReviewLoop-scoped Token Safety (Reviewer + Supervisor)
+  reviewSpend.js        DURABLE ReviewLoop-scoped Token Safety (Reviewer + Supervisor)
+  prTrust.js            PR trust boundary (reviewer id + explicit reviewed HEAD == current HEAD)
   prReviewController.js  PR external-review loop (ExternalModelTriggerAuthority)
-  providerWiring.js     production Reviewer/Supervisor callables
+  githubBackend.js      production PR transport via the `gh` CLI (read + one trigger comment)
+  providerWiring.js     production Reviewer/Supervisor pool (RoleRouter) + PR backend
   controller.js         reviewloop_begin + reviewloop_review
   runtimeDir.js         ~/.reviewloop
 
@@ -86,4 +89,33 @@ Supervisor). External `@codex/@claude review` crosses
 
 Limits (`REVIEWLOOP_*`): `MAX_COST_USD`, `MAX_USAGE_VOLUME`,
 `MAX_REVIEW_ROUNDS`, `MAX_REVIEWER_CALLS`, `MAX_SUPERVISOR_CALLS`,
-`MAX_EXTERNAL_REVIEW_TRIGGERS`.
+`MAX_EXTERNAL_REVIEW_TRIGGERS`, `MAX_REVIEW_DIFF_CHARS`, `MAX_REVIEW_CHUNKS`.
+
+The aggregate budget (call counts, `usageVolume` = input + output + cache
+creation + cache read, `costUsd`) is **durable** and keyed by `loopId`: it
+accumulates across every `reviewloop_review` round, the Supervisor call, and a
+process restart. A crash after provider settlement cannot reset it — the
+reservation ledger is cross-checked on load and any settled/blocking metered
+reservation with no matching spend record is counted conservatively (call
+counted, usage UNKNOWN, never zero).
+
+**Malformed provider output** (unparseable, no findings channel, invalid
+severity, empty Supervisor guidance) is never reduced to a clean empty result —
+it fails closed to `HUMAN_REQUIRED`.
+
+**Review evidence coverage**: the Worker's full attributed diff is reviewed —
+either in one bounded call or split into deterministic chunks that are EACH
+reviewed and metered; `PASS` requires every chunk to have been reviewed
+successfully. Evidence too large to chunk within the cap → `REVIEW_TOO_LARGE` →
+`HUMAN_REQUIRED`.
+
+**Baseline attribution**: `git stash create` snapshots the exact pre-Worker
+tracked state without touching the tree; the review diff is `baseline..current`
+(never `HEAD..current`), so pre-existing staged/unstaged/untracked user work is
+never attributed to the Worker. Unattributable state → `HUMAN_REQUIRED`. No
+Worker change since `begin` → deterministic `NO_PROGRESS`, zero Reviewer calls.
+
+**PR trust boundary** (`prTrust.js`, reusing `trustedPrReview.js`): a trusted
+external review must prove reviewer identity == configured, an explicit reviewed
+HEAD in the payload, and reviewed HEAD == current PR HEAD. Missing any → reject.
+The normalizer never substitutes the current HEAD for a missing one.

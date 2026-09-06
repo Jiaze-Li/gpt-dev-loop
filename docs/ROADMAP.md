@@ -20,18 +20,34 @@
   installs supported.
 - Deterministic/mock test suite for the new architecture.
 
+## Independent-review blocker pass (this change)
+
+- Malformed Reviewer/Supervisor output fails closed (never CLEAN, never valid
+  REWORK guidance).
+- Aggregate Token Safety is durable across rounds and restarts.
+- Production PR backend wired via the `gh` CLI (read + one trigger comment).
+- Strict PR trust boundary (reviewer identity + explicit reviewed HEAD ==
+  current HEAD), reusing the V2 trusted-review primitives.
+- No silent diff truncation — bounded or deterministically chunked review.
+- Reviewer/Supervisor pool routed through RoleRouter; the CallIntent binds the
+  actually-selected family; bounded failover re-authorizes.
+- Full baseline attribution via `git stash create`; unattributable state and
+  "no Worker change yet" both fail safely.
+- Baseline Gate evidence captured at `begin` (0 model tokens).
+- PR reviewer default = `codex`; `internal` can never be a PR trigger identity.
+
 ## Not yet run (needs real providers / real GitHub)
 
-- ReviewLoop real-provider Reviewer/Supervisor E2E.
+- ReviewLoop real-provider Reviewer/Supervisor E2E (only the `agy` families
+  have a live transport in this build; `codex`/`claude` families are
+  capability-declared but marked unavailable until their transports are wired).
 - ReviewLoop real PR external-review loop (`@codex review` / `@claude review`).
+- Real multi-provider failover (structurally wired + mock-certified).
 - A controlled `Worker + ReviewLoop` vs `Worker alone` wrapper benchmark
-  (ReviewLoop cannot observe Worker token usage through MCP, so active
-  telemetry must not manufacture an E2E multiplier).
+  (ReviewLoop cannot observe Worker token usage through MCP).
 
 ## Later
 
-- Production wiring of provider-specific Reviewer/Supervisor adapters through
-  `roleRouting` (currently a lean `callAgy` path).
-- PR backend wired to the `gh` CLI.
+- Live `codex` / `claude` Reviewer/Supervisor transports.
 - Optional read-only ReviewLoop dashboard (removed in this migration; re-add
   only if it can stay zero-token and simple).
