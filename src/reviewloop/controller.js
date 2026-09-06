@@ -33,6 +33,7 @@ import {
   isTerminal,
 } from './state.js';
 import { captureBaseline, collectWorkerDelta } from './gitEvidence.js';
+import { withInProcessLoopLock, acquireLoopFileLease } from './loopLease.js';
 import { discoverVerificationCommands, runGate, GATE_VERDICTS } from './gatePolicy.js';
 import {
   normalizeReview,
@@ -104,6 +105,10 @@ export function createReviewLoopController({
 } = {}) {
   const persistence = injectedPersistence ?? new Persistence(runtimeRoot);
   const store = new ReviewLoopStore(persistence);
+  // The cross-process lock file lives under the real runtime dir. Only a
+  // filesystem-backed persistence has one; an in-memory test persistence does
+  // not, and there the in-process lock chain is the whole guarantee.
+  const fileLeaseRoot = typeof persistence?.workflowDir === 'function' ? runtimeRoot : null;
   // Safety events are scoped to ONE reviewloop_review invocation. The array is
   // replaced (never appended-to across calls) at the top of review() so a
   // long-lived controller (one per MCP process, shared by every loopId) never
@@ -276,6 +281,37 @@ export function createReviewLoopController({
 
   async function review({ loopId, signal, onHeartbeat } = {}) {
     if (!loopId) throw new Error('reviewloop_review: loopId is required');
+    // Serialize every reviewloop_review for this loopId. In-process: overlapping
+    // calls run one after another (the second then hits the deterministic
+    // NO_PROGRESS guard — one dispatch, no lost update). Cross-process: a live
+    // foreign holder makes this call return BUSY without touching any state.
+    return withInProcessLoopLock(loopId, async () => {
+      const lease = await acquireLoopFileLease({ runtimeRoot: fileLeaseRoot, loopId });
+      if (!lease.ok) {
+        // Another reviewloop_review is already running for this loop (another
+        // process). Report the in-contract "call again later" state — never run
+        // a concurrent Reviewer or clobber the in-flight call's durable state.
+        safetyEvents = [];
+        return {
+          status: 'WAITING_FOR_REVIEW',
+          loopId,
+          reason: 'another reviewloop_review is already running for this loop'
+            + (lease.heldBy?.pid ? ` (holder pid ${lease.heldBy.pid} on ${lease.heldBy.host ?? '?'})` : '')
+            + '; wait for it to finish, then call reviewloop_review again',
+          nextAction: 'Wait for the in-flight review of this loop to finish, then call reviewloop_review again.',
+          telemetry: await durableTelemetry(loopId),
+          safetyEvents: [],
+        };
+      }
+      try {
+        return await reviewInner({ loopId, signal, onHeartbeat });
+      } finally {
+        await lease.release();
+      }
+    });
+  }
+
+  async function reviewInner({ loopId, signal, onHeartbeat }) {
     // Per-invocation safety-event isolation: start this call with a clean list.
     safetyEvents = [];
     const loopState = await loadLoop(loopId);
