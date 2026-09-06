@@ -13,14 +13,21 @@
 
 const POSIX_PROCESS_GROUPS = process.platform !== 'win32';
 
+// POSIX kill(2) gives pid == -1 special broadcast semantics: it signals every
+// process the caller is permitted to signal, rather than process-group 1.
+// A fake/injected child with pid=1 must therefore NEVER become a negative
+// process-group target. Other positive ids retain ordinary -PGID semantics.
+function safeProcessGroupId(value) {
+  return Number.isInteger(value) && value > 1 ? value : null;
+}
+
 // Spread into child_process.spawn options. Callers must NOT child.unref(): they
 // still await the direct child's close event in addition to the group teardown.
 export const PROCESS_GROUP_SPAWN_OPTS = Object.freeze({ detached: true });
 
 function groupIdFor(child) {
   if (!POSIX_PROCESS_GROUPS) return null;
-  const pid = child?.pid;
-  return Number.isInteger(pid) && pid > 0 ? pid : null;
+  return safeProcessGroupId(child?.pid);
 }
 
 function directChildExited(child) {
@@ -33,9 +40,10 @@ function directChildExited(child) {
 
 // `kill(-pgid, 0)` probes the group without signalling it.
 export function processGroupExists(pgid) {
-  if (!POSIX_PROCESS_GROUPS || !Number.isInteger(pgid) || pgid <= 0) return false;
+  const safePgid = safeProcessGroupId(pgid);
+  if (!POSIX_PROCESS_GROUPS || safePgid === null) return false;
   try {
-    process.kill(-pgid, 0);
+    process.kill(-safePgid, 0);
     return true;
   } catch (err) {
     if (err?.code === 'ESRCH') return false;
@@ -49,11 +57,12 @@ export function processGroupExists(pgid) {
 // merely because the direct child has exited: descendants can outlive the
 // leader while remaining members of the same process group.
 export function killProcessTree(child, signal = 'SIGTERM', { pgid = groupIdFor(child) } = {}) {
-  if (!child && !pgid) return;
+  const safePgid = safeProcessGroupId(pgid);
+  if (!child && safePgid === null) return;
 
-  if (pgid) {
+  if (safePgid !== null) {
     try {
-      process.kill(-pgid, signal);
+      process.kill(-safePgid, signal);
       return;
     } catch (err) {
       if (err?.code === 'ESRCH') return;
@@ -62,6 +71,9 @@ export function killProcessTree(child, signal = 'SIGTERM', { pgid = groupIdFor(c
     }
   }
 
+  // Invalid/special PGIDs (especially 1) are never converted to negative kill
+  // targets. The direct-child fallback is intentionally narrower and cannot
+  // acquire POSIX broadcast semantics.
   if (directChildExited(child)) return;
   try {
     child.kill(signal);
