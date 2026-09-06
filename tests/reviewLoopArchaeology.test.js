@@ -1,0 +1,64 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execSync } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+function grep(pattern, paths) {
+  try {
+    return execSync(`git grep -n -E ${JSON.stringify(pattern)} -- ${paths}`, { cwd: ROOT, encoding: 'utf8' }).trim().split('\n').filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+test('no active SuperGPT MCP tool / CLI / server names remain', () => {
+  const hits = grep('supergpt_route|supergpt_start_and_wait|supergptMcpServer|bin/supergpt\\.js', 'src bin agent-policy package.json');
+  assert.deepEqual(hits, [], hits.join('\n'));
+});
+
+test('active source has no Planner / Executor role, no Fast/Full path, no taskCohesion', () => {
+  const hits = grep("DEFAULT_ROLE_POLICY\\.planner|DEFAULT_ROLE_POLICY\\.executor|taskCohesion|pathSelection|FAST_PATH|FULL_PATH", 'src bin agent-policy');
+  assert.deepEqual(hits, [], hits.join('\n'));
+});
+
+test('removed modules are gone from the tree', () => {
+  for (const f of [
+    'src/orchestrator/planner.js',
+    'src/orchestrator/taskCohesion.js',
+    'src/orchestrator/pathSelection.js',
+    'src/orchestrator/automatedLoop.js',
+    'src/orchestrator/supergpt.js',
+    'src/orchestrator/workflowWorktree.js',
+    'src/orchestrator/adapters/claudeSessionManager.js',
+    'src/mcp/supergptMcpServer.js',
+  ]) {
+    assert.equal(existsSync(new URL(f, new URL('..', import.meta.url))), false, f);
+  }
+});
+
+test('COMMON is the ReviewLoop Worker Contract and mentions no retired concepts', () => {
+  const common = readFileSync(new URL('../agent-policy/COMMON.md', import.meta.url), 'utf8');
+  assert.match(common, /ReviewLoop Worker Contract/);
+  assert.doesNotMatch(common, /Front[- ]Agent|route-first|DIRECT \| SUPERGPT|Fast Path|Full Path|\bPlanner\b|\bExecutor\b|Task Card|start_and_wait/);
+});
+
+test('any remaining "supergpt" occurrences in src/bin are migration/compat-only', () => {
+  const hits = grep('supergpt|SuperGPT', 'src bin');
+  for (const line of hits) {
+    assert.match(
+      line,
+      /install-plugin\.js|LEGACY|legacy|migrat|SUPERGPT-GLOBAL-POLICY|\.supergpt|recordedBaselines|old runtime|auxiliary|worktree paths/i,
+      `unexpected active SuperGPT reference: ${line}`,
+    );
+  }
+});
+
+test('package.json is renamed to reviewloop with reviewloop bins', () => {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(pkg.name, 'reviewloop');
+  assert.deepEqual(Object.keys(pkg.bin).sort(), ['reviewloop', 'reviewloop-mcp']);
+  assert.match(pkg.description, /ReviewLoop/);
+});

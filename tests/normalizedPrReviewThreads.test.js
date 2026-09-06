@@ -60,7 +60,7 @@ test('FIXED and RESOLVED transitions retain verification and resolution evidence
     success: true, threadId: 'thread-1', resolvedAt: '2026-08-31T00:00:00.000Z',
   });
   assert.equal(resolved.lifecycle, FINDING_LIFECYCLE.RESOLVED);
-  assert.equal(resolved.resolvedBy, 'supergpt');
+  assert.equal(resolved.resolvedBy, 'reviewloop');
   assert.equal(resolved.resolvedOnHead, 'head-2');
   assert.equal(resolved.verificationReviewId, 'review-2');
   assert.deepEqual(recordThreadResolution(resolved, { success: false }), resolved);

@@ -67,29 +67,3 @@ test('capability lookups are deterministic across repeated calls', () => {
   assert.deepEqual(a, b);
   assert.equal(isExecutorEligible('codex:default'), isExecutorEligible('codex:default'));
 });
-
-test('existing routing behaviour for decision roles (planner/supervisor/reviewer) does not regress', () => {
-  // The capability policy module is additive: RoleRouter still routes
-  // planner/supervisor/reviewer purely off DEFAULT_ROLE_POLICY /
-  // PRODUCTION_ROLE_CAPABILITIES, unaffected by executorEligible.
-  const resolveFamily = (family) => ({
-    requestedFamily: family,
-    resolvedModel: null,
-    provider: family.split(':')[0],
-    capabilities: { roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [] },
-  });
-  const router = new RoleRouter({
-    rolePolicy: DEFAULT_ROLE_POLICY,
-    quotaRegistry: new QuotaPoolRegistry({ filePath: null }),
-    providerHealth: new ProviderHealthRegistry(),
-    resolveFamily,
-  });
-  const planner = router.route('planner');
-  assert.equal(planner.requestedFamily, 'codex:default');
-  const supervisor = router.route('supervisor');
-  assert.equal(supervisor.requestedFamily, 'agy:gemini');
-  const reviewer = router.route('reviewer');
-  assert.equal(reviewer.requestedFamily, 'agy:gpt-oss');
-  const executor = router.route('executor');
-  assert.equal(executor.requestedFamily, 'claude:sonnet');
-});
