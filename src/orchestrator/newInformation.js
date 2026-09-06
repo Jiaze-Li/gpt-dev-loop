@@ -261,6 +261,23 @@ export class NewInformationLedger {
     return null;
   }
 
+  // Returns the consumption record if THIS exact (role, operationId) already
+  // durably claimed one of `evidenceIds` — else null. Retry / failover never
+  // CREATES eligibility (findEligibleUnconsumed still governs that), but the
+  // logical state that authorized the first physical attempt of an operation
+  // covers the bounded failover retries of that same operation: the caller
+  // must pass attempt > 1, and the retry count is bounded elsewhere.
+  async findConsumedBy({
+    workflowId, role, operationId, evidenceIds = [],
+  }) {
+    const state = await this._load(workflowId);
+    for (const evidenceId of evidenceIds) {
+      const key = computeConsumptionKey({ role, operationId, evidenceId });
+      if (state.consumptions.has(key)) return state.consumptions.get(key);
+    }
+    return null;
+  }
+
   // Diagnostics / tests only.
   async list(workflowId) {
     const state = await this._load(workflowId);

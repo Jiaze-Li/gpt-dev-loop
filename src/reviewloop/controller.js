@@ -225,9 +225,13 @@ export function createReviewLoopController({
   // One metered provider call with bounded failover. Each physical attempt
   // re-routes (excluding failed families), re-authorizes (fresh permit), and
   // re-binds the CallIntent to the actually-selected family. A provider
-  // failure is not New Information — every attempt supplies the SAME
-  // evidenceIds and the New Information ledger is what makes a 2nd attempt on
-  // identical evidence legal exactly once per (role, operation, evidence).
+  // failure is not New Information: every attempt supplies the SAME single
+  // composite evidenceId, and attempt 1 durably CONSUMES it. Attempts 2..N
+  // (attempt > 1) are authorized by that same prior claim — one logical
+  // (diff + gate) state authorizes exactly one dispatch SEQUENCE, bounded by
+  // MAX_PROVIDER_ATTEMPTS — never a fresh consumption per attempt, and never
+  // a fresh dispatch on identical evidence for a first attempt (crash/resume
+  // re-call included).
   async function meteredWithFailover({
     spend, role, routeFn, defaultFamily, defaultProvider, operationId, evidenceIds, invoke,
   }) {
@@ -290,16 +294,18 @@ export function createReviewLoopController({
       };
     }
 
-    const gateEvidence = await spend.registerEvidence({
-      kind: 'gate', taskId: loopState.loopId, fingerprint: gate.fingerprint,
-    });
-
     const perChunk = [];
     for (const chunk of chunks) {
       const chunkId = `${loopState.loopId}:round-${loopState.round}:chunk-${chunk.index}`;
+      // ONE composite logical review-state evidence per chunk: the diff chunk
+      // AND the gate fingerprint together. A single logical (diff + gate) state
+      // authorizes exactly ONE physical Reviewer dispatch SEQUENCE — bounded
+      // failover retries of that same operation reuse this one claim, and it is
+      // never re-earned by a re-call on identical evidence (crash/resume
+      // included). Multiple evidenceIds no longer multiply dispatch eligibility.
       // eslint-disable-next-line no-await-in-loop
-      const diffEvidence = await spend.registerEvidence({
-        kind: 'diff', taskId: chunkId, diffHash: chunk.hash,
+      const reviewStateEvidence = await spend.registerEvidence({
+        kind: 'reviewstate', taskId: chunkId, diffHash: sha256Hex(`${chunk.hash}::${gate.fingerprint}`),
       });
       // eslint-disable-next-line no-await-in-loop
       const raw = await meteredWithFailover({
@@ -309,7 +315,7 @@ export function createReviewLoopController({
         defaultFamily: 'agy:gpt-oss',
         defaultProvider: 'agy',
         operationId: chunkId,
-        evidenceIds: [diffEvidence.evidenceId, gateEvidence.evidenceId],
+        evidenceIds: [reviewStateEvidence.evidenceId],
         invoke: ({ selection }) => Promise.resolve(reviewerFn({
           objective,
           diff: chunk.text,

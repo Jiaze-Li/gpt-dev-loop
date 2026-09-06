@@ -267,6 +267,11 @@ export function createReviewLoopSpend({
 
   async function registerEvidence({ kind, ...args }) {
     const wf = { workflowId: loopId, ...args };
+    // A composite (diff chunk + gate fingerprint) logical review state. Shares
+    // the CHANGED_TASK_DIFF taxonomy — it IS a "the reviewable state changed"
+    // event — but its fingerprint folds in the gate outcome so a diff that is
+    // byte-identical but was gated differently is a distinct logical state.
+    if (kind === 'reviewstate') return registerTaskDiffEvidence(informationLedger, wf);
     if (kind === 'diff') return registerTaskDiffEvidence(informationLedger, wf);
     if (kind === 'findings') return registerReviewFindingsEvidence(informationLedger, wf);
     if (kind === 'gate') return registerGateFingerprintEvidence(informationLedger, wf);

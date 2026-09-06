@@ -342,6 +342,31 @@ export class ModelSpendAuthority {
           { intent },
         );
       }
+      // Retry / failover of an operation that ALREADY legitimately consumed one
+      // of these evidenceIds on an earlier physical attempt: the single logical
+      // state that authorized attempt 1 covers attempts 2..N of the SAME
+      // (role, operationId). This never CREATES eligibility — a first attempt
+      // (attempt <= 1) with no fresh evidence is still denied below, and the
+      // retry count is bounded by the caller (MAX_PROVIDER_ATTEMPTS). It exists
+      // so "one diff+gate logical state authorizes exactly one dispatch
+      // SEQUENCE", not "each evidenceId is a separate dispatch token".
+      if (!eligible && Number(intent.attempt) > 1) {
+        let priorClaim = null;
+        try {
+          priorClaim = await this._informationLedger.findConsumedBy({
+            workflowId: intent.workflowId, role: intent.role, operationId: intent.operationId, evidenceIds: candidateEvidenceIds,
+          });
+        } catch (error) {
+          throw new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+            `new information state could not be read: ${error?.message ?? error}`,
+            { intent },
+          );
+        }
+        if (priorClaim) {
+          eligible = { evidenceId: priorClaim.evidenceId, type: null, _failoverReuse: true };
+        }
+      }
       if (!eligible) {
         // § Phase 6 — a Global New Information denial is a BLOCKING,
         // user-visible safety event, exactly like an UNRESOLVED reservation.
@@ -364,9 +389,13 @@ export class ModelSpendAuthority {
         );
       }
       try {
-        await this._informationLedger.consume({
-          workflowId: intent.workflowId, role: intent.role, operationId: intent.operationId, evidenceId: eligible.evidenceId,
-        });
+        // A failover-reuse claim is already durably consumed — re-consuming is
+        // an idempotent no-op, but skip it to keep the intent explicit.
+        if (!eligible._failoverReuse) {
+          await this._informationLedger.consume({
+            workflowId: intent.workflowId, role: intent.role, operationId: intent.operationId, evidenceId: eligible.evidenceId,
+          });
+        }
       } catch (error) {
         throw new AuthorizationError(
           AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
