@@ -221,6 +221,16 @@ export class ModelSpendAuthority {
     return this._reservationLedger;
   }
 
+  // The durable reservationId minted for a permit this authority issued (so a
+  // caller can attach its own durable accounting record to the same physical
+  // attempt). Returns null for an unknown / forged permit.
+  reservationIdFor(permit) {
+    const token = permit instanceof PhysicalCallPermit
+      ? permit._revealTokenTo(PhysicalCallPermit._brand)
+      : undefined;
+    return (typeof token === 'string' && this._issued.get(token)?.reservationId) || null;
+  }
+
   get informationLedger() {
     return this._informationLedger;
   }

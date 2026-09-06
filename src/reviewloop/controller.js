@@ -66,9 +66,17 @@ function requireProvider(name) {
   };
 }
 
+// Provider-failure codes that a bounded failover attempt may follow. All are
+// either "the call never reached the provider" (pre-send: unavailable, ENOENT,
+// spawn failure) or "reached it but produced no usable result and no
+// unresolved spend" (rate limit, quota, protocol error, timeout classified as
+// mechanically bounded). A mid-flight failure with unknown usage never lands
+// here — dispatch() has already turned it into a spend-blocking
+// AuthorizationError.
 const RETRYABLE = new Set([
   'PROVIDER_UNAVAILABLE', 'PROVIDER_TIMEOUT', 'PROVIDER_RATE_LIMITED',
   'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_PROTOCOL_ERROR', 'EXECUTOR_TIMEOUT',
+  'AGY_ENOENT', 'AGY_SPAWN_FAILED',
 ]);
 
 export function createReviewLoopController({

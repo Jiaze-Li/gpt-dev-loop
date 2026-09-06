@@ -22,7 +22,7 @@
 
 import { ModelSpendAuthority } from '../orchestrator/modelSpendAuthority.js';
 import { ReservationLedger, ReservationStore } from '../orchestrator/modelSpendReservation.js';
-import { AuthorizationError, AUTHORIZATION_ERROR_CODES } from '../orchestrator/errors.js';
+import { AuthorizationError, AUTHORIZATION_ERROR_CODES, isAuthorizationFailure } from '../orchestrator/errors.js';
 import {
   NewInformationLedger,
   InformationStore,
@@ -59,13 +59,23 @@ const SPEND_STATE_KEY = 'reviewLoopSpend';
 const METERED_ROLES = new Set(['reviewer', 'supervisor']);
 
 // Error codes that PROVE the physical provider call never reached the provider
-// (spawn failure, transport unavailable, pre-send abort). For these — and only
-// these — the token spend is mechanically, provably zero (the one carve-out
-// modelSpendAuthority.js's extractSettlementUsage already recognises). The
-// business error is still thrown so the caller can fail over.
-const PRE_SEND_ZERO_CODES = new Set([
-  'PROVIDER_UNAVAILABLE', 'ENOENT', 'AGY_BAD_INPUT', 'PROVIDER_NOT_STARTED',
+// (spawn failure, transport unavailable, pre-send abort / bad input). For these
+// — and only these — the token spend is mechanically, provably zero. A
+// mechanically-zero attempt STILL settles the reservation SETTLED_KNOWN and
+// STILL writes a durable accounting record (usage 0); the business error is
+// re-thrown so the caller can fail over, and a normal failover therefore never
+// leaves a settled reservation without a matching spend record (no false
+// "unaccounted spend" block after a restart). Unified across the agy transport
+// (AGY_ENOENT / AGY_SPAWN_FAILED / AGY_BAD_INPUT) and the generic pool.
+export const PRE_SEND_ZERO_CODES = new Set([
+  'PROVIDER_UNAVAILABLE', 'PROVIDER_NOT_STARTED',
+  'ENOENT', 'AGY_ENOENT', 'AGY_SPAWN_FAILED', 'AGY_BAD_INPUT',
 ]);
+
+export function isMechanicallyZeroPreSend(err) {
+  const code = err?.code ?? err?.providerFailure ?? '';
+  return PRE_SEND_ZERO_CODES.has(code) && !err?.details?.usage && !err?.usage;
+}
 
 function num(env, key, fallback) {
   const raw = env?.[key];
@@ -198,23 +208,38 @@ export function createReviewLoopSpend({
     const reconciledRecords = [...logged];
     // An UNRESOLVED / DISPATCHING reservation is already a blocking condition
     // that ModelSpendAuthority.authorize() enforces (hasUnresolved). Here we
-    // only look for SETTLED_KNOWN calls whose usage/cost numbers were lost —
-    // those look "fine" to the reservation ledger but their real spend is gone.
+    // only look for SETTLED_KNOWN calls whose durable accounting record was
+    // lost to a crash between settlement and the spend-log append.
+    //
+    // Every metered attempt — success, known-usage failure, OR mechanically-
+    // zero pre-send failure — now writes a spend-log record tagged with its
+    // reservationId, so a NORMAL failover never shows up here. An orphan is a
+    // SETTLED_KNOWN reservation with no spend-log record carrying its id.
     const settled = meteredReservations.filter((r) => r.status === 'SETTLED_KNOWN');
-    let missing = settled.length - logged.length;
-    cachedUnaccounted = Math.max(0, missing);
-    for (const r of settled) {
-      if (missing <= 0) break;
+    const loggedIds = new Set(logged.map((rec) => rec.reservationId).filter(Boolean));
+    const idTrackingActive = logged.length === 0 || loggedIds.size > 0;
+
+    let orphans;
+    if (idTrackingActive) {
+      orphans = settled.filter((r) => !loggedIds.has(r.reservationId));
+    } else {
+      // Legacy spend log written before reservationId tagging — fall back to a
+      // count comparison.
+      const gap = settled.length - logged.length;
+      orphans = gap > 0 ? settled.slice(0, gap) : [];
+    }
+    cachedUnaccounted = orphans.length;
+    for (const r of orphans) {
       reconciledRecords.push({
         role: r.role ?? r.intent?.role ?? 'reviewer',
         model: null,
         usageKnown: false,
         usageVolume: 0,
         costUsd: 0,
+        reservationId: r.reservationId ?? null,
         reconstructedFromReservation: true,
         at: r.settledAt ?? new Date().toISOString(),
       });
-      missing -= 1;
     }
     priorRecords = reconciledRecords;
     return priorRecords;
@@ -307,38 +332,70 @@ export function createReviewLoopSpend({
       evidenceIds,
     };
     const permit = await authority.authorize(intent);
-    const result = await authority.dispatch(permit, intent, async () => {
-      let out;
-      try {
-        out = await call();
-      } catch (err) {
-        const code = err?.code ?? err?.providerFailure ?? '';
-        if (PRE_SEND_ZERO_CODES.has(code) && !(err?.details?.usage) && !err?.usage) {
-          // Mechanically zero — attach it so the reservation settles KNOWN and
-          // the business error is re-thrown normally for failover.
-          err.details = { ...(err.details ?? {}), usage: { input_tokens: 0, output_tokens: 0 } };
+    const reservationId = typeof authority.reservationIdFor === 'function'
+      ? authority.reservationIdFor(permit)
+      : null;
+
+    const appendRecord = async (rec) => {
+      const full = { ...rec, role, reservationId, at: new Date().toISOString() };
+      // Durable-before-return: the aggregate must reflect this attempt even if
+      // the controller crashes before it saves loop state.
+      await spendStore.append(loopId, full);
+      sessionRecords.push(full);
+    };
+
+    let result;
+    try {
+      result = await authority.dispatch(permit, intent, async () => {
+        let out;
+        try {
+          out = await call();
+        } catch (err) {
+          if (isMechanicallyZeroPreSend(err)) {
+            // Attach mechanically-zero usage so the reservation settles KNOWN
+            // and the business error is re-thrown normally for failover.
+            err.details = { ...(err.details ?? {}), usage: { input_tokens: 0, output_tokens: 0 } };
+          }
+          throw err;
         }
-        throw err;
+        return {
+          value: out?.value ?? out,
+          usage: out?.usage ?? null,
+          model: out?.model ?? model ?? null,
+          costUsd: Number.isFinite(out?.costUsd) ? out.costUsd : 0,
+        };
+      });
+    } catch (err) {
+      // dispatch threw. A spend/authorization denial (SPEND_DENIED,
+      // MODEL_SPEND_USAGE_UNRESOLVED, ...) means there is NO reliably-settled
+      // physical attempt to account for — re-throw untouched. Any other error
+      // that made it past dispatch's settlement means the reservation is
+      // SETTLED_KNOWN (a provider/business failure with known usage, or a
+      // mechanically-zero pre-send failure): write its durable accounting
+      // record NOW so a normal failover never looks like unaccounted spend on
+      // the next load.
+      if (!isAuthorizationFailure(err)) {
+        const usage = err?.details?.usage ?? err?.usage
+          ?? (isMechanicallyZeroPreSend(err) ? { input_tokens: 0, output_tokens: 0 } : null);
+        await appendRecord({
+          model: model ?? null,
+          usageKnown: usage != null,
+          usageVolume: usageVolumeOf(usage),
+          costUsd: Number.isFinite(err?.details?.costUsd) ? err.details.costUsd : 0,
+          businessOutcome: 'FAILURE',
+          failureCode: err?.code ?? err?.providerFailure ?? null,
+        });
       }
-      return {
-        value: out?.value ?? out,
-        usage: out?.usage ?? null,
-        model: out?.model ?? model ?? null,
-        costUsd: Number.isFinite(out?.costUsd) ? out.costUsd : 0,
-      };
-    });
-    const record = {
-      role,
+      throw err;
+    }
+
+    await appendRecord({
       model: result?.model ?? model ?? null,
       usageKnown: result?.usage != null,
       usageVolume: usageVolumeOf(result?.usage),
       costUsd: Number.isFinite(result?.costUsd) ? result.costUsd : 0,
-      at: new Date().toISOString(),
-    };
-    // Durable-before-return: the aggregate must reflect this call even if the
-    // controller crashes before it saves loop state.
-    await spendStore.append(loopId, record);
-    sessionRecords.push(record);
+      businessOutcome: 'SUCCESS',
+    });
     return result?.value ?? result;
   }
 
