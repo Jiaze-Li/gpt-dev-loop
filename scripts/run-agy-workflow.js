@@ -241,6 +241,7 @@ export async function resolveWorkflowPlan({
     plan: result.planText,
     summary: result.summary,
     tasks: result.tasks,
+    taskCollapse: result.taskCollapse ?? null,
     closeoutVerificationCommands: result.closeoutVerificationCommands ?? [],
     closeoutPolicySources: result.closeoutPolicySources ?? [],
     source: 'nl',

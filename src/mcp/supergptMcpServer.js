@@ -433,9 +433,7 @@ export function createSuperGptMcpServer({
         reason: z.string().nullable().optional(),
         question: z.string().nullable().optional(),
         path: z.string().nullable().optional(),
-        evidence: z.record(z.string(), z.any()).nullable().optional(),
         deliveredFiles: z.array(z.string()).optional(),
-        formattedProgress: z.string().nullable().optional(),
         localPollCount: z.number(),
         frontAgentWaitCount: z.number(),
         frontAgentWatchCount: z.number(),
@@ -502,8 +500,6 @@ export function createSuperGptMcpServer({
         }
       }
 
-      const canonical = state ? toCanonicalProgress(state) || state : null;
-
       // Project the workflow's own safety events, then fold in any local
       // front-agent polling regression (workflow-independent, WARNING —
       // the workflow itself is unaffected but the pattern must not be silent).
@@ -534,6 +530,10 @@ export function createSuperGptMcpServer({
         }
       }
 
+      // Default terminal projection is intentionally minimal — only what the
+      // front agent needs to relay the result. Verbose progress renders and
+      // full evidence bundles stay in persisted workflow state, reachable via
+      // supergpt_status / supergpt_telemetry / the dashboard on demand.
       const structured = {
         status: state?.workflowStatus ?? (extra?.signal?.aborted ? 'CANCELLED' : 'TIMEOUT'),
         stage: state?.stage ?? null,
@@ -542,9 +542,7 @@ export function createSuperGptMcpServer({
         reason,
         question: state?.question ?? null,
         path: state?.workflowPath ?? null,
-        evidence: state?.evidence ?? null,
         deliveredFiles: state?.deliveredFiles ?? [],
-        formattedProgress: canonical ? renderGenericProgress(canonical) : null,
         localPollCount: localPolls,
         frontAgentWaitCount: frontAgentCounters.waitCount,
         frontAgentWatchCount: frontAgentCounters.watchCount,

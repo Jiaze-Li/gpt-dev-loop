@@ -276,6 +276,42 @@ test('checkPollingRegression: pure-function polling-regression detection', () =>
   assert.ok(legacy.issues.some((i) => i.signal === 'legacy-start-watch'));
 });
 
+test('start_and_wait: terminal projection is minimal — no verbose progress/evidence, bounded size', async () => {
+  const fake = fakeLoop({
+    runningPolls: 1,
+    terminalStatus: 'DONE',
+    stateOverrides: {
+      // Simulate a workflow whose persisted state carries a large evidence
+      // bundle and progress model — these must NOT leak into the front result.
+      evidence: { gate: { diff: 'x'.repeat(5000), logs: 'y'.repeat(5000) } },
+      history: Array.from({ length: 50 }, (_, i) => ({ task: `t${i}`, note: 'z'.repeat(200) })),
+    },
+  });
+  const { client } = await connect(fake);
+  const res = await client.callTool({
+    name: 'supergpt_start_and_wait',
+    arguments: { goal: 'ship', cwd: '/tmp/ws', keepaliveMs: 1000 },
+  });
+  const out = res.structuredContent;
+
+  const allowedKeys = new Set([
+    'status', 'stage', 'workflowId', 'summary', 'reason', 'question', 'path',
+    'deliveredFiles', 'localPollCount', 'frontAgentWaitCount', 'frontAgentWatchCount',
+    'safetyEvents', 'blockingSafetyEvent',
+  ]);
+  for (const key of Object.keys(out)) {
+    assert.ok(allowedKeys.has(key), `unexpected field in terminal projection: ${key}`);
+  }
+  assert.equal('formattedProgress' in out, false);
+  assert.equal('evidence' in out, false);
+  assert.equal('history' in out, false);
+
+  // Regression guard: a clean DONE result stays small even when workflow state
+  // is large. 4KB is generous headroom over the ~400B real payload.
+  const bytes = Buffer.byteLength(JSON.stringify(out), 'utf8');
+  assert.ok(bytes < 4096, `terminal projection ballooned to ${bytes} bytes`);
+});
+
 test('doctor: front-agent contract check passes for the live repo (all three frontends share one COMMON)', () => {
   const res = checkFrontAgentContract();
   assert.equal(res.ok, true, JSON.stringify(res.issues));

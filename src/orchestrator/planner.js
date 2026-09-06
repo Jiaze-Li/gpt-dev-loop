@@ -37,6 +37,7 @@ import {
 import { AgyStructuredOutputError, parseAgyJsonObject, isNonEmptyString } from '../agy/agyJson.js';
 import { AGY_SUPERVISOR_DEFAULT_MODEL } from '../agy/agyConfig.js';
 import { normalizeWorkspaceRelativePaths, resolveRepoRelativePaths, WorkspacePathError } from './workspaceConfig.js';
+import { collapseCohesiveTasks } from './taskCohesion.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -365,12 +366,19 @@ export function parsePlannerJson(obj, { repoFiles } = {}) {
     };
   });
 
+  // Deterministic Full-Path task-collapse: merge adjacent cohesive tasks so a
+  // single logical change is not fanned out into multiple Executor+Reviewer
+  // pipelines. Pure, order-preserving, never widens write scope. (Fast Path
+  // builds its own single-task plan and never reaches here.)
+  const collapse = collapseCohesiveTasks(tasks);
+  const finalTasks = collapse.tasks;
+
   let closeoutVerificationCommands = Array.isArray(obj.closeout_verification_commands)
     ? obj.closeout_verification_commands.map(String).map((c) => c.trim()).filter(Boolean)
     : [];
 
-  if (closeoutVerificationCommands.length === 0 && tasks.length > 0) {
-    const taskCommands = tasks.flatMap((t) => (Array.isArray(t.verification_commands) ? t.verification_commands : []));
+  if (closeoutVerificationCommands.length === 0 && finalTasks.length > 0) {
+    const taskCommands = finalTasks.flatMap((t) => (Array.isArray(t.verification_commands) ? t.verification_commands : []));
     closeoutVerificationCommands = [...new Set(taskCommands.map((c) => String(c).trim()).filter(Boolean))];
   }
 
@@ -385,7 +393,13 @@ export function parsePlannerJson(obj, { repoFiles } = {}) {
     status: 'READY',
     planText: obj.plan_text.trim(),
     summary: obj.summary.trim(),
-    tasks,
+    tasks: finalTasks,
+    taskCollapse: {
+      collapsed: collapse.collapsed,
+      from: collapse.from,
+      to: collapse.to,
+      groups: collapse.groups,
+    },
     closeoutVerificationCommands,
     closeoutPolicySources,
   };
