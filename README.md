@@ -67,9 +67,11 @@ npm run doctor
 
 ## Certification status
 
-- ReviewLoop deterministic/mock certification: **PASS** (`npm test`)
-- ReviewLoop real-provider E2E: **NOT YET RUN**
-- ReviewLoop real PR external-review loop: **NOT YET RUN**
+- ReviewLoop deterministic/mock certification: **PASS** (`npm test`, `npm run doctor`)
+- ReviewLoop real-provider Reviewer/Supervisor E2E: **ATTEMPTED / NOT CERTIFIED**
+  (a live `agy` Reviewer has been reached; no run has been carried to a
+  certified end-to-end verdict — see `docs/ROADMAP.md`)
+- ReviewLoop real PR external-review loop: **NOT RUN**
 
 Historical SuperGPT V1/V2 measured numbers are labelled historical in
 `docs/history/` and are not ReviewLoop certification.

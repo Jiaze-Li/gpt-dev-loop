@@ -48,7 +48,7 @@ import {
   AuthorizationError, AUTHORIZATION_ERROR_CODES, isCancellation,
 } from './errors.js';
 import { isExecutorEligible as productionIsExecutorEligible } from './providerCapabilities.js';
-import { ReservationLedger, RESERVATION_STATUS } from './modelSpendReservation.js';
+import { ReservationLedger, RESERVATION_STATUS, SETTLEMENT_REASON } from './modelSpendReservation.js';
 import { NewInformationLedger } from './newInformation.js';
 
 // The strongest invocation identifiers mechanically available at the role
@@ -73,23 +73,31 @@ import { NewInformationLedger } from './newInformation.js';
 // on both sides and are unaffected.
 export const CALL_INTENT_KEYS = Object.freeze(['role', 'family', 'provider', 'operationId', 'attempt', 'workflowId', 'evidenceRef']);
 
-// Provider-reported token volume of a settled reservation's usage reference.
-// A mechanically-zero pre-send failure settles SETTLED_KNOWN with an explicit
-// all-zero usage object — that is 0 here and proves nothing was sent. Any
-// non-zero value means the provider was really reached.
-function settledUsageVolume(usageReference) {
-  if (!usageReference || typeof usageReference !== 'object') return 0;
-  const n = (...keys) => {
-    for (const k of keys) {
-      const v = usageReference[k];
-      if (Number.isFinite(v)) return v;
-    }
-    return 0;
-  };
-  return n('input_tokens', 'inputTokens')
-    + n('output_tokens', 'outputTokens')
-    + n('cache_creation_input_tokens', 'cacheCreationInputTokens', 'cache_creation_input')
-    + n('cache_read_input_tokens', 'cacheReadInputTokens', 'cache_read_input');
+// Whether an earlier physical attempt is DURABLY, MECHANICALLY proven to have
+// never reached the provider. This is the ONLY basis on which a later attempt
+// may reuse the New Information claim that authorized attempt 1.
+//
+//   UNKNOWN != ZERO   ZERO USAGE != PRE-SEND
+//
+// A zero token count is NOT accepted as proof: a post-send
+// PROVIDER_PROTOCOL_ERROR can settle SETTLED_KNOWN with usage {0,0} yet still
+// have hit the provider. Proof requires one of these durable, unambiguous
+// states:
+//   - RESERVED / CANCELLED_PRE_DISPATCH — the ordering invariant proves the
+//     physical call was impossible: markDispatching persists the durable
+//     DISPATCHING boundary before dispatchFn is ever invoked, so a reservation
+//     that never reached DISPATCHING never sent a byte.
+//   - SETTLED_KNOWN with settlementReason === PROVEN_PRE_SEND_ZERO — dispatch()
+//     saw an explicit orchestrator-set pre-send provenance flag on the
+//     failure (spawn/transport abort before any bytes were sent).
+// Anything else — DISPATCHING, UNRESOLVED, SETTLED_KNOWN success, ordinary
+// provider failure (with or without usage {0,0}), or missing/ambiguous
+// provenance — is treated as "may have reached the provider".
+function isProvenPreSendZero(reservation) {
+  if (reservation.status === RESERVATION_STATUS.RESERVED
+    || reservation.status === RESERVATION_STATUS.CANCELLED_PRE_DISPATCH) return true;
+  return reservation.status === RESERVATION_STATUS.SETTLED_KNOWN
+    && reservation.settlementReason === SETTLEMENT_REASON.PROVEN_PRE_SEND_ZERO;
 }
 
 function computeEvidenceRef(evidenceIds) {
@@ -381,15 +389,16 @@ export class ModelSpendAuthority {
       // SEQUENCE", not "each evidenceId is a separate dispatch token".
       if (!eligible && Number(intent.attempt) > 1) {
         // Bounded failover may reuse the ONE New Information claim that
-        // authorized attempt 1 of this operation — but ONLY when every earlier
-        // physical attempt of this SAME (role, operationId) is mechanically
-        // proven to have spent zero: it either never crossed the durable
-        // DISPATCHING boundary, or it settled SETTLED_KNOWN with an all-zero
-        // (pre-send) usage record. If any earlier attempt reached the provider
-        // — SETTLED_KNOWN with non-zero usage, or a still-open DISPATCHING /
-        // UNRESOLVED record — then "no new information" means no further
-        // physical call, exactly as for a first attempt. (A provider protocol
-        // error AFTER the tokens were spent is not a licence to try again.)
+        // authorized attempt 1 of this operation — but ONLY when there is at
+        // least one earlier physical attempt of this SAME (role, operationId)
+        // on record AND every one of them is DURABLY, MECHANICALLY proven to
+        // have never reached the provider (CANCELLED_PRE_DISPATCH, or
+        // SETTLED_KNOWN with settlementReason PROVEN_PRE_SEND_ZERO — see
+        // isProvenPreSendZero). A zero token count is NOT proof: a post-send
+        // PROVIDER_PROTOCOL_ERROR can report usage {0,0} yet still have spent.
+        // Missing / ambiguous provenance, a still-open DISPATCHING / UNRESOLVED
+        // record, an ordinary provider failure, or a success all mean "no new
+        // information -> no further physical call", exactly as for attempt 1.
         let priorReservations = [];
         try {
           priorReservations = await this._reservationLedger.list(intent.workflowId);
@@ -405,12 +414,9 @@ export class ModelSpendAuthority {
           && (r.role ?? null) === (intent.role ?? null)
           && Number(r.physicalAttempt) < Number(intent.attempt)
         ));
-        const anyReachedProvider = earlierAttempts.some((r) => (
-          r.status === RESERVATION_STATUS.DISPATCHING
-          || r.status === RESERVATION_STATUS.UNRESOLVED
-          || (r.status === RESERVATION_STATUS.SETTLED_KNOWN && settledUsageVolume(r.usageReference) > 0)
-        ));
-        if (!anyReachedProvider) {
+        const allProvenPreSendZero = earlierAttempts.length > 0
+          && earlierAttempts.every(isProvenPreSendZero);
+        if (allProvenPreSendZero) {
           let priorClaim = null;
           try {
             priorClaim = await this._informationLedger.findConsumedBy({
@@ -564,6 +570,12 @@ export class ModelSpendAuthority {
       outcome = { ok: false, error };
     }
     const settlement = extractSettlementUsage(outcome);
+    // Durable pre-send provenance: set ONLY by an upstream orchestrator layer
+    // (reviewSpend.js) on a failure it mechanically classified as a spawn /
+    // transport abort before any bytes were sent — never inferred here from a
+    // zero token count. This is what lets a later attempt reuse the same New
+    // Information claim (see isProvenPreSendZero / the failover-reuse gate).
+    const preSendZeroProven = !outcome.ok && outcome.error?.details?.preSendZeroProven === true;
 
     if (settlement.known) {
       try {
@@ -572,7 +584,11 @@ export class ModelSpendAuthority {
           reservationId: record.reservationId,
           usageCallId: settlement.callId,
           usageReference: settlement.usage,
-          reason: outcome.ok ? 'PROVIDER_CALL_SUCCEEDED' : 'PROVIDER_CALL_FAILED_WITH_KNOWN_USAGE',
+          reason: outcome.ok
+            ? 'PROVIDER_CALL_SUCCEEDED'
+            : (preSendZeroProven
+              ? SETTLEMENT_REASON.PROVEN_PRE_SEND_ZERO
+              : 'PROVIDER_CALL_FAILED_WITH_KNOWN_USAGE'),
         });
       } catch (persistError) {
         // Settlement persistence failure (§ Failure 2). The provider

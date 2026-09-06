@@ -47,6 +47,17 @@ export const RESERVATION_STATUS = Object.freeze({
 
 const WORKFLOW_STATE_KEY = 'modelSpendReservations';
 
+// The ONLY settlement reason that durably proves a SETTLED_KNOWN reservation
+// never reached the provider. It is written solely by
+// ModelSpendAuthority.dispatch() when the dispatch outcome carries an explicit
+// orchestrator-set pre-send provenance flag (details.preSendZeroProven) —
+// NEVER inferred from a zero token count. `SETTLED_KNOWN` + all-zero usage on
+// its own proves nothing about pre-send (a post-send PROVIDER_PROTOCOL_ERROR
+// can report usage {0,0} yet still have hit the provider).
+export const SETTLEMENT_REASON = Object.freeze({
+  PROVEN_PRE_SEND_ZERO: 'PROVEN_PRE_SEND_ZERO',
+});
+
 // A reservation in one of these statuses must block further internal model
 // spend in its workflow. DISPATCHING is included even though it has not yet
 // been rewritten to UNRESOLVED by reconcileOnResume(): it is itself proof

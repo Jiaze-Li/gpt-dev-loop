@@ -372,8 +372,19 @@ export function createReviewLoopSpend({
         } catch (err) {
           if (isMechanicallyZeroPreSend(err)) {
             // Attach mechanically-zero usage so the reservation settles KNOWN
-            // and the business error is re-thrown normally for failover.
-            err.details = { ...(err.details ?? {}), usage: { input_tokens: 0, output_tokens: 0 } };
+            // and the business error is re-thrown normally for failover. Also
+            // attach an EXPLICIT pre-send provenance flag: this is a spawn /
+            // transport abort before any bytes were sent (isMechanicallyZeroPreSend
+            // already required a PRE_SEND_ZERO_CODES code AND the absence of any
+            // provider-supplied usage). ModelSpendAuthority.dispatch() persists
+            // this as settlementReason PROVEN_PRE_SEND_ZERO — the ONLY durable
+            // basis for a later attempt to reuse the same New Information claim.
+            // A plain provider `{0,0}` usage NEVER earns this flag.
+            err.details = {
+              ...(err.details ?? {}),
+              usage: { input_tokens: 0, output_tokens: 0 },
+              preSendZeroProven: true,
+            };
           }
           throw err;
         }

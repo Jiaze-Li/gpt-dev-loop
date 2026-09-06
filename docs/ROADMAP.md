@@ -74,7 +74,7 @@ doctor` green. NOT real-provider E2E.
 
 ## Independent re-verification pass (this change)
 
-Deterministic/mock `npm test` (303/303) + `npm run doctor` green. Closes the
+Deterministic/mock `npm test` + `npm run doctor` green. Closes the
 4 P1 + 3 P2 raised by the independent re-verification of the release-hardening
 pass:
 
@@ -100,20 +100,52 @@ pass:
   the durable loop state to `HUMAN_REQUIRED` (returned status == persisted
   state).
 
+## Independent re-verification pass 2 (this change)
+
+Deterministic/mock `npm test` + `npm run doctor` green. Closes the final
+Token-Safety P1 from the independent re-verification:
+
+- Failover reuse no longer infers "never reached the provider" from a zero
+  token count. `SETTLED_KNOWN` + zero usage proves nothing about pre-send — a
+  post-send `PROVIDER_PROTOCOL_ERROR` / `PROVIDER_RATE_LIMITED` can report
+  usage `{0,0}` and still have spent. Reuse of the one New Information claim is
+  now permitted ONLY when every earlier physical attempt carries a durable,
+  unambiguous pre-send provenance: `RESERVED` / `CANCELLED_PRE_DISPATCH` (never
+  crossed the durable `DISPATCHING` boundary), or `SETTLED_KNOWN` with
+  `settlementReason === PROVEN_PRE_SEND_ZERO` — a reason written solely from an
+  explicit orchestrator-set flag on a mechanically-classified spawn/transport
+  abort (`AGY_ENOENT` / `AGY_SPAWN_FAILED` / …), never from a provider's own
+  `{0,0}`. Missing / ambiguous provenance, an ordinary provider failure, or a
+  success all deny the reuse. Durable across a restart.
+
 ## Real-provider status (needs real providers / real GitHub)
 
-- Deterministic/mock certification = **PASS** — 303/303 `npm test`,
+Corrected against this machine's durable reservation + spend ledgers under
+`~/.reviewloop/` (not from recollection):
+
+- Deterministic/mock certification = **PASS** — `npm test` 309/309,
   `npm run doctor` PASS.
 - `npm run install-global` = **executed** against this machine's agent
   config / dotfiles (managed block + `reviewloop` MCP registration).
-- Real provider calls to date = **2** (one-shot live smoke: an Executor-era
-  `claude:sonnet` call + one `agy` Reviewer call; PASS).
+- Real ReviewLoop provider calls with a durable record on this machine =
+  **2**, both in one loop (`rl-20260906075721-c674d31f`): `reviewer`,
+  family `agy:gpt-oss`, model `gpt-oss-120b-medium`, a deterministically
+  chunked review — `SETTLED_KNOWN` / `PROVIDER_CALL_SUCCEEDED`, ~122.8k and
+  ~26.1k tokens; **dollar cost UNKNOWN** (provider reported none). Three
+  older loops hold `reviewer` / `agy:gpt-oss` reservations with
+  fixture-shaped usage (`{1,1}`, `{5,2,3}`) that cannot be mechanically
+  distinguished from a stubbed Reviewer — **NOT COUNTED** as certified real
+  calls.
+- Any earlier `claude:sonnet` / Executor-era real call = **UNKNOWN** — no
+  durable record survives in the current runtime dir; not asserted.
+- No `codex` or `claude` real provider call has any durable record.
+  `codex`/`claude` families stay capability-declared, transport-unavailable.
 - ReviewLoop real-provider Reviewer/Supervisor E2E over the current
-  architecture = **ATTEMPTED / NOT CERTIFIED** (`reviewloop_review` reached a
-  live `agy` Reviewer; the run was not carried to a certified end-to-end
-  verdict — the deterministic Gate + regression suite is the accepted bar
-  for this pass). `codex`/`claude` families stay capability-declared,
-  transport-unavailable.
+  architecture = **ATTEMPTED / NOT CERTIFIED**. The one real run
+  (`rl-20260906075721-c674d31f`) reached a live `agy` Reviewer with 2
+  successful physical calls but terminated `HUMAN_REQUIRED` — it was not
+  carried to a certified PASS/REWORK end-to-end verdict. The deterministic
+  Gate + regression suite is the accepted bar for this pass.
 - ReviewLoop real PR external-review loop (`@codex review` / `@claude review`)
   = **NOT RUN**.
 - Real multi-provider failover = **NOT RUN** (structurally wired +

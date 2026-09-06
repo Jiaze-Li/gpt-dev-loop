@@ -114,10 +114,15 @@ already done.
 
 **One logical review state → one dispatch sequence**: a chunk cites ONE
 composite evidenceId (`sha(diffChunkHash :: gateFingerprint)`). Attempt 1
-durably consumes it; bounded failover retries (`attempt > 1`) reuse that one
-claim; a first attempt on already-consumed evidence is denied — so a re-call
-on an identical `(diff+gate)` state across crash/resume yields exactly one
-physical Reviewer dispatch. `NO NEW INFORMATION → NO NEW MODEL CALL` holds.
+durably consumes it; bounded failover retries (`attempt > 1`) may reuse that
+one claim ONLY when every earlier physical attempt is durably proven never to
+have reached the provider (`RESERVED` / `CANCELLED_PRE_DISPATCH`, or
+`SETTLED_KNOWN` with `settlementReason === PROVEN_PRE_SEND_ZERO` — set from an
+explicit pre-send provenance flag, never inferred from a zero token count); a
+first attempt on already-consumed evidence is denied — so a re-call on an
+identical `(diff+gate)` state across crash/resume yields exactly one physical
+Reviewer dispatch, and a post-send provider error is never a licence to retry.
+`NO NEW INFORMATION → NO NEW MODEL CALL` holds.
 
 **Per-`loopId` serialization**: an in-process lock chain plus a durable
 cross-process lock file (`<runtime>/<loopId>/reviewloop.lock`) serialize every
