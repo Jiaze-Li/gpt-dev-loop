@@ -22,6 +22,7 @@
 
 import { ModelSpendAuthority } from '../orchestrator/modelSpendAuthority.js';
 import { ReservationLedger, ReservationStore } from '../orchestrator/modelSpendReservation.js';
+import { AuthorizationError, AUTHORIZATION_ERROR_CODES } from '../orchestrator/errors.js';
 import {
   NewInformationLedger,
   InformationStore,
@@ -173,10 +174,20 @@ export function createReviewLoopSpend({
     try { await reservationLedger.reconcileOnResume(loopId); } catch { /* best effort */ }
   }
 
-  // Cross-check the durable reservation ledger against the durable spend log:
-  // any SETTLED_KNOWN / blocking metered reservation with no matching spend
-  // record (crash after settlement, before the spend-log append) is counted
-  // conservatively — the call happened, its usage is UNKNOWN (never zero).
+  // Cross-check the durable reservation ledger against the durable spend log.
+  // A physical metered call ALWAYS reserves+dispatches+settles durably in the
+  // reservation ledger; its usage/cost numbers live ONLY in the spend log,
+  // written durably-before-return. So:
+  //
+  //   settled/blocking metered reservations  >  spend-log records
+  //     => at least one physical call whose real usage AND cost were lost to a
+  //        crash between settlement and the spend-log append.
+  //
+  // UNKNOWN != ZERO: we do NOT substitute 0 and keep spending. `unaccounted`
+  // is a fail-closed condition — every subsequent metered call is refused
+  // until a human acknowledges it (REVIEWLOOP_ACK_UNACCOUNTED_SPEND). The
+  // reconstructed records are kept only so telemetry can show WHY.
+  let cachedUnaccounted = 0;
   async function loadPriorRecords() {
     if (priorRecords) return priorRecords;
     await ensureReconciled();
@@ -185,30 +196,46 @@ export function createReviewLoopSpend({
     try { reservations = await reservationLedger.list(loopId); } catch { reservations = []; }
     const meteredReservations = reservations.filter((r) => METERED_ROLES.has(r.role ?? r.intent?.role));
     const reconciledRecords = [...logged];
-    const settledCount = meteredReservations.filter((r) => r.status === 'SETTLED_KNOWN' || r.status === 'UNRESOLVED' || r.status === 'DISPATCHING').length;
-    let missing = settledCount - logged.length;
-    for (const r of meteredReservations) {
+    // An UNRESOLVED / DISPATCHING reservation is already a blocking condition
+    // that ModelSpendAuthority.authorize() enforces (hasUnresolved). Here we
+    // only look for SETTLED_KNOWN calls whose usage/cost numbers were lost —
+    // those look "fine" to the reservation ledger but their real spend is gone.
+    const settled = meteredReservations.filter((r) => r.status === 'SETTLED_KNOWN');
+    let missing = settled.length - logged.length;
+    cachedUnaccounted = Math.max(0, missing);
+    for (const r of settled) {
       if (missing <= 0) break;
-      if (r.status === 'SETTLED_KNOWN' || r.status === 'UNRESOLVED' || r.status === 'DISPATCHING') {
-        reconciledRecords.push({
-          role: r.role ?? r.intent?.role ?? 'reviewer',
-          model: null,
-          usageKnown: false,
-          usageVolume: 0,
-          costUsd: 0,
-          reconstructedFromReservation: true,
-          at: r.settledAt ?? new Date().toISOString(),
-        });
-        missing -= 1;
-      }
+      reconciledRecords.push({
+        role: r.role ?? r.intent?.role ?? 'reviewer',
+        model: null,
+        usageKnown: false,
+        usageVolume: 0,
+        costUsd: 0,
+        reconstructedFromReservation: true,
+        at: r.settledAt ?? new Date().toISOString(),
+      });
+      missing -= 1;
     }
     priorRecords = reconciledRecords;
     return priorRecords;
   }
 
+  function unaccountedAcknowledged() {
+    const ack = env?.REVIEWLOOP_ACK_UNACCOUNTED_SPEND;
+    return ack === '1' || ack === 'true' || ack === loopId;
+  }
+
+  async function hasUnaccountedSpend() {
+    await loadPriorRecords();
+    return cachedUnaccounted > 0 && !unaccountedAcknowledged();
+  }
+
   async function currentTotals() {
     const prior = await loadPriorRecords();
-    return foldTotals([...prior, ...sessionRecords]);
+    return {
+      ...foldTotals([...prior, ...sessionRecords]),
+      unaccountedSpendCalls: cachedUnaccounted,
+    };
   }
 
   // Aggregate deterministic ceiling policy. Runs inside authorize(), before a
@@ -254,6 +281,18 @@ export function createReviewLoopSpend({
     role, family = 'agy:gpt-oss', provider = 'agy', model = null,
     operationId, attempt = 1, evidenceIds = [], call,
   }) {
+    // Fail closed: a prior physical metered call whose real usage AND cost were
+    // lost to a crash cannot be reconstructed. UNKNOWN != ZERO — refuse all
+    // further ReviewLoop spend until a human acknowledges it.
+    if (await hasUnaccountedSpend()) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED,
+        `ReviewLoop ${loopId} has ${cachedUnaccounted} settled metered call(s) whose usage/cost `
+          + 'could not be recovered after a crash; further model spend is blocked until a human '
+          + 'clears it (REVIEWLOOP_ACK_UNACCOUNTED_SPEND)',
+        { loopId, unaccountedSpendCalls: cachedUnaccounted },
+      );
+    }
     pendingTotals = await currentTotals();
     const intent = {
       role, family, provider,
@@ -306,6 +345,8 @@ export function createReviewLoopSpend({
       usageVolume: t.usageVolume,
       costUsd: t.costUsd,
       unknownUsageCalls: t.unknownUsageCalls,
+      unaccountedSpendCalls: t.unaccountedSpendCalls ?? 0,
+      spendBlocked: (t.unaccountedSpendCalls ?? 0) > 0 && !unaccountedAcknowledged(),
       limits,
       workerUsage: 'external / not observable by ReviewLoop',
     };
@@ -319,6 +360,7 @@ export function createReviewLoopSpend({
     registerEvidence,
     meteredCall,
     currentTotals,
+    hasUnaccountedSpend,
     telemetry,
   };
 }

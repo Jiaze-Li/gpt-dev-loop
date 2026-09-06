@@ -70,7 +70,7 @@ export function createPrReviewController({
     // trust boundary here (defense in depth — the backend also checks).
     const existing = await prBackend.findExistingReview({ prNumber, headSha: currentHead, reviewer });
     if (existing) {
-      const trust = checkPrReviewTrust({ raw: existing, configuredReviewer: reviewer, currentHead });
+      const trust = checkPrReviewTrust({ raw: existing, configuredReviewer: reviewer, currentHead, env });
       if (!trust.ok) {
         return {
           outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED,
@@ -154,7 +154,7 @@ export function createPrReviewController({
       };
     }
 
-    const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead });
+    const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead, env });
     if (!trust.ok) {
       // A returned review that does not prove reviewer identity + exact HEAD is
       // not a trusted result — keep the trigger pending rather than accept it.

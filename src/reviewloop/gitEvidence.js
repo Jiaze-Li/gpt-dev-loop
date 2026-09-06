@@ -122,13 +122,16 @@ export async function collectWorkerDelta({ cwd, baseline, spawn = nodeSpawn } = 
   const nameRes = await runGit(['diff', '--name-only', baseRef], cwd, spawn);
   const trackedChanged = nameRes.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
 
-  // Untracked attribution: a file the Worker newly created, or an existing
-  // untracked file whose content changed since baseline.
-  const currentUntracked = await untrackedFiles(cwd, spawn);
+  // Untracked attribution: a file the Worker newly created, an existing
+  // untracked file whose content changed, or a pre-existing untracked file the
+  // Worker DELETED (git diff cannot see an untracked-file deletion).
+  const currentUntracked = new Set(await untrackedFiles(cwd, spawn));
   const baselineUntracked = baseline.untrackedHashes ?? {};
   const untrackedChanged = [];
+  const untrackedDeleted = [];
   let evidenceComplete = baseline.evidenceComplete !== false;
   const incompleteReasons = [...(baseline.incompleteReasons ?? [])];
+
   for (const filePath of currentUntracked) {
     // eslint-disable-next-line no-await-in-loop
     const h = await blobHash(cwd, spawn, filePath);
@@ -142,22 +145,43 @@ export async function collectWorkerDelta({ cwd, baseline, spawn = nodeSpawn } = 
     }
     // pre-existing untracked, unchanged -> NOT Worker output, excluded.
   }
+  for (const filePath of Object.keys(baselineUntracked)) {
+    if (!currentUntracked.has(filePath)) untrackedDeleted.push(filePath);
+  }
 
-  const changedFiles = [...new Set([...trackedChanged, ...untrackedChanged])].sort();
+  const changedFiles = [
+    ...new Set([...trackedChanged, ...untrackedChanged, ...untrackedDeleted]),
+  ].sort();
 
-  // Full worker-attributed evidence text: the tracked diff plus the content of
-  // Worker-touched untracked files (bounded per file).
+  // Full worker-attributed evidence text: the tracked diff, the COMPLETE
+  // content of every Worker-touched untracked text file (never truncated —
+  // size is handled downstream by the deterministic diff chunker), and a
+  // deletion marker for every removed pre-existing untracked file. A binary or
+  // unreadable Worker-created file cannot be reviewed as text, so evidence is
+  // marked incomplete and the controller fails closed (HUMAN_REQUIRED) rather
+  // than letting a review PASS without covering it.
   const untrackedBlocks = [];
   for (const filePath of untrackedChanged) {
-    let body = null;
+    let buf = null;
     try {
       // eslint-disable-next-line no-await-in-loop
-      const buf = await readFile(path.join(cwd, filePath));
-      if (!buf.includes(0)) body = buf.toString('utf8').slice(0, 65_536);
-    } catch { /* unreadable / binary */ }
-    untrackedBlocks.push(body != null
-      ? `--- new/changed untracked file ${filePath} ---\n${body}`
-      : `--- new/changed untracked file ${filePath} (content not shown) ---`);
+      buf = await readFile(path.join(cwd, filePath));
+    } catch (err) {
+      evidenceComplete = false;
+      incompleteReasons.push(`Worker-created untracked file ${filePath} is unreadable: ${err?.message ?? err}`);
+      untrackedBlocks.push(`--- Worker untracked file ${filePath} (UNREADABLE) ---`);
+      continue;
+    }
+    if (buf.includes(0)) {
+      evidenceComplete = false;
+      incompleteReasons.push(`Worker-created untracked file ${filePath} is binary (${buf.length} bytes) — cannot be reviewed as text`);
+      untrackedBlocks.push(`--- Worker untracked file ${filePath} (BINARY, ${buf.length} bytes) ---`);
+      continue;
+    }
+    untrackedBlocks.push(`--- Worker untracked file ${filePath} (${buf.length} bytes) ---\n${buf.toString('utf8')}`);
+  }
+  for (const filePath of untrackedDeleted) {
+    untrackedBlocks.push(`--- Worker deleted pre-existing untracked file ${filePath} ---`);
   }
   const diff = [trackedDiff, ...untrackedBlocks].filter(Boolean).join('\n');
 
@@ -175,6 +199,7 @@ export async function collectWorkerDelta({ cwd, baseline, spawn = nodeSpawn } = 
     changedFiles,
     trackedChanged,
     untrackedChanged,
+    untrackedDeleted,
     evidenceComplete,
     incompleteReasons,
     noWorkerChangeYet,

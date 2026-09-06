@@ -15,16 +15,6 @@ import { checkPrReviewTrust } from './prTrust.js';
 
 const execFileP = promisify(nodeExecFile);
 
-const REVIEWER_LOGIN = Object.freeze({
-  codex: ['chatgpt-codex-connector', 'codex', 'openai-codex'],
-  claude: ['claude', 'anthropic-claude', 'claude-bot'],
-});
-
-function reviewerMatchesLogin(reviewer, login) {
-  const l = String(login ?? '').toLowerCase();
-  return (REVIEWER_LOGIN[reviewer] ?? [reviewer]).some((cand) => l.includes(cand));
-}
-
 // Pull a ```json { "findings": [...] } ``` block out of a review body, else
 // fall back to the review state.
 function extractFindings(body, state) {
@@ -84,23 +74,24 @@ export function createGithubReviewBackend({
 } = {}) {
   const gh = transport ?? github ?? createGhTransport({ repo: env?.REVIEWLOOP_GH_REPO ?? null });
 
+  // Every review with a matching reviewed HEAD is handed to the trust boundary
+  // AS-IS (real GitHub login preserved, never pre-canonicalised). The trust
+  // boundary decides identity via an exact login allowlist.
   async function latestTrustedReview({ prNumber, headSha, reviewer }) {
     const reviews = await gh.listReviews({ prNumber });
     const candidates = reviews
-      .filter((r) => reviewerMatchesLogin(reviewer, r.login))
       .filter((r) => (r.commitId ?? r.headSha) === headSha)
       .sort((a, b) => String(b.submittedAt ?? '').localeCompare(String(a.submittedAt ?? '')));
     for (const r of candidates) {
       const raw = {
-        reviewer,
-        reviewerLogin: r.login,
+        login: r.login,
         headSha: r.commitId ?? r.headSha ?? null,
         state: r.state,
         findings: extractFindings(r.body, r.state),
         reviewId: r.id,
         url: r.htmlUrl,
       };
-      const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead: headSha });
+      const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead: headSha, env });
       if (trust.ok) return trust.review;
     }
     return null;
