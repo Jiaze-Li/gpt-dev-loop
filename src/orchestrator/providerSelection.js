@@ -147,10 +147,32 @@ export function selectProviders({
   // its own usage (or lack of it) stands, subject to the general rule.
   const resolveAndCapture = async (resolve, call) => {
     let transportInvoked = false;
-    const trackedCall = async (...args) => { transportInvoked = true; return call(...args); };
+    let transportUsage = null;
+    // The physical Planner transport (the codex/agy/claude adapters below)
+    // returns provider-native `usage`, but `resolve` (resolveWorkflowPlan ->
+    // generatePlan) hands back a plan object that does not carry it. Capture it
+    // here and lift it onto the resolved value so the Model Spend Reservation
+    // settles SETTLED_KNOWN — a real Planner call whose cost IS known was
+    // previously dropped through the plan-result wrapping and latched the
+    // reservation UNRESOLVED, blocking the whole workflow.
+    const trackedCall = async (...args) => {
+      transportInvoked = true;
+      const out = await call(...args);
+      if (out && typeof out === 'object' && out.usage != null) transportUsage = out.usage;
+      return out;
+    };
     const resolved = await resolve(trackedCall);
-    if (!transportInvoked && resolved && typeof resolved === 'object' && resolved.usage == null) {
-      resolved.usage = { input_tokens: 0, output_tokens: 0 };
+    if (resolved && typeof resolved === 'object' && resolved.usage == null) {
+      if (!transportInvoked) {
+        // Documented zero-token happy path: a deterministic/local plan
+        // resolution that never reached a provider — mechanically zero, the
+        // one carve-out Token Safety already recognises. Never an estimate.
+        resolved.usage = { input_tokens: 0, output_tokens: 0 };
+      } else if (transportUsage != null) {
+        resolved.usage = transportUsage;
+      }
+      // transport invoked but no usage telemetry -> leave `usage` unset:
+      // UNRESOLVED / fail closed, never treated as zero.
     }
     return capturePlannerResolution(resolved);
   };

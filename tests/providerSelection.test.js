@@ -143,6 +143,44 @@ test('Planner physical invocation records native usage exactly once with immutab
   assert.equal(usageTracker.summary().planner.calls, 1);
 });
 
+test('real-shaped Planner call settles its spend reservation SETTLED_KNOWN even when resolve() returns a usage-free plan object', async () => {
+  const { UsageTracker } = await import('../src/orchestrator/usageTracker.js');
+  const usageTracker = new UsageTracker();
+  const workflowId = 'wf-planner-reservation-settlement';
+  const events = [];
+  const safetyEvents = [];
+  const selected = selectProviders({
+    env: { SUPERGPT_CODEX_MODEL: 'codex-planner-test' },
+    workflowId,
+    usageTracker,
+    onEvent: (e) => events.push(e),
+    recordSafetyEvent: (e) => safetyEvents.push(e),
+    codexCall: async () => ({
+      text: JSON.stringify({ status: 'READY' }),
+      usage: { input_tokens: 220, output_tokens: 40, cache_read_tokens: 12 },
+      durationMs: 9,
+    }),
+  });
+  const evidence = await registerUserInputEvidence(selected.informationLedger, {
+    workflowId, interactionId: 'planner-initial-input', text: 'plan the work',
+  });
+
+  // Mirror production `resolveWorkflowPlan`: it invokes the transport but hands
+  // back a plan object that does NOT carry the provider usage.
+  await selected.runtime.invoke('planner', {
+    resolve: async (call) => {
+      await call({ prompt: 'plan the work' });
+      return { plan: 'do the thing', summary: 's', tasks: [], source: 'nl' };
+    },
+  }, { operationId: workflowId, workflowId, evidenceIds: [evidence.evidenceId] });
+
+  const settled = events.filter((e) => e.type === 'RESERVATION_SETTLED_KNOWN');
+  const unresolved = events.filter((e) => e.type === 'RESERVATION_UNRESOLVED');
+  assert.equal(settled.length, 1, 'reservation must settle SETTLED_KNOWN');
+  assert.equal(unresolved.length, 0, 'reservation must not latch UNRESOLVED');
+  assert.equal(safetyEvents.length, 0, 'no blocking safety event');
+});
+
 test('nullWindowSession opens nothing and satisfies the loop tab invariant', async () => {
   assert.deepEqual(await nullWindowSession.create(), { windowId: null, initialTabId: null });
   const activation = await nullWindowSession.activateTab(null);
