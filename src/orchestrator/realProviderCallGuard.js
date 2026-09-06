@@ -66,6 +66,7 @@ export const REAL_PROVIDER_CALL_ENTRYPOINTS = Object.freeze([
   'scripts/test-agy-conversations-live.js',
   'scripts/test-agy-reviewer-live.js',
   'scripts/live-smoke-active-pools.js',
+  'scripts/benchmark-direct-vs-supergpt.js',
   'scripts/run-final-e2e.js',
   'scripts/test-rework-live-e2e.js',
   'scripts/measure-supervisor-decisions.js',

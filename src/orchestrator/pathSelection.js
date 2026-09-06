@@ -44,6 +44,7 @@ export const PATH_SELECTION_REASONS = Object.freeze({
   PR_CLOSEOUT_INTENT: 'pr_closeout_intent',
   FULL_NO_BOUNDED_TASK: 'full_no_bounded_task',
   FULL_EXPLICIT_REQUEST: 'full_explicit_request',
+  FULL_BENCHMARK_FORCE_SEAM: 'full_benchmark_force_seam',
   FULL_EXPLICIT_MULTI_STEP: 'full_explicit_multi_step',
   FULL_MISSING_FILE_SCOPE: 'full_missing_file_scope',
   FULL_BROAD_FILE_SCOPE: 'full_broad_file_scope',
@@ -510,6 +511,24 @@ export function deriveBoundedTaskFromGoal(goal, { cwd = null } = {}) {
   };
 }
 
+// Benchmark/test-only seam. Forces Full Path so a real end-to-end token-economics
+// measurement can exercise Planner -> Executor -> Gate -> Reviewer without relying
+// on the natural router classifying a fixture goal as FULL.
+//
+// Deliberately double-gated so it can NEVER take effect in a production config:
+//   1. SUPERGPT_BENCHMARK_FORCE_FULL === '1'   (the explicit opt-in), AND
+//   2. SUPERGPT_ALLOW_REAL_PROVIDER_CALLS === '1'  (only ever set by the live
+//      benchmark / live-smoke entrypoints, never by the MCP server or the app).
+//
+// It ONLY changes path selection. Everything downstream — the real Planner
+// physical call, Token Safety spend settlement, the deterministic Gate, the
+// independent Reviewer — runs exactly as it does for any other Full Path
+// workflow. It never injects a plan.
+function benchmarkForceFullActive(env) {
+  const e = env ?? {};
+  return e.SUPERGPT_BENCHMARK_FORCE_FULL === '1' && e.SUPERGPT_ALLOW_REAL_PROVIDER_CALLS === '1';
+}
+
 function fullDecision(reason, detail) {
   return Object.freeze({
     path: WORKFLOW_PATHS.FULL,
@@ -579,9 +598,16 @@ export function restorePathDecision(frozen) {
  *                     taskContract:object|null, frozenPlan:object|null,
  *                     restored:boolean}>}
  */
-export function selectWorkflowPath({ goal, cwd = process.cwd(), boundedTask, explicitFullPath = false, frozenDecision = null } = {}) {
+export function selectWorkflowPath({ goal, cwd = process.cwd(), boundedTask, explicitFullPath = false, frozenDecision = null, env = process.env } = {}) {
   if (frozenDecision) {
     return restorePathDecision(frozenDecision);
+  }
+
+  if (benchmarkForceFullActive(env)) {
+    return fullDecision(
+      PATH_SELECTION_REASONS.FULL_BENCHMARK_FORCE_SEAM,
+      'benchmark/test-only seam SUPERGPT_BENCHMARK_FORCE_FULL forced the Full Path',
+    );
   }
 
   // 1. Natural-language PR Closeout intent recognition -> PR_CLOSEOUT mode directly

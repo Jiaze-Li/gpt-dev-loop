@@ -229,6 +229,53 @@ test('restore of a Full Path decision needs no contract', () => {
   assert.equal(restored.taskContract, null);
 });
 
+// --- benchmark/test-only Full Path seam --------------------------
+
+test('benchmark force-full seam: OFF by default — a safe bounded task still selects Fast Path', () => {
+  const d = selectWorkflowPath({ goal: 'fix the pagination bug', boundedTask: safeTask(), env: {} });
+  assert.equal(d.path, WORKFLOW_PATHS.FAST);
+});
+
+test('benchmark force-full seam: inert with the opt-in var alone (no live-provider authorization)', () => {
+  const d = selectWorkflowPath({
+    goal: 'fix the pagination bug',
+    boundedTask: safeTask(),
+    env: { SUPERGPT_BENCHMARK_FORCE_FULL: '1' },
+  });
+  assert.equal(d.path, WORKFLOW_PATHS.FAST);
+});
+
+test('benchmark force-full seam: inert with the live-provider var alone', () => {
+  const d = selectWorkflowPath({
+    goal: 'fix the pagination bug',
+    boundedTask: safeTask(),
+    env: { SUPERGPT_ALLOW_REAL_PROVIDER_CALLS: '1' },
+  });
+  assert.equal(d.path, WORKFLOW_PATHS.FAST);
+});
+
+test('benchmark force-full seam: double-gated ON forces Full Path even for a safe bounded task', () => {
+  const d = selectWorkflowPath({
+    goal: 'fix the pagination bug',
+    boundedTask: safeTask(),
+    env: { SUPERGPT_BENCHMARK_FORCE_FULL: '1', SUPERGPT_ALLOW_REAL_PROVIDER_CALLS: '1' },
+  });
+  assert.equal(d.path, WORKFLOW_PATHS.FULL);
+  assert.equal(d.reason, PATH_SELECTION_REASONS.FULL_BENCHMARK_FORCE_SEAM);
+  assert.equal(d.taskContract, null);
+  assert.equal(d.frozenPlan, null);
+});
+
+test('benchmark force-full seam: never overrides a restored/frozen decision (resume safety)', () => {
+  const fast = selectWorkflowPath({ goal: 'fix pagination', boundedTask: safeTask(), env: {} });
+  const frozen = serializePathDecision(fast);
+  const resumed = selectWorkflowPath({
+    frozenDecision: frozen,
+    env: { SUPERGPT_BENCHMARK_FORCE_FULL: '1', SUPERGPT_ALLOW_REAL_PROVIDER_CALLS: '1' },
+  });
+  assert.equal(resumed.path, WORKFLOW_PATHS.FAST);
+});
+
 // --- progress exposure helpers -----------------------------------
 
 test('pathProgressFields exposes the path and reason for status/watch/result', () => {

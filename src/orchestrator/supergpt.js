@@ -2103,7 +2103,7 @@ async function defaultPipeline({
     } catch { frozenPathDecision = null; }
   }
   const pathDecision = selectWorkflowPath(
-    frozenPathDecision ? { frozenDecision: frozenPathDecision } : { goal, cwd: repoRoot, boundedTask, explicitFullPath },
+    frozenPathDecision ? { frozenDecision: frozenPathDecision } : { goal, cwd: repoRoot, boundedTask, explicitFullPath, env },
   );
   if (!frozenPathDecision && metaExists && !isResume) {
     try {
