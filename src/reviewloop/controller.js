@@ -498,7 +498,7 @@ export function createReviewLoopController({
             reason: `the verification config (${frozenPlan.source}) was modified after reviewloop_begin`,
             actionTaken: 'review blocked; frozen Gate cannot be trusted',
           });
-          loopState.round += 1;
+          loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
           recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'verification plan drift');
           await store.save(loopState.loopId, loopState);
           return {
@@ -542,7 +542,11 @@ export function createReviewLoopController({
     }
 
     if (gate.verdict === GATE_VERDICTS.FAIL) {
-      loopState.round += 1;
+      // A deterministic Gate FAIL is a repair cycle, NOT a fresh Reviewer
+      // round: it never consumes one of the objective's max review rounds and
+      // the independent Reviewer has not run. An identical failing (diff+gate)
+      // resubmission still deterministically returns NO_PROGRESS (above).
+      loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
       loopState.lastReviewedFingerprint = fp;
       loopState.lastGateFingerprint = gate.fingerprint;
       recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'gate regression');

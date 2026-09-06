@@ -55,7 +55,8 @@ export function initialLoopState(objective) {
     loopId: objective.loopId,
     state: REVIEW_LOOP_STATES.READY_FOR_WORK,
     objective,
-    round: 0,
+    round: 0, // FRESH Reviewer rounds only — a deterministic Gate FAIL never advances this
+    gateRepairCount: 0, // deterministic Gate FAIL -> REWORK cycles (separate from `round`)
     reviewerCalls: 0,
     supervisorCalls: 0,
     externalTriggerCount: 0,

@@ -143,9 +143,13 @@ function foldTotals(records) {
     reviewerCalls: acc.reviewerCalls + (r.role === 'reviewer' ? 1 : 0),
     supervisorCalls: acc.supervisorCalls + (r.role === 'supervisor' ? 1 : 0),
     usageVolume: acc.usageVolume + (Number.isFinite(r.usageVolume) ? r.usageVolume : 0),
-    costUsd: acc.costUsd + (Number.isFinite(r.costUsd) ? r.costUsd : 0),
+    // Sum of KNOWN dollar cost only. A call whose provider reported no cost
+    // contributes 0 to the sum but increments unknownCostCalls — the dollar
+    // figure is then a lower bound, never asserted as the true spend.
+    costUsd: acc.costUsd + (r.costKnown !== false && Number.isFinite(r.costUsd) ? r.costUsd : 0),
     unknownUsageCalls: acc.unknownUsageCalls + (r.usageKnown ? 0 : 1),
-  }), { reviewerCalls: 0, supervisorCalls: 0, usageVolume: 0, costUsd: 0, unknownUsageCalls: 0 });
+    unknownCostCalls: acc.unknownCostCalls + (r.costKnown === false ? 1 : 0),
+  }), { reviewerCalls: 0, supervisorCalls: 0, usageVolume: 0, costUsd: 0, unknownUsageCalls: 0, unknownCostCalls: 0 });
 }
 
 // Build the ReviewLoop spend surface. `persistence` (optional) makes the
@@ -277,11 +281,26 @@ export function createReviewLoopSpend({
     if (intent.role === 'supervisor' && totals.supervisorCalls >= limits.maxSupervisorCalls) {
       return { allow: false, reason: `ReviewLoop supervisor call ceiling (${limits.maxSupervisorCalls}) reached` };
     }
+    // usageVolume is the HARD runaway guard — it is provider-reported token
+    // volume and UNKNOWN volume already counts as a physical call elsewhere.
     if (totals.usageVolume >= limits.maxUsageVolume) {
       return { allow: false, reason: `ReviewLoop usage-volume ceiling (${limits.maxUsageVolume}) reached` };
     }
+    // Cost ceiling semantics (UNKNOWN != $0): `totals.costUsd` is the sum of
+    // KNOWN dollar cost only. It fires when the known sum alone reaches the
+    // ceiling. When some calls had no provider-reported cost the known sum is a
+    // lower bound — so also deny once the KNOWN sum passes a conservative
+    // fraction of the ceiling while unknown-cost calls exist, rather than
+    // letting unpriced calls run indefinitely under a $0 assumption.
     if (totals.costUsd >= limits.maxCostUsd) {
       return { allow: false, reason: `ReviewLoop cost ceiling ($${limits.maxCostUsd}) reached` };
+    }
+    if ((totals.unknownCostCalls ?? 0) > 0 && totals.costUsd >= limits.maxCostUsd * 0.5) {
+      return {
+        allow: false,
+        reason: `ReviewLoop cost ceiling: known spend $${totals.costUsd.toFixed(2)} plus `
+          + `${totals.unknownCostCalls} call(s) of unknown cost — refusing to keep spending against an unpriced ceiling`,
+      };
     }
     return { allow: true };
   };
@@ -362,7 +381,9 @@ export function createReviewLoopSpend({
           value: out?.value ?? out,
           usage: out?.usage ?? null,
           model: out?.model ?? model ?? null,
-          costUsd: Number.isFinite(out?.costUsd) ? out.costUsd : 0,
+          // Pass the provider cost through UNCHANGED (undefined when unknown) —
+          // UNKNOWN != $0. The record layer marks costKnown accordingly.
+          costUsd: out?.costUsd,
         };
       });
     } catch (err) {
@@ -377,11 +398,16 @@ export function createReviewLoopSpend({
       if (!isAuthorizationFailure(err)) {
         const usage = err?.details?.usage ?? err?.usage
           ?? (isMechanicallyZeroPreSend(err) ? { input_tokens: 0, output_tokens: 0 } : null);
+        // A mechanically-zero pre-send failure genuinely cost $0; any other
+        // failure's cost is only known if the error carried it.
+        const failCost = err?.details?.costUsd;
+        const costKnown = Number.isFinite(failCost) || isMechanicallyZeroPreSend(err);
         await appendRecord({
           model: model ?? null,
           usageKnown: usage != null,
           usageVolume: usageVolumeOf(usage),
-          costUsd: Number.isFinite(err?.details?.costUsd) ? err.details.costUsd : 0,
+          costUsd: Number.isFinite(failCost) ? failCost : 0,
+          costKnown,
           businessOutcome: 'FAILURE',
           failureCode: err?.code ?? err?.providerFailure ?? null,
         });
@@ -394,6 +420,7 @@ export function createReviewLoopSpend({
       usageKnown: result?.usage != null,
       usageVolume: usageVolumeOf(result?.usage),
       costUsd: Number.isFinite(result?.costUsd) ? result.costUsd : 0,
+      costKnown: Number.isFinite(result?.costUsd),
       businessOutcome: 'SUCCESS',
     });
     return result?.value ?? result;
@@ -405,7 +432,11 @@ export function createReviewLoopSpend({
       reviewerCalls: t.reviewerCalls,
       supervisorCalls: t.supervisorCalls,
       usageVolume: t.usageVolume,
+      // costUsd is the sum of KNOWN dollar cost; a lower bound when
+      // costKnown === false.
       costUsd: t.costUsd,
+      costKnown: (t.unknownCostCalls ?? 0) === 0,
+      unknownCostCalls: t.unknownCostCalls ?? 0,
       unknownUsageCalls: t.unknownUsageCalls,
       unaccountedSpendCalls: t.unaccountedSpendCalls ?? 0,
       spendBlocked: (t.unaccountedSpendCalls ?? 0) > 0 && !unaccountedAcknowledged(),

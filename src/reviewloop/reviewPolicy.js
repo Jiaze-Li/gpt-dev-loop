@@ -155,6 +155,7 @@ export function compactReworkPayload({ loopState, review, gate, supervisorGuidan
     loopId: loopState.loopId,
     round: loopState.round,
     maxRounds: loopState.objective?.maxReviewRounds ?? 3,
+    gateRepairCount: loopState.gateRepairCount ?? 0,
     blockingFindings: review.blockingFindings,
     nonBlockingCount: review.nonBlockingFindings.length + (review.nonBlockingOmitted ?? 0),
     gate: gate ? { verdict: gate.verdict, failures: gate.failureIdentities?.slice(0, 10) ?? [] } : null,
