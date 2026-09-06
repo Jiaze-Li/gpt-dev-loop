@@ -90,13 +90,13 @@ test('cross-process: a live foreign lock holder makes reviewloop_review return B
   }
 });
 
-test('an expired lock file is reclaimed', async () => {
+test('an expired lock file from another host is reclaimed', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-stale-'));
   try {
     const dir = path.join(root, 'LOOP1');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'reviewloop.lock'), JSON.stringify({
-      token: 'old', pid: process.pid, host: 'x',
+      token: 'old', pid: process.pid, host: 'some-other-host',
       acquiredAt: '2000-01-01T00:00:00Z', expiresAt: '2000-01-01T00:10:00Z',
     }));
     const lease = await acquireLoopFileLease({ runtimeRoot: root, loopId: 'LOOP1' });
@@ -107,18 +107,60 @@ test('an expired lock file is reclaimed', async () => {
   }
 });
 
-test('a lock held by a dead pid is reclaimed', async () => {
+test('a lock held by a dead pid on THIS host is reclaimed regardless of TTL', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-dead-'));
   try {
     const dir = path.join(root, 'LOOP2');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, 'reviewloop.lock'), JSON.stringify({
-      token: 'old', pid: 999_999_999, host: 'x',
+      token: 'old', pid: 999_999_999, host: os.hostname(),
       acquiredAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 1e6).toISOString(),
     }));
     const lease = await acquireLoopFileLease({ runtimeRoot: root, loopId: 'LOOP2' });
     assert.equal(lease.ok, true);
     await lease.release();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('lease TTL expires while the owner pid is alive on this host -> a second process still cannot enter', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-alive-'));
+  try {
+    const dir = path.join(root, 'LOOP3');
+    fs.mkdirSync(dir, { recursive: true });
+    // A lock whose fixed TTL lapsed long ago, but whose owner process (this
+    // very test process) is still running on this host.
+    fs.writeFileSync(path.join(dir, 'reviewloop.lock'), JSON.stringify({
+      token: 'live-owner', pid: process.pid, host: os.hostname(),
+      acquiredAt: '2000-01-01T00:00:00Z', expiresAt: '2000-01-01T00:10:00Z',
+    }));
+    const lease = await acquireLoopFileLease({ runtimeRoot: root, loopId: 'LOOP3' });
+    assert.equal(lease.ok, false, 'a live same-host owner keeps its lock past the TTL');
+    assert.equal(lease.heldBy?.token, 'live-owner');
+    // The lock file was NOT stolen.
+    const still = JSON.parse(fs.readFileSync(path.join(dir, 'reviewloop.lock'), 'utf8'));
+    assert.equal(still.token, 'live-owner');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a held lease renews its own expiry (heartbeat)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-renew-'));
+  try {
+    const lease = await acquireLoopFileLease({ runtimeRoot: root, loopId: 'LOOP4' });
+    assert.equal(lease.ok, true);
+    const lockPath = path.join(root, 'LOOP4', 'reviewloop.lock');
+    const before = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    await sleep(2);
+    assert.equal(await lease.renew(), true);
+    const after = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.ok(Date.parse(after.expiresAt) >= Date.parse(before.expiresAt));
+    assert.ok(Date.parse(after.renewedAt) >= Date.parse(before.renewedAt));
+    await lease.release();
+    assert.equal(fs.existsSync(lockPath), false, 'release removes the lock');
+    assert.equal(await lease.renew(), false, 'renew after release is a no-op');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

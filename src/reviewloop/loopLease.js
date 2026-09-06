@@ -11,16 +11,29 @@
 //     one process; the second call runs AFTER the first and then hits the
 //     deterministic NO_PROGRESS guard — one dispatch, no lost update);
 //   * a durable cross-process lock file `<runtimeRoot>/<loopId>/reviewloop.lock`
-//     ({ token, pid, host, acquiredAt, expiresAt }). A live foreign holder ->
-//     the caller is told the loop is BUSY and does nothing. A stale lock
-//     (expired, or the holder pid is gone) is reclaimed.
+//     ({ token, pid, host, acquiredAt, expiresAt, renewedAt }).
+//
+// Reclaim rule (safety-critical): a lock is reclaimed ONLY when its owner is
+// provably gone.
+//   * same host  -> the owner pid no longer exists. This is authoritative and
+//     the fixed TTL is IRRELEVANT here: a slow-but-alive owner (a long chunked
+//     review, a 15-minute PR wait) keeps its lock past the nominal TTL.
+//   * other host -> we cannot inspect the pid, so we fall back to the TTL —
+//     which a live owner keeps fresh by RENEWING it on a timer (heartbeat).
+//     An expired remote lock is presumed abandoned.
+//   * unreadable / malformed lock record -> treated as abandoned.
 
-import { open, readFile, unlink, mkdir } from 'node:fs/promises';
+import {
+  open, readFile, writeFile, unlink, mkdir,
+} from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 
 export const DEFAULT_LEASE_TTL_MS = 20 * 60_000;
+// Renew well inside the TTL so a live owner's lock never lapses for a peer on
+// another host between heartbeats.
+export const DEFAULT_LEASE_RENEW_MS = 5 * 60_000;
 
 const inProcessChains = new Map(); // loopId -> Promise
 
@@ -48,14 +61,33 @@ function holderAlive(pid) {
   }
 }
 
-// Acquire the durable cross-process lock. Returns { ok: true, release } or
-// { ok: false, heldBy }. When no `runtimeRoot` filesystem is available (unit
-// tests with an in-memory persistence), returns a no-op ok lease — the
+function ownedBySameHost(record) {
+  return Boolean(record && typeof record === 'object' && record.host && record.host === os.hostname());
+}
+
+// True only when the current lock's owner is provably gone (see the reclaim
+// rule at the top of this file).
+function isReclaimable(current, now) {
+  if (!current || typeof current !== 'object') return true;
+  if (ownedBySameHost(current)) {
+    // Authoritative: the fixed TTL does not matter when we can see the pid.
+    return !holderAlive(current.pid);
+  }
+  const expiresAt = Date.parse(current.expiresAt ?? '');
+  return !Number.isFinite(expiresAt) || expiresAt < now;
+}
+
+// Acquire the durable cross-process lock. Returns { ok: true, release, renew }
+// or { ok: false, heldBy }. When no `runtimeRoot` filesystem is available
+// (unit tests with an in-memory persistence), returns a no-op ok lease — the
 // in-process chain is still the correctness guarantee there.
 export async function acquireLoopFileLease({
-  runtimeRoot = null, loopId, ttlMs = DEFAULT_LEASE_TTL_MS, clock = () => Date.now(),
+  runtimeRoot = null, loopId, ttlMs = DEFAULT_LEASE_TTL_MS,
+  renewMs = DEFAULT_LEASE_RENEW_MS, clock = () => Date.now(),
 } = {}) {
-  if (!runtimeRoot || !loopId) return { ok: true, release: async () => {} };
+  if (!runtimeRoot || !loopId) {
+    return { ok: true, release: async () => {}, renew: async () => true };
+  }
   const dir = path.join(runtimeRoot, loopId);
   const lockPath = path.join(dir, 'reviewloop.lock');
   const token = randomUUID();
@@ -66,11 +98,40 @@ export async function acquireLoopFileLease({
       await handle.writeFile(JSON.stringify({
         token, pid: process.pid, host: os.hostname(),
         acquiredAt: new Date(clock()).toISOString(),
+        renewedAt: new Date(clock()).toISOString(),
         expiresAt: new Date(clock() + ttlMs).toISOString(),
       }));
     } finally {
       await handle.close();
     }
+  };
+
+  // Extend this lock's TTL in place. Only rewrites a lock still owned by this
+  // token; a no-op (returns false) once the lock is gone or was reclaimed.
+  const renew = async () => {
+    try {
+      const current = JSON.parse(await readFile(lockPath, 'utf8'));
+      if (current?.token !== token) return false;
+      current.renewedAt = new Date(clock()).toISOString();
+      current.expiresAt = new Date(clock() + ttlMs).toISOString();
+      await writeFile(lockPath, JSON.stringify(current));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const acquired = () => {
+    const timer = setInterval(() => { renew().catch(() => {}); }, Math.max(1_000, renewMs));
+    if (typeof timer.unref === 'function') timer.unref();
+    return {
+      ok: true,
+      renew,
+      release: async () => {
+        clearInterval(timer);
+        await releaseIfOwned(lockPath, token);
+      },
+    };
   };
 
   try {
@@ -81,7 +142,7 @@ export async function acquireLoopFileLease({
     try {
       // eslint-disable-next-line no-await-in-loop
       await write();
-      return { ok: true, release: async () => releaseIfOwned(lockPath, token) };
+      return acquired();
     } catch (err) {
       if (err?.code !== 'EEXIST') {
         // Filesystem problem — do not silently proceed unserialised.
@@ -92,12 +153,10 @@ export async function acquireLoopFileLease({
         // eslint-disable-next-line no-await-in-loop
         current = JSON.parse(await readFile(lockPath, 'utf8'));
       } catch { current = null; }
-      const expired = current?.expiresAt && Date.parse(current.expiresAt) < clock();
-      const dead = current && !holderAlive(current.pid);
-      if (current && !expired && !dead) {
+      if (!isReclaimable(current, clock())) {
         return { ok: false, heldBy: current };
       }
-      // Stale — reclaim and retry once.
+      // Provably abandoned — reclaim and retry once.
       try {
         // eslint-disable-next-line no-await-in-loop
         await unlink(lockPath);

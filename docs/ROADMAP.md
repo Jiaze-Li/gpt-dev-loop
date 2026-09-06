@@ -72,13 +72,52 @@ doctor` green. NOT real-provider E2E.
 - `safetyEvents` isolated per invocation; early-return telemetry reports
   durable cumulative spend.
 
-## Not yet run (needs real providers / real GitHub)
+## Independent re-verification pass (this change)
 
-- ReviewLoop real-provider Reviewer/Supervisor E2E (only the `agy` families
-  have a live transport in this build; `codex`/`claude` families are
-  capability-declared but marked unavailable until their transports are wired).
-- ReviewLoop real PR external-review loop (`@codex review` / `@claude review`).
-- Real multi-provider failover (structurally wired + mock-certified).
+Deterministic/mock `npm test` (303/303) + `npm run doctor` green. Closes the
+4 P1 + 3 P2 raised by the independent re-verification of the release-hardening
+pass:
+
+- Bounded failover may reuse the one New Information claim ONLY when every
+  earlier physical attempt is mechanically proven pre-send zero. An attempt
+  that reached the provider (known non-zero usage / open DISPATCHING) →
+  "no new information" → no further physical call.
+- The cross-process BUSY path is strictly read-only: it no longer runs
+  resume reconciliation or touches any RESERVED / DISPATCHING reservation
+  belonging to the live owner.
+- Lease expiry is owner-aware: a same-host lock whose owner pid is still
+  alive is never stolen on the fixed TTL alone; a held lease renews its own
+  expiry on a heartbeat; only a provably-gone owner (dead same-host pid, or
+  an expired remote lock) is reclaimed.
+- A GitHub `CHANGES_REQUESTED` review verdict is unconditionally blocking —
+  an empty / P3-only structured findings block can no longer downgrade it to
+  CLEAN.
+- A review round is bound to the logical (diff + gate) review state; a
+  crash/resume of the same chunked review never consumes another round, and
+  a resumed incomplete chunk continues the one authorized dispatch sequence
+  instead of earning a fresh one.
+- Every provider/spend failure that returns `HUMAN_REQUIRED` now also latches
+  the durable loop state to `HUMAN_REQUIRED` (returned status == persisted
+  state).
+
+## Real-provider status (needs real providers / real GitHub)
+
+- Deterministic/mock certification = **PASS** — 303/303 `npm test`,
+  `npm run doctor` PASS.
+- `npm run install-global` = **executed** against this machine's agent
+  config / dotfiles (managed block + `reviewloop` MCP registration).
+- Real provider calls to date = **2** (one-shot live smoke: an Executor-era
+  `claude:sonnet` call + one `agy` Reviewer call; PASS).
+- ReviewLoop real-provider Reviewer/Supervisor E2E over the current
+  architecture = **ATTEMPTED / NOT CERTIFIED** (`reviewloop_review` reached a
+  live `agy` Reviewer; the run was not carried to a certified end-to-end
+  verdict — the deterministic Gate + regression suite is the accepted bar
+  for this pass). `codex`/`claude` families stay capability-declared,
+  transport-unavailable.
+- ReviewLoop real PR external-review loop (`@codex review` / `@claude review`)
+  = **NOT RUN**.
+- Real multi-provider failover = **NOT RUN** (structurally wired +
+  mock-certified).
 - A controlled `Worker + ReviewLoop` vs `Worker alone` wrapper benchmark
   (ReviewLoop cannot observe Worker token usage through MCP).
 

@@ -246,14 +246,27 @@ export function createReviewLoopController({
   // a fresh dispatch on identical evidence for a first attempt (crash/resume
   // re-call included).
   async function meteredWithFailover({
-    spend, role, routeFn, defaultFamily, defaultProvider, operationId, evidenceIds, invoke,
+    spend, role, routeFn, defaultFamily, defaultProvider, operationId, evidenceIds, invoke, workflowId = null,
   }) {
     const tried = new Set();
     let lastErr = null;
-    for (let attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt += 1) {
+    // Resume/continuation: if this exact (role, operationId) already durably
+    // CONSUMED its evidence in a prior (crashed) session, this call is not a
+    // fresh first attempt — it continues that one authorized dispatch SEQUENCE.
+    // Start the bounded attempt counter past 1 so authorize() takes the
+    // failover-reuse path, which STILL refuses if any earlier attempt actually
+    // reached the provider (non-zero settled usage / open DISPATCHING).
+    let startAttempt = 1;
+    try {
+      const priorClaim = await spend.informationLedger?.findConsumedBy?.({
+        workflowId, role, operationId, evidenceIds,
+      });
+      if (priorClaim) startAttempt = 2;
+    } catch { /* treat as a first attempt; authorize() re-checks deterministically */ }
+    for (let attempt = startAttempt; attempt < startAttempt + MAX_PROVIDER_ATTEMPTS; attempt += 1) {
       let selection = null;
       if (routeFn) {
-        selection = routeFn({ reworkCycles: attempt - 1 });
+        selection = routeFn({ reworkCycles: attempt - startAttempt });
         if (!selection) break;
         if (tried.has(selection.family)) break;
         tried.add(selection.family);
@@ -292,6 +305,12 @@ export function createReviewLoopController({
         // process). Report the in-contract "call again later" state — never run
         // a concurrent Reviewer or clobber the in-flight call's durable state.
         safetyEvents = [];
+        // BUSY is a strictly READ-ONLY outcome: another process owns this loop
+        // and is the one entitled to reconcile/settle its reservations. This
+        // path must not call durableTelemetry() (it runs reconcileOnResume and
+        // can rewrite RESERVED/DISPATCHING reservations under the live owner) —
+        // it touches no durable state at all. The owning call reports accurate
+        // telemetry when it finishes.
         return {
           status: 'WAITING_FOR_REVIEW',
           loopId,
@@ -299,7 +318,7 @@ export function createReviewLoopController({
             + (lease.heldBy?.pid ? ` (holder pid ${lease.heldBy.pid} on ${lease.heldBy.host ?? '?'})` : '')
             + '; wait for it to finish, then call reviewloop_review again',
           nextAction: 'Wait for the in-flight review of this loop to finish, then call reviewloop_review again.',
-          telemetry: await durableTelemetry(loopId),
+          telemetry: { ...emptyTelemetry(), note: 'another process owns this loop; telemetry not read to keep this path side-effect-free' },
           safetyEvents: [],
         };
       }
@@ -326,6 +345,20 @@ export function createReviewLoopController({
 
   // ---- Reviewer over full attributed evidence (bounded or chunked) --------
   async function runReviewerOverEvidence({ spend, loopState, objective, delta, gate }) {
+    // Round is bound to the LOGICAL review state (delta + gate fingerprint),
+    // NOT to how many times reviewloop_review was invoked. A crash/resume that
+    // re-enters with the SAME logical review state — its durable per-chunk
+    // checkpoint is still on record — reuses the round it already assigned and
+    // never consumes another of the objective's max review rounds.
+    const checkpointKey = sha256Hex(`${delta.fingerprint}::${gate.fingerprint}`);
+    const resumeCheckpoint = loopState.chunkReviewCheckpoint;
+    if (resumeCheckpoint && resumeCheckpoint.key === checkpointKey
+      && Number.isInteger(resumeCheckpoint.round)) {
+      loopState.round = resumeCheckpoint.round;
+    } else {
+      loopState.round += 1;
+    }
+
     const { chunks, oversized, reason } = chunkDiffForReview(delta.diff, { env });
     if (oversized) {
       return {
@@ -341,11 +374,16 @@ export function createReviewLoopController({
     // Durable per-chunk checkpoint. Keyed to the exact review state (delta +
     // gate); a changed diff invalidates it. On resume, a chunk already in the
     // checkpoint is NOT re-sent to the model — its normalized result is reused.
-    const checkpointKey = sha256Hex(`${delta.fingerprint}::${gate.fingerprint}`);
+    // It also carries the round this logical review state was assigned so a
+    // resume never re-increments it.
     let checkpoint = loopState.chunkReviewCheckpoint;
     if (!checkpoint || checkpoint.key !== checkpointKey) {
-      checkpoint = { key: checkpointKey, chunkTotal: chunks.length, chunks: {} };
+      checkpoint = {
+        key: checkpointKey, chunkTotal: chunks.length, chunks: {}, round: loopState.round,
+      };
       loopState.chunkReviewCheckpoint = checkpoint;
+    } else if (!Number.isInteger(checkpoint.round)) {
+      checkpoint.round = loopState.round;
     }
 
     const perChunk = [];
@@ -378,6 +416,7 @@ export function createReviewLoopController({
         defaultFamily: 'agy:gpt-oss',
         defaultProvider: 'agy',
         operationId: chunkId,
+        workflowId: loopState.loopId,
         evidenceIds: [reviewStateEvidence.evidenceId],
         invoke: ({ selection }) => Promise.resolve(reviewerFn({
           objective,
@@ -560,7 +599,9 @@ export function createReviewLoopController({
     }
 
     const spend = spendFor(loopState.loopId);
-    loopState.round += 1;
+    // The fresh-round increment now lives in runReviewerOverEvidence, bound to
+    // the logical (delta + gate) review state so a crash/resume of the same
+    // review never consumes an extra round.
 
     let reviewOut;
     try {
@@ -647,6 +688,7 @@ export function createReviewLoopController({
         defaultFamily: 'agy:gemini',
         defaultProvider: 'agy',
         operationId: `${loopState.loopId}:supervise`,
+        workflowId: loopState.loopId,
         evidenceIds: [findingsEvidence.evidenceId],
         invoke: ({ selection }) => Promise.resolve(supervisorFn({
           objective, blockingFindings: review.blockingFindings, gate,
@@ -786,7 +828,13 @@ export function createReviewLoopController({
       telemetry: telemetry ?? emptyTelemetry(), safetyEvents,
     };
   }
-  function spendDenialResult(loopState, err, telemetry) {
+  // A provider/spend failure that surfaces as HUMAN_REQUIRED MUST also latch the
+  // durable loop state to HUMAN_REQUIRED — the returned status and the persisted
+  // state can never disagree. (Before this, the caller was told HUMAN_REQUIRED
+  // while the loop stayed at REVIEWING on disk.)
+  async function spendDenialResult(loopState, err, telemetry) {
+    recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, `model spend blocked: ${err?.code ?? err?.message ?? err}`);
+    try { await store.save(loopState.loopId, loopState); } catch { /* best effort; the returned status still reflects intent */ }
     return {
       status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
       reason: `ReviewLoop model spend blocked: ${err?.message ?? err}`,

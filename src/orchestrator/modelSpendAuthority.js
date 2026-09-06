@@ -48,7 +48,7 @@ import {
   AuthorizationError, AUTHORIZATION_ERROR_CODES, isCancellation,
 } from './errors.js';
 import { isExecutorEligible as productionIsExecutorEligible } from './providerCapabilities.js';
-import { ReservationLedger } from './modelSpendReservation.js';
+import { ReservationLedger, RESERVATION_STATUS } from './modelSpendReservation.js';
 import { NewInformationLedger } from './newInformation.js';
 
 // The strongest invocation identifiers mechanically available at the role
@@ -72,6 +72,25 @@ import { NewInformationLedger } from './newInformation.js';
 // that do not wire a NewInformationLedger) normalize to `evidenceRef: null`
 // on both sides and are unaffected.
 export const CALL_INTENT_KEYS = Object.freeze(['role', 'family', 'provider', 'operationId', 'attempt', 'workflowId', 'evidenceRef']);
+
+// Provider-reported token volume of a settled reservation's usage reference.
+// A mechanically-zero pre-send failure settles SETTLED_KNOWN with an explicit
+// all-zero usage object — that is 0 here and proves nothing was sent. Any
+// non-zero value means the provider was really reached.
+function settledUsageVolume(usageReference) {
+  if (!usageReference || typeof usageReference !== 'object') return 0;
+  const n = (...keys) => {
+    for (const k of keys) {
+      const v = usageReference[k];
+      if (Number.isFinite(v)) return v;
+    }
+    return 0;
+  };
+  return n('input_tokens', 'inputTokens')
+    + n('output_tokens', 'outputTokens')
+    + n('cache_creation_input_tokens', 'cacheCreationInputTokens', 'cache_creation_input')
+    + n('cache_read_input_tokens', 'cacheReadInputTokens', 'cache_read_input');
+}
 
 function computeEvidenceRef(evidenceIds) {
   if (!Array.isArray(evidenceIds) || evidenceIds.length === 0) return null;
@@ -361,20 +380,52 @@ export class ModelSpendAuthority {
       // so "one diff+gate logical state authorizes exactly one dispatch
       // SEQUENCE", not "each evidenceId is a separate dispatch token".
       if (!eligible && Number(intent.attempt) > 1) {
-        let priorClaim = null;
+        // Bounded failover may reuse the ONE New Information claim that
+        // authorized attempt 1 of this operation — but ONLY when every earlier
+        // physical attempt of this SAME (role, operationId) is mechanically
+        // proven to have spent zero: it either never crossed the durable
+        // DISPATCHING boundary, or it settled SETTLED_KNOWN with an all-zero
+        // (pre-send) usage record. If any earlier attempt reached the provider
+        // — SETTLED_KNOWN with non-zero usage, or a still-open DISPATCHING /
+        // UNRESOLVED record — then "no new information" means no further
+        // physical call, exactly as for a first attempt. (A provider protocol
+        // error AFTER the tokens were spent is not a licence to try again.)
+        let priorReservations = [];
         try {
-          priorClaim = await this._informationLedger.findConsumedBy({
-            workflowId: intent.workflowId, role: intent.role, operationId: intent.operationId, evidenceIds: candidateEvidenceIds,
-          });
+          priorReservations = await this._reservationLedger.list(intent.workflowId);
         } catch (error) {
           throw new AuthorizationError(
             AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
-            `new information state could not be read: ${error?.message ?? error}`,
+            `model spend reservation state could not be read for failover-reuse: ${error?.message ?? error}`,
             { intent },
           );
         }
-        if (priorClaim) {
-          eligible = { evidenceId: priorClaim.evidenceId, type: null, _failoverReuse: true };
+        const earlierAttempts = priorReservations.filter((r) => (
+          (r.taskId ?? null) === (intent.operationId ?? null)
+          && (r.role ?? null) === (intent.role ?? null)
+          && Number(r.physicalAttempt) < Number(intent.attempt)
+        ));
+        const anyReachedProvider = earlierAttempts.some((r) => (
+          r.status === RESERVATION_STATUS.DISPATCHING
+          || r.status === RESERVATION_STATUS.UNRESOLVED
+          || (r.status === RESERVATION_STATUS.SETTLED_KNOWN && settledUsageVolume(r.usageReference) > 0)
+        ));
+        if (!anyReachedProvider) {
+          let priorClaim = null;
+          try {
+            priorClaim = await this._informationLedger.findConsumedBy({
+              workflowId: intent.workflowId, role: intent.role, operationId: intent.operationId, evidenceIds: candidateEvidenceIds,
+            });
+          } catch (error) {
+            throw new AuthorizationError(
+              AUTHORIZATION_ERROR_CODES.MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE,
+              `new information state could not be read: ${error?.message ?? error}`,
+              { intent },
+            );
+          }
+          if (priorClaim) {
+            eligible = { evidenceId: priorClaim.evidenceId, type: null, _failoverReuse: true };
+          }
         }
       }
       if (!eligible) {

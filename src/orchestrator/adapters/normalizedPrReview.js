@@ -316,6 +316,24 @@ export function normalizeProviderReview({
     ...finding,
     reviewId: finding?.reviewId ?? finding?.review_id ?? reviewId ?? null,
   })).filter(Boolean);
+
+  // GitHub's own submission verdict, when the caller threads it through, is
+  // authoritative and UNCONDITIONALLY blocking: a CHANGES_REQUESTED review with
+  // an empty (or all-non-blocking) structured findings list must never
+  // normalize to CLEAN. A synthetic blocking finding is added so the Core sees
+  // ACTIONABLE and non-convergence tracking has a stable signature to compare.
+  const githubState = collapse(
+    raw.github_review_state ?? raw.githubReviewState ?? raw.review_state ?? raw.reviewState,
+  );
+  if ((githubState === 'changes_requested' || githubState === 'dismissed')
+    && !findings.some((f) => isBlockingSeverity(f.severity))) {
+    findings.unshift(normalizeReviewFinding({
+      severity: 'P2',
+      title: `trusted reviewer submitted ${githubState.toUpperCase()} for this HEAD — resolve it in the PR review thread`,
+      reviewId: reviewId ?? null,
+    }));
+  }
+
   const blocking = findings.filter((f) => isBlockingSeverity(f.severity));
 
   return {

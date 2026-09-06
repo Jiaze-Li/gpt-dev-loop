@@ -12,6 +12,7 @@
 import { execFile as nodeExecFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { checkPrReviewTrust } from './prTrust.js';
+import { normalizeFindingSeverity, isBlockingSeverity } from '../orchestrator/adapters/normalizedPrReview.js';
 
 const execFileP = promisify(nodeExecFile);
 
@@ -65,6 +66,28 @@ function findingsForSubmission({ state, body }) {
     // Not a real submission — the reviewer never sent it.
     return { findings: [], dismissed: false, clean: false, pending: true };
   }
+  if (upper === REVIEW_STATE.CHANGES_REQUESTED) {
+    // GitHub's own review verdict. CHANGES_REQUESTED is UNCONDITIONALLY
+    // blocking — a structured findings block (even an empty one, even one with
+    // only non-blocking P3s) is additive detail; it can never downgrade the
+    // reviewer's explicit "changes requested" verdict to clean. This branch is
+    // deliberately ABOVE the generic `structured` handling below so a
+    // ```json {"findings":[]}``` block can't turn CHANGES_REQUESTED into CLEAN.
+    const extra = Array.isArray(structured) ? structured : [];
+    const extraHasBlocking = extra.some(
+      (f) => isBlockingSeverity(normalizeFindingSeverity(f?.severity ?? f?.level ?? f?.priority)),
+    );
+    const findings = [...extra];
+    if (!extraHasBlocking) {
+      findings.unshift({
+        severity: severityPrefix(body) ?? 'P2',
+        file: null,
+        line: null,
+        title: firstLine(body) || 'trusted reviewer requested changes — read the PR review thread',
+      });
+    }
+    return { findings, dismissed: false, clean: false };
+  }
   if (structured) {
     return { findings: structured, dismissed: false, clean: upper === REVIEW_STATE.APPROVED && structured.length === 0 };
   }
@@ -78,12 +101,6 @@ function findingsForSubmission({ state, body }) {
       };
     }
     return { findings: [], dismissed: false, clean: true };
-  }
-  if (upper === REVIEW_STATE.CHANGES_REQUESTED) {
-    return {
-      findings: [{ severity: severityPrefix(body) ?? 'P2', file: null, line: null, title: firstLine(body) || 'trusted reviewer requested changes — read the PR review thread' }],
-      dismissed: false, clean: false,
-    };
   }
   // COMMENTED (or any unknown state) with no structured findings: a trusted
   // reviewer left a human-readable comment we cannot mechanically parse. That
