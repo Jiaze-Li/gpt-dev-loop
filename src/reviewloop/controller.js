@@ -92,11 +92,29 @@ export function createReviewLoopController({
 } = {}) {
   const persistence = injectedPersistence ?? new Persistence(runtimeRoot);
   const store = new ReviewLoopStore(persistence);
-  const safetyEvents = [];
+  // Safety events are scoped to ONE reviewloop_review invocation. The array is
+  // replaced (never appended-to across calls) at the top of review() so a
+  // long-lived controller (one per MCP process, shared by every loopId) never
+  // leaks one loop's safety events into another loop's result, and never grows
+  // unbounded. Durable cumulative spend still comes from spend.telemetry(),
+  // which reads the durable per-loop ledger.
+  let safetyEvents = [];
   const collectSafetyEvent = (e) => {
     safetyEvents.push(e);
     recordSafetyEvent?.(e);
   };
+
+  // Cumulative, durable per-loop spend telemetry with zero model calls — used
+  // on every early-return path (NO_PROGRESS / WAITING_FOR_REVIEW /
+  // PUSH_REQUIRED / terminal) so those results never understate spend that
+  // earlier rounds already incurred.
+  async function durableTelemetry(loopId) {
+    try {
+      return await spendFor(loopId).telemetry();
+    } catch {
+      return emptyTelemetry();
+    }
+  }
 
   async function begin({
     goal, cwd, prNumber = null, reviewer = null,
@@ -138,9 +156,18 @@ export function createReviewLoopController({
       if (!prHead) throw new Error(`reviewloop_begin: cannot resolve HEAD for PR #${prNumber}`);
     }
 
+    // REVIEWLOOP_MAX_REVIEW_ROUNDS is a public tuning knob: an explicit begin
+    // argument wins, otherwise the env value feeds the frozen objective (which
+    // is the value decideConvergence() actually enforces), otherwise the
+    // objective default. Never left resolved-but-ignored.
+    const envMaxRounds = Number(env?.REVIEWLOOP_MAX_REVIEW_ROUNDS);
+    const resolvedMaxRounds = Number.isInteger(maxReviewRounds) && maxReviewRounds > 0
+      ? maxReviewRounds
+      : (Number.isInteger(envMaxRounds) && envMaxRounds > 0 ? envMaxRounds : undefined);
+
     const objective = createReviewObjective({
       loopId, goal, repository, mode, prNumber, reviewer, baseline, prHead,
-      constraints, blockingSeverities, maxReviewRounds,
+      constraints, blockingSeverities, maxReviewRounds: resolvedMaxRounds,
     });
 
     const loopState = initialLoopState(objective);
@@ -219,6 +246,8 @@ export function createReviewLoopController({
 
   async function review({ loopId, signal, onHeartbeat } = {}) {
     if (!loopId) throw new Error('reviewloop_review: loopId is required');
+    // Per-invocation safety-event isolation: start this call with a clean list.
+    safetyEvents = [];
     const loopState = await loadLoop(loopId);
     const objective = loopState.objective;
 
@@ -326,7 +355,7 @@ export function createReviewLoopController({
         loopId: loopState.loopId,
         round: loopState.round,
         reason: 'no Worker change has been made since reviewloop_begin; do the work, then call reviewloop_review',
-        telemetry: emptyTelemetry(),
+        telemetry: await durableTelemetry(loopState.loopId),
         safetyEvents,
       };
     }
@@ -343,7 +372,7 @@ export function createReviewLoopController({
         loopId: loopState.loopId,
         round: loopState.round,
         reason: `cannot reliably separate Worker changes from pre-existing work: ${(delta.incompleteReasons ?? []).join('; ')}`,
-        telemetry: emptyTelemetry(),
+        telemetry: await durableTelemetry(loopState.loopId),
         safetyEvents,
       };
     }
@@ -365,7 +394,7 @@ export function createReviewLoopController({
         round: loopState.round,
         reason: 'submitted state is identical to the last review; no Reviewer/Supervisor call made',
         lastReview: compactLastReview(loopState),
-        telemetry: emptyTelemetry(),
+        telemetry: await durableTelemetry(loopState.loopId),
         safetyEvents,
       };
     }
@@ -379,7 +408,7 @@ export function createReviewLoopController({
       return {
         ...compactReworkPayload({ loopState, review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 }, gate }),
         reason: 'deterministic Gate failed with a new regression; fix it before Reviewer runs',
-        telemetry: emptyTelemetry(),
+        telemetry: await durableTelemetry(loopState.loopId),
         safetyEvents,
       };
     }
@@ -507,21 +536,21 @@ export function createReviewLoopController({
 
     if (result.outcome === PR_REVIEW_OUTCOMES.PUSH_REQUIRED) {
       await store.save(loopState.loopId, loopState);
-      return { status: 'PUSH_REQUIRED', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: emptyTelemetry(), safetyEvents };
+      return { status: 'PUSH_REQUIRED', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: await durableTelemetry(loopState.loopId), safetyEvents };
     }
     if (result.outcome === PR_REVIEW_OUTCOMES.WAITING_FOR_REVIEW) {
       recordTransition(loopState, REVIEW_LOOP_STATES.WAITING_FOR_REVIEW, 'external review pending');
       loopState.pendingExternalTrigger = loopState.pendingExternalTrigger
         ?? { head: result.head, reviewer: objective.reviewer, status: 'TRIGGERED' };
       await store.save(loopState.loopId, loopState);
-      return { status: 'WAITING_FOR_REVIEW', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: emptyTelemetry(), safetyEvents };
+      return { status: 'WAITING_FOR_REVIEW', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: await durableTelemetry(loopState.loopId), safetyEvents };
     }
     if (result.outcome === PR_REVIEW_OUTCOMES.HUMAN_REQUIRED) {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, result.reason);
       await store.save(loopState.loopId, loopState);
       return {
         status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head ?? null, reason: result.reason,
-        blockingFindings: loopState.lastReview?.blockingFindings ?? [], telemetry: emptyTelemetry(), safetyEvents,
+        blockingFindings: loopState.lastReview?.blockingFindings ?? [], telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
       };
     }
 
@@ -533,7 +562,7 @@ export function createReviewLoopController({
       return {
         status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head,
         reason: `trusted PR review was not usable (${review.error?.reason}): ${review.error?.message ?? ''}`,
-        telemetry: emptyTelemetry(), safetyEvents,
+        telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
       };
     }
 
@@ -615,11 +644,11 @@ export function createReviewLoopController({
       telemetry: telemetry ?? emptyTelemetry(), safetyEvents,
     };
   }
-  function terminalResult(loopState) {
+  async function terminalResult(loopState) {
     return {
       status: loopState.state, loopId: loopState.loopId, round: loopState.round,
       reason: 'loop already terminal', lastReview: compactLastReview(loopState),
-      telemetry: emptyTelemetry(), safetyEvents,
+      telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
     };
   }
   function compactLastReview(loopState) {

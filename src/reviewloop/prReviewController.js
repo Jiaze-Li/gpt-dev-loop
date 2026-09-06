@@ -20,6 +20,7 @@ import {
 import { isExternalTriggerFailure } from '../orchestrator/errors.js';
 import { normalizeReview } from './reviewPolicy.js';
 import { checkPrReviewTrust } from './prTrust.js';
+import { resolveReviewLoopLimits } from './reviewSpend.js';
 
 export const PR_REVIEW_OUTCOMES = Object.freeze({
   REVIEW_READY: 'REVIEW_READY',
@@ -37,8 +38,14 @@ export function createPrReviewController({
   recordSafetyEvent,
   triggerAuthority = null,
 } = {}) {
+  // REVIEWLOOP_MAX_EXTERNAL_REVIEW_TRIGGERS is a public tuning knob — wire it
+  // into the deterministic trigger ceiling the ExternalModelTriggerAuthority
+  // already enforces, rather than leaving it resolved-but-ignored.
+  const { maxExternalReviewTriggers } = resolveReviewLoopLimits(env);
   const authority = triggerAuthority ?? new ExternalModelTriggerAuthority({
     store: persistence ? new ExternalTriggerStore(persistence) : null,
+    maxExternalModelTriggers: maxExternalReviewTriggers,
+    maxExternalReviewRounds: maxExternalReviewTriggers,
     recordSafetyEvent,
     onEvent,
   });

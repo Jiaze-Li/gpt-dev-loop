@@ -65,14 +65,51 @@ export function validateSupervisorPayload(parsed, { raw } = {}) {
   return { guidance: String(parsed.guidance).trim(), recommendation: rec };
 }
 
+// callAgy() resolves to the TRANSPORT envelope:
+//   { model, exitCode, text, json, stdout, durationMs, conversationId, usage }
+// where `json` is agy's own envelope ({ result, usage, conversation_id, ... })
+// and `text` is the MODEL's reply — i.e. the actual
+// `{"findings":[...]}` / `{"guidance":"...","recommendation":"..."}` payload,
+// possibly fenced. The reviewer/supervisor payload therefore lives in `text`,
+// NOT in `json`. Parsing `json` first (the old behaviour) fed the transport
+// envelope to validateReviewerPayload, which has no `findings` array, so every
+// real production Reviewer call failed closed.
+function stripFence(text) {
+  return String(text ?? '')
+    .replace(/^\s*```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/, '')
+    .trim();
+}
+
+function looksLikePayload(obj) {
+  return obj && typeof obj === 'object' && !Array.isArray(obj)
+    && (Array.isArray(obj.findings) || 'recommendation' in obj || 'guidance' in obj);
+}
+
 function parseJsonish(res) {
-  if (res && typeof res.json === 'object' && res.json !== null) return { parsed: res.json, raw: res.json };
-  const text = String(res?.text ?? res ?? '');
-  try {
-    return { parsed: JSON.parse(text.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim()), raw: text };
-  } catch {
-    return { parsed: null, raw: text };
+  if (typeof res === 'string') {
+    try { return { parsed: JSON.parse(stripFence(res)), raw: res }; } catch { return { parsed: null, raw: res }; }
   }
+  // 1. The model's own reply text — the normal channel.
+  const replyText = typeof res?.text === 'string' ? res.text : null;
+  if (replyText && stripFence(replyText)) {
+    try {
+      return { parsed: JSON.parse(stripFence(replyText)), raw: replyText };
+    } catch { /* fall through */ }
+  }
+  // 2. `agy --json-schema` can make the ENVELOPE itself the schema'd object.
+  //    Only accept res.json when it already looks like a reviewer/supervisor
+  //    payload — never the bare transport envelope.
+  if (looksLikePayload(res?.json)) {
+    return { parsed: res.json, raw: res.json };
+  }
+  // 3. A nested envelope field sometimes carries the JSON as a string.
+  for (const cand of [res?.json?.result, res?.json?.output, res?.json?.content]) {
+    if (typeof cand === 'string' && stripFence(cand)) {
+      try { return { parsed: JSON.parse(stripFence(cand)), raw: cand }; } catch { /* keep trying */ }
+    }
+  }
+  return { parsed: null, raw: replyText ?? (res?.json ? JSON.stringify(res.json) : '') };
 }
 
 // ---- Reviewer / Supervisor pool -----------------------------------------

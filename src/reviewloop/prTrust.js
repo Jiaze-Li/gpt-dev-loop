@@ -24,11 +24,16 @@ export const TRUST_REJECT_REASONS = Object.freeze({
   MALFORMED: 'MALFORMED',
 });
 
-// Exact GitHub bot-account logins per configured PR reviewer. Deployment-
-// overridable via env (comma-separated), but ALWAYS exact-match.
+// Exact GitHub bot-account logins per configured PR reviewer. These are the
+// literal `user.login` strings the GitHub REST API returns for the review
+// author — a GitHub App acting on a PR always appears as "<app-slug>[bot]"
+// (e.g. GET /repos/{o}/{r}/pulls/{n}/reviews -> [].user.login). The bare,
+// suffix-less slug is NOT what REST returns and is deliberately absent so a
+// look-alike account registered under the bare slug cannot be trusted.
+// Deployment-overridable via env (comma-separated), but ALWAYS exact-match.
 export const DEFAULT_REVIEWER_LOGINS = Object.freeze({
-  codex: Object.freeze(['chatgpt-codex-connector']),
-  claude: Object.freeze(['claude[bot]', 'claude']),
+  codex: Object.freeze(['chatgpt-codex-connector[bot]']),
+  claude: Object.freeze(['claude[bot]']),
 });
 
 function splitEnvList(value) {

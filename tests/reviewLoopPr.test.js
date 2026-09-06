@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
-const TRUSTED_LOGIN = { codex: 'chatgpt-codex-connector', claude: 'claude[bot]' };
+const TRUSTED_LOGIN = { codex: 'chatgpt-codex-connector[bot]', claude: 'claude[bot]' };
 
 // A raw review carries a real trusted GitHub login + the exact reviewed HEAD,
 // exactly as the real GitHub backend surfaces before checkPrReviewTrust().

@@ -18,8 +18,19 @@ import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { collectFailureIdentities } from '../orchestrator/gateFailureIdentity.js';
 import { diffBaselineFailures, BASELINE_DIFF_VERDICTS } from '../orchestrator/baselineDiffGate.js';
+import { PROCESS_GROUP_SPAWN_OPTS, terminateProcessTree } from '../orchestrator/processTree.js';
 
 export const GATE_VERDICTS = Object.freeze({ PASS: 'PASS', FAIL: 'FAIL', WARN: 'WARN' });
+
+// A hung Gate command must terminate deterministically rather than block the
+// review forever. Deployment-overridable via REVIEWLOOP_GATE_TIMEOUT_MS.
+export const DEFAULT_GATE_TIMEOUT_MS = 10 * 60_000;
+export const GATE_TIMEOUT_EXIT_CODE = 124;
+
+function resolveGateTimeoutMs(env) {
+  const n = Number(env?.REVIEWLOOP_GATE_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_GATE_TIMEOUT_MS;
+}
 
 export function discoverVerificationCommands({ cwd, configured = null } = {}) {
   if (Array.isArray(configured) && configured.length) {
@@ -52,17 +63,55 @@ export function discoverVerificationCommands({ cwd, configured = null } = {}) {
   return { source: 'mechanical', commands: ['git diff --check'] };
 }
 
-function runCommand(command, cwd, spawn) {
+function runCommand(command, cwd, spawn, timeoutMs) {
   return new Promise((resolve) => {
-    const child = spawn('/bin/sh', ['-c', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let child;
+    try {
+      child = spawn('/bin/sh', ['-c', command], {
+        cwd, stdio: ['ignore', 'pipe', 'pipe'], ...PROCESS_GROUP_SPAWN_OPTS,
+      });
+    } catch (e) {
+      resolve({ command, exitCode: 127, stdout: '', stderr: String(e?.message ?? e) });
+      return;
+    }
     const out = [];
     const err = [];
-    child.stdout.on('data', (d) => out.push(d));
-    child.stderr.on('data', (d) => err.push(d));
-    child.on('error', (e) => resolve({ command, exitCode: 127, stdout: '', stderr: String(e?.message ?? e) }));
-    child.on('close', (code) => resolve({
+    let settled = false;
+    let timer = null;
+    let teardown = null;
+    let timedOut = false;
+
+    const finish = async (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (teardown) await teardown.done;
+      resolve(result);
+    };
+
+    timer = setTimeout(() => {
+      timedOut = true;
+      // Whole-process-tree teardown: a Gate shell may itself have spawned a
+      // long-running verification subprocess. Signalling only the direct child
+      // leaves that descendant running.
+      teardown = terminateProcessTree(child);
+      void finish({
+        command,
+        exitCode: GATE_TIMEOUT_EXIT_CODE,
+        timedOut: true,
+        stdout: Buffer.concat(out).toString('utf8').slice(0, 200_000),
+        stderr: `${Buffer.concat(err).toString('utf8').slice(0, 200_000)}\nReviewLoop Gate: command exceeded ${timeoutMs}ms and was terminated`,
+      });
+    }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    child.stdout?.on('data', (d) => out.push(d));
+    child.stderr?.on('data', (d) => err.push(d));
+    child.on('error', (e) => finish({ command, exitCode: 127, stdout: '', stderr: String(e?.message ?? e), timedOut }));
+    child.on('close', (code) => finish({
       command,
-      exitCode: code ?? 0,
+      exitCode: timedOut ? GATE_TIMEOUT_EXIT_CODE : (code ?? 0),
+      timedOut,
       stdout: Buffer.concat(out).toString('utf8').slice(0, 200_000),
       stderr: Buffer.concat(err).toString('utf8').slice(0, 200_000),
     }));
@@ -76,10 +125,13 @@ export async function runGate({
   spawn = nodeSpawn,
   runner = null,
   baselineGateEvidence = null,
+  env = process.env,
+  timeoutMs = null,
 } = {}) {
+  const gateTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : resolveGateTimeoutMs(env);
   const exec = runner
     ? (cmd) => runner(cmd, cwd)
-    : (cmd) => runCommand(cmd, cwd, spawn);
+    : (cmd) => runCommand(cmd, cwd, spawn, gateTimeoutMs);
 
   const results = [];
   for (const command of commands) {
@@ -88,6 +140,7 @@ export async function runGate({
     results.push({
       ...r,
       pass: (r.exitCode ?? 0) === 0,
+      timedOut: r.timedOut === true,
       // gateFailureIdentity.js reads `output`.
       output: `${r.stdout ?? ''}\n${r.stderr ?? ''}`,
     });
@@ -125,6 +178,7 @@ export async function runGate({
       command: r.command,
       exitCode: r.exitCode,
       pass: r.pass,
+      timedOut: r.timedOut === true,
       stdoutTail: String(r.stdout ?? '').slice(-2000),
       stderrTail: String(r.stderr ?? '').slice(-2000),
     })),

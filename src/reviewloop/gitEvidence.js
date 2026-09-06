@@ -9,21 +9,32 @@
 // Mechanism (non-mutating throughout):
 //   baseline:  `git stash create` -> a commit object of the dirty tracked
 //              state, WITHOUT touching the working tree or the stash list.
-//              Plus a blob hash of every pre-existing untracked file.
+//              Plus a content digest of every pre-existing untracked file.
 //   delta:     `git diff <baselineStashCommit>` == exactly the tracked change
 //              the Worker made since begin. Untracked files are attributed by
-//              comparing current blob hashes against the baseline hashes.
+//              comparing current content digests against the baseline digests.
 //
-// If a pre-existing untracked file cannot be safely fingerprinted, the
-// baseline is marked evidenceComplete=false and the controller fails closed.
+// Fail-closed rules:
+//   * Every git command that feeds baseline / diff / HEAD / untracked
+//     attribution is checked for a non-zero exit. A non-zero exit is NEVER
+//     absorbed as an empty diff, an empty untracked set, or a fallback HEAD —
+//     `captureBaseline` throws and `collectWorkerDelta` marks the evidence
+//     incomplete so the controller fails closed (HUMAN_REQUIRED). Only an exit
+//     code of 0 with genuinely empty stdout (a clean tree) is treated as "no
+//     change".
+//   * An untracked path is `lstat`'d BEFORE it is read or digested. A symlink,
+//     FIFO, socket, or device is never followed — doing so would fold an
+//     out-of-tree target's bytes into Reviewer evidence. Any such path fails
+//     the evidence closed. (Mirrors the hardened collector in
+//     src/adapters/gate/git-evidence/index.js.)
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile as nodeReadFile, lstat as nodeLstat } from 'node:fs/promises';
 import path from 'node:path';
 
 function sha256(value) {
-  return createHash('sha256').update(String(value)).digest('hex');
+  return createHash('sha256').update(Buffer.isBuffer(value) ? value : String(value)).digest('hex');
 }
 
 function runGit(args, cwd, spawn = nodeSpawn) {
@@ -48,50 +59,105 @@ function runGit(args, cwd, spawn = nodeSpawn) {
   });
 }
 
-async function untrackedFiles(cwd, spawn) {
-  const res = await runGit(['ls-files', '--others', '--exclude-standard', '-z'], cwd, spawn);
-  return res.stdout.split('\0').filter(Boolean);
+class GitEvidenceError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'GitEvidenceError';
+    this.code = 'REVIEWLOOP_GIT_EVIDENCE_FAILED';
+  }
 }
 
-async function blobHash(cwd, spawn, filePath) {
-  const res = await runGit(['hash-object', '--', filePath], cwd, spawn);
-  return (res.code === 0 && res.stdout.trim()) ? res.stdout.trim() : null;
+// Run a git command that MUST succeed for the evidence to be trustworthy.
+async function gitOrThrow(args, cwd, spawn, context) {
+  const res = await runGit(args, cwd, spawn);
+  if (res.code !== 0) {
+    throw new GitEvidenceError(
+      `ReviewLoop ${context}: "git ${args.join(' ')}" exited ${res.code}: ${(res.stderr || res.stdout || '').trim().slice(0, 400)}`,
+    );
+  }
+  return res;
+}
+
+function describeSpecial(info) {
+  if (info.isFIFO()) return 'FIFO';
+  if (info.isSocket()) return 'socket';
+  if (info.isBlockDevice()) return 'block device';
+  if (info.isCharacterDevice()) return 'character device';
+  if (info.isDirectory()) return 'directory';
+  return 'non-regular file';
+}
+
+// lstat-guarded content digest of an untracked path. NEVER follows a symlink
+// and never reads a special file. Returns one of:
+//   { safe: true, digest }         regular file
+//   { safe: false, reason }        symlink / FIFO / socket / device / dir
+//   { unreadable: true, reason }   lstat or read failure
+async function fingerprintUntracked({ cwd, filePath, lstat, readFile }) {
+  const abs = path.join(cwd, filePath);
+  let info;
+  try {
+    info = await lstat(abs);
+  } catch (err) {
+    return { unreadable: true, reason: `cannot lstat untracked path ${filePath}: ${err?.message ?? err}` };
+  }
+  if (info.isSymbolicLink()) {
+    return { safe: false, reason: `untracked path ${filePath} is a symlink — refusing to follow or read its target` };
+  }
+  if (!info.isFile()) {
+    return { safe: false, reason: `untracked path ${filePath} is a ${describeSpecial(info)} — refusing to read it` };
+  }
+  let buf;
+  try {
+    buf = await readFile(abs);
+  } catch (err) {
+    return { unreadable: true, reason: `cannot read untracked file ${filePath}: ${err?.message ?? err}` };
+  }
+  return { safe: true, digest: sha256(buf), bytes: buf };
+}
+
+async function listUntracked(cwd, spawn, context) {
+  const res = await gitOrThrow(['ls-files', '--others', '--exclude-standard', '-z'], cwd, spawn, context);
+  return res.stdout.split('\0').filter(Boolean);
 }
 
 // Capture the pre-Worker baseline. Never mutates the working tree, the index,
 // or the stash list.
-export async function captureBaseline({ cwd, spawn = nodeSpawn } = {}) {
+export async function captureBaseline({
+  cwd, spawn = nodeSpawn, lstat = nodeLstat, readFile = nodeReadFile,
+} = {}) {
   const repoCheck = await runGit(['rev-parse', '--is-inside-work-tree'], cwd, spawn);
   if (repoCheck.code !== 0 || repoCheck.stdout.trim() !== 'true') {
-    throw new Error(`ReviewLoop baseline: "${cwd}" is not inside a git repository`);
+    throw new GitEvidenceError(`ReviewLoop baseline: "${cwd}" is not inside a git repository`);
   }
-  const headRes = await runGit(['rev-parse', 'HEAD'], cwd, spawn);
-  if (headRes.code !== 0) throw new Error(`ReviewLoop baseline: cannot resolve HEAD in "${cwd}"`);
+  const headRes = await gitOrThrow(['rev-parse', 'HEAD'], cwd, spawn, 'baseline');
   const head = headRes.stdout.trim();
+  if (!head) throw new GitEvidenceError(`ReviewLoop baseline: "git rev-parse HEAD" produced no SHA in "${cwd}"`);
 
   // A commit object snapshot of the tracked dirty state (index + worktree).
-  // Empty output => the tracked tree was clean; use HEAD as the baseline ref.
-  const stashRes = await runGit(['stash', 'create', 'reviewloop-baseline'], cwd, spawn);
-  const baselineRef = (stashRes.code === 0 && stashRes.stdout.trim()) ? stashRes.stdout.trim() : head;
+  // A non-zero exit is a real failure and must not be papered over with HEAD.
+  // Exit 0 + empty stdout => the tracked tree was clean; use HEAD as the ref.
+  const stashRes = await gitOrThrow(['stash', 'create', 'reviewloop-baseline'], cwd, spawn, 'baseline');
+  const baselineRef = stashRes.stdout.trim() || head;
 
-  const statusRes = await runGit(['status', '--porcelain=v1', '-z'], cwd, spawn);
+  const statusRes = await gitOrThrow(['status', '--porcelain=v1', '-z'], cwd, spawn, 'baseline');
   const dirtyFiles = statusRes.stdout.split('\0').filter(Boolean).map((raw) => ({
     path: raw.slice(3),
     status: raw.slice(0, 2).trim(),
     untracked: raw.slice(0, 2) === '??',
   }));
 
-  const untracked = await untrackedFiles(cwd, spawn);
+  const untracked = await listUntracked(cwd, spawn, 'baseline');
   const untrackedHashes = {};
   let evidenceComplete = true;
   const incompleteReasons = [];
   for (const filePath of untracked) {
     // eslint-disable-next-line no-await-in-loop
-    const h = await blobHash(cwd, spawn, filePath);
-    if (h) untrackedHashes[filePath] = h;
-    else {
+    const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile });
+    if (fp.safe) {
+      untrackedHashes[filePath] = fp.digest;
+    } else {
       evidenceComplete = false;
-      incompleteReasons.push(`cannot fingerprint pre-existing untracked file ${filePath}`);
+      incompleteReasons.push(fp.reason);
     }
   }
 
@@ -108,45 +174,79 @@ export async function captureBaseline({ cwd, spawn = nodeSpawn } = {}) {
 
 // Compute the Worker's delta since the baseline. `diff` is scoped to
 // baseline->current, NOT HEAD->current, so pre-existing dirty hunks are
-// excluded. Returns changedFiles attributed to the Worker only.
-export async function collectWorkerDelta({ cwd, baseline, spawn = nodeSpawn } = {}) {
+// excluded. Returns changedFiles attributed to the Worker only. Any git
+// command failure or unsafe untracked path marks evidenceComplete=false so the
+// controller fails closed rather than reviewing partial / spoofed evidence.
+export async function collectWorkerDelta({
+  cwd, baseline, spawn = nodeSpawn, lstat = nodeLstat, readFile = nodeReadFile,
+} = {}) {
   if (!baseline?.head) throw new Error('collectWorkerDelta: baseline.head is required');
   const baseRef = baseline.baselineRef ?? baseline.head;
 
+  let evidenceComplete = baseline.evidenceComplete !== false;
+  const incompleteReasons = [...(baseline.incompleteReasons ?? [])];
+  const fail = (reason) => { evidenceComplete = false; incompleteReasons.push(reason); };
+
   const currentHeadRes = await runGit(['rev-parse', 'HEAD'], cwd, spawn);
-  const currentHead = currentHeadRes.stdout.trim();
+  let currentHead = null;
+  if (currentHeadRes.code === 0 && currentHeadRes.stdout.trim()) {
+    currentHead = currentHeadRes.stdout.trim();
+  } else {
+    fail(`cannot resolve current HEAD: "git rev-parse HEAD" exited ${currentHeadRes.code}`);
+  }
 
   // Tracked delta since the baseline snapshot (index + worktree vs baseRef).
   const diffRes = await runGit(['diff', baseRef], cwd, spawn);
-  const trackedDiff = diffRes.stdout;
-  const nameRes = await runGit(['diff', '--name-only', baseRef], cwd, spawn);
-  const trackedChanged = nameRes.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+  let trackedDiff = '';
+  if (diffRes.code === 0) trackedDiff = diffRes.stdout;
+  else fail(`"git diff ${baseRef}" exited ${diffRes.code}: ${(diffRes.stderr || '').trim().slice(0, 200)}`);
 
-  // Untracked attribution: a file the Worker newly created, an existing
-  // untracked file whose content changed, or a pre-existing untracked file the
-  // Worker DELETED (git diff cannot see an untracked-file deletion).
-  const currentUntracked = new Set(await untrackedFiles(cwd, spawn));
+  const nameRes = await runGit(['diff', '--name-only', baseRef], cwd, spawn);
+  let trackedChanged = [];
+  if (nameRes.code === 0) {
+    trackedChanged = nameRes.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+  } else {
+    fail(`"git diff --name-only ${baseRef}" exited ${nameRes.code}`);
+  }
+
+  // Untracked attribution.
+  const lsRes = await runGit(['ls-files', '--others', '--exclude-standard', '-z'], cwd, spawn);
+  let currentUntracked = new Set();
+  let untrackedListingOk = false;
+  if (lsRes.code === 0) {
+    currentUntracked = new Set(lsRes.stdout.split('\0').filter(Boolean));
+    untrackedListingOk = true;
+  } else {
+    fail(`"git ls-files --others" exited ${lsRes.code}`);
+  }
+
   const baselineUntracked = baseline.untrackedHashes ?? {};
   const untrackedChanged = [];
   const untrackedDeleted = [];
-  let evidenceComplete = baseline.evidenceComplete !== false;
-  const incompleteReasons = [...(baseline.incompleteReasons ?? [])];
+  const safeBytes = new Map(); // filePath -> Buffer (regular files only)
 
   for (const filePath of currentUntracked) {
     // eslint-disable-next-line no-await-in-loop
-    const h = await blobHash(cwd, spawn, filePath);
+    const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile });
+    if (!fp.safe) {
+      // symlink / special / unreadable — never attribute, never read.
+      fail(fp.reason);
+      continue;
+    }
+    safeBytes.set(filePath, fp.bytes);
     if (!(filePath in baselineUntracked)) {
-      untrackedChanged.push(filePath); // brand-new file -> Worker output
-    } else if (h == null) {
-      evidenceComplete = false;
-      incompleteReasons.push(`cannot re-fingerprint untracked file ${filePath}`);
-    } else if (h !== baselineUntracked[filePath]) {
+      untrackedChanged.push(filePath); // brand-new regular file -> Worker output
+    } else if (fp.digest !== baselineUntracked[filePath]) {
       untrackedChanged.push(filePath); // pre-existing untracked, content changed
     }
     // pre-existing untracked, unchanged -> NOT Worker output, excluded.
   }
-  for (const filePath of Object.keys(baselineUntracked)) {
-    if (!currentUntracked.has(filePath)) untrackedDeleted.push(filePath);
+  // A pre-existing untracked file the Worker DELETED (git diff cannot see it).
+  // Only trustworthy when the current untracked listing itself succeeded.
+  if (untrackedListingOk) {
+    for (const filePath of Object.keys(baselineUntracked)) {
+      if (!currentUntracked.has(filePath)) untrackedDeleted.push(filePath);
+    }
   }
 
   const changedFiles = [
@@ -162,19 +262,14 @@ export async function collectWorkerDelta({ cwd, baseline, spawn = nodeSpawn } = 
   // than letting a review PASS without covering it.
   const untrackedBlocks = [];
   for (const filePath of untrackedChanged) {
-    let buf = null;
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      buf = await readFile(path.join(cwd, filePath));
-    } catch (err) {
-      evidenceComplete = false;
-      incompleteReasons.push(`Worker-created untracked file ${filePath} is unreadable: ${err?.message ?? err}`);
+    const buf = safeBytes.get(filePath);
+    if (!buf) {
+      fail(`Worker-created untracked file ${filePath} could not be read for evidence`);
       untrackedBlocks.push(`--- Worker untracked file ${filePath} (UNREADABLE) ---`);
       continue;
     }
     if (buf.includes(0)) {
-      evidenceComplete = false;
-      incompleteReasons.push(`Worker-created untracked file ${filePath} is binary (${buf.length} bytes) — cannot be reviewed as text`);
+      fail(`Worker-created untracked file ${filePath} is binary (${buf.length} bytes) — cannot be reviewed as text`);
       untrackedBlocks.push(`--- Worker untracked file ${filePath} (BINARY, ${buf.length} bytes) ---`);
       continue;
     }
@@ -185,8 +280,10 @@ export async function collectWorkerDelta({ cwd, baseline, spawn = nodeSpawn } = 
   }
   const diff = [trackedDiff, ...untrackedBlocks].filter(Boolean).join('\n');
 
-  const fingerprint = sha256(`${currentHead}\n${diff}`);
-  const noWorkerChangeYet = changedFiles.length === 0
+  const fingerprint = sha256(`${currentHead ?? 'UNKNOWN_HEAD'}\n${diff}`);
+  const noWorkerChangeYet = evidenceComplete
+    && changedFiles.length === 0
+    && currentHead != null
     && currentHead === baseline.head
     && trackedDiff.trim() === '';
 
@@ -206,4 +303,4 @@ export async function collectWorkerDelta({ cwd, baseline, spawn = nodeSpawn } = 
   };
 }
 
-export { sha256 as evidenceSha256 };
+export { sha256 as evidenceSha256, GitEvidenceError };

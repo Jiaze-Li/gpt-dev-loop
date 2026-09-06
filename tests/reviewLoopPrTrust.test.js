@@ -17,13 +17,15 @@ import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 import { normalizeReview } from '../src/reviewloop/reviewPolicy.js';
 
-const CODEX = { login: 'chatgpt-codex-connector' };
+const CODEX = { login: 'chatgpt-codex-connector[bot]' };
 
 test('the allowlist is exact (no substring / includes)', () => {
   const list = reviewerLoginAllowlist('codex', {});
-  assert.deepEqual(list, ['chatgpt-codex-connector']);
+  assert.deepEqual(list, ['chatgpt-codex-connector[bot]']);
   // a substring look-alike is not in the list
   assert.equal(list.includes('evil-chatgpt-codex-connector-bot'), false);
+  // the bare, suffix-less slug is NOT what REST returns and is not trusted
+  assert.equal(list.includes('chatgpt-codex-connector'), false);
 });
 
 test('substring look-alike bot logins are rejected', () => {
@@ -50,7 +52,7 @@ test('the exact allowlisted login + exact current HEAD -> accepted', () => {
   assert.equal(r.ok, true);
   assert.equal(r.review.headSha, 'H1');
   assert.equal(r.review.reviewer, 'codex');
-  assert.equal(r.review.reviewerLogin, 'chatgpt-codex-connector');
+  assert.equal(r.review.reviewerLogin, 'chatgpt-codex-connector[bot]');
 });
 
 test('env can override the allowlist but it is still exact', () => {
@@ -96,15 +98,15 @@ test('backend returns only a review from an exact allowlisted login on the curre
     transport: ghTransport({
       head: 'H2',
       reviews: [
-        { login: 'chatgpt-codex-connector', state: 'CHANGES_REQUESTED', commitId: 'H1', body: '', submittedAt: '2026-01-01' }, // stale HEAD
+        { login: 'chatgpt-codex-connector[bot]', state: 'CHANGES_REQUESTED', commitId: 'H1', body: '', submittedAt: '2026-01-01' }, // stale HEAD
         { login: 'evil-codex-bot', state: 'APPROVED', commitId: 'H2', body: '```json\n{"findings":[]}\n```', submittedAt: '2026-01-03' }, // impostor
-        { login: 'chatgpt-codex-connector', state: 'APPROVED', commitId: 'H2', body: '```json\n{"findings":[]}\n```', submittedAt: '2026-01-02' },
+        { login: 'chatgpt-codex-connector[bot]', state: 'APPROVED', commitId: 'H2', body: '```json\n{"findings":[]}\n```', submittedAt: '2026-01-02' },
       ],
     }),
   });
   const review = await backend.findExistingReview({ prNumber: 4, headSha: 'H2', reviewer: 'codex' });
   assert.ok(review);
-  assert.equal(review.reviewerLogin, 'chatgpt-codex-connector');
+  assert.equal(review.reviewerLogin, 'chatgpt-codex-connector[bot]');
   assert.equal(review.headSha, 'H2');
 });
 
