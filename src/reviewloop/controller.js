@@ -338,8 +338,27 @@ export function createReviewLoopController({
       };
     }
 
+    // Durable per-chunk checkpoint. Keyed to the exact review state (delta +
+    // gate); a changed diff invalidates it. On resume, a chunk already in the
+    // checkpoint is NOT re-sent to the model — its normalized result is reused.
+    const checkpointKey = sha256Hex(`${delta.fingerprint}::${gate.fingerprint}`);
+    let checkpoint = loopState.chunkReviewCheckpoint;
+    if (!checkpoint || checkpoint.key !== checkpointKey) {
+      checkpoint = { key: checkpointKey, chunkTotal: chunks.length, chunks: {} };
+      loopState.chunkReviewCheckpoint = checkpoint;
+    }
+
     const perChunk = [];
     for (const chunk of chunks) {
+      const done = checkpoint.chunks[chunk.index];
+      if (done) {
+        // Resume: this chunk was already reviewed in a prior (crashed) attempt.
+        if (done.status === 'FAILED') {
+          return { review: done, chunkCount: chunks.length, failedChunk: chunk.index };
+        }
+        perChunk.push(done);
+        continue;
+      }
       const chunkId = `${loopState.loopId}:round-${loopState.round}:chunk-${chunk.index}`;
       // ONE composite logical review-state evidence per chunk: the diff chunk
       // AND the gate fingerprint together. A single logical (diff + gate) state
@@ -375,6 +394,11 @@ export function createReviewLoopController({
       });
       loopState.reviewerCalls += 1;
       const normalized = normalizeReview({ raw, reviewer: 'internal', provider: 'internal' });
+      // Durable-before-next-chunk: persist this chunk's result so a crash before
+      // the round completes does not re-call the model for it on resume.
+      checkpoint.chunks[chunk.index] = normalized;
+      // eslint-disable-next-line no-await-in-loop
+      await store.save(loopState.loopId, loopState);
       // Any chunk we could not review successfully fails the whole review closed.
       if (normalized.status === 'FAILED') {
         return { review: normalized, chunkCount: chunks.length, failedChunk: chunk.index };
@@ -545,6 +569,9 @@ export function createReviewLoopController({
     loopState.lastReviewedFingerprint = fp;
     loopState.lastGateFingerprint = gate.fingerprint;
     loopState.lastReview = review;
+    // The round's chunks are all reviewed (or it failed closed) — the
+    // checkpoint has served its purpose.
+    loopState.chunkReviewCheckpoint = null;
 
     if (review.status === 'FAILED') {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, review.error?.reason ?? 'review failed');
