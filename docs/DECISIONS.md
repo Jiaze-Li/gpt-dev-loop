@@ -21,3 +21,6 @@ Current architectural decisions. Historical SuperGPT V1/V2 decisions are under
 | D14 | ReviewLoop never auto-merges and never force-pushes. |
 | D15 | The Worker-facing MCP surface is exactly two tools; COMMON ≤ 2.5 KB; result payloads are compact and never carry raw evidence blobs. |
 | D16 | `~/.reviewloop` is the runtime root. `~/.supergpt` is never read, written, or auto-resumed; a legacy V2 snapshot fails closed. |
+| D17 | Reviewer/Supervisor transports are narrow single-turn inference from one isolated empty scratch cwd — never a second coding Worker. One physical attempt per call; failover is the controller's, not the transport's. |
+| D18 | Model families resolve to a concrete model at pool construction from the probed `agy models` catalog (no model call); no family pins a version by default. |
+| D19 | A pool family is either a wired, selectable transport or explicitly UNAVAILABLE with a reason. No phantom always-skipped fallbacks. The `codex`/`claude` transports wire only when a zero-token `--version` probe finds the CLI. |

@@ -123,8 +123,8 @@ Token-Safety P1 from the independent re-verification:
 Corrected against this machine's durable reservation + spend ledgers under
 `~/.reviewloop/` (not from recollection):
 
-- Deterministic/mock certification = **PASS** — `npm test` 309/309,
-  `npm run doctor` PASS.
+- Deterministic/mock certification = **PASS** — `npm test` 336/336,
+  `npm run doctor` PASS, `npm run benchmark:transports` PASS (0 real spawns).
 - `npm run install-global` = **executed** against this machine's agent
   config / dotfiles (managed block + `reviewloop` MCP registration).
 - Real ReviewLoop provider calls with a durable record on this machine =
@@ -138,8 +138,11 @@ Corrected against this machine's durable reservation + spend ledgers under
   calls.
 - Any earlier `claude:sonnet` / Executor-era real call = **UNKNOWN** — no
   durable record survives in the current runtime dir; not asserted.
-- No `codex` or `claude` real provider call has any durable record.
-  `codex`/`claude` families stay capability-declared, transport-unavailable.
+- No `codex` or `claude` real provider call has any durable record. The
+  `codex` / `claude` Reviewer+Supervisor transports are now IMPLEMENTED
+  (narrow, single-turn, `adapters/cliReviewTransports.js`) and wired into the
+  pool only when a zero-token `--version` probe finds the CLI; deterministic
+  fakes exercise every path. Still ZERO real `codex` / `claude` calls.
 - ReviewLoop real-provider Reviewer/Supervisor E2E over the current
   architecture = **ATTEMPTED / NOT CERTIFIED**. The one real run
   (`rl-20260906075721-c674d31f`) reached a live `agy` Reviewer with 2
@@ -155,6 +158,7 @@ Corrected against this machine's durable reservation + spend ledgers under
 
 ## Later
 
-- Live `codex` / `claude` Reviewer/Supervisor transports.
+- A first LIVE `codex` / `claude` Reviewer/Supervisor call (transports are
+  implemented + mock-certified; no real invocation has been made or recorded).
 - Optional read-only ReviewLoop dashboard (removed in this migration; re-add
   only if it can stay zero-token and simple).

@@ -39,6 +39,10 @@ src/reviewloop/
   prReviewController.js  PR external-review loop (ExternalModelTriggerAuthority)
   githubBackend.js      production PR transport via the `gh` CLI (read + one trigger comment)
   providerWiring.js     production Reviewer/Supervisor pool (RoleRouter) + PR backend
+  adapters/
+    scratchCwd.js          shared isolated empty scratch cwd for every narrow transport
+    boundedCli.js          bounded argv-only CLI runner (wall-clock timeout, process-group teardown)
+    cliReviewTransports.js  narrow single-turn codex / claude Reviewer+Supervisor transports
   controller.js         reviewloop_begin + reviewloop_review
   runtimeDir.js         ~/.reviewloop
 
@@ -54,6 +58,35 @@ PR review, `baselineDiffGate`, `gateFailureIdentity`, process-tree cleanup.
 
 Exactly `reviewer` and `supervisor` (`DEFAULT_ROLE_POLICY`). No `planner`, no
 `executor`. The Worker is outside role routing entirely.
+
+## Reviewer / Supervisor transports
+
+Both roles are NARROW, stateless, single-turn inference — never a second
+coding Worker. Every transport (agy, `codex`, `claude`) runs from one shared
+isolated empty scratch cwd (`adapters/scratchCwd.js`): no repo, no
+`CLAUDE.md` / `GEMINI.md` / `AGENTS.md`, no project or agent memory to
+preload. The `codex` / `claude` transports additionally disable user config,
+project rules and MCP servers, run read-only with no tool use, and never
+resume a conversation; each is bounded by a wall-clock timeout with
+whole-process-tree teardown (`adapters/boundedCli.js`). Output goes through
+the SAME strict normalization as agy — malformed → `HUMAN_REQUIRED`, never a
+clean empty result. One physical attempt per call; bounded failover lives in
+the controller, not in the transport.
+
+**Dynamic model-family resolution**: each registered family resolves to a
+concrete model (or the provider-default path) once at pool construction from
+the probed `agy models` catalog — a metadata listing, not a model call.
+`doctor` reports `versionPinnedByDefault=no` for every family.
+
+**Pool composition is honest**: a family is either a WIRED transport that can
+actually be selected and called, or explicitly UNAVAILABLE with a recorded
+reason that distinguishes "adapter present, CLI missing / not authenticated"
+from "no adapter". The `codex` / `claude` adapters always exist; their
+transport is wired only when a zero-token `--version` probe at MCP startup
+says the CLI is there. There are no phantom always-skipped fallback entries.
+An unauthenticated CLI (`PROVIDER_AUTH_FAILED`) is a mechanically pre-send
+zero failure: it fails over to the next eligible family and never latches an
+unresolved-spend block.
 
 ## State machine
 
@@ -173,8 +206,9 @@ HEAD.
 
 **Complete physical-attempt accounting**: every settled metered attempt —
 success, known-usage failure, OR mechanically-zero pre-send failure
-(`PROVIDER_UNAVAILABLE` / `AGY_ENOENT` / `AGY_SPAWN_FAILED` / `AGY_BAD_INPUT`) —
-writes a durable spend-log record tagged with its `reservationId` before the
+(`PROVIDER_UNAVAILABLE` / `PROVIDER_AUTH_FAILED` / `AGY_ENOENT` /
+`AGY_SPAWN_FAILED` / `AGY_BAD_INPUT`) — writes a durable spend-log record
+tagged with its `reservationId` before the
 business error propagates. A normal failover therefore never looks like
 unaccounted spend on the next load. If a crash still leaves a `SETTLED_KNOWN`
 reservation with no matching record (orphan by `reservationId`), its real
