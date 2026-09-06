@@ -15,20 +15,89 @@ import { checkPrReviewTrust } from './prTrust.js';
 
 const execFileP = promisify(nodeExecFile);
 
-// Pull a ```json { "findings": [...] } ``` block out of a review body, else
-// fall back to the review state.
-function extractFindings(body, state) {
+// GitHub PR review submission states (GET /pulls/{n}/reviews[].state).
+const REVIEW_STATE = Object.freeze({
+  APPROVED: 'APPROVED',
+  CHANGES_REQUESTED: 'CHANGES_REQUESTED',
+  COMMENTED: 'COMMENTED',
+  DISMISSED: 'DISMISSED',
+  PENDING: 'PENDING',
+});
+
+// Natural-language markers that a body is calling out a blocking problem even
+// without a structured findings block.
+const NL_BLOCKING_RE = /\b(p1|p2|blocker|blocking|critical|must[- ]fix|major)\b/i;
+
+function firstLine(text) {
+  return String(text ?? '').split('\n').map((s) => s.trim()).find(Boolean)?.slice(0, 200)
+    ?? 'trusted reviewer comment (see PR thread)';
+}
+
+// A leading "P1:" / "**P2**" severity prefix, else null.
+function severityPrefix(text) {
+  const m = String(text ?? '').match(/(?:^|\n)\s*\*{0,2}\s*(P[123])\b/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// A ```json { "findings": [...] } ``` block, if present and well-formed.
+function structuredFindings(body) {
   const m = String(body ?? '').match(/```json\s*([\s\S]*?)```/i);
   if (m) {
     try {
       const parsed = JSON.parse(m[1].trim());
       if (Array.isArray(parsed?.findings)) return parsed.findings;
-    } catch { /* fall through */ }
+    } catch { /* not structured */ }
   }
-  if (String(state ?? '').toUpperCase() === 'CHANGES_REQUESTED') {
-    return [{ severity: 'P2', file: null, line: null, title: 'trusted reviewer requested changes — read the PR review thread' }];
+  return null;
+}
+
+// Turn ONE trusted review submission into { findings, dismissed, clean }.
+// Fail-closed: COMMENTED / DISMISSED / an unparseable body is NEVER silently
+// treated as an empty (clean) findings list.
+function findingsForSubmission({ state, body }) {
+  const upper = String(state ?? '').toUpperCase();
+  const structured = structuredFindings(body);
+
+  if (upper === REVIEW_STATE.DISMISSED) {
+    return { findings: [], dismissed: true, clean: false };
   }
-  return [];
+  if (upper === REVIEW_STATE.PENDING) {
+    // Not a real submission — the reviewer never sent it.
+    return { findings: [], dismissed: false, clean: false, pending: true };
+  }
+  if (structured) {
+    return { findings: structured, dismissed: false, clean: upper === REVIEW_STATE.APPROVED && structured.length === 0 };
+  }
+  if (upper === REVIEW_STATE.APPROVED) {
+    // Approved with a free-text body but no structured findings: if the text
+    // itself flags a blocking issue, honour it; otherwise treat as clean.
+    if (NL_BLOCKING_RE.test(body ?? '')) {
+      return {
+        findings: [{ severity: severityPrefix(body) ?? 'P2', file: null, line: null, title: firstLine(body) }],
+        dismissed: false, clean: false,
+      };
+    }
+    return { findings: [], dismissed: false, clean: true };
+  }
+  if (upper === REVIEW_STATE.CHANGES_REQUESTED) {
+    return {
+      findings: [{ severity: severityPrefix(body) ?? 'P2', file: null, line: null, title: firstLine(body) || 'trusted reviewer requested changes — read the PR review thread' }],
+      dismissed: false, clean: false,
+    };
+  }
+  // COMMENTED (or any unknown state) with no structured findings: a trusted
+  // reviewer left a human-readable comment we cannot mechanically parse. That
+  // is NOT a clean review — surface it as blocking so it cannot PASS silently.
+  const sev = severityPrefix(body) ?? (NL_BLOCKING_RE.test(body ?? '') ? 'P2' : 'P2');
+  return {
+    findings: [{
+      severity: sev,
+      file: null,
+      line: null,
+      title: `trusted reviewer left an unstructured ${upper || 'COMMENTED'} review — resolve it in the PR thread: ${firstLine(body)}`,
+    }],
+    dismissed: false, clean: false,
+  };
 }
 
 // Default `gh`-backed transport. Every method is overridable for tests.
@@ -56,6 +125,24 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
         id: r.id,
       }));
     },
+    // Inline review comments (GET /pulls/{n}/comments). A trusted reviewer that
+    // left ONLY inline comments still produced review evidence that must be
+    // aggregated — it is not in any submission body.
+    async listReviewComments({ prNumber }) {
+      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/comments`, '--paginate']);
+      const arr = JSON.parse(out || '[]');
+      return arr.map((c) => ({
+        login: c.user?.login,
+        body: c.body,
+        path: c.path,
+        line: c.line ?? c.original_line ?? null,
+        commitId: c.commit_id,
+        originalCommitId: c.original_commit_id,
+        pullRequestReviewId: c.pull_request_review_id,
+        id: c.id,
+        htmlUrl: c.html_url,
+      }));
+    },
     async postComment({ prNumber, body }) {
       const out = await gh(['pr', 'comment', String(prNumber), '--body', body]);
       // gh prints the comment URL; use it as the durable trigger id.
@@ -74,28 +161,89 @@ export function createGithubReviewBackend({
 } = {}) {
   const gh = transport ?? github ?? createGhTransport({ repo: env?.REVIEWLOOP_GH_REPO ?? null });
 
-  // Every review with a matching reviewed HEAD is handed to the trust boundary
-  // AS-IS (real GitHub login preserved, never pre-canonicalised). The trust
-  // boundary decides identity via an exact login allowlist.
-  async function latestTrustedReview({ prNumber, headSha, reviewer }) {
-    const reviews = await gh.listReviews({ prNumber });
-    const candidates = reviews
-      .filter((r) => (r.commitId ?? r.headSha) === headSha)
-      .sort((a, b) => String(b.submittedAt ?? '').localeCompare(String(a.submittedAt ?? '')));
-    for (const r of candidates) {
-      const raw = {
-        login: r.login,
-        headSha: r.commitId ?? r.headSha ?? null,
-        state: r.state,
-        findings: extractFindings(r.body, r.state),
-        reviewId: r.id,
-        url: r.htmlUrl,
-      };
-      const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead: headSha, env });
-      if (trust.ok) return trust.review;
+  // Aggregate EVERY trusted review submission and EVERY trusted inline review
+  // comment for the exact PR HEAD. A later APPROVED never erases an earlier
+  // CHANGES_REQUESTED / COMMENTED finding; a COMMENTED / DISMISSED / unparsed
+  // review never silently reads as clean.
+  async function aggregateTrustedReview({ prNumber, headSha, reviewer }) {
+    const reviews = (await gh.listReviews({ prNumber })) ?? [];
+    const inlineRaw = typeof gh.listReviewComments === 'function'
+      ? ((await gh.listReviewComments({ prNumber })) ?? [])
+      : [];
+
+    const trustedSubs = [];
+    for (const r of reviews) {
+      const reviewedHead = r.commitId ?? r.headSha ?? r.commit_id ?? null;
+      if (reviewedHead !== headSha) continue;
+      // PENDING is a draft the reviewer never submitted — not review evidence.
+      if (String(r.state ?? '').toUpperCase() === 'PENDING') continue;
+      const trust = checkPrReviewTrust({
+        raw: { login: r.login, headSha: reviewedHead, state: r.state, reviewId: r.id, url: r.htmlUrl },
+        configuredReviewer: reviewer, currentHead: headSha, env,
+      });
+      if (trust.ok) trustedSubs.push({ ...r, _login: trust.review.reviewerLogin });
     }
-    return null;
+
+    const trustedInline = [];
+    for (const c of inlineRaw) {
+      const reviewedHead = c.commitId ?? c.originalCommitId ?? c.commit_id ?? null;
+      if (reviewedHead !== headSha) continue;
+      const trust = checkPrReviewTrust({
+        raw: { login: c.login, headSha: reviewedHead },
+        configuredReviewer: reviewer, currentHead: headSha, env,
+      });
+      if (trust.ok) trustedInline.push(c);
+    }
+
+    if (trustedSubs.length === 0 && trustedInline.length === 0) return null;
+
+    const findings = [];
+    let anyDismissed = false;
+    let anyCleanApproval = false;
+
+    for (const sub of trustedSubs.sort((a, b) => String(a.submittedAt ?? '').localeCompare(String(b.submittedAt ?? '')))) {
+      const outcome = findingsForSubmission({ state: sub.state, body: sub.body });
+      if (outcome.pending) continue;
+      if (outcome.dismissed) { anyDismissed = true; continue; }
+      if (outcome.clean) anyCleanApproval = true;
+      for (const f of outcome.findings) findings.push(f);
+    }
+
+    for (const c of trustedInline) {
+      findings.push({
+        severity: severityPrefix(c.body) ?? 'P2',
+        file: c.path ?? null,
+        line: Number.isInteger(c.line) ? c.line : null,
+        title: `inline review comment: ${firstLine(c.body)}`,
+      });
+    }
+
+    // A DISMISSED review with nothing else that positively clears (or blocks)
+    // this HEAD is not a passing review — fail closed.
+    if (anyDismissed && !anyCleanApproval && findings.length === 0) {
+      return {
+        login: trustedSubs[0]?._login ?? null,
+        headSha, head_sha: headSha,
+        status: 'failed',
+        error: 'the trusted review for this HEAD was DISMISSED; a fresh review is required',
+        findings: [],
+      };
+    }
+
+    return {
+      login: trustedSubs[0]?._login ?? trustedInline[0]?.login ?? null,
+      reviewer: String(reviewer).toLowerCase(),
+      reviewerLogin: trustedSubs[0]?._login ?? null,
+      headSha,
+      head_sha: headSha,
+      state: 'AGGREGATED',
+      findings,
+      trustedSubmissions: trustedSubs.length,
+      trustedInlineComments: trustedInline.length,
+    };
   }
+
+  const latestTrustedReview = aggregateTrustedReview;
 
   return {
     async getPrHead({ prNumber }) {
