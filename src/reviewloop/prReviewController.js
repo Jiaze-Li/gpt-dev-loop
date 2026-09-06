@@ -19,6 +19,7 @@ import {
 } from '../orchestrator/externalModelTriggerAuthority.js';
 import { isExternalTriggerFailure } from '../orchestrator/errors.js';
 import { normalizeReview } from './reviewPolicy.js';
+import { checkPrReviewTrust } from './prTrust.js';
 
 export const PR_REVIEW_OUTCOMES = Object.freeze({
   REVIEW_READY: 'REVIEW_READY',
@@ -65,13 +66,22 @@ export function createPrReviewController({
     }
 
     // §19 — a fresh trusted review already exists for the CURRENT HEAD: ingest
-    // it, do not post another trigger.
+    // it, do not post another trigger. Re-checked against the ReviewLoop PR
+    // trust boundary here (defense in depth — the backend also checks).
     const existing = await prBackend.findExistingReview({ prNumber, headSha: currentHead, reviewer });
     if (existing) {
+      const trust = checkPrReviewTrust({ raw: existing, configuredReviewer: reviewer, currentHead });
+      if (!trust.ok) {
+        return {
+          outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED,
+          head: currentHead,
+          reason: `existing PR review failed the ReviewLoop trust boundary (${trust.reason})`,
+        };
+      }
       await authority.recordResult({
         workflowId: loopId, prNumber, headSha: currentHead, resultMeta: { source: 'existing' },
       }).catch(() => {});
-      return finalizeReview({ raw: existing, reviewer, head: currentHead, source: 'existing-current-head' });
+      return finalizeReview({ raw: trust.review, reviewer, head: currentHead, source: 'existing-current-head' });
     }
 
     // Reattach to an in-flight trigger for this head (WAITING_FOR_REVIEW resume)
@@ -144,15 +154,28 @@ export function createPrReviewController({
       };
     }
 
+    const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead });
+    if (!trust.ok) {
+      // A returned review that does not prove reviewer identity + exact HEAD is
+      // not a trusted result — keep the trigger pending rather than accept it.
+      return {
+        outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED,
+        head: currentHead,
+        reason: `PR review result failed the ReviewLoop trust boundary (${trust.reason})`,
+      };
+    }
     await authority.recordResult({
       workflowId: loopId, prNumber, headSha: currentHead, resultMeta: { source: 'trigger' },
     }).catch(() => {});
     loopState.pendingExternalTrigger = null;
-    return finalizeReview({ raw, reviewer, head: currentHead, source: 'fresh-trigger' });
+    return finalizeReview({ raw: trust.review, reviewer, head: currentHead, source: 'fresh-trigger' });
   }
 
   function finalizeReview({ raw, reviewer, head, source }) {
-    const review = normalizeReview({ raw, reviewer, provider: reviewer, head });
+    // raw has already passed checkPrReviewTrust: raw.headSha is explicit and
+    // equals `head`. requireExplicitHead guards against any regression that
+    // would let the normalizer substitute the current HEAD.
+    const review = normalizeReview({ raw, reviewer, provider: reviewer, head, requireExplicitHead: true });
     review.source = source;
     return { outcome: PR_REVIEW_OUTCOMES.REVIEW_READY, review, head };
   }

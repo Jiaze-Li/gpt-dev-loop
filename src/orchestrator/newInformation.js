@@ -295,7 +295,7 @@ export async function registerTaskCardEvidence(ledger, { workflowId, taskId, tas
     type: NEW_INFORMATION_EVENT_TYPES.NEW_TASK_CARD,
     subject: taskId ?? null,
     fingerprint: sha256(JSON.stringify(taskCard ?? {})),
-    source: 'planner',
+    source: 'worker',
   });
 }
 
@@ -315,7 +315,7 @@ export async function registerTaskDiffEvidence(ledger, { workflowId, taskId, dif
     type: NEW_INFORMATION_EVENT_TYPES.CHANGED_TASK_DIFF,
     subject: taskId ?? null,
     fingerprint: diffHash,
-    source: 'executor',
+    source: 'worker',
   });
 }
 

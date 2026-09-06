@@ -31,8 +31,48 @@ export const REVIEW_VERDICTS = Object.freeze({
 // Compact normalized review the Core stores and (partly) returns to the Worker.
 // Raw findings text and full diff stay in local persistence, never echoed
 // wholesale into Worker context.
-export function normalizeReview({ raw, reviewer, provider, head } = {}) {
-  const normalized = normalizeProviderReview({ raw, reviewer, provider, currentPrHead: head });
+export function normalizeReview({
+  raw, reviewer, provider, head, requireExplicitHead = false,
+} = {}) {
+  // B1 — a malformed / unparseable / schema-invalid provider payload is
+  // surfaced (never silently reduced to an empty findings list) and fails
+  // closed here.
+  if (raw && typeof raw === 'object' && raw.malformed === true) {
+    return {
+      status: 'FAILED',
+      reviewer: reviewer ?? null,
+      provider: provider ?? null,
+      reviewedFingerprint: null,
+      reviewedHead: null,
+      blockingFindings: [],
+      nonBlockingFindings: [],
+      nonBlockingOmitted: 0,
+      findingSignatures: [],
+      error: { reason: 'MALFORMED_REVIEWER_OUTPUT', message: String(raw.reason ?? 'reviewer output is malformed') },
+    };
+  }
+  // B4 — in PR mode the reviewed HEAD must be explicit in the payload, never
+  // substituted from the current HEAD.
+  const explicitHead = typeof (raw?.head_sha ?? raw?.headSha ?? raw?.reviewedHead ?? raw?.commit_id) === 'string'
+    ? String(raw.head_sha ?? raw.headSha ?? raw.reviewedHead ?? raw.commit_id).trim()
+    : null;
+  if (requireExplicitHead && !explicitHead) {
+    return {
+      status: 'FAILED',
+      reviewer: reviewer ?? null,
+      provider: provider ?? null,
+      reviewedFingerprint: null,
+      reviewedHead: null,
+      blockingFindings: [],
+      nonBlockingFindings: [],
+      nonBlockingOmitted: 0,
+      findingSignatures: [],
+      error: { reason: 'MISSING_REVIEWED_HEAD', message: 'PR review payload does not state which HEAD it reviewed' },
+    };
+  }
+  const normalized = normalizeProviderReview({
+    raw, reviewer, provider, currentPrHead: requireExplicitHead ? explicitHead : head,
+  });
   const blocking = (normalized.blocking ?? []).map((f) => ({
     severity: f.severity,
     file: f.file ?? null,
@@ -49,7 +89,7 @@ export function normalizeReview({ raw, reviewer, provider, head } = {}) {
     reviewer: normalized.reviewer ?? reviewer ?? null,
     provider: normalized.provider ?? provider ?? null,
     reviewedFingerprint: null, // filled by the controller
-    reviewedHead: normalized.head_sha ?? head ?? null,
+    reviewedHead: requireExplicitHead ? explicitHead : (normalized.head_sha ?? head ?? null),
     blockingFindings: blocking,
     nonBlockingFindings: nonBlocking.slice(0, 8),
     nonBlockingOmitted: Math.max(0, nonBlocking.length - 8),

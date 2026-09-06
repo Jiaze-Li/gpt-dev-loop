@@ -1,18 +1,22 @@
 // ReviewLoop controller — the two re-entrant operations behind the MCP tools.
 //
-//   reviewloop_begin(loopId, goal, cwd, prNumber?, reviewer?)  -> register
-//     immutable objective + capture baseline/head. ZERO model calls.
+//   reviewloop_begin  -> register the immutable objective + capture the exact
+//     pre-Worker baseline (LOCAL) or bind the PR HEAD (PR). Also captures
+//     baseline Gate evidence when trusted verification is deterministically
+//     discoverable. ZERO model calls.
 //
-//   reviewloop_review(loopId)  -> the one re-entrant operation:
-//     detect changed state -> deterministic Gate -> Reviewer (if justified)
-//     -> convergence policy -> Supervisor (only on evidence-backed escalation)
-//     -> PASS | REWORK | HUMAN_REQUIRED | WAITING_FOR_REVIEW.
+//   reviewloop_review -> the one re-entrant operation: attribute the Worker's
+//     delta -> deterministic Gate -> independent Reviewer over the FULL
+//     attributed evidence (bounded or deterministically chunked) -> convergence
+//     policy -> Supervisor (exception-only) -> PASS | REWORK | HUMAN_REQUIRED |
+//     WAITING_FOR_REVIEW | NO_PROGRESS | PUSH_REQUIRED.
 //
 // The SAME Worker handles REWORK and calls reviewloop_review again. ReviewLoop
-// never writes application code, never commits, never pushes, never merges.
+// never writes application code, never commits, pushes, merges, or force-pushes.
 
 import { randomUUID } from 'node:crypto';
 import { Persistence } from '../orchestrator/persistence.js';
+import { isAuthorizationFailure } from '../orchestrator/errors.js';
 import { REVIEWLOOP_RUNTIME_ROOT } from './runtimeDir.js';
 import {
   createReviewObjective,
@@ -39,8 +43,10 @@ import {
 } from './reviewPolicy.js';
 import { createReviewLoopSpend } from './reviewSpend.js';
 import { createPrReviewController, PR_REVIEW_OUTCOMES } from './prReviewController.js';
+import { chunkDiffForReview } from './diffChunker.js';
 
-const RUNTIME_ROOT = REVIEWLOOP_RUNTIME_ROOT; // outside every target repo
+const RUNTIME_ROOT = REVIEWLOOP_RUNTIME_ROOT;
+const MAX_PROVIDER_ATTEMPTS = 3;
 
 function compactBaselineSummary(baseline) {
   return {
@@ -50,13 +56,16 @@ function compactBaselineSummary(baseline) {
   };
 }
 
-// A no-op Reviewer/Supervisor that fails closed. Production wiring injects the
-// real internal provider adapters; deterministic tests inject mocks.
 function requireProvider(name) {
   return async () => {
     throw new Error(`ReviewLoop: no ${name} provider wired (real provider calls are not made in this context)`);
   };
 }
+
+const RETRYABLE = new Set([
+  'PROVIDER_UNAVAILABLE', 'PROVIDER_TIMEOUT', 'PROVIDER_RATE_LIMITED',
+  'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_PROTOCOL_ERROR', 'EXECUTOR_TIMEOUT',
+]);
 
 export function createReviewLoopController({
   persistence: injectedPersistence = null,
@@ -64,12 +73,16 @@ export function createReviewLoopController({
   env = process.env,
   onEvent,
   recordSafetyEvent = null,
-  // injected provider functions — production wiring supplies real adapters
   reviewerFn = requireProvider('Reviewer'),
   supervisorFn = requireProvider('Supervisor'),
+  // optional pool routing (production wiring). Return { family, provider,
+  // model, transport } or null. When present, the controller binds the real
+  // selected family into the CallIntent and drives bounded failover.
+  routeReviewerFn = null,
+  routeSupervisorFn = null,
+  recordProviderFailure = null,
   prBackend = null,
   triggerAuthority = null,
-  // injected process seams for deterministic tests
   captureBaselineFn = captureBaseline,
   collectWorkerDeltaFn = collectWorkerDelta,
   runGateFn = runGate,
@@ -97,14 +110,31 @@ export function createReviewLoopController({
 
     let baseline = null;
     let prHead = null;
-    let repository = { root: cwd, name: null, url: null };
+    const repository = { root: cwd, name: null, url: null };
+    let baselineGate = null;
 
     if (mode === REVIEW_MODES.LOCAL) {
       baseline = await captureBaselineFn({ cwd });
+      // B8 — baseline Gate evidence, 0 model tokens. Only when trusted/
+      // discoverable verification exists; a failure to run it is recorded as
+      // incomplete coverage, never faked as PASS.
+      try {
+        const discovered = discoverVerificationCommandsFn({ cwd, configured: verificationCommands });
+        if (discovered.source !== 'mechanical') {
+          const g = await runGateFn({ cwd, commands: discovered.commands, runner: gateRunner });
+          baselineGate = {
+            evidence: g.evidence ?? { results: g.results ?? [], pass: g.pass },
+            pass: g.pass,
+            capturedAt: new Date().toISOString(),
+            source: discovered.source,
+          };
+        }
+      } catch (err) {
+        baselineGate = { coverage: 'INCOMPLETE', reason: String(err?.message ?? err) };
+      }
     } else {
-      const backend = prBackend;
-      if (!backend) throw new Error('reviewloop_begin: PR mode requires a PR backend');
-      prHead = await backend.getPrHead({ prNumber });
+      if (!prBackend) throw new Error('reviewloop_begin: PR mode requires a PR backend');
+      prHead = await prBackend.getPrHead({ prNumber });
       if (!prHead) throw new Error(`reviewloop_begin: cannot resolve HEAD for PR #${prNumber}`);
     }
 
@@ -115,6 +145,7 @@ export function createReviewLoopController({
 
     const loopState = initialLoopState(objective);
     loopState.verificationCommands = verificationCommands ?? null;
+    loopState.baselineGateEvidence = baselineGate;
     if (mode === REVIEW_MODES.PR) loopState.lastReviewedPrHead = null;
     await store.save(loopId, loopState);
     onEvent?.({ type: 'REVIEWLOOP_BEGIN', loopId, mode });
@@ -125,6 +156,7 @@ export function createReviewLoopController({
       status: 'READY',
       baseline: baseline ? compactBaselineSummary(baseline) : null,
       prHead: prHead ?? null,
+      reviewer: objective.reviewer,
       objectiveFingerprint: objective.fingerprint,
     };
   }
@@ -145,6 +177,46 @@ export function createReviewLoopController({
     });
   }
 
+  // One metered provider call with bounded failover. Each physical attempt
+  // re-routes (excluding failed families), re-authorizes (fresh permit), and
+  // re-binds the CallIntent to the actually-selected family. A provider
+  // failure is not New Information — every attempt supplies the SAME
+  // evidenceIds and the New Information ledger is what makes a 2nd attempt on
+  // identical evidence legal exactly once per (role, operation, evidence).
+  async function meteredWithFailover({
+    spend, role, routeFn, defaultFamily, defaultProvider, operationId, evidenceIds, invoke,
+  }) {
+    const tried = new Set();
+    let lastErr = null;
+    for (let attempt = 1; attempt <= MAX_PROVIDER_ATTEMPTS; attempt += 1) {
+      let selection = null;
+      if (routeFn) {
+        selection = routeFn({ reworkCycles: attempt - 1 });
+        if (!selection) break;
+        if (tried.has(selection.family)) break;
+        tried.add(selection.family);
+      }
+      const family = selection?.family ?? defaultFamily;
+      const provider = selection?.provider ?? defaultProvider;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        return await spend.meteredCall({
+          role, family, provider, model: selection?.model ?? null,
+          operationId, attempt, evidenceIds,
+          call: () => invoke({ selection }),
+        });
+      } catch (err) {
+        lastErr = err;
+        if (isAuthorizationFailure(err)) throw err; // spend/objective denial — never retry
+        const code = err?.code ?? err?.providerFailure ?? '';
+        if (!RETRYABLE.has(code)) throw err;
+        if (selection && recordProviderFailure) recordProviderFailure(selection, { code });
+        // loop -> next attempt re-routes
+      }
+    }
+    throw lastErr ?? new Error(`ReviewLoop: no eligible ${role} provider`);
+  }
+
   async function review({ loopId, signal, onHeartbeat } = {}) {
     if (!loopId) throw new Error('reviewloop_review: loopId is required');
     const loopState = await loadLoop(loopId);
@@ -153,38 +225,138 @@ export function createReviewLoopController({
     if (isTerminal(loopState.state) && loopState.state !== REVIEW_LOOP_STATES.HUMAN_REQUIRED) {
       return terminalResult(loopState);
     }
-
-    if (objective.mode === REVIEW_MODES.PR) {
-      return reviewPr({ loopState, signal, onHeartbeat });
-    }
+    if (objective.mode === REVIEW_MODES.PR) return reviewPr({ loopState, signal, onHeartbeat });
     return reviewLocal({ loopState });
   }
 
-  // ---- LOCAL mode ----------------------------------------------------------
+  // ---- Reviewer over full attributed evidence (bounded or chunked) --------
+  async function runReviewerOverEvidence({ spend, loopState, objective, delta, gate }) {
+    const { chunks, oversized, reason } = chunkDiffForReview(delta.diff, { env });
+    if (oversized) {
+      return {
+        review: {
+          status: 'FAILED', reviewer: 'internal', provider: 'internal',
+          blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0,
+          findingSignatures: [], error: { reason: 'REVIEW_TOO_LARGE', message: reason },
+        },
+        chunkCount: chunks.length,
+      };
+    }
+
+    const gateEvidence = await spend.registerEvidence({
+      kind: 'gate', taskId: loopState.loopId, fingerprint: gate.fingerprint,
+    });
+
+    const perChunk = [];
+    for (const chunk of chunks) {
+      const chunkId = `${loopState.loopId}:round-${loopState.round}:chunk-${chunk.index}`;
+      // eslint-disable-next-line no-await-in-loop
+      const diffEvidence = await spend.registerEvidence({
+        kind: 'diff', taskId: chunkId, diffHash: chunk.hash,
+      });
+      // eslint-disable-next-line no-await-in-loop
+      const raw = await meteredWithFailover({
+        spend,
+        role: 'reviewer',
+        routeFn: routeReviewerFn,
+        defaultFamily: 'agy:gpt-oss',
+        defaultProvider: 'agy',
+        operationId: chunkId,
+        evidenceIds: [diffEvidence.evidenceId, gateEvidence.evidenceId],
+        invoke: ({ selection }) => Promise.resolve(reviewerFn({
+          objective,
+          diff: chunk.text,
+          changedFiles: delta.changedFiles,
+          gate,
+          round: loopState.round,
+          chunk: { index: chunk.index, total: chunk.total },
+          previousFindings: loopState.lastReview?.blockingFindings ?? [],
+          selection,
+        })).then((out) => ({
+          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd,
+        })),
+      });
+      loopState.reviewerCalls += 1;
+      const normalized = normalizeReview({ raw, reviewer: 'internal', provider: 'internal' });
+      // Any chunk we could not review successfully fails the whole review closed.
+      if (normalized.status === 'FAILED') {
+        return { review: normalized, chunkCount: chunks.length, failedChunk: chunk.index };
+      }
+      perChunk.push(normalized);
+    }
+
+    // Aggregate: union of findings across every successfully-reviewed chunk.
+    const bySig = new Map();
+    for (const r of perChunk) {
+      for (const f of [...r.blockingFindings, ...r.nonBlockingFindings.map((n) => ({ ...n, signature: `${n.severity}:${n.file ?? ''}:${n.title ?? ''}` }))]) {
+        if (f.signature && !bySig.has(f.signature)) bySig.set(f.signature, f);
+      }
+    }
+    const findings = [...bySig.values()];
+    const blocking = findings.filter((f) => objective.blockingSeverities.includes(f.severity));
+    return {
+      review: {
+        status: blocking.length ? 'ACTIONABLE' : 'CLEAN',
+        reviewer: 'internal',
+        provider: 'internal',
+        reviewedHead: delta.currentHead,
+        blockingFindings: blocking,
+        nonBlockingFindings: findings.filter((f) => !objective.blockingSeverities.includes(f.severity)).slice(0, 8),
+        nonBlockingOmitted: Math.max(0, findings.filter((f) => !objective.blockingSeverities.includes(f.severity)).length - 8),
+        findingSignatures: [...new Set(blocking.map((f) => f.signature).filter(Boolean))].sort(),
+        error: null,
+      },
+      chunkCount: chunks.length,
+    };
+  }
+
+  // ---- LOCAL mode --------------------------------------------------------
   async function reviewLocal({ loopState }) {
     const objective = loopState.objective;
     const cwd = objective.repository?.root;
     const baseline = objective.baseline;
 
-    recordTransition(loopState, REVIEW_LOOP_STATES.REVIEWING, 'review requested');
-
     const delta = await collectWorkerDeltaFn({ cwd, baseline });
 
-    // Deterministic Gate (zero model tokens).
-    const discovered = discoverVerificationCommandsFn({
-      cwd, configured: loopState.verificationCommands,
-    });
+    // B7 — no Worker change since begin -> deterministic NO_PROGRESS, 0 Reviewer.
+    if (delta.noWorkerChangeYet) {
+      await store.save(loopState.loopId, loopState);
+      return {
+        status: 'NO_PROGRESS',
+        loopId: loopState.loopId,
+        round: loopState.round,
+        reason: 'no Worker change has been made since reviewloop_begin; do the work, then call reviewloop_review',
+        telemetry: emptyTelemetry(),
+        safetyEvents,
+      };
+    }
+
+    recordTransition(loopState, REVIEW_LOOP_STATES.REVIEWING, 'review requested');
+
+    // B7 — a pre-existing change that cannot be attributed away from the Worker
+    // must not be sent to the Reviewer as Worker output.
+    if (delta.evidenceComplete === false) {
+      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'baseline attribution incomplete');
+      await store.save(loopState.loopId, loopState);
+      return {
+        status: 'HUMAN_REQUIRED',
+        loopId: loopState.loopId,
+        round: loopState.round,
+        reason: `cannot reliably separate Worker changes from pre-existing work: ${(delta.incompleteReasons ?? []).join('; ')}`,
+        telemetry: emptyTelemetry(),
+        safetyEvents,
+      };
+    }
+
+    const discovered = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
     const gate = await runGateFn({
-      cwd,
-      commands: discovered.commands,
-      runner: gateRunner,
-      baselineGateEvidence: loopState.baselineGateEvidence ?? null,
+      cwd, commands: discovered.commands, runner: gateRunner,
+      baselineGateEvidence: loopState.baselineGateEvidence?.evidence ?? null,
     });
     gate.commandSource = discovered.source;
 
     const fp = reviewFingerprint({ deltaFingerprint: delta.fingerprint, gateFingerprint: gate.fingerprint });
 
-    // No new information -> no new model call.
     if (loopState.lastReviewedFingerprint && loopState.lastReviewedFingerprint === fp) {
       await store.save(loopState.loopId, loopState);
       return {
@@ -198,8 +370,6 @@ export function createReviewLoopController({
       };
     }
 
-    // Gate FAIL with an actionable NEW regression -> REWORK directly, no
-    // Reviewer / Supervisor spend.
     if (gate.verdict === GATE_VERDICTS.FAIL) {
       loopState.round += 1;
       loopState.lastReviewedFingerprint = fp;
@@ -214,40 +384,34 @@ export function createReviewLoopController({
       };
     }
 
-    // Gate PASS/WARN -> Reviewer.
     const spend = spendFor(loopState.loopId);
     loopState.round += 1;
 
-    const diffEvidence = await spend.registerEvidence({
-      kind: 'diff', taskId: loopState.loopId, diffHash: delta.fingerprint,
-    });
-    const gateEvidence = await spend.registerEvidence({
-      kind: 'gate', taskId: loopState.loopId, fingerprint: gate.fingerprint,
-    });
-
-    const rawReview = await spend.meteredCall({
-      role: 'reviewer',
-      operationId: `${loopState.loopId}:round-${loopState.round}`,
-      attempt: loopState.round,
-      evidenceIds: [diffEvidence.evidenceId, gateEvidence.evidenceId],
-      call: async () => {
-        const out = await reviewerFn({
-          objective, diff: delta.diff, changedFiles: delta.changedFiles, gate,
-          round: loopState.round, previousFindings: loopState.lastReview?.blockingFindings ?? [],
-        });
-        return { value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null };
-      },
-    });
-    loopState.reviewerCalls += 1;
-
-    const review = normalizeReview({ raw: rawReview, reviewer: 'internal', provider: 'internal' });
+    let reviewOut;
+    try {
+      reviewOut = await runReviewerOverEvidence({ spend, loopState, objective, delta, gate });
+    } catch (err) {
+      return spendDenialResult(loopState, err, await spend.telemetry());
+    }
+    const review = reviewOut.review;
     review.reviewedFingerprint = fp;
     loopState.lastReviewedFingerprint = fp;
     loopState.lastGateFingerprint = gate.fingerprint;
     loopState.lastReview = review;
 
-    // decideConvergence compares against the PREVIOUS round's signatures, so
-    // record this round's signatures only after the decision is made.
+    if (review.status === 'FAILED') {
+      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, review.error?.reason ?? 'review failed');
+      await store.save(loopState.loopId, loopState);
+      return {
+        status: 'HUMAN_REQUIRED',
+        loopId: loopState.loopId,
+        round: loopState.round,
+        reason: `Reviewer did not produce a usable result (${review.error?.reason}): ${review.error?.message ?? ''}`,
+        telemetry: await spend.telemetry(),
+        safetyEvents,
+      };
+    }
+
     const decision = decideConvergence({ loopState, review });
     loopState.findingSignatureHistory = [
       ...(loopState.findingSignatureHistory ?? []),
@@ -255,48 +419,29 @@ export function createReviewLoopController({
     ];
 
     let supervisorGuidance = null;
-    if (decision.verdict === REVIEW_VERDICTS.REWORK && decision.invokeSupervisor
-      && !loopState.supervisorInvoked) {
-      recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
-      const findingsEvidence = await spend.registerEvidence({
-        kind: 'findings', taskId: loopState.loopId, signature: review.findingSignatures.join('|') || 'none',
-      });
-      const guidance = await spend.meteredCall({
-        role: 'supervisor',
-        operationId: `${loopState.loopId}:supervise`,
-        attempt: 1,
-        evidenceIds: [findingsEvidence.evidenceId],
-        call: async () => {
-          const out = await supervisorFn({
-            objective,
-            blockingFindings: review.blockingFindings,
-            gate,
-            round: loopState.round,
-            priorSignatures: loopState.findingSignatureHistory,
-          });
-          return { value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null };
-        },
-      });
-      loopState.supervisorCalls += 1;
-      loopState.supervisorInvoked = true;
-      supervisorGuidance = typeof guidance === 'string' ? guidance : (guidance?.guidance ?? guidance?.text ?? null);
-      loopState.lastSupervisorGuidance = supervisorGuidance;
-      if (guidance?.recommendation === 'HUMAN_REQUIRED') {
-        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'supervisor recommends human');
+    if (decision.verdict === REVIEW_VERDICTS.REWORK && decision.invokeSupervisor && !loopState.supervisorInvoked) {
+      const sup = await runSupervisor({ spend, loopState, objective, review, gate });
+      if (sup.humanRequired) {
+        recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
+        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
         await store.save(loopState.loopId, loopState);
-        return humanRequiredResult(loopState, review, spend, supervisorGuidance);
+        return humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance);
       }
+      if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
+      recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
+      supervisorGuidance = sup.guidance;
+      loopState.lastSupervisorGuidance = supervisorGuidance;
     }
 
     if (decision.verdict === REVIEW_VERDICTS.PASS) {
       recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
       await store.save(loopState.loopId, loopState);
-      return passResult(loopState, review, spend);
+      return passResult(loopState, review, await spend.telemetry());
     }
     if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
       await store.save(loopState.loopId, loopState);
-      return humanRequiredResult(loopState, review, spend, supervisorGuidance);
+      return humanRequiredResult(loopState, review, await spend.telemetry(), supervisorGuidance);
     }
 
     recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, decision.reason);
@@ -304,84 +449,104 @@ export function createReviewLoopController({
     return {
       ...compactReworkPayload({ loopState, review, gate, supervisorGuidance }),
       reason: decision.reason,
-      telemetry: spend.telemetry(),
+      telemetry: await spend.telemetry(),
       safetyEvents,
     };
   }
 
-  // ---- PR mode ------------------------------------------------------------
+  // Supervisor, exception-only. Returns { guidance } | { humanRequired, reason }
+  // | { denied, error }.
+  async function runSupervisor({ spend, loopState, objective, review, gate }) {
+    const findingsEvidence = await spend.registerEvidence({
+      kind: 'findings', taskId: loopState.loopId, signature: review.findingSignatures.join('|') || 'none',
+    });
+    let raw;
+    try {
+      raw = await meteredWithFailover({
+        spend,
+        role: 'supervisor',
+        routeFn: routeSupervisorFn,
+        defaultFamily: 'agy:gemini',
+        defaultProvider: 'agy',
+        operationId: `${loopState.loopId}:supervise`,
+        evidenceIds: [findingsEvidence.evidenceId],
+        invoke: ({ selection }) => Promise.resolve(supervisorFn({
+          objective, blockingFindings: review.blockingFindings, gate,
+          round: loopState.round, priorSignatures: loopState.findingSignatureHistory, selection,
+        })).then((out) => ({
+          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd,
+        })),
+      });
+    } catch (err) {
+      if (isAuthorizationFailure(err)) return { denied: true, error: err };
+      return { humanRequired: true, reason: `Supervisor call failed: ${err?.message ?? err}` };
+    }
+    loopState.supervisorCalls += 1;
+    loopState.supervisorInvoked = true;
+    // B1 — malformed Supervisor output is never treated as valid REWORK guidance.
+    if (!raw || raw.malformed === true || typeof raw.guidance !== 'string' || !raw.guidance.trim()) {
+      return { humanRequired: true, reason: `Supervisor produced no usable repair guidance${raw?.reason ? ` (${raw.reason})` : ''}` };
+    }
+    if (String(raw.recommendation).toUpperCase() === 'HUMAN_REQUIRED') {
+      return { humanRequired: true, reason: 'Supervisor recommends human involvement', guidance: raw.guidance };
+    }
+    return { guidance: raw.guidance };
+  }
+
+  // ---- PR mode ---------------------------------------------------------
   async function reviewPr({ loopState, signal, onHeartbeat }) {
     const objective = loopState.objective;
     recordTransition(loopState, REVIEW_LOOP_STATES.REVIEWING, 'PR review requested');
 
     const prCtl = createPrReviewController({
-      loopId: loopState.loopId,
-      persistence,
-      prBackend,
-      env,
-      onEvent,
-      recordSafetyEvent: collectSafetyEvent,
-      triggerAuthority,
+      loopId: loopState.loopId, persistence, prBackend, env, onEvent,
+      recordSafetyEvent: collectSafetyEvent, triggerAuthority,
     });
 
     const result = await prCtl.obtainReview({ objective, loopState, signal, onHeartbeat });
 
     if (result.outcome === PR_REVIEW_OUTCOMES.PUSH_REQUIRED) {
       await store.save(loopState.loopId, loopState);
-      return {
-        status: 'PUSH_REQUIRED',
-        loopId: loopState.loopId,
-        head: result.head,
-        reason: result.reason,
-        telemetry: emptyTelemetry(),
-        safetyEvents,
-      };
+      return { status: 'PUSH_REQUIRED', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: emptyTelemetry(), safetyEvents };
     }
-
     if (result.outcome === PR_REVIEW_OUTCOMES.WAITING_FOR_REVIEW) {
       recordTransition(loopState, REVIEW_LOOP_STATES.WAITING_FOR_REVIEW, 'external review pending');
       loopState.pendingExternalTrigger = loopState.pendingExternalTrigger
         ?? { head: result.head, reviewer: objective.reviewer, status: 'TRIGGERED' };
       await store.save(loopState.loopId, loopState);
-      return {
-        status: 'WAITING_FOR_REVIEW',
-        loopId: loopState.loopId,
-        head: result.head,
-        reason: result.reason,
-        telemetry: emptyTelemetry(),
-        safetyEvents,
-      };
+      return { status: 'WAITING_FOR_REVIEW', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: emptyTelemetry(), safetyEvents };
     }
-
     if (result.outcome === PR_REVIEW_OUTCOMES.HUMAN_REQUIRED) {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, result.reason);
       await store.save(loopState.loopId, loopState);
       return {
-        status: 'HUMAN_REQUIRED',
-        loopId: loopState.loopId,
-        head: result.head ?? null,
-        reason: result.reason,
-        blockingFindings: loopState.lastReview?.blockingFindings ?? [],
-        telemetry: emptyTelemetry(),
-        safetyEvents,
+        status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head ?? null, reason: result.reason,
+        blockingFindings: loopState.lastReview?.blockingFindings ?? [], telemetry: emptyTelemetry(), safetyEvents,
       };
     }
 
     // REVIEW_READY
     const review = result.review;
-    const newHead = result.head !== loopState.lastReviewedPrHead;
-    if (newHead) {
-      loopState.round += 1;
+    if (review.status === 'FAILED') {
+      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, review.error?.reason ?? 'pr review failed');
+      await store.save(loopState.loopId, loopState);
+      return {
+        status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head,
+        reason: `trusted PR review was not usable (${review.error?.reason}): ${review.error?.message ?? ''}`,
+        telemetry: emptyTelemetry(), safetyEvents,
+      };
     }
+
+    const newHead = result.head !== loopState.lastReviewedPrHead;
+    if (newHead) loopState.round += 1;
     loopState.lastReviewedPrHead = result.head;
     loopState.lastReview = review;
     loopState.pendingExternalTrigger = null;
 
     const spend = spendFor(loopState.loopId);
-    // Register the external result as evidence so a later identical head can't
-    // re-authorize a Reviewer/Supervisor call.
     await spend.registerEvidence({
-      kind: 'external', subject: `pr-${objective.prNumber}`, fingerprint: `${result.head}:${review.findingSignatures.join('|')}`,
+      kind: 'external', subject: `pr-${objective.prNumber}`,
+      fingerprint: `${result.head}:${review.findingSignatures.join('|')}`,
     });
 
     const decision = decideConvergence({ loopState, review });
@@ -393,35 +558,25 @@ export function createReviewLoopController({
     if (decision.verdict === REVIEW_VERDICTS.PASS) {
       recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
       await store.save(loopState.loopId, loopState);
-      return passResult(loopState, review, spend);
+      return passResult(loopState, review, await spend.telemetry());
     }
     if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
       await store.save(loopState.loopId, loopState);
-      return humanRequiredResult(loopState, review, spend, null);
+      return humanRequiredResult(loopState, review, await spend.telemetry(), null);
     }
 
     let supervisorGuidance = null;
     if (decision.invokeSupervisor && !loopState.supervisorInvoked) {
+      const sup = await runSupervisor({ spend, loopState, objective, review, gate: null });
+      if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
       recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'PR non-convergence escalation');
-      const findingsEvidence = await spend.registerEvidence({
-        kind: 'findings', taskId: loopState.loopId, signature: review.findingSignatures.join('|') || 'none',
-      });
-      const guidance = await spend.meteredCall({
-        role: 'supervisor',
-        operationId: `${loopState.loopId}:supervise`,
-        attempt: 1,
-        evidenceIds: [findingsEvidence.evidenceId],
-        call: async () => {
-          const out = await supervisorFn({
-            objective, blockingFindings: review.blockingFindings, round: loopState.round,
-          });
-          return { value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null };
-        },
-      });
-      loopState.supervisorCalls += 1;
-      loopState.supervisorInvoked = true;
-      supervisorGuidance = typeof guidance === 'string' ? guidance : (guidance?.guidance ?? null);
+      if (sup.humanRequired) {
+        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
+        await store.save(loopState.loopId, loopState);
+        return humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance);
+      }
+      supervisorGuidance = sup.guidance;
       loopState.lastSupervisorGuidance = supervisorGuidance;
     }
 
@@ -431,63 +586,49 @@ export function createReviewLoopController({
       ...compactReworkPayload({ loopState, review, gate: null, supervisorGuidance }),
       head: result.head,
       reason: `${decision.reason}; push your fix so ReviewLoop can request a review of the new HEAD`,
-      telemetry: spend.telemetry(),
+      telemetry: await spend.telemetry(),
       safetyEvents,
     };
   }
 
-  // ---- result shaping ----------------------------------------------------
-  function passResult(loopState, review, spend) {
+  // ---- result shaping ------------------------------------------------
+  function passResult(loopState, review, telemetry) {
     return {
-      status: 'PASS',
-      loopId: loopState.loopId,
-      round: loopState.round,
-      reviewer: review.reviewer,
-      nonBlockingFindings: review.nonBlockingFindings,
-      nonBlockingOmitted: review.nonBlockingOmitted ?? 0,
-      telemetry: spend ? spend.telemetry() : emptyTelemetry(),
-      safetyEvents,
+      status: 'PASS', loopId: loopState.loopId, round: loopState.round, reviewer: review.reviewer,
+      nonBlockingFindings: review.nonBlockingFindings, nonBlockingOmitted: review.nonBlockingOmitted ?? 0,
+      telemetry: telemetry ?? emptyTelemetry(), safetyEvents,
     };
   }
-
-  function humanRequiredResult(loopState, review, spend, supervisorGuidance) {
+  function humanRequiredResult(loopState, review, telemetry, supervisorGuidance) {
     return {
-      status: 'HUMAN_REQUIRED',
-      loopId: loopState.loopId,
-      round: loopState.round,
+      status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
       blockingFindings: review?.blockingFindings ?? [],
       supervisorGuidance: supervisorGuidance ?? loopState.lastSupervisorGuidance ?? null,
       reason: loopState.history?.slice(-1)[0]?.reason ?? 'review did not converge',
-      telemetry: spend ? spend.telemetry() : emptyTelemetry(),
-      safetyEvents,
+      telemetry: telemetry ?? emptyTelemetry(), safetyEvents,
     };
   }
-
+  function spendDenialResult(loopState, err, telemetry) {
+    return {
+      status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
+      reason: `ReviewLoop model spend blocked: ${err?.message ?? err}`,
+      telemetry: telemetry ?? emptyTelemetry(), safetyEvents,
+    };
+  }
   function terminalResult(loopState) {
     return {
-      status: loopState.state,
-      loopId: loopState.loopId,
-      round: loopState.round,
-      reason: 'loop already terminal',
-      lastReview: compactLastReview(loopState),
-      telemetry: emptyTelemetry(),
-      safetyEvents,
+      status: loopState.state, loopId: loopState.loopId, round: loopState.round,
+      reason: 'loop already terminal', lastReview: compactLastReview(loopState),
+      telemetry: emptyTelemetry(), safetyEvents,
     };
   }
-
   function compactLastReview(loopState) {
     const r = loopState.lastReview;
     if (!r) return null;
     return { status: r.status, blockingFindings: r.blockingFindings, findingSignatures: r.findingSignatures };
   }
-
   function emptyTelemetry() {
-    return {
-      reviewerCalls: 0,
-      supervisorCalls: 0,
-      externalTriggers: 0,
-      workerUsage: 'external / not observable by ReviewLoop',
-    };
+    return { reviewerCalls: 0, supervisorCalls: 0, externalTriggers: 0, workerUsage: 'external / not observable by ReviewLoop' };
   }
 
   return { begin, review, _store: store, _persistence: persistence };

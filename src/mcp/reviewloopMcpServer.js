@@ -48,6 +48,7 @@ export function createReviewLoopMcpServer({
         status: z.literal('READY'),
         baseline: z.record(z.string(), z.any()).nullable(),
         prHead: z.string().nullable(),
+        reviewer: z.string(),
       },
     },
     async ({ goal, cwd: reqCwd, prNumber, reviewer }) => {
@@ -63,6 +64,7 @@ export function createReviewLoopMcpServer({
         status: 'READY',
         baseline: res.baseline ?? null,
         prHead: res.prHead ?? null,
+        reviewer: res.reviewer,
       };
       return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
     },

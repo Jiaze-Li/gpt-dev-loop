@@ -84,11 +84,17 @@ export async function runGate({
   const results = [];
   for (const command of commands) {
     // eslint-disable-next-line no-await-in-loop
-    results.push(await exec(command));
+    const r = await exec(command);
+    results.push({
+      ...r,
+      pass: (r.exitCode ?? 0) === 0,
+      // gateFailureIdentity.js reads `output`.
+      output: `${r.stdout ?? ''}\n${r.stderr ?? ''}`,
+    });
   }
-  const rawPass = results.every((r) => (r.exitCode ?? 0) === 0);
+  const rawPass = results.every((r) => r.pass);
   const evidence = { results, pass: rawPass };
-  const failureIdentities = collectFailureIdentities(evidence);
+  const failureIdentities = collectFailureIdentities(evidence).identities;
   const fingerprint = failureIdentities.length
     ? failureIdentities.slice().sort().join('|')
     : `pass:${commands.join(',')}`;
@@ -97,9 +103,12 @@ export async function runGate({
   let baselineDiff = null;
   if (!rawPass && baselineGateEvidence) {
     baselineDiff = diffBaselineFailures(baselineGateEvidence, evidence);
-    // Only newly-introduced failures are a real regression; pre-existing repo
-    // red tests degrade FAIL to WARN (V2 baseline-diff gate lesson).
-    if (baselineDiff.verdict === BASELINE_DIFF_VERDICTS.NO_NEW_FAILURES) {
+    // Only newly-introduced failures are a real regression; a run that is red
+    // ONLY because of failures the baseline already had degrades FAIL -> WARN
+    // (V2 baseline-diff gate lesson). An unparseable / uncomparable failure
+    // stays FAIL (conservative).
+    if (baselineDiff.verdict === BASELINE_DIFF_VERDICTS.PASS_WITH_BASELINE_FAILURES
+      || baselineDiff.verdict === BASELINE_DIFF_VERDICTS.PASS) {
       verdict = GATE_VERDICTS.WARN;
     }
   }
@@ -109,10 +118,13 @@ export async function runGate({
     pass: verdict === GATE_VERDICTS.PASS,
     fingerprint,
     failureIdentities,
+    // Full evidence (with complete stdout/stderr) — used ONLY for baseline
+    // capture / baseline-diff, never echoed wholesale to the Worker.
+    evidence,
     results: results.map((r) => ({
       command: r.command,
       exitCode: r.exitCode,
-      // keep tails only — full output persists locally, not echoed to Worker
+      pass: r.pass,
       stdoutTail: String(r.stdout ?? '').slice(-2000),
       stderrTail: String(r.stderr ?? '').slice(-2000),
     })),

@@ -12,7 +12,11 @@ export const REVIEW_MODES = Object.freeze({ LOCAL: 'LOCAL', PR: 'PR' });
 
 export const DEFAULT_BLOCKING_SEVERITIES = Object.freeze(['P1', 'P2']);
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
-export const DEFAULT_REVIEWER = 'internal';
+// LOCAL mode always uses the internal Reviewer pool. PR mode uses an explicit
+// external reviewer; when the caller omits it, the default is `codex` — never
+// `internal` (an internal identity must never become a PR trigger identity).
+export const DEFAULT_PR_REVIEWER = 'codex';
+export const PR_REVIEWERS = Object.freeze(['codex', 'claude']);
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -76,9 +80,14 @@ export function createReviewObjective({
       : null,
     mode: resolvedMode,
     prNumber: resolvedMode === REVIEW_MODES.PR ? (prNumber ?? null) : null,
-    reviewer: resolvedMode === REVIEW_MODES.PR
-      ? String(reviewer || DEFAULT_REVIEWER).toLowerCase()
-      : 'internal',
+    reviewer: (() => {
+      if (resolvedMode !== REVIEW_MODES.PR) return 'internal';
+      const r = String(reviewer || DEFAULT_PR_REVIEWER).toLowerCase();
+      if (!PR_REVIEWERS.includes(r)) {
+        throw new Error(`createReviewObjective: PR reviewer must be one of ${PR_REVIEWERS.join(' | ')}, got "${r}"`);
+      }
+      return r;
+    })(),
     baseline: baseline ?? null,
     initialPrHead: resolvedMode === REVIEW_MODES.PR ? (prHead ?? null) : null,
     constraints: normalizedConstraints,
