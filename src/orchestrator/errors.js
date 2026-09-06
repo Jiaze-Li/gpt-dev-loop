@@ -32,7 +32,7 @@ export class ProviderCancelledError extends Error {
 //   - an aborted AbortSignal handed to invoke()
 //   - AbortError / ABORT_ERR from a native aborted operation
 //   - AGY_ABORTED from src/agy/agyClient.js
-//   - CancellationError from src/orchestrator/supergpt.js
+//   - CancellationError from src/orchestrator/the removed orchestrator
 //   - ProviderCancelledError (above), or any error tagged { cancelled: true }
 //   - an AdapterError whose providerFailure is PROVIDER_CANCELLED
 export function isCancellation(error, signal) {

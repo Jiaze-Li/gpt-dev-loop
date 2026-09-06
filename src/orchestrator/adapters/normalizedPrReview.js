@@ -154,7 +154,7 @@ export function recordThreadResolution(finding, {
     lifecycle: FINDING_LIFECYCLE.RESOLVED,
     threadResolutionStatus: THREAD_RESOLUTION_STATUS.RESOLVED,
     resolvedAt: identity(resolvedAt),
-    resolvedBy: 'supergpt',
+    resolvedBy: 'reviewloop',
   };
 }
 

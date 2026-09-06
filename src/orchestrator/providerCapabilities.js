@@ -116,7 +116,7 @@ export const PROVIDER_CAPABILITIES = deepFreeze({
     provider: 'claude',
     // Adapter exists (roleRouting.js PRODUCTION_ROLE_CAPABILITIES declares
     // 'executor'), but it is not an automatic Executor failover candidate
-    // (DEFAULT_ROLE_POLICY.executor is Sonnet-only). Not deleted — just not
+    // (the automatic Executor chain was removed with V2). Not deleted — just not
     // eligible for the automatic chain.
     executorEligible: false,
     live: {

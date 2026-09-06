@@ -4,21 +4,17 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
+// ReviewLoop active model roles are exactly: supervisor, reviewer.
+// The Worker (the coding agent the user is talking to) is OUTSIDE role routing
+// entirely — ReviewLoop never selects, spawns, budgets, or model-restricts it.
+// There is no `planner` and no `executor` role: execution is Worker-owned.
 export const DEFAULT_ROLE_POLICY = Object.freeze({
-  planner: Object.freeze([{ family: 'codex:default', effort: 'medium' }, { family: 'agy:gemini', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gpt-oss', effort: 'medium', degraded: true }]),
   supervisor: Object.freeze([{ family: 'agy:gemini', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gpt-oss', effort: 'medium', degraded: true }]),
   reviewer: Object.freeze([{ family: 'agy:gpt-oss', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'agy:gemini', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }]),
-  // Executor automatic candidate chain is temporarily Sonnet-only. The
-  // codex:default and claude:opus executor adapters remain implemented and
-  // capability-declared, but are not automatic failover candidates: a
-  // retryable Sonnet failure fails the Executor invocation back to the upper
-  // workflow layer instead of silently rerunning on another model.
-  executor: Object.freeze([{ family: 'claude:sonnet' }]),
 });
 
 export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
   'codex:default': ['codex'],
-  'claude:sonnet': ['claude'],
   'claude:opus': ['claude'],
   'agy:gemini': ['agy-gemini'],
   'agy:gpt-oss': ['agy-claude-gpt'],
@@ -30,11 +26,10 @@ export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
 // Keep unsupported pairs in DEFAULT_ROLE_POLICY: policy can enable a future
 // adapter without pretending it exists today.
 export const PRODUCTION_ROLE_CAPABILITIES = Object.freeze({
-  'codex:default': Object.freeze(['planner', 'supervisor', 'reviewer', 'executor']),
-  'agy:gemini': Object.freeze(['planner', 'supervisor', 'reviewer']),
-  'agy:gpt-oss': Object.freeze(['planner', 'supervisor', 'reviewer']),
-  'claude:sonnet': Object.freeze(['executor']),
-  'claude:opus': Object.freeze(['planner', 'supervisor', 'reviewer', 'executor']),
+  'codex:default': Object.freeze(['supervisor', 'reviewer']),
+  'agy:gemini': Object.freeze(['supervisor', 'reviewer']),
+  'agy:gpt-oss': Object.freeze(['supervisor', 'reviewer']),
+  'claude:opus': Object.freeze(['supervisor', 'reviewer']),
 });
 
 export function supportsProductionRole(family, role) {
@@ -48,7 +43,7 @@ function copy(value) { return JSON.parse(JSON.stringify(value)); }
 function nowIso(now) { return new Date(now).toISOString(); }
 
 export class QuotaPoolRegistry {
-  constructor({ filePath = path.join(os.homedir(), '.supergpt', 'quota-pools.json'), topology = DEFAULT_QUOTA_TOPOLOGY, now = () => Date.now(), baseBackoffMs = DEFAULT_BACKOFF_MS } = {}) {
+  constructor({ filePath = path.join(os.homedir(), '.reviewloop', 'quota-pools.json'), topology = DEFAULT_QUOTA_TOPOLOGY, now = () => Date.now(), baseBackoffMs = DEFAULT_BACKOFF_MS } = {}) {
     this.filePath = filePath; this.topology = { ...topology }; this.now = now; this.baseBackoffMs = baseBackoffMs;
     this.pools = {};
     if (filePath && existsSync(filePath)) {
@@ -58,7 +53,7 @@ export class QuotaPoolRegistry {
   persist() {
     if (!this.filePath) return;
     mkdirSync(path.dirname(this.filePath), { recursive: true });
-    writeFileSync(this.filePath, `${JSON.stringify({ schema: 'supergpt.quota-pools/v1', pools: this.pools }, null, 2)}\n`);
+    writeFileSync(this.filePath, `${JSON.stringify({ schema: 'reviewloop.quota-pools/v1', pools: this.pools }, null, 2)}\n`);
   }
   poolsFor(family) { return [...(this.topology[family] ?? [])]; }
   setTopology(family, poolIds) { this.topology[family] = [...new Set(poolIds)]; }

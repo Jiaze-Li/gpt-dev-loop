@@ -1,0 +1,127 @@
+// ReviewLoop MCP Server.
+//
+// Deliberately TINY agent-facing surface — every exposed tool/schema is
+// always-loaded Worker context. Exactly two normal Worker-facing tools:
+//
+//   reviewloop_begin(goal, cwd, prNumber?, reviewer?)
+//       Register the immutable review objective and capture the baseline
+//       (LOCAL) or bind the PR HEAD (PR). Zero model calls.
+//
+//   reviewloop_review(loopId)
+//       The one re-entrant operation: deterministic Gate -> Reviewer (if
+//       justified) -> convergence policy -> Supervisor (only on non-
+//       convergence). Returns PASS | REWORK | HUMAN_REQUIRED |
+//       WAITING_FOR_REVIEW | NO_PROGRESS | PUSH_REQUIRED.
+//
+// Status / dashboard / stop live on the human `reviewloop` CLI, not here.
+
+import path from 'node:path';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+
+import { createReviewLoopController } from '../reviewloop/controller.js';
+import { createProductionReviewLoopProviders } from '../reviewloop/providerWiring.js';
+
+export function createReviewLoopMcpServer({
+  controller = null,
+  cwd = process.cwd(),
+} = {}) {
+  const server = new McpServer({ name: 'reviewloop', version: '1.0.0' });
+
+  const ctl = controller ?? createReviewLoopController(createProductionReviewLoopProviders());
+
+  server.registerTool(
+    'reviewloop_begin',
+    {
+      description:
+        'Register a ReviewLoop session for a non-trivial coding task BEFORE your first edit so the baseline is captured. ReviewLoop does not implement the task — you do, in this session. Returns a loopId. Zero model calls.',
+      inputSchema: {
+        goal: z.string().min(1).describe('the original user coding goal (immutable success definition)'),
+        cwd: z.string().optional().describe('workspace directory (default: server cwd)'),
+        prNumber: z.number().int().optional().describe('PR number — switches to PR review mode'),
+        reviewer: z.enum(['codex', 'claude']).optional().describe('PR-mode external reviewer (default: codex)'),
+      },
+      outputSchema: {
+        loopId: z.string(),
+        mode: z.enum(['LOCAL', 'PR']),
+        status: z.literal('READY'),
+        baseline: z.record(z.string(), z.any()).nullable(),
+        prHead: z.string().nullable(),
+      },
+    },
+    async ({ goal, cwd: reqCwd, prNumber, reviewer }) => {
+      const res = await ctl.begin({
+        goal,
+        cwd: reqCwd ? path.resolve(reqCwd) : cwd,
+        prNumber: prNumber ?? null,
+        reviewer: reviewer ?? null,
+      });
+      const structured = {
+        loopId: res.loopId,
+        mode: res.mode,
+        status: 'READY',
+        baseline: res.baseline ?? null,
+        prHead: res.prHead ?? null,
+      };
+      return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
+    },
+  );
+
+  server.registerTool(
+    'reviewloop_review',
+    {
+      description:
+        'Run one ReviewLoop round for a loopId: deterministic Gate, then independent Reviewer if justified, then convergence policy. PASS -> done. REWORK -> fix the returned findings yourself in THIS session and call again. HUMAN_REQUIRED -> surface the blocker. WAITING_FOR_REVIEW -> a PR review was triggered; call again later. Blocks locally with zero model tokens while waiting.',
+      inputSchema: {
+        loopId: z.string().min(1).describe('the loopId from reviewloop_begin'),
+      },
+      outputSchema: {
+        status: z.string(),
+        loopId: z.string(),
+        round: z.number().optional(),
+        reason: z.string().nullable().optional(),
+        blockingFindings: z.array(z.record(z.string(), z.any())).optional(),
+        nonBlockingFindings: z.array(z.record(z.string(), z.any())).optional(),
+        supervisorGuidance: z.string().nullable().optional(),
+        head: z.string().nullable().optional(),
+        nextAction: z.string().nullable().optional(),
+        telemetry: z.record(z.string(), z.any()).optional(),
+      },
+    },
+    async ({ loopId }, extra) => {
+      const res = await ctl.review({
+        loopId,
+        signal: extra?.signal,
+        onHeartbeat: async (msg) => {
+          if (typeof extra?.sendNotification === 'function') {
+            try {
+              await extra.sendNotification({
+                method: 'notifications/progress',
+                params: {
+                  progressToken: extra?._meta?.progressToken ?? loopId,
+                  progress: 1,
+                  message: msg ?? `ReviewLoop ${loopId}: waiting (0 model tokens)`,
+                },
+              });
+            } catch { /* ignore */ }
+          }
+        },
+      });
+      return {
+        content: [{ type: 'text', text: JSON.stringify(res, null, 2) }],
+        structuredContent: res,
+        isError: res.status === 'FAILED',
+      };
+    },
+  );
+
+  return server;
+}
+
+export async function startReviewLoopMcpServer(options = {}) {
+  const server = createReviewLoopMcpServer(options);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  return server;
+}

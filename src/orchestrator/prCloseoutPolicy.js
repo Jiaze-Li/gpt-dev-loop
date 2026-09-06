@@ -1,6 +1,6 @@
 // V2-C — deterministic PR closeout decision + state model.
 //
-// SuperGPT stays execution owner; the trusted PR reviewer is a separate
+// ReviewLoop stays execution owner; the trusted PR reviewer is a separate
 // read-only trust boundary. This module is pure and deterministic: given the
 // durable closeout state, an already-ingested trusted review, and the current
 // PR head, it returns the next action and the next state.

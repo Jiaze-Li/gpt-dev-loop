@@ -197,7 +197,7 @@ export class ModelSpendAuthority {
   // "which collaborator objects this Authority instance was constructed
   // with", the same pattern already used for
   // `policy`/`providerCapabilities`/`reservationLedger`. Production wiring
-  // (providerSelection.js#selectProviders) always constructs this Authority
+  // (reviewSpend.js) always constructs this Authority
   // WITH an informationLedger, so production enforcement is unconditional; a
   // caller that constructs its own ModelSpendAuthority without one gets the
   // pre-existing, unaffected behavior — the intended compatibility boundary
@@ -297,7 +297,7 @@ export class ModelSpendAuthority {
     // § Global New Information Policy (Wiring Cards 1-3): production wires
     // ONE shared informationLedger onto the ONE ModelSpendAuthority used by
     // every role (Planner, Supervisor, Executor, Reviewer, PR-closeout
-    // repair) — see providerSelection.js#selectProviders and supergpt.js. As
+    // repair) — see reviewSpend.js and the removed orchestrator. As
     // of Wiring Card 3 every production internal physical model call site
     // supplies `evidenceIds`; production enforcement is therefore effectively
     // unconditional for every real workflow.
@@ -319,10 +319,10 @@ export class ModelSpendAuthority {
     // exercise permit/reservation/provider mechanics) behaving exactly as it
     // did before this feature existed — that absence of an informationLedger
     // is the ONLY compatibility boundary, not a per-call property. Every
-    // production ModelSpendAuthority (providerSelection.js#selectProviders)
+    // production ModelSpendAuthority (reviewSpend.js)
     // is constructed WITH an informationLedger, so production enforcement is
     // unconditional. Grep for `evidenceIds:` at invoke() call sites in
-    // src/orchestrator/{automatedLoop,providerSelection,supergpt}.js to
+    // src/orchestrator/{reviewloop/*}.js to
     // verify the production inventory has not silently grown or shrunk — see
     // also tests/newInformationProductionWiring.test.js.
     if (this._informationLedger) {

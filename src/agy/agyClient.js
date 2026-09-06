@@ -79,7 +79,7 @@ export class AgyOutputError extends AgyError {
 }
 
 // Raised when a conversation resume was requested (`conversationId`) but `agy`
-// could not resume it, or resumed a *different* conversation. SuperGPT needs
+// could not resume it, or resumed a *different* conversation. ReviewLoop needs
 // explicit turn-to-turn continuity, so any ambiguity here fails closed.
 export class AgyConversationResumeError extends AgyError {
   constructor(message) {

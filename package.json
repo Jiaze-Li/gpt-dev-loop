@@ -1,21 +1,19 @@
 {
-  "name": "gpt-dev-loop",
-  "version": "1.0.0",
+  "name": "reviewloop",
+  "version": "2.0.0",
   "private": true,
-  "description": "SuperGPT V1: local autonomous coding workflow with role-routed providers and deterministic delivery.",
+  "description": "ReviewLoop: a post-execution review and repair controller for coding agents. The Worker (your current coding agent) owns execution; ReviewLoop owns independent verification, review, external-review waiting, non-convergence detection, and exception guidance.",
   "type": "module",
   "bin": {
-    "supergpt": "bin/supergpt.js",
-    "supergpt-mcp": "bin/supergpt-mcp.js"
+    "reviewloop": "bin/reviewloop.js",
+    "reviewloop-mcp": "bin/reviewloop-mcp.js"
   },
   "scripts": {
     "doctor": "node ./scripts/doctor.js",
     "test": "node --test tests/*.test.js",
     "install-global": "node ./bin/install-plugin.js",
     "uninstall-global": "node ./bin/install-plugin.js --uninstall",
-    "benchmark": "node ./bin/benchmark-tokens.js",
-    "benchmark:live": "node ./bin/benchmark-tokens.js --live",
-    "probe:provider-overhead": "node ./bin/probe-provider-overhead.js"
+    "benchmark": "node ./scripts/benchmark-context-footprint.js"
   },
   "engines": {
     "node": ">=20"

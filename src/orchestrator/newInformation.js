@@ -89,11 +89,10 @@ export function computeConsumptionKey({ role, operationId, evidenceId }) {
 // the task's Final Report): CHANGED_TASK_DIFF alone does not, by itself,
 // justify another Executor call — Executor is the role that PRODUCES that
 // diff, so re-running it on its own artifact is never eligible here.
+// ReviewLoop active metered roles are exactly supervisor + reviewer. There is
+// no planner or executor role — execution is Worker-owned and outside
+// ReviewLoop model-spend accounting entirely.
 export const ROLE_EVENT_ELIGIBILITY = Object.freeze({
-  planner: new Set([
-    NEW_INFORMATION_EVENT_TYPES.NEW_USER_INPUT,
-    NEW_INFORMATION_EVENT_TYPES.CHANGED_REPOSITORY_STATE,
-  ]),
   supervisor: new Set([
     NEW_INFORMATION_EVENT_TYPES.NEW_TASK_CARD,
     NEW_INFORMATION_EVENT_TYPES.NEW_USER_INPUT,
@@ -101,17 +100,6 @@ export const ROLE_EVENT_ELIGIBILITY = Object.freeze({
     NEW_INFORMATION_EVENT_TYPES.CHANGED_TASK_DIFF,
     NEW_INFORMATION_EVENT_TYPES.NEW_REVIEW_FINDINGS,
     NEW_INFORMATION_EVENT_TYPES.CHANGED_REPOSITORY_STATE,
-    NEW_INFORMATION_EVENT_TYPES.NEW_EXTERNAL_RESULT,
-  ]),
-  executor: new Set([
-    NEW_INFORMATION_EVENT_TYPES.NEW_TASK_CARD,
-    NEW_INFORMATION_EVENT_TYPES.NEW_USER_INPUT,
-    NEW_INFORMATION_EVENT_TYPES.NEW_GATE_FINGERPRINT,
-    NEW_INFORMATION_EVENT_TYPES.NEW_REVIEW_FINDINGS,
-    NEW_INFORMATION_EVENT_TYPES.CHANGED_REPOSITORY_STATE,
-    // § Wiring Card 3 / PART B — the PR-closeout repair Executor is justified
-    // by a deterministic EXTERNAL trusted-review result (head + normalized
-    // actionable finding signatures), never by its own prior diff.
     NEW_INFORMATION_EVENT_TYPES.NEW_EXTERNAL_RESULT,
   ]),
   reviewer: new Set([
