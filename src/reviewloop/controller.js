@@ -14,7 +14,7 @@
 // The SAME Worker handles REWORK and calls reviewloop_review again. ReviewLoop
 // never writes application code, never commits, pushes, merges, or force-pushes.
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { Persistence } from '../orchestrator/persistence.js';
 import { isAuthorizationFailure } from '../orchestrator/errors.js';
 import { REVIEWLOOP_RUNTIME_ROOT } from './runtimeDir.js';
@@ -47,6 +47,10 @@ import { chunkDiffForReview } from './diffChunker.js';
 
 const RUNTIME_ROOT = REVIEWLOOP_RUNTIME_ROOT;
 const MAX_PROVIDER_ATTEMPTS = 3;
+
+function sha256Hex(value) {
+  return createHash('sha256').update(String(value)).digest('hex').slice(0, 32);
+}
 
 function compactBaselineSummary(baseline) {
   return {
@@ -130,21 +134,34 @@ export function createReviewLoopController({
     let prHead = null;
     const repository = { root: cwd, name: null, url: null };
     let baselineGate = null;
+    let verificationPlan = null;
 
     if (mode === REVIEW_MODES.LOCAL) {
       baseline = await captureBaselineFn({ cwd });
-      // B8 — baseline Gate evidence, 0 model tokens. Only when trusted/
-      // discoverable verification exists; a failure to run it is recorded as
-      // incomplete coverage, never faked as PASS.
+
+      // Freeze the verification plan NOW. reviewloop_review always runs these
+      // exact commands; a later edit to .reviewloop.json / package.json's test
+      // script cannot weaken the Gate.
+      const discovered = discoverVerificationCommandsFn({ cwd, configured: verificationCommands });
+      verificationPlan = {
+        source: String(discovered.source ?? 'unknown'),
+        commands: (discovered.commands ?? []).map(String),
+        manifestFingerprint: discovered.manifestFingerprint
+          ?? sha256Hex(`fallback::${JSON.stringify(discovered.commands ?? [])}`),
+        frozenAt: new Date(clock()).toISOString(),
+      };
+
+      // B8 — baseline Gate evidence, 0 model tokens, over the FROZEN plan. Only
+      // when trusted/discoverable verification exists; a failure to run it is
+      // recorded as incomplete coverage, never faked as PASS.
       try {
-        const discovered = discoverVerificationCommandsFn({ cwd, configured: verificationCommands });
-        if (discovered.source !== 'mechanical') {
-          const g = await runGateFn({ cwd, commands: discovered.commands, runner: gateRunner });
+        if (verificationPlan.source !== 'mechanical' && verificationPlan.commands.length) {
+          const g = await runGateFn({ cwd, commands: verificationPlan.commands, runner: gateRunner, env });
           baselineGate = {
             evidence: g.evidence ?? { results: g.results ?? [], pass: g.pass },
             pass: g.pass,
             capturedAt: new Date().toISOString(),
-            source: discovered.source,
+            source: verificationPlan.source,
           };
         }
       } catch (err) {
@@ -168,6 +185,7 @@ export function createReviewLoopController({
     const objective = createReviewObjective({
       loopId, goal, repository, mode, prNumber, reviewer, baseline, prHead,
       constraints, blockingSeverities, maxReviewRounds: resolvedMaxRounds,
+      verificationPlan,
     });
 
     const loopState = initialLoopState(objective);
@@ -377,12 +395,62 @@ export function createReviewLoopController({
       };
     }
 
-    const discovered = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
+    // The verification plan was FROZEN at reviewloop_begin. Use exactly those
+    // commands — never re-derive from the (possibly Worker-edited) on-disk
+    // config. Only fall back to fresh discovery for a legacy loop persisted
+    // before the plan was frozen.
+    const frozenPlan = objective.verificationPlan;
+    let gateCommands;
+    let commandSource;
+    if (frozenPlan?.commands?.length) {
+      gateCommands = frozenPlan.commands;
+      commandSource = `${frozenPlan.source} (frozen at begin)`;
+      // A Worker that rewrote `.reviewloop.json` / the `package.json` test
+      // script after begin cannot weaken the Gate. Running the frozen command
+      // array already defeats a `.reviewloop.json` edit; but a `package.json`
+      // plan is the indirection `npm test`, so a rewritten test script would
+      // still run. Any manifest drift therefore fails the review closed rather
+      // than trusting the Gate: the Worker must revert the config or start a
+      // fresh reviewloop_begin.
+      try {
+        const current = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
+        if (current?.manifestFingerprint && frozenPlan.manifestFingerprint
+          && current.manifestFingerprint !== frozenPlan.manifestFingerprint) {
+          collectSafetyEvent({
+            code: 'VERIFICATION_PLAN_DRIFT',
+            severity: 'BLOCKING',
+            role: 'gate',
+            taskId: loopState.loopId,
+            reason: `the verification config (${frozenPlan.source}) was modified after reviewloop_begin`,
+            actionTaken: 'review blocked; frozen Gate cannot be trusted',
+          });
+          loopState.round += 1;
+          recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'verification plan drift');
+          await store.save(loopState.loopId, loopState);
+          return {
+            ...compactReworkPayload({
+              loopState,
+              review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 },
+              gate: { verdict: 'FAIL', failureIdentities: ['verification-plan-drift'] },
+            }),
+            reason: 'the verification configuration was changed after reviewloop_begin; revert '
+              + '.reviewloop.json / the package.json test script to what it was, or start a new '
+              + 'reviewloop_begin — ReviewLoop will not run a Gate the Worker can edit mid-loop',
+            telemetry: await durableTelemetry(loopState.loopId),
+            safetyEvents,
+          };
+        }
+      } catch { /* discovery is best-effort here */ }
+    } else {
+      const discovered = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
+      gateCommands = discovered.commands;
+      commandSource = discovered.source;
+    }
     const gate = await runGateFn({
-      cwd, commands: discovered.commands, runner: gateRunner,
+      cwd, commands: gateCommands, runner: gateRunner, env,
       baselineGateEvidence: loopState.baselineGateEvidence?.evidence ?? null,
     });
-    gate.commandSource = discovered.source;
+    gate.commandSource = commandSource;
 
     const fp = reviewFingerprint({ deltaFingerprint: delta.fingerprint, gateFingerprint: gate.fingerprint });
 

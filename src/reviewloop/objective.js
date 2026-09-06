@@ -45,6 +45,7 @@ export function createReviewObjective({
   constraints = [],
   blockingSeverities = DEFAULT_BLOCKING_SEVERITIES,
   maxReviewRounds = DEFAULT_MAX_REVIEW_ROUNDS,
+  verificationPlan = null,
   createdAt = new Date().toISOString(),
 } = {}) {
   if (!loopId) throw new Error('createReviewObjective: loopId is required');
@@ -93,25 +94,30 @@ export function createReviewObjective({
     constraints: normalizedConstraints,
     blockingSeverities: blocking,
     maxReviewRounds: rounds,
+    // The deterministic Gate's verification plan, FROZEN at reviewloop_begin.
+    // reviewloop_review always runs these exact commands; a later edit to
+    // .reviewloop.json / package.json's test script cannot weaken the Gate.
+    verificationPlan: verificationPlan
+      ? {
+        source: String(verificationPlan.source ?? 'unknown'),
+        commands: Array.isArray(verificationPlan.commands) ? verificationPlan.commands.map(String) : [],
+        manifestFingerprint: verificationPlan.manifestFingerprint ?? null,
+        frozenAt: verificationPlan.frozenAt ?? createdAt,
+      }
+      : null,
     createdAt,
   };
 
-  objective.fingerprint = sha256(JSON.stringify({
-    goal: objective.goal,
-    repository: objective.repository,
-    mode: objective.mode,
-    prNumber: objective.prNumber,
-    reviewer: objective.reviewer,
-    constraints: objective.constraints,
-    blockingSeverities: objective.blockingSeverities,
-    maxReviewRounds: objective.maxReviewRounds,
-  }));
+  objective.fingerprint = fingerprintFields(objective);
 
   return freezeDeep(objective);
 }
 
-function computeObjectiveFingerprint(o) {
-  return sha256(JSON.stringify({
+// The load-bearing fields, hashed for tamper-detection. `verificationPlan` is
+// only folded in when present, so an objective created before this field
+// existed keeps its original fingerprint and still rehydrates.
+function fingerprintFields(o) {
+  const base = {
     goal: o.goal,
     repository: o.repository ?? null,
     mode: o.mode,
@@ -120,7 +126,13 @@ function computeObjectiveFingerprint(o) {
     constraints: o.constraints ?? [],
     blockingSeverities: o.blockingSeverities ?? [],
     maxReviewRounds: o.maxReviewRounds,
-  }));
+  };
+  if (o.verificationPlan) base.verificationPlan = o.verificationPlan;
+  return sha256(JSON.stringify(base));
+}
+
+function computeObjectiveFingerprint(o) {
+  return fingerprintFields(o);
 }
 
 // A serialized objective read back from durable state is re-frozen so nothing
@@ -160,6 +172,13 @@ export function assertObjectiveNotWeakened(original, candidate) {
   const candConstraints = new Set(candidate.constraints ?? []);
   for (const c of original.constraints ?? []) {
     if (!candConstraints.has(c)) problems.push(`constraint dropped: ${c}`);
+  }
+  if (original.verificationPlan) {
+    if (!candidate.verificationPlan) {
+      problems.push('verification plan dropped');
+    } else if (JSON.stringify(candidate.verificationPlan) !== JSON.stringify(original.verificationPlan)) {
+      problems.push('frozen verification plan changed');
+    }
   }
   if (problems.length) {
     throw new Error(`ReviewObjective weakened: ${problems.join('; ')}`);

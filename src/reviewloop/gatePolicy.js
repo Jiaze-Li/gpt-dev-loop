@@ -15,6 +15,7 @@
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { collectFailureIdentities } from '../orchestrator/gateFailureIdentity.js';
 import { diffBaselineFailures, BASELINE_DIFF_VERDICTS } from '../orchestrator/baselineDiffGate.js';
@@ -32,17 +33,26 @@ function resolveGateTimeoutMs(env) {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_GATE_TIMEOUT_MS;
 }
 
+// `manifestFingerprint` digests exactly the bytes/values the plan was derived
+// from, so reviewloop_begin can FREEZE the plan and a later reviewloop_review
+// can detect that the Worker rewrote `.reviewloop.json` / the `test` script.
+function planFp(discriminator) {
+  return createHash('sha256').update(discriminator).digest('hex').slice(0, 32);
+}
+
 export function discoverVerificationCommands({ cwd, configured = null } = {}) {
   if (Array.isArray(configured) && configured.length) {
-    return { source: 'configured', commands: configured.map(String) };
+    const commands = configured.map(String);
+    return { source: 'configured', commands, manifestFingerprint: planFp(`configured::${JSON.stringify(commands)}`) };
   }
   const repoConfig = path.join(cwd, '.reviewloop.json');
   if (existsSync(repoConfig)) {
     try {
-      const parsed = JSON.parse(readFileSync(repoConfig, 'utf8'));
+      const rawText = readFileSync(repoConfig, 'utf8');
+      const parsed = JSON.parse(rawText);
       const verify = parsed?.verify ?? parsed?.verification_commands;
       if (Array.isArray(verify) && verify.length) {
-        return { source: 'repo-config', commands: verify.map(String) };
+        return { source: 'repo-config', commands: verify.map(String), manifestFingerprint: planFp(`repo-config::${rawText}`) };
       }
     } catch {
       /* fall through to manifest discovery */
@@ -53,14 +63,14 @@ export function discoverVerificationCommands({ cwd, configured = null } = {}) {
     try {
       const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
       if (pkg?.scripts?.test && !/no test specified/i.test(pkg.scripts.test)) {
-        return { source: 'package.json', commands: ['npm test'] };
+        return { source: 'package.json', commands: ['npm test'], manifestFingerprint: planFp(`package.json::test::${pkg.scripts.test}`) };
       }
     } catch {
       /* fall through */
     }
   }
   // Minimal mechanical check — never invents a dangerous command.
-  return { source: 'mechanical', commands: ['git diff --check'] };
+  return { source: 'mechanical', commands: ['git diff --check'], manifestFingerprint: planFp('mechanical') };
 }
 
 function runCommand(command, cwd, spawn, timeoutMs) {
