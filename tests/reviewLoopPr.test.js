@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
-// A raw review carries a trusted reviewer identity + the exact reviewed HEAD,
-// exactly as the real GitHub backend guarantees after checkPrReviewTrust().
+const TRUSTED_LOGIN = { codex: 'chatgpt-codex-connector', claude: 'claude[bot]' };
+
+// A raw review carries a real trusted GitHub login + the exact reviewed HEAD,
+// exactly as the real GitHub backend surfaces before checkPrReviewTrust().
 function stamp(raw, headSha, reviewer) {
   if (!raw) return raw;
-  return { reviewer, headSha, head_sha: headSha, ...raw };
+  return { login: TRUSTED_LOGIN[reviewer], headSha, head_sha: headSha, ...raw };
 }
 
 function mockPrBackend({ heads = ['H1'], existing = {}, results = {}, reviewer = 'codex' } = {}) {

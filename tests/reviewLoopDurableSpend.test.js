@@ -5,6 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopSpend, usageVolumeOf } from '../src/reviewloop/reviewSpend.js';
+import { AUTHORIZATION_ERROR_CODES } from '../src/orchestrator/errors.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
 function freshSpend(persistence, env) {
@@ -79,14 +80,11 @@ test('cache tokens count toward the aggregate', async () => {
   );
 });
 
-test('a settled reservation with no matching spend record (crash) is counted conservatively', async () => {
+test('crash-after-SETTLED_KNOWN with an unrecoverable spend record -> fail closed', async () => {
   const persistence = new MemoryPersistence();
-  const env = { REVIEWLOOP_MAX_REVIEWER_CALLS: '1' };
-  const spend = freshSpend(persistence, env);
-  const ev = await spend.registerEvidence({ kind: 'diff', taskId: 't', diffHash: 'h' });
-  // Simulate: reservation reserved+dispatched+settled durably, but the process
-  // crashed before the spend-log append. We forge that by writing a
-  // SETTLED_KNOWN reservation directly and NO spend record.
+  // high call ceiling, generous usage ceiling: the block is purely because
+  // the real usage/cost of the crashed call cannot be recovered.
+  const env = { REVIEWLOOP_MAX_REVIEWER_CALLS: '99', REVIEWLOOP_MAX_USAGE_VOLUME: '9999999', REVIEWLOOP_MAX_COST_USD: '999' };
   await persistence.updateWorkflowState('LOOP', {
     modelSpendReservations: {
       'res-1': { reservationId: 'res-1', status: 'SETTLED_KNOWN', role: 'reviewer', intent: { role: 'reviewer' } },
@@ -96,16 +94,50 @@ test('a settled reservation with no matching spend record (crash) is counted con
   const totals = await afterRestart.currentTotals();
   assert.equal(totals.reviewerCalls, 1, 'the crashed call is still counted');
   assert.equal(totals.unknownUsageCalls, 1, 'its usage is UNKNOWN, never zero');
-  await assert.rejects(() => oneReviewerCall(afterRestart, 'h2'), /reviewer call ceiling/);
+  assert.equal(totals.unaccountedSpendCalls, 1);
+  await assert.rejects(
+    () => oneReviewerCall(afterRestart, 'h2'),
+    (err) => err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED && /could not be recovered/.test(err.message),
+  );
 });
 
-test('an UNRESOLVED reservation after restart blocks all spend', async () => {
+test('crash-after-SETTLED_KNOWN also blocks when the usage ceiling is already exhausted', async () => {
+  const persistence = new MemoryPersistence();
+  const env = { REVIEWLOOP_MAX_REVIEWER_CALLS: '99', REVIEWLOOP_MAX_USAGE_VOLUME: '100' };
+  // one real recorded call that already exhausts the usage ceiling
+  await oneReviewerCall(freshSpend(persistence, env), 'logged', { input_tokens: 100, output_tokens: 20 });
+  // plus a SETTLED_KNOWN reservation whose spend record was lost
+  const cur = await persistence.readWorkflowState('LOOP');
+  await persistence.updateWorkflowState('LOOP', {
+    modelSpendReservations: {
+      ...(cur.modelSpendReservations ?? {}),
+      'res-crashed': { reservationId: 'res-crashed', status: 'SETTLED_KNOWN', role: 'reviewer', intent: { role: 'reviewer' } },
+    },
+  });
+  const afterRestart = createReviewLoopSpend({ loopId: 'LOOP', persistence, env });
+  await assert.rejects(() => oneReviewerCall(afterRestart, 'next'), (err) => err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED);
+});
+
+test('a human can acknowledge unrecoverable spend to unblock (REVIEWLOOP_ACK_UNACCOUNTED_SPEND)', async () => {
   const persistence = new MemoryPersistence();
   await persistence.updateWorkflowState('LOOP', {
     modelSpendReservations: {
-      'res-x': { reservationId: 'res-x', status: 'UNRESOLVED', role: 'reviewer', intent: { role: 'reviewer' } },
+      'res-1': { reservationId: 'res-1', status: 'SETTLED_KNOWN', role: 'reviewer', intent: { role: 'reviewer' } },
+    },
+  });
+  const env = { REVIEWLOOP_ACK_UNACCOUNTED_SPEND: 'LOOP' };
+  const spend = createReviewLoopSpend({ loopId: 'LOOP', persistence, env });
+  const v = await oneReviewerCall(spend, 'ok');
+  assert.deepEqual(v, {});
+});
+
+test('an UNRESOLVED reservation after restart blocks all spend (via the reservation ledger)', async () => {
+  const persistence = new MemoryPersistence();
+  await persistence.updateWorkflowState('LOOP', {
+    modelSpendReservations: {
+      'res-x': { reservationId: 'res-x', status: 'UNRESOLVED', role: 'reviewer', taskId: 'x', physicalAttempt: 1, intent: { role: 'reviewer' } },
     },
   });
   const spend = createReviewLoopSpend({ loopId: 'LOOP', persistence });
-  await assert.rejects(() => oneReviewerCall(spend, 'z'), (err) => /UNRESOLVED|unresolved/.test(err.message));
+  await assert.rejects(() => oneReviewerCall(spend, 'z'), (err) => err.code === AUTHORIZATION_ERROR_CODES.MODEL_SPEND_USAGE_UNRESOLVED);
 });
