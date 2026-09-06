@@ -59,6 +59,27 @@ test('a genuinely unparseable model reply is surfaced as malformed (fail closed)
   assert.equal(out.value.malformed, true);
 });
 
+test('prose wrapped around a fenced JSON block is still parsed', async () => {
+  const providers = createProductionReviewLoopProviders({
+    callAgy: callAgyShaped({
+      replyText: 'I reviewed the diff against the objective.\n\n```json\n{"findings":[{"severity":"P2","file":"x.js","title":"missing null check"}]}\n```\n\nOverall the change looks reasonable.',
+    }),
+  });
+  const out = await providers.reviewerFn({ objective, diff: 'd', changedFiles: ['x.js'], gate: {} });
+  assert.equal(out.value.malformed, undefined);
+  assert.equal(out.value.findings[0].severity, 'P2');
+});
+
+test('prose wrapped around a bare JSON object (no fence) is still parsed', async () => {
+  const providers = createProductionReviewLoopProviders({
+    callAgy: callAgyShaped({
+      replyText: 'Here is my assessment: {"findings": []} — nothing blocking.',
+    }),
+  });
+  const out = await providers.reviewerFn({ objective, diff: 'd', changedFiles: [], gate: {} });
+  assert.deepEqual(out.value, { findings: [] });
+});
+
 test('json-schema mode: the payload arrives as the envelope object itself', async () => {
   const providers = createProductionReviewLoopProviders({
     callAgy: async () => ({

@@ -86,9 +86,54 @@ function looksLikePayload(obj) {
     && (Array.isArray(obj.findings) || 'recommendation' in obj || 'guidance' in obj);
 }
 
+// A model reply is often prose wrapped around the JSON, e.g.
+//   "I reviewed the diff. ```json\n{...}\n``` Let me know."
+// Pull the JSON out of it: first a ```json fenced block, then the first
+// balanced {...} substring that parses AND looks like a reviewer/supervisor
+// payload. Deterministic; never executes anything.
+function extractEmbeddedJson(text) {
+  const s = String(text ?? '');
+  const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) {
+    try {
+      const p = JSON.parse(fenced[1].trim());
+      if (p && typeof p === 'object') return p;
+    } catch { /* keep looking */ }
+  }
+  for (let i = s.indexOf('{'); i !== -1; i = s.indexOf('{', i + 1)) {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < s.length; j += 1) {
+      const c = s[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === '\\') esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === '{') depth += 1;
+      else if (c === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            const p = JSON.parse(s.slice(i, j + 1));
+            if (looksLikePayload(p)) return p;
+          } catch { /* not this one */ }
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 function parseJsonish(res) {
   if (typeof res === 'string') {
-    try { return { parsed: JSON.parse(stripFence(res)), raw: res }; } catch { return { parsed: null, raw: res }; }
+    try { return { parsed: JSON.parse(stripFence(res)), raw: res }; } catch { /* embedded */ }
+    const embedded = extractEmbeddedJson(res);
+    return { parsed: embedded, raw: res };
   }
   // 1. The model's own reply text — the normal channel.
   const replyText = typeof res?.text === 'string' ? res.text : null;
@@ -96,6 +141,8 @@ function parseJsonish(res) {
     try {
       return { parsed: JSON.parse(stripFence(replyText)), raw: replyText };
     } catch { /* fall through */ }
+    const embedded = extractEmbeddedJson(replyText);
+    if (embedded) return { parsed: embedded, raw: replyText };
   }
   // 2. `agy --json-schema` can make the ENVELOPE itself the schema'd object.
   //    Only accept res.json when it already looks like a reviewer/supervisor
@@ -107,6 +154,8 @@ function parseJsonish(res) {
   for (const cand of [res?.json?.result, res?.json?.output, res?.json?.content]) {
     if (typeof cand === 'string' && stripFence(cand)) {
       try { return { parsed: JSON.parse(stripFence(cand)), raw: cand }; } catch { /* keep trying */ }
+      const embedded = extractEmbeddedJson(cand);
+      if (embedded) return { parsed: embedded, raw: cand };
     }
   }
   return { parsed: null, raw: replyText ?? (res?.json ? JSON.stringify(res.json) : '') };
