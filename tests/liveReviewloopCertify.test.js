@@ -153,6 +153,93 @@ test('5. single-call ceilings: a first-call Supervisor failure does NOT fall bac
   assert.equal(MODE_CEILINGS.reviewer.REVIEWLOOP_MAX_REVIEWER_CALLS, '1');
 });
 
+// ---- certification target isolation --------------------------------------
+//
+// Production RoleRouter still chooses the candidate, but the harness refuses to
+// physically dispatch any family outside the certification target. A fallback
+// the router would have picked is recorded by name only (suppressedFallback-
+// Families) and never reaches the controller for dispatch.
+
+const OK_FINDINGS = () => ({ text: '{"findings":[]}', usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }, model: 'agy-sonnet-cert' });
+
+test('R-A. reviewer: codex skipped before dispatch -> router would pick agy:sonnet -> zero Sonnet calls, FAIL', async () => {
+  const agyCalls = [];
+  const callAgy = async (opts) => { agyCalls.push(opts); return OK_FINDINGS(); };
+  const noCodex = { 'codex:default': { available: false }, 'claude:opus': { available: false } };
+  const deps = {
+    createProviders: () => fakeProviders({ callAgy, transportRuntime: noCodex }),
+    probeAgyModelCatalog: () => null,
+    probeReviewTransportRuntime: async () => noCodex,
+  };
+  const { exitCode, output } = await main({ argv: ['--mode', 'reviewer'], env: { [OPT_IN_ENV]: '1' }, deps });
+  assert.equal(exitCode, 1);
+  assert.equal(output.status, 'FAIL', JSON.stringify(output));
+  assert.notEqual(output.terminal, 'PASS');
+  assert.deepEqual(output.suppressedFallbackFamilies, ['agy:sonnet'], 'production routing would next choose agy:sonnet');
+  assert.equal(agyCalls.length, 0, 'Sonnet transport physicalInvocations = 0');
+  assert.equal(output.reviewerCalls, 0);
+});
+
+test('R-B. reviewer: codex selected -> retryable pre-send failure -> router advances to Sonnet -> one Codex call, zero Sonnet calls, FAIL', async () => {
+  const codexTransport = spy(async () => { throw Object.assign(new Error('codex pre-send failure'), { code: 'PROVIDER_UNAVAILABLE' }); });
+  const agyCalls = [];
+  const callAgy = async (opts) => { agyCalls.push(opts); return OK_FINDINGS(); };
+  const deps = {
+    createProviders: () => fakeProviders({ codexTransport, callAgy }),
+    probeAgyModelCatalog: () => null,
+    probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: false } }),
+  };
+  const { exitCode, output } = await main({ argv: ['--mode', 'reviewer'], env: { [OPT_IN_ENV]: '1' }, deps });
+  assert.equal(exitCode, 1);
+  assert.equal(output.status, 'FAIL', JSON.stringify(output));
+  assert.equal(codexTransport.calls.length, 1, 'Codex physicalInvocations = 1');
+  assert.equal(agyCalls.length, 0, 'Sonnet physicalInvocations = 0');
+  assert.deepEqual(output.suppressedFallbackFamilies, ['agy:sonnet']);
+});
+
+test('S-A. supervisor: gemini unavailable -> router would pick codex -> zero Codex calls, FAIL', async () => {
+  const agyCalls = [];
+  const callAgy = async (opts) => { agyCalls.push(opts); return { text: '{"guidance":"x","recommendation":"REWORK"}', usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }, model: 'gemini-cert' }; };
+  const deps = {
+    createProviders: () => {
+      const p = fakeProviders({ callAgy });
+      p.recordProviderFailure({ role: 'supervisor', family: 'agy:gemini', provider: 'agy-gemini' }, { code: 'PROVIDER_UNAVAILABLE' });
+      return p;
+    },
+    probeAgyModelCatalog: () => null,
+    probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: false } }),
+  };
+  const { exitCode, output } = await main({ argv: ['--mode', 'supervisor'], env: { [OPT_IN_ENV]: '1' }, deps });
+  assert.equal(exitCode, 1);
+  assert.equal(output.status, 'FAIL', JSON.stringify(output));
+  assert.deepEqual(output.suppressedFallbackFamilies, ['codex:default'], 'production routing would next choose codex:default');
+  assert.equal(output.supervisorCalls, 0, 'Codex physicalInvocations = 0');
+  // the synthetic reviewer precondition is the only agy consumer here
+  assert.equal(agyCalls.length, 0);
+});
+
+test('S-B. supervisor: gemini selected -> retryable safe failure -> router advances Codex -> one Gemini call, zero Codex calls, FAIL', async () => {
+  const agyCalls = [];
+  const callAgy = async (opts) => {
+    agyCalls.push(opts);
+    throw Object.assign(new Error('gemini transport unavailable (retryable, pre-send)'), { code: 'PROVIDER_UNAVAILABLE' });
+  };
+  const deps = {
+    createProviders: () => fakeProviders({ callAgy, transportRuntime: { 'codex:default': { available: true }, 'claude:opus': { available: false } } }),
+    probeAgyModelCatalog: () => null,
+    probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: false } }),
+  };
+  const { exitCode, output } = await main({ argv: ['--mode', 'supervisor'], env: { [OPT_IN_ENV]: '1' }, deps });
+  assert.equal(exitCode, 1);
+  assert.equal(output.status, 'FAIL', JSON.stringify(output));
+  assert.equal(agyCalls.length, 1, 'Gemini physicalInvocations = 1');
+  assert.deepEqual(output.suppressedFallbackFamilies, ['codex:default'], 'Codex physicalInvocations = 0 (selected by the router, suppressed before dispatch)');
+  // exactly one metered Supervisor attempt (the Gemini one) — the suppressed
+  // Codex re-route is never dispatched or accounted.
+  assert.equal(output.supervisorCalls, 1);
+  assert.equal(output.selectedSupervisorFamily, 'agy:gemini');
+});
+
 test('6. the live certification script is not referenced by npm test / doctor / benchmark', () => {
   const pkg = JSON.parse(readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
   for (const [name, cmd] of Object.entries(pkg.scripts ?? {})) {

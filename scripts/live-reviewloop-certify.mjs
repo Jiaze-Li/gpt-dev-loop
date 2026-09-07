@@ -133,10 +133,25 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     const providers = d.createProviders({ env: baseEnv, agyCatalog, transportRuntime });
 
     const reviewerSelections = [];
+    const suppressedFallbackFamilies = [];
     const providerFailures = [];
+    // Certification target isolation. Production RoleRouter still picks the
+    // candidate (health / quota-cooldown aware), but this harness refuses to
+    // physically dispatch anything outside the Reviewer certification scope
+    // (codex:default). If the router would advance to a fallback family —
+    // because codex was skipped before dispatch, or because a first real codex
+    // attempt failed safely and failover re-routed — we record the family name
+    // only and hand the controller a null selection, which stops the failover
+    // loop with ZERO fallback-provider physical calls. Certification then FAILs
+    // on the missing terminal PASS / missing codex:default selection.
     const routeReviewerFn = (signals) => {
       const sel = providers.routeReviewerFn(signals);
-      if (sel?.family) reviewerSelections.push(sel.family);
+      if (!sel?.family) return sel;
+      if (sel.family !== 'codex:default') {
+        suppressedFallbackFamilies.push(sel.family);
+        return null;
+      }
+      reviewerSelections.push(sel.family);
       return sel;
     };
     const recordProviderFailure = (selection, failure) => {
@@ -171,6 +186,7 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
         + ` (codex:default runtime: ${JSON.stringify(transportRuntime?.['codex:default'] ?? null)})`);
     }
     if (reviewerSelections.length !== 1) failures.push(`Reviewer routed ${reviewerSelections.length} times (${reviewerSelections.join(' -> ')}); a single certification call must not failover`);
+    if (suppressedFallbackFamilies.length) failures.push(`production routing would have dispatched an out-of-scope fallback Reviewer family: ${suppressedFallbackFamilies.join(', ')}`);
     if (providerFailures.length) failures.push(`provider failover/failure recorded: ${JSON.stringify(providerFailures)}`);
     if ((tel.reviewerCalls ?? 0) !== 1) failures.push(`reviewerCalls=${tel.reviewerCalls}, expected 1`);
     if ((tel.supervisorCalls ?? 0) !== 0) failures.push(`supervisorCalls=${tel.supervisorCalls}, expected 0`);
@@ -193,6 +209,7 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
         usageBreakdown: tel.usageBreakdown ?? {},
         gatePass: (tel.reviewerCalls ?? 0) >= 1 || res.status === 'PASS',
         tempRepo: true,
+        ...(suppressedFallbackFamilies.length ? { suppressedFallbackFamilies } : {}),
         ...(failures.length ? { failures } : {}),
       },
     };
@@ -223,6 +240,7 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
     const providers = d.createProviders({ env: baseEnv, agyCatalog, transportRuntime });
 
     const supervisorSelections = [];
+    const suppressedFallbackFamilies = [];
     const providerFailures = [];
 
     // Reviewer: SYNTHETIC deterministic precondition. No real transport is
@@ -241,9 +259,20 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
       model: 'synthetic-precondition',
     });
 
+    // Certification target isolation — same contract as the Reviewer wrapper,
+    // scoped to agy:gemini. Production RoleRouter still chooses the candidate;
+    // the harness refuses to physically dispatch any Supervisor family outside
+    // certification scope. A skipped-before-dispatch Gemini, or a first real
+    // Gemini call that fails safely and re-routes, yields a null selection
+    // (failover loop stops, ZERO fallback calls) and a certification FAIL.
     const routeSupervisorFn = (signals) => {
       const sel = providers.routeSupervisorFn(signals);
-      if (sel?.family) supervisorSelections.push(sel.family);
+      if (!sel?.family) return sel;
+      if (sel.family !== 'agy:gemini') {
+        suppressedFallbackFamilies.push(sel.family);
+        return null;
+      }
+      supervisorSelections.push(sel.family);
       return sel;
     };
     const recordProviderFailure = (selection, failure) => {
@@ -282,6 +311,7 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
     if (!['REWORK', 'PASS'].includes(r2.status)) failures.push(`round 2 terminal is ${r2.status} (${r2.reason ?? ''})`);
     if (!r2.supervisorGuidance) failures.push('controller did not surface Supervisor guidance — Supervisor path did not complete');
     if (selectedSupervisorFamily !== 'agy:gemini') failures.push(`selected Supervisor family is ${selectedSupervisorFamily ?? 'none'}, expected agy:gemini`);
+    if (suppressedFallbackFamilies.length) failures.push(`production routing would have dispatched an out-of-scope fallback Supervisor family: ${suppressedFallbackFamilies.join(', ')}`);
     if ((tel.supervisorCalls ?? 0) !== 1) failures.push(`supervisorCalls=${tel.supervisorCalls}, expected 1`);
     if (supervisorFallback.length) failures.push(`Supervisor failover/failure recorded (certification does not fall back to Codex): ${JSON.stringify(supervisorFallback)}`);
     if (!supervisorRecord) failures.push('no durable Supervisor spend record — physical call not accounted');
@@ -302,6 +332,7 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
         usageBreakdown: tel.usageBreakdown ?? {},
         minimalAgent: providers.runtimeStatus?.['agy:gemini']?.runtimeAvailable === true,
         reviewerPrecondition: 'synthetic',
+        ...(suppressedFallbackFamilies.length ? { suppressedFallbackFamilies } : {}),
         ...(failures.length ? { failures } : {}),
       },
     };
