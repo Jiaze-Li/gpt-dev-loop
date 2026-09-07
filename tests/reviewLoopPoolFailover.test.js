@@ -77,16 +77,16 @@ test('pool: an unavailable CLI runtime records UNAVAILABLE health and is never s
     providerHealth: health,
     transportRuntime: {
       'codex:default': { available: false, reason: 'CLI not installed' },
-      'claude:opus': { available: false, reason: 'not logged in' },
+      'claude:opus': { available: false, reason: 'not authenticated' },
     },
   });
   assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
   assert.match(pool.runtimeStatus['codex:default'].reason, /runtime unavailable: CLI not installed/);
-  // supervisor still resolves, skipping both CLI families
+  assert.match(pool.runtimeStatus['claude:opus'].reason, /not authenticated/);
   assert.equal(pool.route('supervisor').family, 'agy:gemini');
 });
 
-test('controller: a CLI AUTH_FAILED (not logged in) fails over to the next family', async () => {
+test('controller: post-dispatch AUTH_REJECTED has unknown spend and MUST NOT fail over', async () => {
   const persistence = new MemoryPersistence();
   const tried = [];
   let n = 0;
@@ -99,10 +99,8 @@ test('controller: a CLI AUTH_FAILED (not logged in) fails over to the next famil
     recordProviderFailure: () => {},
     reviewerFn: async ({ selection }) => {
       tried.push(selection.family);
-      if (n++ === 0) {
-        throw Object.assign(new Error('codex exec failed (exit 1)'), { code: CLI_FAILURE.AUTH_FAILED });
-      }
-      return { value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } };
+      n += 1;
+      throw Object.assign(new Error('codex exec failed after prompt-bearing invocation: 401'), { code: CLI_FAILURE.AUTH_REJECTED });
     },
     captureBaselineFn: async () => ({ head: 'B', dirtyFiles: [], evidenceComplete: true }),
     collectWorkerDeltaFn: async () => ({ fingerprint: 'd', diff: 'x', changedFiles: ['a.js'], currentHead: 'B', evidenceComplete: true, noWorkerChangeYet: false }),
@@ -111,34 +109,28 @@ test('controller: a CLI AUTH_FAILED (not logged in) fails over to the next famil
   });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
   const r = await controller.review({ loopId });
-  assert.equal(r.status, 'PASS');
-  assert.deepEqual(tried, ['codex:default', 'agy:gpt-oss']);
+  assert.notEqual(r.status, 'PASS');
+  assert.deepEqual(tried, ['codex:default'], 'unknown-spend auth rejection must not reach a second family');
 
   const state = await persistence.readWorkflowState(loopId);
   const reservations = Object.values(state.modelSpendReservations ?? {});
-  assert.equal(reservations.length, 2);
-  assert.deepEqual(reservations.map((x) => x.family).sort(), ['agy:gpt-oss', 'codex:default']);
+  assert.equal(reservations.length, 1);
+  assert.equal(reservations[0].family, 'codex:default');
+  assert.equal(reservations[0].state, 'UNRESOLVED');
 });
 
-test('controller: every family unauthenticated -> failover exhausts and rethrows the last error', async () => {
-  const persistence = new MemoryPersistence();
-  const families = ['agy:gpt-oss', 'codex:default', 'claude:opus'];
-  let i = 0;
-  const controller = createReviewLoopController({
-    persistence,
-    routeReviewerFn: () => (i < families.length ? { family: families[i], provider: 'x', model: null, transport: async () => ({}) } : null),
-    recordProviderFailure: () => {},
-    reviewerFn: async () => {
-      i += 1;
-      throw Object.assign(new Error('not logged in'), { code: CLI_FAILURE.AUTH_FAILED });
+test('pool: locally unauthenticated CLI families are skipped deterministically before model dispatch', () => {
+  const health = new ProviderHealthRegistry();
+  const pool = createReviewLoopProviderPool({
+    callAgy: async () => ({}),
+    providerHealth: health,
+    transportRuntime: {
+      'codex:default': { available: false, reason: 'not authenticated' },
+      'claude:opus': { available: false, reason: 'not authenticated' },
     },
-    captureBaselineFn: async () => ({ head: 'B', dirtyFiles: [], evidenceComplete: true }),
-    collectWorkerDeltaFn: async () => ({ fingerprint: 'd', diff: 'x', changedFiles: ['a.js'], currentHead: 'B', evidenceComplete: true, noWorkerChangeYet: false }),
-    runGateFn: async () => ({ verdict: 'PASS', pass: true, fingerprint: 'g', failureIdentities: [], results: [] }),
-    discoverVerificationCommandsFn: () => ({ source: 'test', commands: ['echo'] }),
   });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
-  const r = await controller.review({ loopId });
-  // no eligible provider -> fail-closed, never PASS
-  assert.notEqual(r.status, 'PASS');
+  assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
+  assert.equal(pool.runtimeStatus['claude:opus'].runtimeAvailable, false);
+  assert.equal(pool.route('reviewer').family, 'agy:gpt-oss');
+  assert.equal(pool.route('supervisor').family, 'agy:gemini');
 });
