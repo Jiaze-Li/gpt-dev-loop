@@ -43,6 +43,7 @@ src/reviewloop/
     scratchCwd.js          shared isolated empty scratch cwd for every narrow transport
     boundedCli.js          bounded argv-only CLI runner (wall-clock timeout, process-group teardown)
     cliReviewTransports.js  narrow single-turn codex / claude Reviewer+Supervisor transports
+    minimalAgyAgent.js      deterministic provisioning of the workspace-local `reviewloop-minimal` AGY custom agent (inheritCustomizations:false)
   controller.js         reviewloop_begin + reviewloop_review
   runtimeDir.js         ~/.reviewloop
 
@@ -82,17 +83,35 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | --- | --- | --- | --- |
 | `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | argv-fixed 2026-09-07; **live-cert pending** (was `PROVIDER_PROTOCOL_ERROR` — see below) |
 | `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | ~16.9k input (~10.6k cache-read), output ~9 |
-| `agy:gpt-oss` | `--disable-slash-commands`, scratch cwd — that is the entire per-call surface `agy` exposes | user config, global MCP, tool schemas, agent memory, workspace preload — `agy` has **no** `--strict-mcp-config` / `--ignore-user-config` / `--setting-sources` / tool-disable / dynamic-section flag | ~12.1k input, no cache blow-up — acceptable |
-| `agy:gemini` | same as `agy:gpt-oss` (nothing meaningful) | same as `agy:gpt-oss` | **~150.7k input + ~656.8k cache-read** — an order of magnitude worse |
+| `agy:gpt-oss` | `--agent reviewloop-minimal` (workspace-local custom agent, `inheritCustomizations: false`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | ~12.1k input, no cache blow-up — acceptable (pre-minimal-agent baseline) |
+| `agy:gemini` | same as `agy:gpt-oss` | same as `agy:gpt-oss` | **~150.7k input + ~656.8k cache-read** (pre-minimal-agent baseline) — an order of magnitude worse |
+
+**AGY default-agent isolation (argv-wired 2026-09-07, live effect NOT YET
+CERTIFIED)**: ReviewLoop now runs both AGY families through a workspace-local
+`reviewloop-minimal` agent (`.agents/agents/reviewloop-minimal/agent.md` with
+`inheritCustomizations: false`) instead of AGY's ambient/default agent. It is
+provisioned deterministically and idempotently into the isolated scratch
+workspace only — never into `~/.gemini`, `~/.config`, AGY global settings/MCP
+config, or any pre-existing user agent/skill/plugin/rule, so plain `agy` use in
+a terminal is unchanged. This is intended to drop the inherited
+MCP/skills/rules/plugins/subagents context while preserving existing
+Antigravity authentication and subscription entitlement. If provisioning fails,
+the AGY families are marked **UNAVAILABLE** (fail closed) — ReviewLoop never
+silently falls back to the default AGY agent, since that would reintroduce the
+high-context ambient load. Effect on live token usage (the `agy:gemini`
+Supervisor figure above in particular) is **not yet certified**; the numbers in
+the table remain the pre-minimal-agent baseline.
 
 **`agy:gemini` is marked `highContext` in `DEFAULT_ROLE_POLICY` and excluded
 from automatic Reviewer/Supervisor routing** (`RoleRouter` skips a
 `highContext` candidate unless a caller passes `signals.allowHighContext ===
 true`). It stays last in both policy lists so a future `agy` release that adds
-a real narrowing flag can re-enable it with a one-line change. The only
-narrowing path `agy` offers today (`agy mcp disable`) mutates the user's
-global config, which ReviewLoop must not do. Routing order here follows the
-measured token cost above, not a subjective model-quality judgement.
+a real narrowing flag can re-enable it with a one-line change; re-adding it to
+automatic routing is gated on live certification of the `reviewloop-minimal`
+agent, not done here. `agy mcp disable` (the only other narrowing path) mutates
+the user's global config, which ReviewLoop must not do. Routing order here
+follows the measured token cost above, not a subjective model-quality
+judgement.
 
 **Claude `PROVIDER_PROTOCOL_ERROR` root cause (fixed 2026-09-07)**: the
 transport passed `--mcp-config '{}'`. The installed CLI (2.1.x) validates the

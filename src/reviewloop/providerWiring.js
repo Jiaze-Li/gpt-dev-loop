@@ -23,6 +23,7 @@ import {
 import { resolveModelFamily, MODEL_FAMILY_REGISTRY } from '../orchestrator/modelFamilyResolver.js';
 import { narrowReviewTransportCwd } from './adapters/scratchCwd.js';
 import { makeCodexReviewTransport, makeClaudeReviewTransport } from './adapters/cliReviewTransports.js';
+import { provisionMinimalAgyAgent, MINIMAL_AGY_AGENT_NAME } from './adapters/minimalAgyAgent.js';
 import { createGithubReviewBackend } from './githubBackend.js';
 
 export const ACTIVE_ROLE_POOLS = Object.freeze(Object.keys(DEFAULT_ROLE_POLICY));
@@ -195,6 +196,10 @@ export function createReviewLoopProviderPool({
   transportOverrides = null,
   // Injected into the codex/claude CLI transports (deterministic tests).
   spawn = undefined,
+  // Provisions the workspace-local `reviewloop-minimal` AGY custom agent into
+  // the isolated scratch cwd. Deterministic tests inject a fake (or a thrower
+  // to exercise the fail-closed path).
+  provisionMinimalAgent = provisionMinimalAgyAgent,
 } = {}) {
   // Resolve every registered family to a concrete model (or null = provider
   // default) at construction. Stable family identity in, concrete version out —
@@ -207,31 +212,56 @@ export function createReviewLoopProviderPool({
     Object.entries(resolution).map(([f, r]) => [f, r.resolvedModel]),
   );
 
-  // agy families: always wired here. Real agy availability surfaces at call
-  // time (AGY_ENOENT -> RETRYABLE -> failover), same as before.
+  // Both AGY families run through a dedicated workspace-local minimal agent
+  // (`--agent reviewloop-minimal`, inheritCustomizations:false) provisioned into
+  // the isolated scratch cwd. If provisioning fails we FAIL CLOSED: the AGY
+  // families are marked UNAVAILABLE and never wired — we do NOT silently fall
+  // back to AGY's ambient default agent, which would reintroduce the inherited
+  // MCP / skills / rules / plugins / subagents context this removes.
+  let minimalAgent = null;
+  let minimalAgentError = null;
+  try {
+    minimalAgent = provisionMinimalAgent({ cwd: narrowReviewTransportCwd() });
+  } catch (err) {
+    minimalAgentError = err;
+  }
+
+  // Real agy availability still surfaces at call time (AGY_ENOENT -> RETRYABLE
+  // -> failover), same as before — this only gates on the local agent file.
   const narrow = (family) => async (prompt) => {
     const res = await callAgy({
       prompt,
       model: modelForFamily[family] ?? null,
       cwd: narrowReviewTransportCwd(),
       disableSlashCommands: true,
+      agent: MINIMAL_AGY_AGENT_NAME,
     });
     return { ...res, meta: { promptChars: String(prompt ?? '').length } };
   };
-  const transports = {
-    'agy:gemini': narrow('agy:gemini'),
-    'agy:gpt-oss': narrow('agy:gpt-oss'),
-  };
+  const transports = {};
+  if (minimalAgent) {
+    transports['agy:gemini'] = narrow('agy:gemini');
+    transports['agy:gpt-oss'] = narrow('agy:gpt-oss');
+  }
 
   // adapterImplemented / runtimeAvailable / defaultModelResolution per family —
   // consumed by doctor and the pool-composition tests.
   const runtimeStatus = {};
   for (const family of ['agy:gemini', 'agy:gpt-oss']) {
+    const available = Boolean(minimalAgent);
     runtimeStatus[family] = {
-      adapterImplemented: true, runtimeAvailable: true, reason: 'wired (agy CLI; ENOENT -> failover at call time)',
+      adapterImplemented: true,
+      runtimeAvailable: available,
+      reason: available
+        ? 'wired (agy CLI + reviewloop-minimal agent; ENOENT -> failover at call time)'
+        : `fail-closed: reviewloop-minimal agent provisioning failed: ${minimalAgentError?.message ?? 'unknown error'}`,
+      minimalAgent: available ? { name: minimalAgent.name, path: minimalAgent.path } : null,
       defaultModelResolution: resolution[family].resolvedFrom,
       concreteVersionPinnedByDefault: resolution[family].concreteVersionPinned,
     };
+    if (!available) {
+      providerHealth.record(family, 'UNAVAILABLE', runtimeStatus[family].reason);
+    }
   }
 
   // CLI families: the adapter always exists. Wire the transport only when the

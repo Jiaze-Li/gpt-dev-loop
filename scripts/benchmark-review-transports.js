@@ -19,6 +19,8 @@ import {
 import { narrowReviewTransportCwd } from '../src/reviewloop/adapters/scratchCwd.js';
 import { payloadMetaOf, usageBreakdownOf, contextOverheadTokens } from '../src/reviewloop/reviewSpend.js';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
+import { createReviewLoopProviderPool } from '../src/reviewloop/providerWiring.js';
+import { MINIMAL_AGY_AGENT_NAME, MINIMAL_AGY_AGENT_RELATIVE_PATH } from '../src/reviewloop/adapters/minimalAgyAgent.js';
 
 const SYNTHETIC_PROMPT = [
   'You are an INDEPENDENT code reviewer. Judge ONLY against the original objective.',
@@ -188,11 +190,38 @@ export async function runFakeReviewLoopE2E() {
   };
 }
 
+// The AGY transport goes through callAgy (not a CLI adapter). Verify — with a
+// fake callAgy, ZERO real spawns — that both AGY families are wired through the
+// dedicated `reviewloop-minimal` custom agent and that the agent file is
+// materialised in the isolated scratch workspace.
+async function measureAgyMinimalAgent() {
+  const seen = [];
+  const pool = createReviewLoopProviderPool({
+    callAgy: async (opts) => { seen.push(opts); return { text: '{"findings":[]}', usage: { input_tokens: 1, output_tokens: 1 } }; },
+  });
+  const reviewer = pool.route('reviewer');
+  const supervisor = pool.route('supervisor', { allowHighContext: true });
+  if (reviewer?.transport) await reviewer.transport('P');
+  if (supervisor?.transport) await supervisor.transport('P');
+  const { existsSync } = await import('node:fs');
+  const path = await import('node:path');
+  return {
+    reviewerFamily: reviewer?.family ?? null,
+    supervisorFamily: supervisor?.family ?? null,
+    everyCallUsesMinimalAgent: seen.length > 0 && seen.every((o) => o.agent === MINIMAL_AGY_AGENT_NAME),
+    everyCallFromScratchCwd: seen.length > 0 && seen.every((o) => o.cwd === narrowReviewTransportCwd()),
+    noConversationResume: seen.every((o) => o.conversationId === undefined),
+    agentFileMaterialised: existsSync(path.join(narrowReviewTransportCwd(), MINIMAL_AGY_AGENT_RELATIVE_PATH)),
+    realSpawns: 0,
+  };
+}
+
 export async function runReviewTransportBenchmark() {
   const rows = [
     await measure('codex:default', (opts) => makeCodexReviewTransport(opts)),
     await measure('claude:opus', (opts) => makeClaudeReviewTransport({ ...opts, model: 'opus' })),
   ];
+  const agyMinimalAgent = await measureAgyMinimalAgent();
   const e2e = await runFakeReviewLoopE2E();
   return {
     benchmark: 'reviewloop.review-transports/v2',
@@ -200,6 +229,7 @@ export async function runReviewTransportBenchmark() {
     scratchCwd: narrowReviewTransportCwd(),
     syntheticPromptChars: SYNTHETIC_PROMPT.length,
     rows,
+    agyMinimalAgent,
     e2e,
     note: 'Deterministic fake spawn + fake provider functions. No real model invocation.',
   };
@@ -210,12 +240,15 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log(JSON.stringify(r, null, 2));
     const badTransport = r.rows.filter((x) => !x.narrowFlagsPresent || x.resumesConversation
       || !x.runsFromIsolatedScratchCwd || x.realSpawns !== 0);
+    const a = r.agyMinimalAgent;
+    const badAgy = !a.everyCallUsesMinimalAgent || !a.everyCallFromScratchCwd
+      || !a.noConversationResume || !a.agentFileMaterialised || a.realSpawns !== 0;
     const badE2E = r.e2e.A.statuses.join(',') !== 'PASS'
       || r.e2e.B.statuses.join(',') !== 'REWORK,PASS'
       || r.e2e.C.statuses.join(',') !== 'REWORK,REWORK'
       || r.e2e.C.supervisorCalls !== 1;
-    if (badTransport.length || badE2E) {
-      console.error('BENCHMARK REGRESSION', { badTransport, e2e: r.e2e });
+    if (badTransport.length || badE2E || badAgy) {
+      console.error('BENCHMARK REGRESSION', { badTransport, badAgy, agyMinimalAgent: r.agyMinimalAgent, e2e: r.e2e });
       process.exit(1);
     }
   });
