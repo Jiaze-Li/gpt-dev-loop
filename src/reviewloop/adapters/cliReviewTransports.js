@@ -11,9 +11,12 @@
 //   - output goes through the SAME strict structured normalization as the agy
 //     transport (providerWiring parseJsonish + validate*Payload); malformed ->
 //     HUMAN_REQUIRED, never CLEAN/PASS
-//   - quota / auth / unavailable / protocol / timeout failures throw a
-//     CliTransportError whose code is one of the RETRYABLE provider-failure
-//     codes the RoleRouter health/quota fallback already handles
+//
+// Authentication has a strict two-boundary treatment:
+//   - zero-token LOCAL preflight (`codex login status`, `claude auth status`)
+//     decides whether a CLI family is eligible before any model dispatch;
+//   - an auth-looking failure AFTER a prompt-bearing invocation starts is
+//     AUTH_REJECTED and is NOT proof of zero spend. Token Safety fails closed.
 //
 // No second retry/failover state machine: one physical attempt per call. The
 // controller's meteredWithFailover owns bounded failover; every physical
@@ -26,14 +29,27 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { narrowReviewTransportCwd } from './scratchCwd.js';
 import { runBoundedCli, classifyCliFailure, CliTransportError, CLI_FAILURE, probeCli } from './boundedCli.js';
 
-// Zero-token runtime availability probe for the CLI-backed families. Returns
-// { 'codex:default': {available, reason, version?}, 'claude:opus': {...} }.
-// Never throws. The adapter always exists; this only answers whether the
-// runtime is there.
+async function probeAuthenticatedCli(executable, authArgs, { spawn } = {}) {
+  const version = await probeCli(executable, { spawn });
+  if (!version.available) return version;
+
+  const auth = await runBoundedCli({ executable, args: authArgs, timeoutMs: 5_000, spawn });
+  if (auth.spawnErrorCode === 'ENOENT') return { available: false, reason: 'CLI not installed' };
+  if (auth.spawnErrorCode) return { available: false, reason: `auth probe failed: ${auth.spawnErrorCode}` };
+  if (auth.timedOut) return { available: false, reason: 'auth probe timed out' };
+  if (auth.code !== 0) {
+    return { available: false, reason: 'not authenticated', version: version.version, authChecked: true };
+  }
+  return { available: true, reason: 'ok', version: version.version, authChecked: true };
+}
+
+// Zero-token runtime + authentication preflight for the CLI-backed families.
+// `codex login status` and `claude auth status` are local account-status
+// commands; they do not carry a review prompt or start model inference.
 export async function probeReviewTransportRuntime({ spawn } = {}) {
   const [codex, claude] = await Promise.all([
-    probeCli('codex', { spawn }),
-    probeCli('claude', { spawn }),
+    probeAuthenticatedCli('codex', ['login', 'status'], { spawn }),
+    probeAuthenticatedCli('claude', ['auth', 'status'], { spawn }),
   ]);
   return { 'codex:default': codex, 'claude:opus': claude };
 }
@@ -47,7 +63,7 @@ function firstNumber(...vals) {
 
 // ---- Codex --------------------------------------------------------------
 //
-// `codex exec` narrow-mode flags (confirmed via `codex exec --help`):
+// `codex exec` narrow-mode flags:
 //   --ephemeral            no session files persisted
 //   --ignore-user-config   do not load $CODEX_HOME/config.toml (instructions)
 //   --ignore-rules         do not load user/project execpolicy .rules
@@ -72,10 +88,7 @@ export function makeCodexReviewTransport({
     if (typeof model === 'string' && model.trim() !== '') args.push('-m', model.trim());
     args.push(String(prompt));
 
-    let res;
-    try {
-      res = await runBoundedCli({ executable: 'codex', args, cwd, timeoutMs, spawn, env });
-    } finally { /* tmp cleaned below */ }
+    const res = await runBoundedCli({ executable: 'codex', args, cwd, timeoutMs, spawn, env });
 
     if (res.timedOut) {
       rmSync(tmp, { recursive: true, force: true });
@@ -131,9 +144,9 @@ export function makeCodexReviewTransport({
 //
 // `claude -p` narrow-mode flags:
 //   --output-format json                       machine-readable envelope
-//   --strict-mcp-config --mcp-config {}         no MCP servers
-//   --disallowedTools <all>                     no tool use
-//   --exclude-dynamic-system-prompt-sections    trims the system prompt
+//   --strict-mcp-config --mcp-config {}        no MCP servers
+//   --disallowedTools <all>                    no tool use
+//   --exclude-dynamic-system-prompt-sections   trims the system prompt
 //   (run from scratch cwd -> no CLAUDE.md / project context)
 // The `claude` shell alias adds --dangerously-skip-permissions; spawning the
 // binary directly (argv, not a shell) never sees that alias.
