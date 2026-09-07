@@ -73,20 +73,30 @@ the SAME strict normalization as agy — malformed → `HUMAN_REQUIRED`, never a
 clean empty result. One physical attempt per call; bounded failover lives in
 the controller, not in the transport.
 
-**Dynamic model-family resolution**: each registered family resolves to a
-concrete model (or the provider-default path) once at pool construction from
-the probed `agy models` catalog — a metadata listing, not a model call.
-`doctor` reports `versionPinnedByDefault=no` for every family.
+**Dynamic model-family resolution** preserves family semantics without
+concrete release pins. `agy:gemini` / `agy:gpt-oss` resolve from the probed
+`agy models` catalog when available; `codex:default` omits a model flag and
+tracks the Codex provider default; `claude:opus` passes the stable Claude CLI
+alias `--model opus`, which tracks the current Opus release. Provider-returned
+concrete model identity is persisted by telemetry. `doctor` must report
+`versionPinnedByDefault=no` for every family.
 
 **Pool composition is honest**: a family is either a WIRED transport that can
 actually be selected and called, or explicitly UNAVAILABLE with a recorded
-reason that distinguishes "adapter present, CLI missing / not authenticated"
-from "no adapter". The `codex` / `claude` adapters always exist; their
-transport is wired only when a zero-token `--version` probe at MCP startup
-says the CLI is there. There are no phantom always-skipped fallback entries.
-An unauthenticated CLI (`PROVIDER_AUTH_FAILED`) is a mechanically pre-send
-zero failure: it fails over to the next eligible family and never latches an
-unresolved-spend block.
+reason. The `codex` / `claude` adapters always exist, but production wires them
+only after two zero-model startup checks succeed: `--version` and the local
+auth-status command (`codex login status` / `claude auth status`). A missing or
+locally unauthenticated CLI is removed from eligibility before any ReviewLoop
+model permit is requested; routing can therefore choose the next family with
+zero model spend.
+
+**Authentication has two safety boundaries**. Local auth preflight is the only
+mechanically pre-dispatch authentication signal. If a prompt-bearing CLI
+invocation has already started and then returns a 401/403/authentication-looking
+failure, the transport classifies it as `PROVIDER_AUTH_REJECTED`, not as
+pre-send zero. Absent reliable provider usage, ModelSpendAuthority settles it
+UNRESOLVED and further spend/failover on the same evidence is blocked.
+`UNKNOWN != ZERO` wins over convenience.
 
 ## State machine
 
@@ -111,6 +121,11 @@ Default: `blockingSeverities = [P1, P2]`, `maxReviewRounds = 3`.
 - Round 3: P1/P2 still present → HUMAN_REQUIRED.
 - Any round with no P1 and no P2 → PASS. Waiting never consumes a round.
 - Identical evidence resubmitted → deterministic `NO_PROGRESS`, no model call.
+
+The zero-provider `benchmark:transports` harness mechanically covers the
+controller paths E2E-A (one-round PASS), E2E-B (REWORK → changed implementation
+→ PASS), and E2E-C (persistent blocker after changed implementation →
+Supervisor exactly once → REWORK), in addition to CLI transport narrowness.
 
 ## Token Safety
 
@@ -206,14 +221,15 @@ HEAD.
 
 **Complete physical-attempt accounting**: every settled metered attempt —
 success, known-usage failure, OR mechanically-zero pre-send failure
-(`PROVIDER_UNAVAILABLE` / `PROVIDER_AUTH_FAILED` / `AGY_ENOENT` /
-`AGY_SPAWN_FAILED` / `AGY_BAD_INPUT`) — writes a durable spend-log record
-tagged with its `reservationId` before the
-business error propagates. A normal failover therefore never looks like
-unaccounted spend on the next load. If a crash still leaves a `SETTLED_KNOWN`
-reservation with no matching record (orphan by `reservationId`), its real
-usage/cost are gone — `UNKNOWN != ZERO`, so every further metered call is
-refused (`MODEL_SPEND_USAGE_UNRESOLVED`) until a human acknowledges it
+(`PROVIDER_UNAVAILABLE` / `AGY_ENOENT` / `AGY_SPAWN_FAILED` /
+`AGY_BAD_INPUT`) — writes a durable spend-log record tagged with its
+`reservationId` before the business error propagates. Production CLI auth
+preflight happens before a model-spend permit and therefore creates no metered
+attempt at all. A normal failover never looks like unaccounted spend on the
+next load. If a crash still leaves a `SETTLED_KNOWN` reservation with no
+matching record (orphan by `reservationId`), its real usage/cost are gone —
+`UNKNOWN != ZERO`, so every further metered call is refused
+(`MODEL_SPEND_USAGE_UNRESOLVED`) until a human acknowledges it
 (`REVIEWLOOP_ACK_UNACCOUNTED_SPEND`).
 
 **Unknown dollar cost is never $0**: a provider that reports no cost yields
