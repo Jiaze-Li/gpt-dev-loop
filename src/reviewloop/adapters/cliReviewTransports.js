@@ -29,14 +29,44 @@ import { spawn as nodeSpawn } from 'node:child_process';
 import { narrowReviewTransportCwd } from './scratchCwd.js';
 import { runBoundedCli, classifyCliFailure, CliTransportError, CLI_FAILURE, probeCli } from './boundedCli.js';
 
-async function probeAuthenticatedCli(executable, authArgs, { spawn } = {}) {
-  const version = await probeCli(executable, { spawn });
+// Wall-clock bound for the zero-token local auth preflight, per executable.
+//
+// The old flat 5s bound produced a FALSE "auth probe timed out" -> UNAVAILABLE
+// for `claude`: Claude Code is a heavy Node CLI whose cold start plus
+// `claude auth status` (keychain read, config load) routinely runs past 5s on a
+// perfectly authenticated machine, while `codex login status` is a fast native
+// binary. Widen the bound so a merely-slow-but-valid probe is NOT mistaken for a
+// missing account — without ever waiting unbounded (still capped, still
+// fail-closed: a real timeout, a non-zero exit, or a spawn error are all still
+// UNAVAILABLE).
+export const DEFAULT_AUTH_PROBE_TIMEOUT_MS = Object.freeze({
+  codex: 10_000,
+  claude: 25_000,
+});
+const FALLBACK_AUTH_PROBE_TIMEOUT_MS = 10_000;
+export const MAX_AUTH_PROBE_TIMEOUT_MS = 60_000;
+export const AUTH_PROBE_TIMEOUT_ENV = 'REVIEWLOOP_AUTH_PROBE_TIMEOUT_MS';
+
+export function resolveAuthProbeTimeoutMs(executable, env = process.env) {
+  const raw = env?.[AUTH_PROBE_TIMEOUT_ENV];
+  const override = raw == null ? NaN : Number(raw);
+  if (Number.isFinite(override) && override > 0) {
+    return Math.min(override, MAX_AUTH_PROBE_TIMEOUT_MS);
+  }
+  return DEFAULT_AUTH_PROBE_TIMEOUT_MS[executable] ?? FALLBACK_AUTH_PROBE_TIMEOUT_MS;
+}
+
+async function probeAuthenticatedCli(executable, authArgs, { spawn, env = process.env, timeoutMs } = {}) {
+  const bound = Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? timeoutMs
+    : resolveAuthProbeTimeoutMs(executable, env);
+  const version = await probeCli(executable, { spawn, timeoutMs: bound });
   if (!version.available) return version;
 
-  const auth = await runBoundedCli({ executable, args: authArgs, timeoutMs: 5_000, spawn });
+  const auth = await runBoundedCli({ executable, args: authArgs, timeoutMs: bound, spawn, env });
   if (auth.spawnErrorCode === 'ENOENT') return { available: false, reason: 'CLI not installed' };
   if (auth.spawnErrorCode) return { available: false, reason: `auth probe failed: ${auth.spawnErrorCode}` };
-  if (auth.timedOut) return { available: false, reason: 'auth probe timed out' };
+  if (auth.timedOut) return { available: false, reason: `auth probe timed out after ${bound}ms` };
   if (auth.code !== 0) {
     return { available: false, reason: 'not authenticated', version: version.version, authChecked: true };
   }
@@ -46,10 +76,10 @@ async function probeAuthenticatedCli(executable, authArgs, { spawn } = {}) {
 // Zero-token runtime + authentication preflight for the CLI-backed families.
 // `codex login status` and `claude auth status` are local account-status
 // commands; they do not carry a review prompt or start model inference.
-export async function probeReviewTransportRuntime({ spawn } = {}) {
+export async function probeReviewTransportRuntime({ spawn, env = process.env } = {}) {
   const [codex, claude] = await Promise.all([
-    probeAuthenticatedCli('codex', ['login', 'status'], { spawn }),
-    probeAuthenticatedCli('claude', ['auth', 'status'], { spawn }),
+    probeAuthenticatedCli('codex', ['login', 'status'], { spawn, env }),
+    probeAuthenticatedCli('claude', ['auth', 'status'], { spawn, env }),
   ]);
   return { 'codex:default': codex, 'claude:opus': claude };
 }

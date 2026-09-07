@@ -10,6 +10,9 @@ import {
   makeCodexReviewTransport,
   makeClaudeReviewTransport,
   probeReviewTransportRuntime,
+  resolveAuthProbeTimeoutMs,
+  DEFAULT_AUTH_PROBE_TIMEOUT_MS,
+  MAX_AUTH_PROBE_TIMEOUT_MS,
 } from '../src/reviewloop/adapters/cliReviewTransports.js';
 import { CLI_FAILURE } from '../src/reviewloop/adapters/boundedCli.js';
 import { createReviewLoopProviderPool } from '../src/reviewloop/providerWiring.js';
@@ -28,7 +31,7 @@ function fakeSpawn(handler) {
     const r = handler({ command, args }) ?? {};
     child.kill = (signal) => { (child.killCalls ??= []).push(signal); return true; };
     if (r.neverCloses) return child;
-    queueMicrotask(() => {
+    const emitClose = () => {
       if (r.spawnError) { child.emit('error', Object.assign(new Error('spawn fail'), { code: r.spawnError })); return; }
       if (r.writesOutFile) {
         const i = args.indexOf('-o');
@@ -37,7 +40,9 @@ function fakeSpawn(handler) {
       if (r.stdout) child.stdout.emit('data', Buffer.from(r.stdout));
       if (r.stderr) child.stderr.emit('data', Buffer.from(r.stderr));
       child.emit('close', r.code ?? 0);
-    });
+    };
+    if (Number.isFinite(r.closeAfterMs)) setTimeout(emitClose, r.closeAfterMs);
+    else queueMicrotask(emitClose);
     return child;
   };
   spawn.calls = calls;
@@ -232,4 +237,62 @@ test('probeReviewTransportRuntime: missing CLI or local unauthenticated status i
   assert.equal(rt['claude:opus'].authChecked, true);
   assert.ok(spawn.calls.some((c) => c.command === 'codex' && c.args.join(' ') === 'login status'));
   assert.ok(spawn.calls.some((c) => c.command === 'claude' && c.args.join(' ') === 'auth status'));
+});
+
+// ---- auth-probe timeout: slow-but-valid is NOT unavailable -------------
+
+test('resolveAuthProbeTimeoutMs: generous per-CLI default, env override, hard cap', () => {
+  assert.equal(resolveAuthProbeTimeoutMs('claude', {}), DEFAULT_AUTH_PROBE_TIMEOUT_MS.claude);
+  assert.ok(DEFAULT_AUTH_PROBE_TIMEOUT_MS.claude >= 20_000, 'claude cold start + auth status routinely exceeds the old 5s');
+  assert.equal(resolveAuthProbeTimeoutMs('codex', {}), DEFAULT_AUTH_PROBE_TIMEOUT_MS.codex);
+  assert.equal(resolveAuthProbeTimeoutMs('claude', { REVIEWLOOP_AUTH_PROBE_TIMEOUT_MS: '15000' }), 15_000);
+  // never unbounded
+  assert.equal(resolveAuthProbeTimeoutMs('claude', { REVIEWLOOP_AUTH_PROBE_TIMEOUT_MS: '999999999' }), MAX_AUTH_PROBE_TIMEOUT_MS);
+  assert.equal(resolveAuthProbeTimeoutMs('claude', { REVIEWLOOP_AUTH_PROBE_TIMEOUT_MS: 'nonsense' }), DEFAULT_AUTH_PROBE_TIMEOUT_MS.claude);
+});
+
+test('probeReviewTransportRuntime: a slow-but-valid claude auth status stays AVAILABLE', async () => {
+  // auth status resolves exit 0 well past the old flat 5s bound but within the
+  // widened claude bound -> authenticated, not a phantom "timed out".
+  const spawn = fakeSpawn(({ command, args }) => {
+    if (args[0] === '--version') return { code: 0, stdout: `${command}-version` };
+    if (command === 'codex') return { code: 0, stdout: 'Logged in' };
+    if (command === 'claude' && args.join(' ') === 'auth status') {
+      return { code: 0, stdout: '{"loggedIn":true}', closeAfterMs: 60 };
+    }
+    return { code: 1 };
+  });
+  const rt = await probeReviewTransportRuntime({ spawn, env: { REVIEWLOOP_AUTH_PROBE_TIMEOUT_MS: '1000' } });
+  assert.equal(rt['claude:opus'].available, true);
+  assert.equal(rt['claude:opus'].authChecked, true);
+  assert.equal(rt['claude:opus'].reason, 'ok');
+});
+
+test('probeReviewTransportRuntime: a real claude auth failure is UNAVAILABLE (fail-closed preserved)', async () => {
+  const spawn = fakeSpawn(({ command, args }) => {
+    if (args[0] === '--version') return { code: 0, stdout: `${command}-version` };
+    if (command === 'codex') return { code: 0, stdout: 'Logged in' };
+    if (command === 'claude' && args.join(' ') === 'auth status') {
+      return { code: 1, stderr: 'Not authenticated. Run `claude login`.' };
+    }
+    return { code: 1 };
+  });
+  const rt = await probeReviewTransportRuntime({ spawn });
+  assert.equal(rt['claude:opus'].available, false);
+  assert.equal(rt['claude:opus'].reason, 'not authenticated');
+  assert.equal(rt['claude:opus'].authChecked, true);
+});
+
+test('probeReviewTransportRuntime: a genuinely hung auth probe still fails closed, bounded', async () => {
+  const started = Date.now();
+  const spawn = fakeSpawn(({ command, args }) => {
+    if (args[0] === '--version') return { code: 0, stdout: `${command}-version` };
+    if (command === 'codex') return { code: 0, stdout: 'Logged in' };
+    if (command === 'claude' && args.join(' ') === 'auth status') return { neverCloses: true };
+    return { code: 1 };
+  });
+  const rt = await probeReviewTransportRuntime({ spawn, env: { REVIEWLOOP_AUTH_PROBE_TIMEOUT_MS: '120' } });
+  assert.equal(rt['claude:opus'].available, false);
+  assert.match(rt['claude:opus'].reason, /auth probe timed out after 120ms/);
+  assert.ok(Date.now() - started < 5_000, 'the probe returned on its own bound, not an unbounded wait');
 });
