@@ -67,13 +67,19 @@ npm run doctor
 
 ## Certification status
 
-- ReviewLoop deterministic/mock certification: **PASS** (`npm test`, `npm run doctor`)
+- Last locally reported deterministic/mock certification before the latest
+  auth/alias/E2E rework: **PASS** (`npm test` 336/336, `npm run doctor`,
+  `npm run benchmark:transports`). The current head requires one local rerun
+  before merge; see `docs/ROADMAP.md` / PR #4.
 - ReviewLoop real-provider Reviewer/Supervisor E2E: **ATTEMPTED / NOT CERTIFIED**
   (a live `agy` Reviewer has been reached; no run has been carried to a
-  certified end-to-end verdict — see `docs/ROADMAP.md`)
-- `codex` / `claude` Reviewer/Supervisor transports: **IMPLEMENTED + mock-certified**
-  (narrow single-turn; wired only when the CLI is present; no real call made)
-- ReviewLoop real PR external-review loop: **NOT RUN**
+  certified end-to-end verdict).
+- `codex` / `claude` Reviewer/Supervisor transports: **IMPLEMENTED**;
+  production eligibility requires zero-model version + local-auth preflights.
+  No real Codex/Claude Reviewer/Supervisor call has been made.
+- `claude:opus` uses the stable provider alias `opus`; `codex:default` follows
+  the provider default. No concrete release is pinned by default.
+- ReviewLoop real PR external-review loop: **NOT RUN**.
 
 Historical SuperGPT V1/V2 measured numbers are labelled historical in
 `docs/history/` and are not ReviewLoop certification.
