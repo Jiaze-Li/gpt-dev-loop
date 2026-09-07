@@ -102,34 +102,69 @@ export function resolveReviewLoopLimits(env = process.env) {
   };
 }
 
-// usageVolume = input + output + cache_creation_input + cache_read_input
-// (whichever fields the provider telemetry reports). UNKNOWN != ZERO: a call
-// with no usage object at all contributes 0 volume but is flagged
-// usageKnown=false and still counts as a physical call.
-export function usageVolumeOf(usage) {
-  if (!usage || typeof usage !== 'object') return 0;
-  const f = (...keys) => {
-    for (const k of keys) {
-      const v = usage[k];
-      if (Number.isFinite(v)) return v;
-    }
-    return 0;
-  };
-  return f('input_tokens', 'inputTokens')
-    + f('output_tokens', 'outputTokens')
-    + f('cache_creation_input_tokens', 'cacheCreationInputTokens', 'cache_creation_input')
-    + f('cache_read_input_tokens', 'cacheReadInputTokens', 'cache_read_input');
+// ---- provider/family-aware token accounting --------------------------------
+//
+// `usageVolume` is the HARD safety ceiling (REVIEWLOOP_MAX_USAGE_VOLUME), so it
+// MUST NOT double-count. Cache semantics differ per provider family:
+//
+//   OpenAI / Codex : `cached` (a.k.a. cache_read) tokens are a SUBSET of the
+//                    input/prompt tokens, and reasoning tokens are a subset of
+//                    output. `input + output + cache_read` bills the cached
+//                    prefix twice. Codex live evidence: input 16922
+//                    (cache_read 10624 of it) + output 9 -> volume 16931.
+//   Anthropic      : cache_creation and cache_read are SEPARATE billing
+//                    categories from uncached input; thinking is already inside
+//                    output. All three input categories add.
+//   AGY (Gemini /  : the CLI surfaces a provider-reported authoritative total
+//   gpt-oss)         that is the source of truth (Gemini live: input 6713 +
+//                    output 539 == reported total 7252; cache_read 8128 is NOT
+//                    additive and is not even mechanically a subset of input).
+//
+// Precedence for every family:
+//   1. an authoritative provider-reported total  -> use it verbatim
+//   2. else a family-specific deterministic fallback (semantics confirmed)
+//   3. else a conservative additive sum, FLAGGED semanticsKnown:false —
+//      UNKNOWN != ZERO: never under-count a safety ceiling, never pretend the
+//      number is an exact provider figure.
+//
+// The raw per-field breakdown is ALWAYS preserved for telemetry regardless of
+// which method produced the volume.
+
+const ACCOUNTING_CLASS_BY_FAMILY = Object.freeze({
+  'codex:default': 'openai',
+  'claude:opus': 'anthropic',
+  'agy:gemini': 'agy',
+  'agy:gpt-oss': 'agy',
+});
+
+const ACCOUNTING_CLASS_BY_PROVIDER = Object.freeze({
+  codex: 'openai',
+  openai: 'openai',
+  claude: 'anthropic',
+  anthropic: 'anthropic',
+  'agy-gemini': 'agy',
+  'agy-claude-gpt': 'agy',
+  agy: 'agy',
+});
+
+// Deterministic accounting class from the ACTUAL family/provider bound into the
+// CallIntent — never guessed from a model-name string.
+export function accountingClassOf({ family = null, provider = null } = {}) {
+  if (typeof family === 'string' && ACCOUNTING_CLASS_BY_FAMILY[family]) {
+    return ACCOUNTING_CLASS_BY_FAMILY[family];
+  }
+  if (typeof provider === 'string' && ACCOUNTING_CLASS_BY_PROVIDER[provider]) {
+    return ACCOUNTING_CLASS_BY_PROVIDER[provider];
+  }
+  return 'unknown';
 }
 
-// Provider-reported usage broken out per field. UNKNOWN != ZERO: a field the
-// provider did not report is `null`, never 0. Persisted per physical call so
-// transport-context overhead ("diff 20k chars, yet input 120k tokens") is
-// diagnosable after the fact — never estimated into a hard number.
-export function usageBreakdownOf(usage) {
+// Raw provider usage fields, null (never 0) when unreported.
+function rawUsageFields(usage) {
   if (!usage || typeof usage !== 'object') {
     return {
       inputTokens: null, outputTokens: null, thinkingTokens: null,
-      cacheReadTokens: null, cacheCreationTokens: null, totalTokens: null,
+      cacheReadTokens: null, cacheCreationTokens: null, reportedTotalTokens: null,
     };
   }
   const g = (...keys) => {
@@ -139,17 +174,118 @@ export function usageBreakdownOf(usage) {
     }
     return null;
   };
-  const inputTokens = g('input_tokens', 'inputTokens', 'prompt_tokens');
-  const outputTokens = g('output_tokens', 'outputTokens', 'completion_tokens');
-  const thinkingTokens = g('thinking_tokens', 'thinkingTokens', 'reasoning_tokens', 'reasoningTokens');
-  const cacheReadTokens = g('cache_read_input_tokens', 'cacheReadInputTokens', 'cache_read_input', 'cache_read_tokens');
-  const cacheCreationTokens = g('cache_creation_input_tokens', 'cacheCreationInputTokens', 'cache_creation_input', 'cache_creation_tokens');
-  let totalTokens = g('total_tokens', 'totalTokens', 'total');
-  if (totalTokens == null) {
-    const parts = [inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens].filter((v) => Number.isFinite(v));
-    totalTokens = parts.length ? parts.reduce((a, b) => a + b, 0) : null;
+  return {
+    inputTokens: g('input_tokens', 'inputTokens', 'prompt_tokens'),
+    outputTokens: g('output_tokens', 'outputTokens', 'completion_tokens'),
+    thinkingTokens: g(
+      'thinking_tokens', 'thinkingTokens', 'reasoning_tokens', 'reasoningTokens',
+      'thoughts_token_count', 'thoughtsTokenCount',
+    ),
+    cacheReadTokens: g(
+      'cache_read_input_tokens', 'cacheReadInputTokens', 'cache_read_input', 'cache_read_tokens',
+      'cached_input_tokens', 'cached_content_token_count', 'cachedContentTokenCount',
+    ),
+    cacheCreationTokens: g(
+      'cache_creation_input_tokens', 'cacheCreationInputTokens', 'cache_creation_input', 'cache_creation_tokens',
+    ),
+    reportedTotalTokens: g(
+      'total_tokens', 'totalTokens', 'total', 'total_token_count', 'totalTokenCount',
+    ),
+  };
+}
+
+const tok = (v) => (Number.isFinite(v) ? v : 0);
+
+// Provider/family-aware deterministic accounting. Returns the budget
+// `usageVolume`, the method used to derive it, whether the cache semantics are
+// mechanically confirmed for this family, the authoritative provider total (or
+// null), and the raw breakdown. Callers MUST pass the real family + provider
+// bound into the CallIntent.
+export function usageAccountingOf({ usage = null, family = null, provider = null } = {}) {
+  const cls = accountingClassOf({ family, provider });
+  const b = rawUsageFields(usage);
+  const has = usage != null && typeof usage === 'object';
+  const build = (usageVolume, method, semanticsKnown) => ({
+    usageVolume,
+    usageAccountingMethod: method,
+    semanticsKnown,
+    accountingClass: cls,
+    reportedTotalTokens: b.reportedTotalTokens,
+    breakdown: b,
+  });
+
+  if (!has) return build(0, 'no_usage_reported', false);
+
+  // 1. authoritative provider-reported total — trusted for every family whose
+  //    envelope semantics we have confirmed carries a real aggregate total.
+  if (Number.isFinite(b.reportedTotalTokens)) {
+    return build(b.reportedTotalTokens, 'provider_total', true);
   }
-  return { inputTokens, outputTokens, thinkingTokens, cacheReadTokens, cacheCreationTokens, totalTokens };
+
+  // 2. family-specific deterministic fallback.
+  if (cls === 'openai') {
+    // cache_read ⊂ input, reasoning ⊂ output — add neither.
+    return build(tok(b.inputTokens) + tok(b.outputTokens), 'openai_input_plus_output', true);
+  }
+  if (cls === 'anthropic') {
+    // uncached input + output + the two separate cache categories.
+    return build(
+      tok(b.inputTokens) + tok(b.outputTokens) + tok(b.cacheCreationTokens) + tok(b.cacheReadTokens),
+      'anthropic_cache_additive', true,
+    );
+  }
+
+  // 3. AGY without an authoritative total, or a fully unknown provider: we
+  //    cannot prove whether cache_read is a subset or a separate category.
+  //    Sum every reported field (conservative — never under-count a safety
+  //    ceiling) and flag the semantics UNKNOWN.
+  return build(
+    tok(b.inputTokens) + tok(b.outputTokens) + tok(b.thinkingTokens)
+      + tok(b.cacheCreationTokens) + tok(b.cacheReadTokens),
+    'conservative_additive_unknown', false,
+  );
+}
+
+// Back-compat helper: the budget volume alone. Pass { family, provider } for
+// provider-aware accounting; without them the conservative additive path is
+// used (UNKNOWN != ZERO, may over-count — never silently under-count).
+export function usageVolumeOf(usage, { family = null, provider = null } = {}) {
+  return usageAccountingOf({ usage, family, provider }).usageVolume;
+}
+
+// Compact provenance persisted on every durable spend record: given a later
+// `usageVolume`, this says exactly how it was derived.
+export function accountingProvenanceOf(accounting) {
+  return {
+    method: accounting.usageAccountingMethod,
+    semanticsKnown: accounting.semanticsKnown === true,
+    accountingClass: accounting.accountingClass,
+    reportedTotalTokens: Number.isFinite(accounting.reportedTotalTokens)
+      ? accounting.reportedTotalTokens
+      : null,
+  };
+}
+
+// Provider-reported usage broken out per field. UNKNOWN != ZERO: a field the
+// provider did not report is `null`, never 0. Persisted per physical call so
+// transport-context overhead ("diff 20k chars, yet input 120k tokens") is
+// diagnosable after the fact — never estimated into a hard number.
+// `reportedTotalTokens` is STRICTLY what the provider reported (null if it did
+// not); `derivedTotalTokens` is our own additive roll-up and is never presented
+// as a provider figure.
+export function usageBreakdownOf(usage) {
+  const b = rawUsageFields(usage);
+  const parts = [b.inputTokens, b.outputTokens, b.cacheReadTokens, b.cacheCreationTokens]
+    .filter((v) => Number.isFinite(v));
+  return {
+    inputTokens: b.inputTokens,
+    outputTokens: b.outputTokens,
+    thinkingTokens: b.thinkingTokens,
+    cacheReadTokens: b.cacheReadTokens,
+    cacheCreationTokens: b.cacheCreationTokens,
+    reportedTotalTokens: b.reportedTotalTokens,
+    derivedTotalTokens: parts.length ? parts.reduce((a, c) => a + c, 0) : null,
+  };
 }
 
 // Mechanical payload-size metadata for a review/supervise physical call. Only
@@ -213,14 +349,22 @@ function foldTotals(records) {
     costUsd: acc.costUsd + (r.costKnown !== false && Number.isFinite(r.costUsd) ? r.costUsd : 0),
     unknownUsageCalls: acc.unknownUsageCalls + (r.usageKnown ? 0 : 1),
     unknownCostCalls: acc.unknownCostCalls + (r.costKnown === false ? 1 : 0),
-  }), { reviewerCalls: 0, supervisorCalls: 0, usageVolume: 0, costUsd: 0, unknownUsageCalls: 0, unknownCostCalls: 0 });
+    // A call whose usage WAS reported but whose cache semantics could not be
+    // mechanically confirmed for its provider family — its usageVolume is a
+    // conservative additive over-count, not an exact provider figure.
+    unknownSemanticsCalls: acc.unknownSemanticsCalls
+      + (r.usageKnown && r.usageAccounting && r.usageAccounting.semanticsKnown === false ? 1 : 0),
+  }), {
+    reviewerCalls: 0, supervisorCalls: 0, usageVolume: 0, costUsd: 0,
+    unknownUsageCalls: 0, unknownCostCalls: 0, unknownSemanticsCalls: 0,
+  });
 }
 
 // Aggregate provider usage breakdown + payload/overhead metadata across all
 // durable spend records. A field only sums where it was actually reported;
 // `*Unknown` counts the calls where it was not (UNKNOWN != 0).
 function foldBreakdown(records) {
-  const F = ['inputTokens', 'outputTokens', 'thinkingTokens', 'cacheReadTokens', 'cacheCreationTokens', 'totalTokens'];
+  const F = ['inputTokens', 'outputTokens', 'thinkingTokens', 'cacheReadTokens', 'cacheCreationTokens', 'reportedTotalTokens', 'derivedTotalTokens'];
   const sums = Object.fromEntries(F.map((k) => [k, 0]));
   const unknown = Object.fromEntries(F.map((k) => [`${k}Unknown`, 0]));
   let promptChars = 0;
@@ -515,13 +659,15 @@ export function createReviewLoopSpend({
         const costKnown = Number.isFinite(failCost) || isMechanicallyZeroPreSend(err);
         const failMeta = payloadMetaOf(err?.details?.meta ?? null);
         const failBreakdown = usageBreakdownOf(usage);
+        const failAccounting = usageAccountingOf({ usage, family, provider });
         await appendRecord({
           model: model ?? null,
           family,
           provider,
           usageKnown: usage != null,
-          usageVolume: usageVolumeOf(usage),
+          usageVolume: failAccounting.usageVolume,
           usageBreakdown: failBreakdown,
+          usageAccounting: accountingProvenanceOf(failAccounting),
           payloadMeta: failMeta,
           contextOverheadTokens: contextOverheadTokens(failBreakdown, failMeta),
           costUsd: Number.isFinite(failCost) ? failCost : 0,
@@ -535,6 +681,7 @@ export function createReviewLoopSpend({
 
     const okBreakdown = usageBreakdownOf(result?.usage);
     const okMeta = payloadMetaOf(result?.meta);
+    const okAccounting = usageAccountingOf({ usage: result?.usage, family, provider });
     await appendRecord({
       // requestedFamily -> resolvedModel: the concrete model actually used
       // (recovered from the provider envelope when config asked for a family).
@@ -543,7 +690,8 @@ export function createReviewLoopSpend({
       family,
       provider,
       usageKnown: result?.usage != null,
-      usageVolume: usageVolumeOf(result?.usage),
+      usageVolume: okAccounting.usageVolume,
+      usageAccounting: accountingProvenanceOf(okAccounting),
       usageBreakdown: okBreakdown,
       payloadMeta: okMeta,
       contextOverheadTokens: contextOverheadTokens(okBreakdown, okMeta),
@@ -569,6 +717,9 @@ export function createReviewLoopSpend({
       costKnown: (t.unknownCostCalls ?? 0) === 0,
       unknownCostCalls: t.unknownCostCalls ?? 0,
       unknownUsageCalls: t.unknownUsageCalls,
+      // usage reported but provider cache semantics unconfirmed -> that call's
+      // usageVolume is a conservative additive over-count.
+      unknownSemanticsCalls: t.unknownSemanticsCalls ?? 0,
       unaccountedSpendCalls: t.unaccountedSpendCalls ?? 0,
       spendBlocked: (t.unaccountedSpendCalls ?? 0) > 0 && !unaccountedAcknowledged(),
       limits,

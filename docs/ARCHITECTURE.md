@@ -83,32 +83,44 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | --- | --- | --- | --- |
 | `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | argv-fixed 2026-09-07; **live-cert pending** (was `PROVIDER_PROTOCOL_ERROR` — see below) |
 | `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | ~16.9k input (~10.6k cache-read), output ~9 |
-| `agy:gpt-oss` | `--agent reviewloop-minimal` (workspace-local custom agent, `inheritCustomizations: false`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | ~12.1k input, no cache blow-up — acceptable (pre-minimal-agent baseline) |
-| `agy:gemini` | same as `agy:gpt-oss` | same as `agy:gpt-oss` | **~150.7k input + ~656.8k cache-read** (pre-minimal-agent baseline) — an order of magnitude worse |
+| `agy:gpt-oss` | `--agent reviewloop-minimal` (workspace-local custom agent, `inheritCustomizations: false`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | ~12.1k input, ~196 output, cache-read 0, provider total ~12.3k — acceptable |
+| `agy:gemini` | same as `agy:gpt-oss` | same as `agy:gpt-oss` | minimal-agent: input 6713 + output 539 + thinking 506, cache-read 8128, **provider total 7252**, 8.4s (was ~150.7k input + ~656.8k cache-read, ~92.7s) |
 
-**AGY default-agent isolation (argv-wired 2026-09-07, live effect NOT YET
-CERTIFIED)**: ReviewLoop now runs both AGY families through a workspace-local
+**AGY minimal-agent transport — production transport live-certified
+(2026-09-07)**: ReviewLoop runs both AGY families through a workspace-local
 `reviewloop-minimal` agent (`.agents/agents/reviewloop-minimal/agent.md` with
 `inheritCustomizations: false`) instead of AGY's ambient/default agent. It is
 provisioned deterministically and idempotently into the isolated scratch
 workspace only — never into `~/.gemini`, `~/.config`, AGY global settings/MCP
 config, or any pre-existing user agent/skill/plugin/rule, so plain `agy` use in
-a terminal is unchanged. This is intended to drop the inherited
-MCP/skills/rules/plugins/subagents context while preserving existing
-Antigravity authentication and subscription entitlement. If provisioning fails,
-the AGY families are marked **UNAVAILABLE** (fail closed) — ReviewLoop never
-silently falls back to the default AGY agent, since that would reintroduce the
-high-context ambient load. Effect on live token usage (the `agy:gemini`
-Supervisor figure above in particular) is **not yet certified**; the numbers in
-the table remain the pre-minimal-agent baseline.
+a terminal is unchanged. It drops the inherited MCP/skills/rules/plugins/
+subagents context while preserving existing Antigravity authentication and
+subscription entitlement. If provisioning fails, the AGY families are marked
+**UNAVAILABLE** (fail closed) — ReviewLoop never silently falls back to the
+default AGY agent.
+
+A controlled `gemini-3.8-flash-high` Supervisor smoke (one real narrow-transport
+call, promptChars 502) confirms the token-context collapse:
+
+```
+before minimal agent:  input 150668, output 8078, thinking 5916,
+                       cache-read 656768, duration ~92734 ms
+after minimal agent:   input 6713, output 539, thinking 506,
+                       cache-read 8128, provider total 7252,
+                       duration 8375 ms, promptChars 502
+```
+
+This is a **controlled single-turn smoke of the production transport**, not a
+full ReviewLoop controller E2E. `agy:gemini` stays `highContext` / out of
+automatic routing (see below) pending a controller-level run.
 
 **`agy:gemini` is marked `highContext` in `DEFAULT_ROLE_POLICY` and excluded
 from automatic Reviewer/Supervisor routing** (`RoleRouter` skips a
 `highContext` candidate unless a caller passes `signals.allowHighContext ===
 true`). It stays last in both policy lists so a future `agy` release that adds
-a real narrowing flag can re-enable it with a one-line change; re-adding it to
-automatic routing is gated on live certification of the `reviewloop-minimal`
-agent, not done here. `agy mcp disable` (the only other narrowing path) mutates
+a real narrowing flag can re-enable it with a one-line change; the production
+transport is now live-certified (smoke above), but re-adding `agy:gemini` to
+automatic routing is gated on a full controller-level E2E, not done here. `agy mcp disable` (the only other narrowing path) mutates
 the user's global config, which ReviewLoop must not do. Routing order here
 follows the measured token cost above, not a subjective model-quality
 judgement.
@@ -187,13 +199,31 @@ Limits (`REVIEWLOOP_*`): `MAX_COST_USD`, `MAX_USAGE_VOLUME`,
 `MAX_REVIEW_ROUNDS`, `MAX_REVIEWER_CALLS`, `MAX_SUPERVISOR_CALLS`,
 `MAX_EXTERNAL_REVIEW_TRIGGERS`, `MAX_REVIEW_DIFF_CHARS`, `MAX_REVIEW_CHUNKS`.
 
-The aggregate budget (call counts, `usageVolume` = input + output + cache
-creation + cache read, `costUsd`) is **durable** and keyed by `loopId`: it
-accumulates across every `reviewloop_review` round, the Supervisor call, and a
-process restart. A crash after provider settlement cannot reset it — the
-reservation ledger is cross-checked on load and any settled/blocking metered
-reservation with no matching spend record is counted conservatively (call
-counted, usage UNKNOWN, never zero).
+The aggregate budget (call counts, `usageVolume`, `costUsd`) is **durable** and
+keyed by `loopId`: it accumulates across every `reviewloop_review` round, the
+Supervisor call, and a process restart. A crash after provider settlement
+cannot reset it — the reservation ledger is cross-checked on load and any
+settled/blocking metered reservation with no matching spend record is counted
+conservatively (call counted, usage UNKNOWN, never zero).
+
+**`usageVolume` is provider/family-aware** (`usageAccountingOf({ usage, family,
+provider })`, keyed off the actual family/provider bound into the CallIntent —
+never guessed from a model name). Cached tokens must not be double-counted into
+this hard ceiling:
+
+| Class | Method | Rule |
+| --- | --- | --- |
+| any | `provider_total` | an authoritative provider-reported total wins verbatim (AGY Gemini live: input 6713 + output 539 == reported total 7252; cache-read 8128 is **not** added) |
+| `openai` (`codex:default`) | `openai_input_plus_output` | `cache_read ⊂ input`, reasoning `⊂ output` — add neither (Codex live: input 16922 incl. 10624 cache-read, output 9 → volume **16931**, not 27555) |
+| `anthropic` (`claude:opus`) | `anthropic_cache_additive` | `input + output + cache_creation + cache_read` — the two cache categories are separate billing lines, never dropped (live: 2 + 1549 + 2168 + 1285 → **5004**) |
+| `agy` w/o total, or unknown provider | `conservative_additive_unknown` | sum every reported field, **flagged `semanticsKnown:false`** — UNKNOWN != ZERO: never under-count a safety ceiling, never present the number as an exact provider figure |
+
+The raw per-field breakdown (`usageBreakdownOf`) is always preserved for
+telemetry regardless of method — `reportedTotalTokens` is strictly what the
+provider reported (null otherwise); `derivedTotalTokens` is our own additive
+roll-up and is never presented as a provider figure. Every durable spend record
+carries `usageAccounting: { method, semanticsKnown, accountingClass,
+reportedTotalTokens }` provenance; telemetry surfaces `unknownSemanticsCalls`.
 
 **Malformed provider output** (unparseable, no findings channel, invalid
 severity, empty Supervisor guidance) is never reduced to a clean empty result —
