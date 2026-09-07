@@ -191,6 +191,25 @@ export const PROVIDER_CAPABILITIES = deepFreeze({
     soft: { reasoningEffort: field(T.UNAVAILABLE), verbosity: field(T.UNAVAILABLE) },
     unknownUsagePolicy: 'FAIL_CLOSED',
   }),
+  // AGY-hosted Claude Sonnet — Reviewer/Supervisor only, same isolated
+  // `reviewloop-minimal` transport as the other AGY families. Shares the AGY
+  // Claude&GPT quota pool with agy:gpt-oss.
+  'agy:sonnet': entry({
+    family: 'agy:sonnet',
+    provider: 'agy-claude-gpt',
+    executorEligible: false,
+    live: {
+      maxTurns: field(T.UNAVAILABLE),
+      runtimeLimit: field(T.UNAVAILABLE),
+      providerBudget: field(T.UNAVAILABLE),
+      thinkingLimit: field(T.UNAVAILABLE),
+      outputLimit: field(T.UNAVAILABLE),
+    },
+    preDispatch: { inputLimit: field(T.UNAVAILABLE) },
+    postRun: { usageGuard: field(T.UNAVAILABLE) },
+    soft: { reasoningEffort: field(T.UNAVAILABLE), verbosity: field(T.UNAVAILABLE) },
+    unknownUsagePolicy: 'FAIL_CLOSED',
+  }),
 });
 
 // Returns the frozen capability record for `family`, or null when the

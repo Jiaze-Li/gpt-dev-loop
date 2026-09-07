@@ -39,6 +39,14 @@ const CLI_TRANSPORT_FACTORY = Object.freeze({
   'claude:opus': makeClaudeReviewTransport,
 });
 
+// Every ReviewLoop-owned AGY family (agy:gemini, agy:gpt-oss, agy:sonnet, ...):
+// derived from the registry so a newly-registered agy:* family is wired through
+// the same isolated `reviewloop-minimal` path automatically — never left as an
+// unwired policy entry, and never silently falling back to AGY's ambient agent.
+const REVIEWLOOP_AGY_FAMILIES = Object.freeze(
+  Object.keys(MODEL_FAMILY_REGISTRY).filter((f) => f.startsWith('agy:')),
+);
+
 const SEVERITIES = new Set(['P1', 'P2', 'P3']);
 
 // Strict shape validation of a parsed Reviewer payload. Returns the payload
@@ -240,14 +248,13 @@ export function createReviewLoopProviderPool({
   };
   const transports = {};
   if (minimalAgent) {
-    transports['agy:gemini'] = narrow('agy:gemini');
-    transports['agy:gpt-oss'] = narrow('agy:gpt-oss');
+    for (const family of REVIEWLOOP_AGY_FAMILIES) transports[family] = narrow(family);
   }
 
   // adapterImplemented / runtimeAvailable / defaultModelResolution per family —
   // consumed by doctor and the pool-composition tests.
   const runtimeStatus = {};
-  for (const family of ['agy:gemini', 'agy:gpt-oss']) {
+  for (const family of REVIEWLOOP_AGY_FAMILIES) {
     const available = Boolean(minimalAgent);
     runtimeStatus[family] = {
       adapterImplemented: true,

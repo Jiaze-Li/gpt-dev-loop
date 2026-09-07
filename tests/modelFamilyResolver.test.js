@@ -84,11 +84,10 @@ test('5: the durable reservation + spend record persist the ACTUAL resolved mode
     callAgy: async () => ({ text: '{"findings":[]}', model: 'gemini-3.8-flash-high', usage: { input_tokens: 3, output_tokens: 1 } }),
     agyCatalog: ['gemini-3.8-flash-high', 'gpt-oss-999b-medium'],
   });
-  // gemini is high-context (excluded from automatic routing); with the CLI
-  // families unprobed, the degraded gpt-oss fallback is what supervisor picks,
-  // and its model still resolves from the probed catalog.
-  assert.equal(pool.route('supervisor').family, 'agy:gpt-oss');
-  assert.equal(pool.route('supervisor').model, 'gpt-oss-999b-medium');
+  // agy:gemini is first for supervisor and wired via reviewloop-minimal; its
+  // model still resolves from the probed catalog.
+  assert.equal(pool.route('supervisor').family, 'agy:gemini');
+  assert.equal(pool.route('supervisor').model, 'gemini-3.8-flash-high');
 
   const controller = createReviewLoopController({
     persistence,

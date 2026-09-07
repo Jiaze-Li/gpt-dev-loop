@@ -17,6 +17,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { Persistence } from '../orchestrator/persistence.js';
 import { isAuthorizationFailure } from '../orchestrator/errors.js';
+import { DEFAULT_ROLE_POLICY } from '../orchestrator/roleRouting.js';
 import { REVIEWLOOP_RUNTIME_ROOT } from './runtimeDir.js';
 import {
   createReviewObjective,
@@ -47,7 +48,20 @@ import { createPrReviewController, PR_REVIEW_OUTCOMES } from './prReviewControll
 import { chunkDiffForReview } from './diffChunker.js';
 
 const RUNTIME_ROOT = REVIEWLOOP_RUNTIME_ROOT;
-const MAX_PROVIDER_ATTEMPTS = 3;
+
+// Absolute ceiling on physical provider attempts for one metered operation —
+// purely a runaway guard. The EFFECTIVE bound is the role's own candidate count
+// (see providerAttemptBudget): every DEFAULT_ROLE_POLICY candidate must be
+// mechanically reachable when each earlier candidate fails safely, so a role
+// with N candidates gets up to N attempts. The `tried` set already stops a
+// family being re-attempted and `!selection` stops the loop when the pool is
+// exhausted; this ceiling only exists so a pathological policy can never spin.
+const PROVIDER_ATTEMPT_HARD_CEILING = 16;
+
+function providerAttemptBudget(role) {
+  const n = DEFAULT_ROLE_POLICY[role]?.length ?? 0;
+  return Math.min(Math.max(n, 1), PROVIDER_ATTEMPT_HARD_CEILING);
+}
 
 function sha256Hex(value) {
   return createHash('sha256').update(String(value)).digest('hex').slice(0, 32);
@@ -249,13 +263,17 @@ export function createReviewLoopController({
   // composite evidenceId, and attempt 1 durably CONSUMES it. Attempts 2..N
   // (attempt > 1) are authorized by that same prior claim — one logical
   // (diff + gate) state authorizes exactly one dispatch SEQUENCE, bounded by
-  // MAX_PROVIDER_ATTEMPTS — never a fresh consumption per attempt, and never
+  // the role's candidate count — never a fresh consumption per attempt, and never
   // a fresh dispatch on identical evidence for a first attempt (crash/resume
   // re-call included).
   async function meteredWithFailover({
     spend, role, routeFn, defaultFamily, defaultProvider, operationId, evidenceIds, invoke, workflowId = null,
   }) {
     const tried = new Set();
+    // Effective attempt bound = this role's candidate count, so every
+    // DEFAULT_ROLE_POLICY candidate is reachable when each earlier one fails
+    // safely. `tried` + a null selection still stop the loop early.
+    const maxAttempts = providerAttemptBudget(role);
     let lastErr = null;
     // Resume/continuation: if this exact (role, operationId) already durably
     // CONSUMED its evidence in a prior (crashed) session, this call is not a
@@ -270,7 +288,7 @@ export function createReviewLoopController({
       });
       if (priorClaim) startAttempt = 2;
     } catch { /* treat as a first attempt; authorize() re-checks deterministically */ }
-    for (let attempt = startAttempt; attempt < startAttempt + MAX_PROVIDER_ATTEMPTS; attempt += 1) {
+    for (let attempt = startAttempt; attempt < startAttempt + maxAttempts; attempt += 1) {
       let selection = null;
       if (routeFn) {
         selection = routeFn({ reworkCycles: attempt - startAttempt });

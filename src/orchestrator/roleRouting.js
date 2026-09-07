@@ -10,22 +10,43 @@ import os from 'node:os';
 // There is no `planner` and no `executor` role: execution is Worker-owned.
 // `highContext: true` families stay in the policy (a future adapter could
 // narrow them) but are NEVER chosen by automatic routing — only when a caller
-// explicitly opts in with `signals.allowHighContext === true`. `agy:gemini` is
-// marked high-context because the installed `agy` CLI exposes NO per-call lever
-// to narrow inference (no --strict-mcp-config / --ignore-user-config /
-// --setting-sources / tool-disable / dynamic-section trim); a real Supervisor
-// call was measured at ~150.7k input + ~656.8k cache-read tokens, an order of
-// magnitude above every other family. The only AGY narrowing path mutates the
-// user's global config, which ReviewLoop must not do. See docs/ARCHITECTURE.md.
+// explicitly opts in with `signals.allowHighContext === true`. No family is
+// marked high-context today: every AGY family now runs through the workspace-
+// local `reviewloop-minimal` agent (inheritCustomizations:false), which brought
+// a real agy:gemini Supervisor call down from ~150.7k input + ~656.8k
+// cache-read tokens to ~6.7k input + ~8.1k cache-read — in line with every
+// other family. See docs/ARCHITECTURE.md.
+//
+// Fixed deterministic routing (NO risk-based selection). Automatic failover
+// walks the whole list in order on any safe retryable provider/quota failure
+// until the pool is exhausted; every listed candidate is mechanically reachable
+// (asserted by the pool-completeness + traversal tests). Normal production
+// path keeps the three roles on different model families:
+//   Worker = Claude (external) / Reviewer = Codex / Supervisor = AGY Gemini.
 export const DEFAULT_ROLE_POLICY = Object.freeze({
-  supervisor: Object.freeze([{ family: 'codex:default', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gpt-oss', effort: 'medium', degraded: true }, { family: 'agy:gemini', effort: 'medium', highContext: true }]),
-  reviewer: Object.freeze([{ family: 'agy:gpt-oss', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gemini', effort: 'medium', highContext: true }]),
+  supervisor: Object.freeze([
+    { family: 'agy:gemini', effort: 'medium' },
+    { family: 'codex:default', effort: 'medium' },
+    { family: 'agy:sonnet', effort: 'medium' },
+    { family: 'claude:opus', effort: 'medium' },
+    { family: 'agy:gpt-oss', effort: 'medium', degraded: true },
+  ]),
+  reviewer: Object.freeze([
+    { family: 'codex:default', effort: 'medium' },
+    { family: 'agy:sonnet', effort: 'medium' },
+    { family: 'agy:gpt-oss', effort: 'medium' },
+    { family: 'claude:opus', effort: 'medium' },
+  ]),
 });
 
+// agy:sonnet + agy:gpt-oss share ONE AGY "Claude & GPT" quota pool
+// (`agy-claude-gpt`): a quota-exhaustion cooldown on either takes the other out
+// of routing without a wasted probe call. agy:gemini is a SEPARATE pool.
 export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
   'codex:default': ['codex'],
   'claude:opus': ['claude'],
   'agy:gemini': ['agy-gemini'],
+  'agy:sonnet': ['agy-claude-gpt'],
   'agy:gpt-oss': ['agy-claude-gpt'],
 });
 
@@ -37,6 +58,7 @@ export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
 export const PRODUCTION_ROLE_CAPABILITIES = Object.freeze({
   'codex:default': Object.freeze(['supervisor', 'reviewer']),
   'agy:gemini': Object.freeze(['supervisor', 'reviewer']),
+  'agy:sonnet': Object.freeze(['supervisor', 'reviewer']),
   'agy:gpt-oss': Object.freeze(['supervisor', 'reviewer']),
   'claude:opus': Object.freeze(['supervisor', 'reviewer']),
 });

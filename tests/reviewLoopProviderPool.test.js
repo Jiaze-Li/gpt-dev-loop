@@ -11,21 +11,22 @@ import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
 test('reviewer routes to the first eligible family; supervisor to its first', () => {
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}) });
-  assert.equal(pool.route('reviewer').family, 'agy:gpt-oss');
-  // codex:default + claude:opus: runtime not probed -> UNAVAILABLE; agy:gemini
-  // is high-context (excluded from automatic routing) -> the degraded gpt-oss
-  // fallback is the first family actually selectable for supervisor.
-  assert.equal(pool.route('supervisor').family, 'agy:gpt-oss');
+  // codex:default runtime not probed -> UNAVAILABLE; agy:sonnet is the first
+  // wired + healthy Reviewer family.
+  assert.equal(pool.route('reviewer').family, 'agy:sonnet');
+  // agy:gemini is first for supervisor and is wired via reviewloop-minimal.
+  assert.equal(pool.route('supervisor').family, 'agy:gemini');
 });
 
 test('reviewer first candidate in cooldown -> next eligible family selected', () => {
   const quota = new QuotaPoolRegistry({ filePath: null });
-  quota.recordCooldown('agy-claude-gpt'); // the pool backing agy:gpt-oss
+  quota.recordCooldown('agy-claude-gpt'); // the shared agy:sonnet + agy:gpt-oss pool
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}), quotaRegistry: quota });
-  // codex:default skipped (runtime not probed -> UNAVAILABLE); agy:gemini only
-  // reachable with an explicit high-context opt-in.
+  // codex + claude runtime not probed -> UNAVAILABLE; agy:sonnet AND agy:gpt-oss
+  // both skipped (shared exhausted pool) -> no eligible Reviewer.
   assert.equal(pool.route('reviewer'), null);
-  assert.equal(pool.route('reviewer', { allowHighContext: true }).family, 'agy:gemini');
+  // agy:gemini is a SEPARATE pool: still selectable for supervisor.
+  assert.equal(pool.route('supervisor').family, 'agy:gemini');
 });
 
 test('supervisor first candidate unavailable -> next eligible selected', () => {
@@ -33,7 +34,8 @@ test('supervisor first candidate unavailable -> next eligible selected', () => {
   health.record('agy:gemini', 'UNAVAILABLE');
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}), providerHealth: health });
   const sel = pool.route('supervisor');
-  assert.equal(sel.family, 'agy:gpt-oss'); // codex:default + claude:opus: runtime not probed -> UNAVAILABLE
+  // agy:gemini removed, codex/claude runtime not probed -> agy:sonnet.
+  assert.equal(sel.family, 'agy:sonnet');
 });
 
 test('the pool never offers a planner or executor role', () => {
@@ -46,13 +48,12 @@ test('the CallIntent family matches the actually-selected family', async () => {
   const persistence = new MemoryPersistence();
   const seenIntents = [];
   const health = new ProviderHealthRegistry();
-  health.record('agy:gpt-oss', 'UNAVAILABLE'); // force reviewer onto agy:gemini
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}), providerHealth: health });
 
   const controller = createReviewLoopController({
     persistence,
-    // gemini is high-context: an explicit opt-in is required to reach it.
-    routeReviewerFn: (signals) => pool.route('reviewer', { ...signals, allowHighContext: true }),
+    // codex/claude runtime not probed -> agy:sonnet is the selected Reviewer.
+    routeReviewerFn: (signals) => pool.route('reviewer', signals),
     reviewerFn: async ({ selection }) => {
       seenIntents.push(selection.family);
       return { value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } };
@@ -65,13 +66,13 @@ test('the CallIntent family matches the actually-selected family', async () => {
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
   const r = await controller.review({ loopId });
   assert.equal(r.status, 'PASS');
-  assert.equal(seenIntents[0], 'agy:gemini');
+  assert.equal(seenIntents[0], 'agy:sonnet');
 
   // the durable reservation ledger recorded the intent against the SAME family
   const state = await persistence.readWorkflowState(loopId);
   const reservations = Object.values(state.modelSpendReservations ?? {});
   assert.ok(reservations.length >= 1);
-  assert.ok(reservations.every((res) => res.family === 'agy:gemini'));
+  assert.ok(reservations.every((res) => res.family === 'agy:sonnet'));
 });
 
 test('a retryable provider failure fails over and requires a fresh permit', async () => {

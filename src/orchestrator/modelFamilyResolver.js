@@ -47,6 +47,20 @@ export const MODEL_FAMILY_REGISTRY = Object.freeze({
     defaultEffort: 'medium',
     stableAlias: null,
   }),
+  // AGY-hosted Claude Sonnet. Shares the AGY "Claude & GPT" quota pool with
+  // agy:gpt-oss (provider === 'agy-claude-gpt'); agy:gemini is a SEPARATE pool.
+  // `catalogPrefix: 'claude-sonnet-'` selects the newest Sonnet in the live
+  // `agy models` catalog (currently `claude-sonnet-4-6`); no reasoning-effort
+  // suffix variants exist for it, so `defaultEffort` is null.
+  'agy:sonnet': Object.freeze({
+    family: 'agy:sonnet',
+    provider: 'agy-claude-gpt',
+    cli: 'agy',
+    catalogPrefix: 'claude-sonnet-',
+    envKeys: Object.freeze(['REVIEWLOOP_SONNET_MODEL', 'AGY_SONNET_MODEL', 'AGY_MODEL']),
+    defaultEffort: null,
+    stableAlias: null,
+  }),
   'codex:default': Object.freeze({
     family: 'codex:default',
     provider: 'codex',

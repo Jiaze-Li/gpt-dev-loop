@@ -51,7 +51,14 @@ export const REVIEWLOOP_DEFAULTS = Object.freeze({
   // and MAX_USAGE_VOLUME are the real runaway guards. Default headroom is
   // (rounds) x (max chunks + 1).
   MAX_REVIEWER_CALLS: 3 * 13,
-  MAX_SUPERVISOR_CALLS: 2,
+  // The Supervisor is invoked at most ONCE per loop (controller guards on
+  // supervisorInvoked), but that single invocation drives automatic
+  // provider failover across the whole Supervisor pool. This ceiling must
+  // therefore be >= the Supervisor pool candidate count (currently 5:
+  // agy:gemini, codex:default, agy:sonnet, claude:opus, agy:gpt-oss) so the
+  // tail candidate stays mechanically reachable when every earlier one fails
+  // safely. MAX_COST_USD / MAX_USAGE_VOLUME remain the real runaway guards.
+  MAX_SUPERVISOR_CALLS: 5,
   MAX_EXTERNAL_REVIEW_TRIGGERS: 7,
 });
 
@@ -143,6 +150,7 @@ const ACCOUNTING_CLASS_BY_FAMILY = Object.freeze({
   'claude:opus': 'anthropic',
   'agy:gemini': 'agy',
   'agy:gpt-oss': 'agy',
+  'agy:sonnet': 'agy',
 });
 
 const ACCOUNTING_CLASS_BY_PROVIDER = Object.freeze({

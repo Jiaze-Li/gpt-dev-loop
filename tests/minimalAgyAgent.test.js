@@ -145,7 +145,7 @@ test('fail closed: provisioning failure marks both AGY families UNAVAILABLE, nev
     transportRuntime: null,
   });
 
-  for (const family of ['agy:gemini', 'agy:gpt-oss']) {
+  for (const family of ['agy:gemini', 'agy:gpt-oss', 'agy:sonnet']) {
     assert.equal(pool.runtimeStatus[family].runtimeAvailable, false);
     assert.match(pool.runtimeStatus[family].reason, /fail-closed: reviewloop-minimal agent provisioning failed/);
     assert.equal(pool.transports[family], undefined);
@@ -166,4 +166,5 @@ test('fail closed: with CLI runtime available, a provisioning failure still rout
   assert.equal(sel.family, 'codex:default');
   assert.equal(pool.transports['agy:gpt-oss'], undefined);
   assert.equal(pool.transports['agy:gemini'], undefined);
+  assert.equal(pool.transports['agy:sonnet'], undefined);
 });

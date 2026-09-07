@@ -1,9 +1,11 @@
 // Per-role agy model resolution for the Supervisor + Reviewer path.
 //
-// ReviewLoop configuration binds each role to a stable model FAMILY, never a
-// concrete released version (see src/orchestrator/modelFamilyResolver.js):
-//   - Supervisor family: Gemini  (agy:gemini)
-//   - Reviewer   family: GPT-OSS (agy:gpt-oss)
+// ReviewLoop configuration binds each role to an ordered pool of stable model
+// FAMILIES, never a concrete released version (see
+// src/orchestrator/modelFamilyResolver.js + roleRouting.js DEFAULT_ROLE_POLICY).
+// The AGY families in those pools are agy:gemini, agy:sonnet and agy:gpt-oss;
+// the helpers below resolve the two primary ones (Supervisor head = agy:gemini,
+// Reviewer low-cost fallback = agy:gpt-oss) for the telemetry/label layers.
 //
 // Concrete model resolution order (never throws):
 //   1. explicit env override — pins a concrete id (tests / benchmark / repro):

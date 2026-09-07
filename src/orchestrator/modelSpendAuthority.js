@@ -384,7 +384,8 @@ export class ModelSpendAuthority {
       // state that authorized attempt 1 covers attempts 2..N of the SAME
       // (role, operationId). This never CREATES eligibility — a first attempt
       // (attempt <= 1) with no fresh evidence is still denied below, and the
-      // retry count is bounded by the caller (MAX_PROVIDER_ATTEMPTS). It exists
+      // retry count is bounded by the caller (controller.js
+      // providerAttemptBudget(role) == that role's candidate count). It exists
       // so "one diff+gate logical state authorizes exactly one dispatch
       // SEQUENCE", not "each evidenceId is a separate dispatch token".
       if (!eligible && Number(intent.attempt) > 1) {

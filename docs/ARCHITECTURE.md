@@ -85,6 +85,7 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | ~16.9k input (~10.6k cache-read), output ~9 |
 | `agy:gpt-oss` | `--agent reviewloop-minimal` (workspace-local custom agent, `inheritCustomizations: false`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | ~12.1k input, ~196 output, cache-read 0, provider total ~12.3k — acceptable |
 | `agy:gemini` | same as `agy:gpt-oss` | same as `agy:gpt-oss` | minimal-agent: input 6713 + output 539 + thinking 506, cache-read 8128, **provider total 7252**, 8.4s (was ~150.7k input + ~656.8k cache-read, ~92.7s) |
+| `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | routing finalized; controller live certification pending |
 
 **AGY minimal-agent transport — production transport live-certified
 (2026-09-07)**: ReviewLoop runs both AGY families through a workspace-local
@@ -111,19 +112,90 @@ after minimal agent:   input 6713, output 539, thinking 506,
 ```
 
 This is a **controlled single-turn smoke of the production transport**, not a
-full ReviewLoop controller E2E. `agy:gemini` stays `highContext` / out of
-automatic routing (see below) pending a controller-level run.
+full ReviewLoop controller E2E.
 
-**`agy:gemini` is marked `highContext` in `DEFAULT_ROLE_POLICY` and excluded
-from automatic Reviewer/Supervisor routing** (`RoleRouter` skips a
-`highContext` candidate unless a caller passes `signals.allowHighContext ===
-true`). It stays last in both policy lists so a future `agy` release that adds
-a real narrowing flag can re-enable it with a one-line change; the production
-transport is now live-certified (smoke above), but re-adding `agy:gemini` to
-automatic routing is gated on a full controller-level E2E, not done here. `agy mcp disable` (the only other narrowing path) mutates
-the user's global config, which ReviewLoop must not do. Routing order here
-follows the measured token cost above, not a subjective model-quality
-judgement.
+### Final fixed routing (deterministic — NO risk-based selection)
+
+`DEFAULT_ROLE_POLICY` is a fixed ordered list per role. There is no diff-size,
+filename, or keyword heuristic and no risk classifier — automatic failover
+simply walks the list in order.
+
+| Order | Reviewer | Supervisor |
+| --- | --- | --- |
+| 1 | `codex:default` | `agy:gemini` |
+| 2 | `agy:sonnet` | `codex:default` |
+| 3 | `agy:gpt-oss` | `agy:sonnet` |
+| 4 | `claude:opus` | `claude:opus` |
+| 5 | — | `agy:gpt-oss` (`degraded: true`) |
+
+Normal production path keeps the three roles on different model families:
+Worker = Claude (external), Reviewer = Codex, Supervisor = AGY Gemini. GPT-OSS
+is a deliberate low-cost third Reviewer fallback (not degraded); as a Supervisor
+it is only the last-resort degraded保底 when every stronger family is down.
+
+No family is `highContext` any more: every AGY family (`agy:gemini`,
+`agy:gpt-oss`, `agy:sonnet`) runs through the `reviewloop-minimal` agent, which
+collapsed the measured `agy:gemini` tax into line with the other families, so
+`agy:gemini` participates in ordinary automatic routing. The generic
+`RoleRouter` `highContext` mechanism (skipped unless
+`signals.allowHighContext === true`) is retained for any future family that
+needs it.
+
+### Shared quota topology
+
+```
+agy:sonnet  ─┐
+             ├─ agy-claude-gpt  (one AGY "Claude & GPT" quota pool)
+agy:gpt-oss ─┘
+agy:gemini  ─── agy-gemini      (separate Gemini quota pool)
+codex:default ─ codex
+claude:opus  ── claude
+```
+
+A `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_RATE_LIMITED` cooldown on `agy:sonnet`
+puts `agy-claude-gpt` into cooldown, so the sibling `agy:gpt-oss` is skipped at
+route time — no wasted physical call to confirm the same pool is empty. A
+model-specific `agy:sonnet` health failure that is NOT a quota failure leaves
+the shared pool healthy and `agy:gpt-oss` still selectable; family health and
+shared-pool health stay independent.
+
+### Automatic failover (the user does not participate)
+
+Any of the following, when the existing spend-safety semantics allow it,
+automatically advances to the next candidate — up to one attempt per unique
+candidate, then the pool is exhausted and the loop stops (never an infinite
+retry; the `tried` set + a null route both stop it early):
+
+- quota exhausted / rate limited
+- pre-send CLI unavailable / executable missing / local auth unavailable
+- mechanically pre-send spawn failure
+- provider family health unavailable
+- known-settled retryable provider/protocol failure
+
+The effective attempt bound is the role's own candidate count
+(`providerAttemptBudget(role)` in `controller.js`), replacing the old
+hard-coded `MAX_PROVIDER_ATTEMPTS = 3` which could leave the 4th Reviewer / 5th
+Supervisor candidate permanently unreachable. `MAX_SUPERVISOR_CALLS` is
+likewise raised to the Supervisor pool size (5) so one supervised round can
+traverse the whole pool. A `PROVIDER_ATTEMPT_HARD_CEILING` (16) remains purely
+as a runaway guard.
+
+**The one spend-safety stop that is NOT a failover:** if a physical call was
+already dispatched and its usage cannot be reliably settled
+(`MODEL_SPEND_USAGE_UNRESOLVED`), UNKNOWN ≠ ZERO — ReviewLoop fails closed to a
+deterministic terminal and does NOT burn another provider "to be safe". This is
+a safety stop, not an interactive prompt.
+
+### Pool-completeness invariant
+
+`tests/reviewLoopFinalRoutingPool.test.js` mechanically asserts, with zero
+provider calls, that every `DEFAULT_ROLE_POLICY` candidate is: in
+`MODEL_FAMILY_REGISTRY`, role-declared in `PRODUCTION_ROLE_CAPABILITIES`, has a
+quota topology, a provider-capability record, a known accounting class, a wired
+transport, a reported runtime status, and (AGY families) runs
+`--agent reviewloop-minimal`. Plus full ordered traversal at both `route()` and
+controller (`meteredWithFailover`) level, including the no-skip regression for
+the retired attempt cap and the shared-quota sibling skip.
 
 **Claude `PROVIDER_PROTOCOL_ERROR` root cause (fixed 2026-09-07)**: the
 transport passed `--mcp-config '{}'`. The installed CLI (2.1.x) validates the
@@ -134,8 +206,9 @@ protocol error rather than an auth or inference failure. The value is now
 `'{"mcpServers":{}}'`.
 
 **Dynamic model-family resolution** preserves family semantics without
-concrete release pins. `agy:gemini` / `agy:gpt-oss` resolve from the probed
-`agy models` catalog when available; `codex:default` omits a model flag and
+concrete release pins. `agy:gemini` / `agy:gpt-oss` / `agy:sonnet` resolve from
+the probed `agy models` catalog when available (by `catalogPrefix`: `gemini-` /
+`gpt-oss-` / `claude-sonnet-`); `codex:default` omits a model flag and
 tracks the Codex provider default; `claude:opus` passes the stable Claude CLI
 alias `--model opus`, which tracks the current Opus release. Provider-returned
 concrete model identity is persisted by telemetry. `doctor` must report
