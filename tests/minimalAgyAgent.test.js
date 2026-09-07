@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 
 import {
@@ -17,23 +17,37 @@ import {
   MINIMAL_AGY_AGENT_RELATIVE_PATH,
   MINIMAL_AGY_AGENT_MARKDOWN,
 } from '../src/reviewloop/adapters/minimalAgyAgent.js';
-import { createReviewLoopProviderPool, narrowReviewTransportCwd } from '../src/reviewloop/providerWiring.js';
+import {
+  createReviewLoopProviderPool, narrowReviewTransportCwd, narrowAgyGeminiDir,
+} from '../src/reviewloop/providerWiring.js';
 
 function scratch() {
   return mkdtempSync(path.join(os.tmpdir(), 'reviewloop-minimal-agent-'));
 }
 
-test('provisioning writes .agents/agents/reviewloop-minimal/agent.md into the given workspace', () => {
-  const cwd = scratch();
+// A fake callAgy that also writes the agy activation marker to opts.logFile,
+// so pool per-call verification (when enforced) passes for a faked transport.
+function fakeCallAgyWithLog(seen) {
+  return async (opts) => {
+    if (seen) seen.push(opts);
+    if (opts?.logFile) {
+      try { writeFileSync(opts.logFile, 'Starting new conversation (agent=true)\n'); } catch { /* ignore */ }
+    }
+    return { text: '{"findings":[]}', usage: { input_tokens: 1, output_tokens: 1 } };
+  };
+}
+
+test('provisioning writes config/agents/reviewloop-minimal/agent.md into the given gemini dir', () => {
+  const gd = scratch();
   try {
-    const res = provisionMinimalAgyAgent({ cwd });
+    const res = provisionMinimalAgyAgent({ geminiDir: gd });
     assert.equal(res.name, MINIMAL_AGY_AGENT_NAME);
     assert.equal(res.relativePath, MINIMAL_AGY_AGENT_RELATIVE_PATH);
-    assert.equal(res.path, path.join(cwd, '.agents', 'agents', 'reviewloop-minimal', 'agent.md'));
+    assert.equal(res.path, path.join(gd, 'config', 'agents', 'reviewloop-minimal', 'agent.md'));
     assert.equal(res.wrote, true);
     assert.equal(readFileSync(res.path, 'utf8'), MINIMAL_AGY_AGENT_MARKDOWN);
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    rmSync(gd, { recursive: true, force: true });
   }
 });
 
@@ -48,12 +62,12 @@ test('the definition disables inherited customizations', () => {
 });
 
 test('provisioning is idempotent — a second run does not rewrite identical content', () => {
-  const cwd = scratch();
+  const gd = scratch();
   try {
-    assert.equal(provisionMinimalAgyAgent({ cwd }).wrote, true);
-    assert.equal(provisionMinimalAgyAgent({ cwd }).wrote, false);
+    assert.equal(provisionMinimalAgyAgent({ geminiDir: gd }).wrote, true);
+    assert.equal(provisionMinimalAgyAgent({ geminiDir: gd }).wrote, false);
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    rmSync(gd, { recursive: true, force: true });
   }
 });
 
@@ -62,7 +76,7 @@ test('provisioning refuses to write into HOME or a global-config tree', () => {
   for (const target of [home, path.join(home, '.gemini'), path.join(home, '.gemini', 'agents'),
     path.join(home, '.config', 'whatever'), path.join(home, '.antigravity')]) {
     assert.throws(
-      () => provisionMinimalAgyAgent({ cwd: target }),
+      () => provisionMinimalAgyAgent({ geminiDir: target }),
       (err) => err instanceof MinimalAgyAgentProvisionError && /refusing to provision/.test(err.message),
       `expected refusal for ${target}`,
     );
@@ -70,7 +84,7 @@ test('provisioning refuses to write into HOME or a global-config tree', () => {
 });
 
 test('provisioning surfaces a typed error (never a partial success) on a filesystem failure', () => {
-  const cwd = scratch();
+  const gd = scratch();
   try {
     const fs = {
       mkdirSync() {},
@@ -78,19 +92,17 @@ test('provisioning surfaces a typed error (never a partial success) on a filesys
       writeFileSync() { throw new Error('EACCES: read-only file system'); },
     };
     assert.throws(
-      () => provisionMinimalAgyAgent({ cwd, fs }),
+      () => provisionMinimalAgyAgent({ geminiDir: gd, fs }),
       (err) => err instanceof MinimalAgyAgentProvisionError && err.code === 'AGY_MINIMAL_AGENT_PROVISION_FAILED',
     );
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    rmSync(gd, { recursive: true, force: true });
   }
 });
 
-test('pool: both AGY families are wired through --agent reviewloop-minimal, from the isolated scratch cwd', async () => {
+test('pool: both AGY families are wired through --agent reviewloop-minimal, pointed at the isolated gemini dir', async () => {
   const seen = [];
-  const pool = createReviewLoopProviderPool({
-    callAgy: async (opts) => { seen.push(opts); return { text: '{"findings":[]}', usage: { input_tokens: 1, output_tokens: 1 } }; },
-  });
+  const pool = createReviewLoopProviderPool({ callAgy: fakeCallAgyWithLog(seen) });
 
   const reviewer = pool.route('reviewer');
   const supervisor = pool.route('supervisor', { allowHighContext: true });
@@ -102,11 +114,12 @@ test('pool: both AGY families are wired through --agent reviewloop-minimal, from
   for (const opts of seen) {
     assert.equal(opts.agent, MINIMAL_AGY_AGENT_NAME);
     assert.equal(opts.cwd, narrowReviewTransportCwd());
+    assert.equal(opts.geminiDir, narrowAgyGeminiDir());
     assert.equal(opts.disableSlashCommands, true);
     assert.equal(opts.conversationId, undefined);
   }
-  // the agent file really exists in the scratch workspace the transport runs from
-  assert.ok(existsSync(path.join(narrowReviewTransportCwd(), MINIMAL_AGY_AGENT_RELATIVE_PATH)));
+  // the agent file really exists under the isolated gemini dir agy is pointed at
+  assert.ok(existsSync(path.join(narrowAgyGeminiDir(), MINIMAL_AGY_AGENT_RELATIVE_PATH)));
 });
 
 test('pool: production argv (via agyClient) contains --agent reviewloop-minimal', async () => {

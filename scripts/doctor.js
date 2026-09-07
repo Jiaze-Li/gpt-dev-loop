@@ -208,7 +208,10 @@ export function runDoctor({ execSync, log, env } = {}) {
   const transports = checkReviewTransportRuntime({ execSync: exec, env: environment });
   for (const [family, s] of Object.entries(transports.families)) {
     const rt = s.runtimeAvailable ? 'runtime available + locally authenticated' : `runtime UNAVAILABLE (${s.reason})`;
-    write(`  info  transport ${family}: adapter=${s.adapterImplemented ? 'yes' : 'NO'}, ${rt}, model=${s.defaultModelResolution ?? 'n/a'}, versionPinnedByDefault=${s.concreteVersionPinnedByDefault ? 'YES' : 'no'}`);
+    const iso = family.startsWith('agy:')
+      ? `, isolatedAgentLoading=${s.effectiveLoadingVerified ? 'verified' : 'not probed here (verified at MCP startup + per call)'}`
+      : '';
+    write(`  info  transport ${family}: adapter=${s.adapterImplemented ? 'yes' : 'NO'}, ${rt}${iso}, model=${s.defaultModelResolution ?? 'n/a'}, versionPinnedByDefault=${s.concreteVersionPinnedByDefault ? 'YES' : 'no'}`);
   }
 
   const gh = checkGithubCapability({ execSync: exec });

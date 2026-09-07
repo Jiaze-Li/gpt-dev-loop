@@ -38,7 +38,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
-import { createProductionReviewLoopProviders } from '../src/reviewloop/providerWiring.js';
+import {
+  createProductionReviewLoopProviders,
+  detectAgyCustomAgentSupport,
+  narrowAgyGeminiDir,
+} from '../src/reviewloop/providerWiring.js';
 import { probeAgyModelCatalog } from '../src/agy/agyModelCatalog.js';
 import { probeReviewTransportRuntime } from '../src/reviewloop/adapters/cliReviewTransports.js';
 
@@ -116,6 +120,7 @@ const defaultDeps = Object.freeze({
   createProviders: (opts) => createProductionReviewLoopProviders(opts),
   probeAgyModelCatalog: () => probeAgyModelCatalog(),
   probeReviewTransportRuntime: (o) => probeReviewTransportRuntime(o),
+  detectAgyCustomAgentSupport: () => detectAgyCustomAgentSupport({ geminiDir: narrowAgyGeminiDir() }),
 });
 
 // ---- Mode A: reviewer -------------------------------------------------------
@@ -130,7 +135,8 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     const baseEnv = { ...env, ...MODE_CEILINGS.reviewer };
     const agyCatalog = d.probeAgyModelCatalog();
     const transportRuntime = await d.probeReviewTransportRuntime();
-    const providers = d.createProviders({ env: baseEnv, agyCatalog, transportRuntime });
+    const customAgentSupport = await d.detectAgyCustomAgentSupport();
+    const providers = d.createProviders({ env: baseEnv, agyCatalog, transportRuntime, customAgentSupport });
 
     const reviewerSelections = [];
     const suppressedFallbackFamilies = [];
@@ -237,7 +243,8 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
     const baseEnv = { ...env, ...MODE_CEILINGS.supervisor };
     const agyCatalog = d.probeAgyModelCatalog();
     const transportRuntime = await d.probeReviewTransportRuntime();
-    const providers = d.createProviders({ env: baseEnv, agyCatalog, transportRuntime });
+    const customAgentSupport = await d.detectAgyCustomAgentSupport();
+    const providers = d.createProviders({ env: baseEnv, agyCatalog, transportRuntime, customAgentSupport });
 
     const supervisorSelections = [];
     const suppressedFallbackFamilies = [];
@@ -311,6 +318,8 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
     if (!['REWORK', 'PASS'].includes(r2.status)) failures.push(`round 2 terminal is ${r2.status} (${r2.reason ?? ''})`);
     if (!r2.supervisorGuidance) failures.push('controller did not surface Supervisor guidance — Supervisor path did not complete');
     if (selectedSupervisorFamily !== 'agy:gemini') failures.push(`selected Supervisor family is ${selectedSupervisorFamily ?? 'none'}, expected agy:gemini`);
+    if (customAgentSupport?.supported !== true) failures.push(`agy custom-agent capability probe did not confirm isolated-agent loading: ${customAgentSupport?.reason ?? 'unknown'}`);
+    if (providers.runtimeStatus?.['agy:gemini']?.effectiveLoadingVerified !== true) failures.push('agy:gemini effective-loading verification is not active');
     if (suppressedFallbackFamilies.length) failures.push(`production routing would have dispatched an out-of-scope fallback Supervisor family: ${suppressedFallbackFamilies.join(', ')}`);
     if ((tel.supervisorCalls ?? 0) !== 1) failures.push(`supervisorCalls=${tel.supervisorCalls}, expected 1`);
     if (supervisorFallback.length) failures.push(`Supervisor failover/failure recorded (certification does not fall back to Codex): ${JSON.stringify(supervisorFallback)}`);
@@ -331,6 +340,8 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
         usageAccounting: supervisorRecord?.usageAccounting ?? {},
         usageBreakdown: tel.usageBreakdown ?? {},
         minimalAgent: providers.runtimeStatus?.['agy:gemini']?.runtimeAvailable === true,
+        effectiveLoadingVerified: providers.runtimeStatus?.['agy:gemini']?.effectiveLoadingVerified === true,
+        customAgentSupport: { supported: customAgentSupport?.supported === true, reason: customAgentSupport?.reason ?? null },
         reviewerPrecondition: 'synthetic',
         ...(suppressedFallbackFamilies.length ? { suppressedFallbackFamilies } : {}),
         ...(failures.length ? { failures } : {}),

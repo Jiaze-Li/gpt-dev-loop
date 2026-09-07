@@ -43,7 +43,8 @@ src/reviewloop/
     scratchCwd.js          shared isolated empty scratch cwd for every narrow transport
     boundedCli.js          bounded argv-only CLI runner (wall-clock timeout, process-group teardown)
     cliReviewTransports.js  narrow single-turn codex / claude Reviewer+Supervisor transports
-    minimalAgyAgent.js      deterministic provisioning of the workspace-local `reviewloop-minimal` AGY custom agent (inheritCustomizations:false)
+    minimalAgyAgent.js      deterministic provisioning of the `reviewloop-minimal` AGY custom agent (inheritCustomizations:false) into the isolated gemini dir
+    agyCustomAgentCapability.js  startup capability probe + per-call effective-loading verification (agy must actually LOAD reviewloop-minimal, not silently fall back)
   controller.js         reviewloop_begin + reviewloop_review
   runtimeDir.js         ~/.reviewloop
 
@@ -83,41 +84,48 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | --- | --- | --- | --- |
 | `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | argv-fixed 2026-09-07; **live-cert pending** (was `PROVIDER_PROTOCOL_ERROR` — see below) |
 | `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | ~16.9k input (~10.6k cache-read), output ~9 |
-| `agy:gpt-oss` | `--agent reviewloop-minimal` (workspace-local custom agent, `inheritCustomizations: false`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | ~12.1k input, ~196 output, cache-read 0, provider total ~12.3k — acceptable |
-| `agy:gemini` | same as `agy:gpt-oss` (production default effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | **high smoke baseline** (`gemini-3.8-flash-high`): input 6713 + output 539 + thinking 506, cache-read 8128, **provider total 7252**, 8.4s (was ~150.7k input + ~656.8k cache-read, ~92.7s). medium real usage pending controller live certification |
-| `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | routing finalized; controller live certification pending |
+| `agy:gpt-oss` | `--agent reviewloop-minimal` (`inheritCustomizations: false`) discovered from an isolated **redirected gemini dir** (`--gemini_dir`, `adapters/scratchCwd.js#narrowAgyGeminiDir`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | pending re-measurement (see effective-loading note below) |
+| `agy:gemini` | same as `agy:gpt-oss` (production default effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | prior smoke was pre-fix (default agent) — pending re-measurement in the live Supervisor cert |
+| `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | routing finalized; effective-loading + controller live certification pending |
 
-**AGY minimal-agent transport — production transport live-certified
-(2026-09-07)**: ReviewLoop runs both AGY families through a workspace-local
-`reviewloop-minimal` agent (`.agents/agents/reviewloop-minimal/agent.md` with
-`inheritCustomizations: false`) instead of AGY's ambient/default agent. It is
-provisioned deterministically and idempotently into the isolated scratch
-workspace only — never into `~/.gemini`, `~/.config`, AGY global settings/MCP
-config, or any pre-existing user agent/skill/plugin/rule, so plain `agy` use in
-a terminal is unchanged. It drops the inherited MCP/skills/rules/plugins/
-subagents context while preserving existing Antigravity authentication and
-subscription entitlement. If provisioning fails, the AGY families are marked
-**UNAVAILABLE** (fail closed) — ReviewLoop never silently falls back to the
-default AGY agent.
+**AGY minimal-agent transport — effective loading (2026-09-07 fix)**:
+ReviewLoop runs both AGY families through a `reviewloop-minimal` agent
+(`inheritCustomizations: false`) instead of AGY's ambient/default agent.
 
-A controlled Supervisor smoke (one real narrow-transport call, promptChars 502)
-confirms the token-context collapse. **This baseline was run against
-`gemini-3.8-flash-high`** — the production default effort has since moved to
-`medium` (`gemini-3.8-flash-medium`); real `medium` usage is pending the
-controller live certification and the figures below must not be relabelled as
-`medium` data:
+Root cause found 2026-09-07: agy 1.1.27 does **not** discover a custom agent
+from a workspace `.agents/agents/<name>/agent.md`. An unresolvable `--agent`
+**silently falls back to the default agent** (`session.go:81 Agent "…" not
+found, falling back to default`), so every prior AGY review call actually ran
+the full default agent — the file existing on disk proved nothing. agy *does*
+discover agents from its gemini-dir config tree. The real `~/.gemini` is
+off-limits (user data + daily `agy`), so the transport now:
 
-```
-before minimal agent:  input 150668, output 8078, thinking 5916,
-                       cache-read 656768, duration ~92734 ms
-after minimal agent (high smoke baseline):
-                       input 6713, output 539, thinking 506,
-                       cache-read 8128, provider total 7252,
-                       duration 8375 ms, promptChars 502
-```
+- provisions the agent at
+  `<geminiDir>/config/agents/reviewloop-minimal/agent.md` in an **isolated
+  redirected gemini dir** (`narrowAgyGeminiDir()`), and points agy at it with
+  the `--gemini_dir=<dir>` flag. That flag is **not** in `agy --help` for
+  1.1.27, so it is never assumed: `detectAgyCustomAgentSupport()` runs a
+  zero-model-turn probe at MCP startup (stream-json, stdin closed → agy emits
+  `init` and exits) and only enables the AGY families if the agy log confirms
+  `Starting new conversation (agent=true)`. A build that rejects `--gemini_dir`,
+  or that still falls back, → AGY families **UNAVAILABLE** (fail closed).
+- verifies **per call**: the transport captures the agy `--log-file` and
+  raises `AGY_ISOLATION_UNVERIFIED` (and fences off all AGY families so bounded
+  failover routes away) if that call did not activate the custom agent. The
+  default-agent reply is never returned as a usable result.
+- auth is unaffected — agy authenticates via the OS keyring, not the gemini
+  dir — and agy's own logs/cache now land in the isolated dir instead of
+  polluting `~/.gemini`. Plain `agy` in a terminal is untouched.
 
-This is a **controlled single-turn smoke of the production transport**, not a
-full ReviewLoop controller E2E.
+If provisioning fails, the AGY families are marked **UNAVAILABLE** — ReviewLoop
+never silently falls back to the default AGY agent.
+
+Token-context figures are pending re-measurement: earlier "after minimal agent"
+smoke numbers were taken before this fix, i.e. against the default agent or an
+unverified path, and must not be trusted. The live Supervisor certification
+(`scripts/live-reviewloop-certify.mjs --mode supervisor`) now asserts
+`customAgentSupport.supported` and per-call effective-loading verification and
+reports the real before/after.
 
 ### Final fixed routing (deterministic — NO risk-based selection)
 

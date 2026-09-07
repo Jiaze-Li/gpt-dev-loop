@@ -8,7 +8,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,9 +29,24 @@ function spy(returnValue) {
 // A providers object shaped like createProductionReviewLoopProviders(), built on
 // the REAL pool (real RoleRouter, real DEFAULT_ROLE_POLICY, real catalog
 // resolution) with only the transport leaves faked.
-function fakeProviders({ codexTransport = null, callAgy = null, transportRuntime = null } = {}) {
+function fakeProviders({
+  codexTransport = null, callAgy = null, transportRuntime = null,
+  customAgentSupport = { supported: true, reason: 'test' },
+} = {}) {
+  const baseCallAgy = callAgy
+    ?? (async () => ({ text: '{"guidance":"do x","recommendation":"REWORK"}', usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 }, model: 'gemini-cert-medium' }));
+  // When the pool enforces per-call effective-loading verification it passes a
+  // --log-file path; emit the activation marker agy would write so a faked
+  // transport still passes the isolation check.
+  const wrappedCallAgy = async (opts) => {
+    if (opts?.logFile) {
+      try { writeFileSync(opts.logFile, 'Starting new conversation (agent=true)\n'); } catch { /* ignore */ }
+    }
+    return baseCallAgy(opts);
+  };
   const pool = createReviewLoopProviderPool({
-    callAgy: callAgy ?? (async () => ({ text: '{"guidance":"do x","recommendation":"REWORK"}', usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 }, model: 'gemini-cert-medium' })),
+    callAgy: wrappedCallAgy,
+    customAgentSupport,
     transportRuntime: transportRuntime ?? { 'codex:default': { available: true, reason: 'test' }, 'claude:opus': { available: false, reason: 'test' } },
     transportOverrides: codexTransport ? { 'codex:default': codexTransport } : null,
   });
@@ -96,6 +111,7 @@ test('3. reviewer mode drives the real controller production route to codex:defa
   const deps = {
     createProviders: () => fakeProviders({ codexTransport }),
     probeAgyModelCatalog: () => null,
+    detectAgyCustomAgentSupport: async () => ({ supported: true, reason: 'test' }),
     probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: false } }),
   };
   const { exitCode, output } = await main({ argv: ['--mode', 'reviewer'], env: { [OPT_IN_ENV]: '1' }, deps });
@@ -119,6 +135,7 @@ test('4. supervisor mode drives the real Supervisor route (agy:gemini + reviewlo
   const deps = {
     createProviders: () => fakeProviders({ callAgy }),
     probeAgyModelCatalog: () => null,
+    detectAgyCustomAgentSupport: async () => ({ supported: true, reason: 'test' }),
     probeReviewTransportRuntime: async () => ({ 'codex:default': { available: false }, 'claude:opus': { available: false } }),
   };
   const { output } = await main({ argv: ['--mode', 'supervisor'], env: { [OPT_IN_ENV]: '1' }, deps });
@@ -143,6 +160,7 @@ test('5. single-call ceilings: a first-call Supervisor failure does NOT fall bac
   const deps = {
     createProviders: () => fakeProviders({ callAgy }),
     probeAgyModelCatalog: () => null,
+    detectAgyCustomAgentSupport: async () => ({ supported: true, reason: 'test' }),
     probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: true } }),
   };
   const { exitCode, output } = await main({ argv: ['--mode', 'supervisor'], env: { [OPT_IN_ENV]: '1' }, deps });
@@ -169,6 +187,7 @@ test('R-A. reviewer: codex skipped before dispatch -> router would pick agy:sonn
   const deps = {
     createProviders: () => fakeProviders({ callAgy, transportRuntime: noCodex }),
     probeAgyModelCatalog: () => null,
+    detectAgyCustomAgentSupport: async () => ({ supported: true, reason: 'test' }),
     probeReviewTransportRuntime: async () => noCodex,
   };
   const { exitCode, output } = await main({ argv: ['--mode', 'reviewer'], env: { [OPT_IN_ENV]: '1' }, deps });
@@ -187,6 +206,7 @@ test('R-B. reviewer: codex selected -> retryable pre-send failure -> router adva
   const deps = {
     createProviders: () => fakeProviders({ codexTransport, callAgy }),
     probeAgyModelCatalog: () => null,
+    detectAgyCustomAgentSupport: async () => ({ supported: true, reason: 'test' }),
     probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: false } }),
   };
   const { exitCode, output } = await main({ argv: ['--mode', 'reviewer'], env: { [OPT_IN_ENV]: '1' }, deps });
@@ -207,6 +227,7 @@ test('S-A. supervisor: gemini unavailable -> router would pick codex -> zero Cod
       return p;
     },
     probeAgyModelCatalog: () => null,
+    detectAgyCustomAgentSupport: async () => ({ supported: true, reason: 'test' }),
     probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: false } }),
   };
   const { exitCode, output } = await main({ argv: ['--mode', 'supervisor'], env: { [OPT_IN_ENV]: '1' }, deps });
@@ -227,6 +248,7 @@ test('S-B. supervisor: gemini selected -> retryable safe failure -> router advan
   const deps = {
     createProviders: () => fakeProviders({ callAgy, transportRuntime: { 'codex:default': { available: true }, 'claude:opus': { available: false } } }),
     probeAgyModelCatalog: () => null,
+    detectAgyCustomAgentSupport: async () => ({ supported: true, reason: 'test' }),
     probeReviewTransportRuntime: async () => ({ 'codex:default': { available: true }, 'claude:opus': { available: false } }),
   };
   const { exitCode, output } = await main({ argv: ['--mode', 'supervisor'], env: { [OPT_IN_ENV]: '1' }, deps });

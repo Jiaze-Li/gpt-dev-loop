@@ -21,7 +21,11 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 import { createReviewLoopController } from '../reviewloop/controller.js';
-import { createProductionReviewLoopProviders } from '../reviewloop/providerWiring.js';
+import {
+  createProductionReviewLoopProviders,
+  detectAgyCustomAgentSupport,
+  narrowAgyGeminiDir,
+} from '../reviewloop/providerWiring.js';
 import { probeAgyModelCatalog } from '../agy/agyModelCatalog.js';
 import { probeReviewTransportRuntime } from '../reviewloop/adapters/cliReviewTransports.js';
 
@@ -32,11 +36,14 @@ export function createReviewLoopMcpServer({
   // Left null here so a bare createReviewLoopMcpServer() spawns nothing.
   agyCatalog = null,
   transportRuntime = null,
+  // { supported, reason } verdict that agy actually loads the isolated
+  // reviewloop-minimal agent. null -> AGY per-call verification stays off.
+  customAgentSupport = null,
 } = {}) {
   const server = new McpServer({ name: 'reviewloop', version: '1.0.0' });
 
   const ctl = controller ?? createReviewLoopController(
-    createProductionReviewLoopProviders({ agyCatalog, transportRuntime }),
+    createProductionReviewLoopProviders({ agyCatalog, transportRuntime, customAgentSupport }),
   );
 
   server.registerTool(
@@ -133,11 +140,19 @@ export async function startReviewLoopMcpServer(options = {}) {
   // Probe runtime resolution inputs once at startup: the `agy models` catalog
   // (metadata listing, not a model call) and the CLI-transport availability
   // (`codex --version` / `claude --version`). Both degrade safely on failure.
-  const [agyCatalog, transportRuntime] = await Promise.all([
+  const [agyCatalog, transportRuntime, customAgentSupport] = await Promise.all([
     Promise.resolve().then(() => probeAgyModelCatalog()),
     probeReviewTransportRuntime(),
+    // Zero-model-turn probe: does this agy build load the isolated
+    // reviewloop-minimal agent from the redirected gemini dir? Unsupported ->
+    // the AGY families fail closed instead of silently running the default agent.
+    detectAgyCustomAgentSupport({ geminiDir: narrowAgyGeminiDir() }).catch((err) => ({
+      supported: false, reason: `capability probe threw: ${err?.message ?? err}`,
+    })),
   ]);
-  const server = createReviewLoopMcpServer({ agyCatalog, transportRuntime, ...options });
+  const server = createReviewLoopMcpServer({
+    agyCatalog, transportRuntime, customAgentSupport, ...options,
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   return server;

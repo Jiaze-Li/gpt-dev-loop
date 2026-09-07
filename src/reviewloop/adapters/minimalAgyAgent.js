@@ -1,19 +1,24 @@
-// Deterministic provisioning of a dedicated, workspace-local AGY custom agent
-// used ONLY by ReviewLoop's independent Reviewer / Supervisor AGY transports.
+// Deterministic provisioning of a dedicated, isolated AGY custom agent used
+// ONLY by ReviewLoop's independent Reviewer / Supervisor AGY transports.
 //
 // Why: AGY's ambient/default agent inherits the user's skills, rules, plugins,
 // subagents and MCP servers. For a narrow single-turn review that context is
-// pure tax (the live agy:gemini Supervisor was seen carrying ~150k input +
-// ~657k cache-read tokens). A Markdown custom agent with
-// `inheritCustomizations: false` adopts NONE of those ambient customizations
-// (agy >= 1.1.22; confirmed against agy 1.1.27 `--help` / changelog and the
-// on-disk `agy-customizations` guide + a real `agent.md` example).
+// pure tax (the live agy:gemini Supervisor was seen carrying ~38.9k input
+// tokens — the full default agent). A Markdown custom agent with
+// `inheritCustomizations: false` adopts NONE of those ambient customizations.
+//
+// Where it goes: agy 1.1.27 does NOT discover custom agents from a workspace
+// `.agents/agents/<name>/agent.md` — a `--agent` that cannot be resolved
+// silently falls back to the default agent. agy DOES discover agents from its
+// gemini-dir config tree (`<geminiDir>/config/agents/<name>/agent.md`). The real
+// `~/.gemini` is off-limits, so the transport points agy at a redirected,
+// isolated gemini dir (`narrowAgyGeminiDir()`, passed via `--gemini_dir`) and
+// this module provisions the agent there. Whether agy then actually loads it is
+// verified separately — see agyCustomAgentCapability.js.
 //
 // Boundaries (hard):
-//   - The agent is written ONLY under the caller-supplied scratch workspace
-//     (`narrowReviewTransportCwd()`), i.e. AGY's workspace customization root
-//     `<cwd>/.agents/agents/<name>/agent.md`.
-//   - It never writes or modifies the user's `~/.gemini`, `~/.config`,
+//   - The agent is written ONLY under the caller-supplied isolated gemini dir.
+//   - It never writes or modifies the user's real `~/.gemini`, `~/.config`,
 //     `~/.antigravity`, AGY global settings / MCP config, or any pre-existing
 //     user agents / skills / plugins / rules. `provisionMinimalAgyAgent` refuses
 //     to run if its target resolves into HOME or a known global-config tree.
@@ -28,21 +33,18 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 export const MINIMAL_AGY_AGENT_NAME = 'reviewloop-minimal';
 
-// Relative to the scratch workspace root. AGY discovers workspace customizations
-// under `.agents/` (also `.agent/`, `_agents/`, `_agent/`); agents live at
-// `agents/<name>/agent.md` within that root.
+// Relative to the isolated gemini dir. agy discovers agents under its
+// config tree; `config/agents/<name>/agent.md` is the canonical location
+// (confirmed against agy 1.1.27: the agent's frontmatter `name:` is the
+// resolution key, and activation is logged as "agent=true").
 export const MINIMAL_AGY_AGENT_RELATIVE_PATH = path.join(
-  '.agents', 'agents', MINIMAL_AGY_AGENT_NAME, 'agent.md',
+  'config', 'agents', MINIMAL_AGY_AGENT_NAME, 'agent.md',
 );
 
-// The exact agent definition. Frontmatter fields are all confirmed present in
-// the installed agy binary's `customizations.AgentFrontmatter` struct:
-//   name, description, inheritCustomizations, inheritMcp, mainAgent, subagent,
-//   hidden, tools, skills, agents, plugins, rules, model, commandExecutionPolicy
-// `inheritCustomizations: false` is the single switch that drops ambient
-// skills / rules / plugins / subagents / MCP; the empty explicit lists and
-// `inheritMcp: false` are belt-and-suspenders for versions that read them
-// independently.
+// The exact agent definition. `inheritCustomizations: false` is the single
+// switch that drops ambient skills / rules / plugins / subagents / MCP; the
+// empty explicit lists and `inheritMcp: false` are belt-and-suspenders for
+// versions that read them independently.
 export const MINIMAL_AGY_AGENT_MARKDOWN = `---
 name: ${MINIMAL_AGY_AGENT_NAME}
 description: >-
@@ -87,10 +89,11 @@ function isInside(root, target) {
 }
 
 /**
- * Deterministically write `<cwd>/.agents/agents/reviewloop-minimal/agent.md`.
+ * Deterministically write
+ * `<geminiDir>/config/agents/reviewloop-minimal/agent.md`.
  *
  * @param {object} opts
- * @param {string} opts.cwd  isolated scratch workspace root (required)
+ * @param {string} opts.geminiDir  isolated gemini dir root (required)
  * @param {object} [opts.fs] injectable { mkdirSync, readFileSync, writeFileSync }
  * @returns {{ name: string, path: string, relativePath: string, wrote: boolean }}
  * @throws {MinimalAgyAgentProvisionError} on ANY failure — the caller MUST fail
@@ -98,28 +101,28 @@ function isInside(root, target) {
  *   ambient default agent.
  */
 export function provisionMinimalAgyAgent({
-  cwd,
+  geminiDir,
   fs = { mkdirSync, readFileSync, writeFileSync },
 } = {}) {
-  if (typeof cwd !== 'string' || cwd.trim() === '') {
-    throw new MinimalAgyAgentProvisionError('provisionMinimalAgyAgent requires a non-empty cwd');
+  if (typeof geminiDir !== 'string' || geminiDir.trim() === '') {
+    throw new MinimalAgyAgentProvisionError('provisionMinimalAgyAgent requires a non-empty geminiDir');
   }
-  const resolvedCwd = path.resolve(cwd);
+  const resolvedRoot = path.resolve(geminiDir);
   const home = path.resolve(os.homedir());
 
-  if (resolvedCwd === home) {
-    throw new MinimalAgyAgentProvisionError(`refusing to provision into HOME itself: ${resolvedCwd}`);
+  if (resolvedRoot === home) {
+    throw new MinimalAgyAgentProvisionError(`refusing to provision into HOME itself: ${resolvedRoot}`);
   }
   for (const seg of ['.gemini', '.config', '.antigravity']) {
     const protectedRoot = path.join(home, seg);
-    if (isInside(protectedRoot, resolvedCwd)) {
+    if (isInside(protectedRoot, resolvedRoot)) {
       throw new MinimalAgyAgentProvisionError(
-        `refusing to provision inside a protected config tree (${protectedRoot}): ${resolvedCwd}`,
+        `refusing to provision inside a protected config tree (${protectedRoot}): ${resolvedRoot}`,
       );
     }
   }
 
-  const agentDir = path.join(resolvedCwd, '.agents', 'agents', MINIMAL_AGY_AGENT_NAME);
+  const agentDir = path.join(resolvedRoot, 'config', 'agents', MINIMAL_AGY_AGENT_NAME);
   const agentFile = path.join(agentDir, 'agent.md');
 
   try {

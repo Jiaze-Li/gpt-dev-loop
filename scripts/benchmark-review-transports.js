@@ -16,7 +16,7 @@ import {
   makeCodexReviewTransport,
   makeClaudeReviewTransport,
 } from '../src/reviewloop/adapters/cliReviewTransports.js';
-import { narrowReviewTransportCwd } from '../src/reviewloop/adapters/scratchCwd.js';
+import { narrowReviewTransportCwd, narrowAgyGeminiDir } from '../src/reviewloop/adapters/scratchCwd.js';
 import { payloadMetaOf, usageBreakdownOf, contextOverheadTokens } from '../src/reviewloop/reviewSpend.js';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { createReviewLoopProviderPool } from '../src/reviewloop/providerWiring.js';
@@ -210,8 +210,9 @@ async function measureAgyMinimalAgent() {
     supervisorFamily: supervisor?.family ?? null,
     everyCallUsesMinimalAgent: seen.length > 0 && seen.every((o) => o.agent === MINIMAL_AGY_AGENT_NAME),
     everyCallFromScratchCwd: seen.length > 0 && seen.every((o) => o.cwd === narrowReviewTransportCwd()),
+    everyCallRedirectsGeminiDir: seen.length > 0 && seen.every((o) => o.geminiDir === narrowAgyGeminiDir()),
     noConversationResume: seen.every((o) => o.conversationId === undefined),
-    agentFileMaterialised: existsSync(path.join(narrowReviewTransportCwd(), MINIMAL_AGY_AGENT_RELATIVE_PATH)),
+    agentFileMaterialised: existsSync(path.join(narrowAgyGeminiDir(), MINIMAL_AGY_AGENT_RELATIVE_PATH)),
     realSpawns: 0,
   };
 }

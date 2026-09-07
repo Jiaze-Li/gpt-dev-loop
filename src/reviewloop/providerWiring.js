@@ -11,7 +11,10 @@
 // empty finding list — it is surfaced as { malformed: true, ... } so the
 // normalizer fails it closed (FAILED -> HUMAN_REQUIRED).
 
-import { callAgy as defaultCallAgy } from '../agy/agyClient.js';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { callAgy as defaultCallAgy, AgyError } from '../agy/agyClient.js';
 import {
   DEFAULT_ROLE_POLICY,
   PRODUCTION_ROLE_CAPABILITIES,
@@ -21,13 +24,17 @@ import {
   EffortPolicy,
 } from '../orchestrator/roleRouting.js';
 import { resolveModelFamily, MODEL_FAMILY_REGISTRY } from '../orchestrator/modelFamilyResolver.js';
-import { narrowReviewTransportCwd } from './adapters/scratchCwd.js';
+import { narrowReviewTransportCwd, narrowAgyGeminiDir } from './adapters/scratchCwd.js';
 import { makeCodexReviewTransport, makeClaudeReviewTransport } from './adapters/cliReviewTransports.js';
 import { provisionMinimalAgyAgent, MINIMAL_AGY_AGENT_NAME } from './adapters/minimalAgyAgent.js';
+import {
+  detectAgyCustomAgentSupport,
+  verifyEffectiveAgyAgent,
+} from './adapters/agyCustomAgentCapability.js';
 import { createGithubReviewBackend } from './githubBackend.js';
 
 export const ACTIVE_ROLE_POOLS = Object.freeze(Object.keys(DEFAULT_ROLE_POLICY));
-export { narrowReviewTransportCwd };
+export { narrowReviewTransportCwd, narrowAgyGeminiDir, detectAgyCustomAgentSupport };
 
 // Each pool family is one of exactly two things (no "looks like fallback,
 // always skipped" phantoms):
@@ -204,10 +211,21 @@ export function createReviewLoopProviderPool({
   transportOverrides = null,
   // Injected into the codex/claude CLI transports (deterministic tests).
   spawn = undefined,
-  // Provisions the workspace-local `reviewloop-minimal` AGY custom agent into
-  // the isolated scratch cwd. Deterministic tests inject a fake (or a thrower
-  // to exercise the fail-closed path).
+  // Provisions the `reviewloop-minimal` AGY custom agent into the isolated
+  // gemini dir. Deterministic tests inject a fake (or a thrower to exercise the
+  // fail-closed path).
   provisionMinimalAgent = provisionMinimalAgyAgent,
+  // Isolated gemini dir the AGY transport points agy at (via `--gemini_dir`).
+  agyGeminiDir = narrowAgyGeminiDir(),
+  // Precomputed startup verdict that agy actually LOADS the reviewloop-minimal
+  // agent from `agyGeminiDir` (from detectAgyCustomAgentSupport). Shape:
+  //   { supported: boolean, reason: string }
+  // The real entrypoints (MCP server, live-cert) compute and pass it; when it
+  // is provided, per-call effective-loading verification is also enforced.
+  //   null  -> "not probed": AGY families wired on provisioning alone, per-call
+  //            verification skipped (deterministic tests / `doctor` inspection).
+  //   { supported: false } -> AGY families fail closed, never wired.
+  customAgentSupport = null,
 } = {}) {
   // Resolve every registered family to a concrete model (or null = provider
   // default) at construction. Stable family identity in, concrete version out —
@@ -220,34 +238,79 @@ export function createReviewLoopProviderPool({
     Object.entries(resolution).map(([f, r]) => [f, r.resolvedModel]),
   );
 
-  // Both AGY families run through a dedicated workspace-local minimal agent
-  // (`--agent reviewloop-minimal`, inheritCustomizations:false) provisioned into
-  // the isolated scratch cwd. If provisioning fails we FAIL CLOSED: the AGY
-  // families are marked UNAVAILABLE and never wired — we do NOT silently fall
-  // back to AGY's ambient default agent, which would reintroduce the inherited
-  // MCP / skills / rules / plugins / subagents context this removes.
+  // Both AGY families run through a dedicated minimal agent (`--agent
+  // reviewloop-minimal`, inheritCustomizations:false) provisioned into the
+  // isolated gemini dir and reached with `--gemini_dir`. We FAIL CLOSED unless
+  // BOTH hold:
+  //   1. provisioning the agent file succeeded, and
+  //   2. (when probed) agy actually LOADS that agent — agy silently falls back
+  //      to its ambient default agent for an unresolvable `--agent`, which would
+  //      reintroduce the inherited MCP / skills / rules / plugins / subagents
+  //      context this removes.
   let minimalAgent = null;
   let minimalAgentError = null;
   try {
-    minimalAgent = provisionMinimalAgent({ cwd: narrowReviewTransportCwd() });
+    minimalAgent = provisionMinimalAgent({ geminiDir: agyGeminiDir });
   } catch (err) {
     minimalAgentError = err;
   }
 
-  // Real agy availability still surfaces at call time (AGY_ENOENT -> RETRYABLE
-  // -> failover), same as before — this only gates on the local agent file.
+  // `null` customAgentSupport == "not probed" -> trust provisioning alone and
+  // skip per-call verification (deterministic tests / doctor). A concrete
+  // verdict turns on enforcement.
+  const capabilityProbed = customAgentSupport != null;
+  const capabilitySupported = !capabilityProbed || customAgentSupport.supported === true;
+  const capabilityReason = capabilityProbed
+    ? String(customAgentSupport.reason ?? (capabilitySupported ? 'ok' : 'agy does not load the isolated agent'))
+    : null;
+
+  const agyIsolationAvailable = Boolean(minimalAgent) && capabilitySupported;
+
+  // Per-call effective-loading verification. Enforced only once the startup
+  // capability probe has run. Any failure (agy fell back, or the log could not
+  // confirm activation) raises AND marks every AGY family UNAVAILABLE so bounded
+  // failover routes AWAY from AGY rather than repeating a default-agent call on
+  // the next AGY family.
+  const enforcePerCall = capabilityProbed && capabilitySupported;
+  const markAllAgyUnavailable = (reason) => {
+    for (const family of REVIEWLOOP_AGY_FAMILIES) {
+      providerHealth.record(family, 'UNAVAILABLE', reason);
+    }
+  };
   const narrow = (family) => async (prompt) => {
-    const res = await callAgy({
-      prompt,
-      model: modelForFamily[family] ?? null,
-      cwd: narrowReviewTransportCwd(),
-      disableSlashCommands: true,
-      agent: MINIMAL_AGY_AGENT_NAME,
-    });
-    return { ...res, meta: { promptChars: String(prompt ?? '').length } };
+    let logDir = null;
+    let logFile = null;
+    if (enforcePerCall) {
+      logDir = mkdtempSync(path.join(os.tmpdir(), 'reviewloop-agy-verify-'));
+      logFile = path.join(logDir, 'agy.log');
+    }
+    try {
+      const res = await callAgy({
+        prompt,
+        model: modelForFamily[family] ?? null,
+        cwd: narrowReviewTransportCwd(),
+        geminiDir: agyGeminiDir,
+        logFile: logFile ?? undefined,
+        disableSlashCommands: true,
+        agent: MINIMAL_AGY_AGENT_NAME,
+      });
+      if (enforcePerCall) {
+        let logText = '';
+        try { logText = readFileSync(logFile, 'utf8'); } catch { logText = ''; }
+        const verdict = verifyEffectiveAgyAgent({ logText, agentName: MINIMAL_AGY_AGENT_NAME });
+        if (!verdict.verified) {
+          const reason = `AGY isolation unverified for ${family}: ${verdict.reason}`;
+          markAllAgyUnavailable(reason);
+          throw new AgyError(reason, { code: 'AGY_ISOLATION_UNVERIFIED', exitCode: 65 });
+        }
+      }
+      return { ...res, meta: { promptChars: String(prompt ?? '').length } };
+    } finally {
+      if (logDir) { try { rmSync(logDir, { recursive: true, force: true }); } catch { /* best effort */ } }
+    }
   };
   const transports = {};
-  if (minimalAgent) {
+  if (agyIsolationAvailable) {
     for (const family of REVIEWLOOP_AGY_FAMILIES) transports[family] = narrow(family);
   }
 
@@ -255,14 +318,23 @@ export function createReviewLoopProviderPool({
   // consumed by doctor and the pool-composition tests.
   const runtimeStatus = {};
   for (const family of REVIEWLOOP_AGY_FAMILIES) {
-    const available = Boolean(minimalAgent);
+    const available = agyIsolationAvailable;
+    let reason;
+    if (available) {
+      reason = capabilityProbed
+        ? 'wired (agy CLI + reviewloop-minimal agent; effective loading probed + verified per call; ENOENT -> failover at call time)'
+        : 'wired (agy CLI + reviewloop-minimal agent; effective loading NOT probed — inspection/test mode; ENOENT -> failover at call time)';
+    } else if (!minimalAgent) {
+      reason = `fail-closed: reviewloop-minimal agent provisioning failed: ${minimalAgentError?.message ?? 'unknown error'}`;
+    } else {
+      reason = `fail-closed: agy does not load the isolated reviewloop-minimal agent: ${capabilityReason ?? 'unknown'}`;
+    }
     runtimeStatus[family] = {
       adapterImplemented: true,
       runtimeAvailable: available,
-      reason: available
-        ? 'wired (agy CLI + reviewloop-minimal agent; ENOENT -> failover at call time)'
-        : `fail-closed: reviewloop-minimal agent provisioning failed: ${minimalAgentError?.message ?? 'unknown error'}`,
-      minimalAgent: available ? { name: minimalAgent.name, path: minimalAgent.path } : null,
+      reason,
+      minimalAgent: minimalAgent ? { name: minimalAgent.name, path: minimalAgent.path } : null,
+      effectiveLoadingVerified: available && capabilityProbed,
       defaultModelResolution: resolution[family].resolvedFrom,
       concreteVersionPinnedByDefault: resolution[family].concreteVersionPinned,
     };
@@ -413,12 +485,17 @@ function buildSupervisorInvoke() {
 
 export function createProductionReviewLoopProviders({
   env = process.env, callAgy, github, agyCatalog = null, transportRuntime = null,
+  customAgentSupport = null, agyGeminiDir = undefined,
 } = {}) {
-  // `agyCatalog` + `transportRuntime` are supplied by the MCP entrypoint,
-  // which probes them once at startup; left null here so nothing is spawned in
-  // tests (resolution falls back to the provider-default path, and the CLI
-  // families report "adapter present, runtime not probed").
-  const pool = createReviewLoopProviderPool({ callAgy, env, agyCatalog, transportRuntime });
+  // `agyCatalog` + `transportRuntime` + `customAgentSupport` are supplied by the
+  // MCP entrypoint, which probes them once at startup; left null here so nothing
+  // is spawned in tests (resolution falls back to the provider-default path, the
+  // CLI families report "adapter present, runtime not probed", and AGY per-call
+  // effective-loading verification is skipped).
+  const pool = createReviewLoopProviderPool({
+    callAgy, env, agyCatalog, transportRuntime, customAgentSupport,
+    ...(agyGeminiDir ? { agyGeminiDir } : {}),
+  });
   const reviewerInvoke = buildReviewerInvoke();
   const supervisorInvoke = buildSupervisorInvoke();
 

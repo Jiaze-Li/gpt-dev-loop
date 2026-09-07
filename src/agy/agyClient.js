@@ -149,6 +149,12 @@ function extractModel(json) {
  * @param {string} [opts.conversationId]    resume this conversation (fail-closed)
  * @param {boolean} [opts.disableSlashCommands] disable agy slash/skill expansion
  * @param {string} [opts.agent]             optional dedicated agy agent name
+ * @param {string} [opts.geminiDir]         optional isolated gemini dir
+ *   (passed as `--gemini_dir=<path>`). Used by ReviewLoop to point agy at a
+ *   redirected config tree that holds ONLY the `reviewloop-minimal` agent and
+ *   never touches the user's real `~/.gemini`.
+ * @param {string} [opts.logFile]           optional agy `--log-file` path, so
+ *   the caller can verify which agent agy actually activated for the run.
  * @param {string} [opts.cwd]               working dir for the child
  * @param {Function} [opts.spawn]           injectable spawn (for tests)
  * @param {AbortSignal} [opts.signal]       stops the owned agy process group and waits for teardown
@@ -165,6 +171,8 @@ export async function callAgy({
   conversationId,
   disableSlashCommands = true,
   agent,
+  geminiDir,
+  logFile,
   cwd,
   spawn = nodeSpawn,
   signal,
@@ -201,6 +209,9 @@ export async function callAgy({
   if (typeof model === 'string' && model.trim() !== '') args.push('--model', model.trim());
   if (disableSlashCommands) args.push('--disable-slash-commands');
   if (typeof agent === 'string' && agent.trim() !== '') args.push('--agent', agent.trim());
+  // Attached form so the path can never be misparsed as a following flag.
+  if (typeof geminiDir === 'string' && geminiDir.trim() !== '') args.push(`--gemini_dir=${geminiDir.trim()}`);
+  if (typeof logFile === 'string' && logFile.trim() !== '') args.push('--log-file', logFile.trim());
   if (typeof jsonSchema === 'string' && jsonSchema.length > 0) {
     args.push('--json-schema', jsonSchema);
   }
