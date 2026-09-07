@@ -18,7 +18,11 @@ const MAX_CAPTURE_BYTES = 2_000_000;
 
 export const CLI_FAILURE = Object.freeze({
   UNAVAILABLE: 'PROVIDER_UNAVAILABLE',
+  // AUTH_FAILED is reserved for an explicit LOCAL auth preflight that runs
+  // before a prompt/model dispatch. Post-dispatch 401/403 is AUTH_REJECTED:
+  // reaching an auth-looking provider error is NOT proof of zero model spend.
   AUTH_FAILED: 'PROVIDER_AUTH_FAILED',
+  AUTH_REJECTED: 'PROVIDER_AUTH_REJECTED',
   RATE_LIMITED: 'PROVIDER_RATE_LIMITED',
   QUOTA_EXHAUSTED: 'PROVIDER_QUOTA_EXHAUSTED',
   PROTOCOL_ERROR: 'PROVIDER_PROTOCOL_ERROR',
@@ -35,14 +39,15 @@ export class CliTransportError extends Error {
   }
 }
 
-// Map an exit code + stderr to one of the RETRYABLE provider-failure codes the
-// RoleRouter health/quota fallback already understands. Ordering matters:
-// auth/quota/rate-limit before the generic protocol-error bucket.
+// Map an exit code + stderr from a REAL prompt-bearing CLI invocation. An
+// auth-looking response here is deliberately AUTH_REJECTED, not AUTH_FAILED:
+// once the prompt-bearing process started, 401/403 does not mechanically prove
+// that no provider request/spend occurred. Token Safety therefore fails closed.
 export function classifyCliFailure({ code, stderr = '', spawnErrorCode } = {}) {
   if (spawnErrorCode === 'ENOENT') return CLI_FAILURE.UNAVAILABLE;
   const s = String(stderr).toLowerCase();
   if (/\b(401|403)\b|unauthorized|not logged in|not authenticated|no api key|invalid api key|authentication/.test(s)) {
-    return CLI_FAILURE.AUTH_FAILED;
+    return CLI_FAILURE.AUTH_REJECTED;
   }
   if (/insufficient[_ ]?quota|over quota|quota exceeded|billing|payment required|402\b/.test(s)) {
     return CLI_FAILURE.QUOTA_EXHAUSTED;
@@ -127,5 +132,5 @@ export async function probeCli(executable, { spawn = nodeSpawn, timeoutMs = 5_00
   if (r.spawnErrorCode) return { available: false, reason: `probe failed: ${r.spawnErrorCode}` };
   if (r.timedOut) return { available: false, reason: 'probe timed out' };
   if (r.code !== 0) return { available: false, reason: `probe exited ${r.code}` };
-  return { available: true, reason: 'ok', version: r.stdout.trim().split('\n')[0] };
+  return { available: true, reason: 'ok', version: (r.stdout || r.stderr).trim().split('\n')[0] };
 }
