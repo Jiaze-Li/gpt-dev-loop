@@ -18,7 +18,7 @@ test('usageBreakdownOf keeps every field null when unreported (UNKNOWN != 0)', (
   assert.deepEqual(usageBreakdownOf(null), {
     inputTokens: null, outputTokens: null, thinkingTokens: null,
     cacheReadTokens: null, cacheCreationTokens: null,
-    reportedTotalTokens: null, derivedTotalTokens: null,
+    reportedTotalTokens: null, rawFieldSumTokens: null,
   });
   const b = usageBreakdownOf({ input_tokens: 120000, output_tokens: 1778, cache_read_input_tokens: 10 });
   assert.equal(b.inputTokens, 120000);
@@ -26,9 +26,9 @@ test('usageBreakdownOf keeps every field null when unreported (UNKNOWN != 0)', (
   assert.equal(b.cacheReadTokens, 10);
   assert.equal(b.thinkingTokens, null);
   // no provider-reported total in this envelope -> reportedTotalTokens stays
-  // null; derivedTotalTokens is our own additive roll-up, never a provider figure
+  // null; rawFieldSumTokens is a diagnostic arithmetic sum, never a provider figure
   assert.equal(b.reportedTotalTokens, null);
-  assert.equal(b.derivedTotalTokens, 121788);
+  assert.equal(b.rawFieldSumTokens, 121788);
 });
 
 test('contextOverheadTokens surfaces the transport tax; null when either side unknown', () => {

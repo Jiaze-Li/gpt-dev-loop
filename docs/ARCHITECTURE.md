@@ -213,17 +213,29 @@ this hard ceiling:
 
 | Class | Method | Rule |
 | --- | --- | --- |
-| any | `provider_total` | an authoritative provider-reported total wins verbatim (AGY Gemini live: input 6713 + output 539 == reported total 7252; cache-read 8128 is **not** added) |
+| any (confirmed total field only) | `provider_total` | an authoritative provider-reported total wins verbatim — trusted **only** from a token-total field mechanically confirmed for that class (`AUTHORITATIVE_TOTAL_ALIASES`: `openai` → `total_tokens`; `anthropic` → *none*, the Messages API returns no aggregate total; `agy` → `total_tokens`/`totalTokenCount`). A bare `total`, or any total on an unknown provider, is never trusted. AGY Gemini live: reported total 7252, cache-read 8128 not added |
 | `openai` (`codex:default`) | `openai_input_plus_output` | `cache_read ⊂ input`, reasoning `⊂ output` — add neither (Codex live: input 16922 incl. 10624 cache-read, output 9 → volume **16931**, not 27555) |
-| `anthropic` (`claude:opus`) | `anthropic_cache_additive` | `input + output + cache_creation + cache_read` — the two cache categories are separate billing lines, never dropped (live: 2 + 1549 + 2168 + 1285 → **5004**) |
-| `agy` w/o total, or unknown provider | `conservative_additive_unknown` | sum every reported field, **flagged `semanticsKnown:false`** — UNKNOWN != ZERO: never under-count a safety ceiling, never present the number as an exact provider figure |
+| `anthropic` (`claude:opus`) | `anthropic_cache_additive` | `input + output + cache_creation + cache_read` — the two cache categories are separate billing lines, never dropped (live: 2 + 1549 + 2168 + 1285 → **5004**). Absent `cache_*` is a schema-defined 0; absent `input`/`output` is not |
+| `agy` w/o confirmed total, or unknown provider | `conservative_additive_unknown` | sum every reported field, **flagged `semanticsKnown:false`** — UNKNOWN != ZERO: never under-count a safety ceiling, never present the number as an exact provider figure |
+
+**Partial usage fails closed.** A fallback method reports `semanticsKnown:true`
+/ `volumeResolved:true` **only** when every field it mechanically requires
+(`openai`/`anthropic`: `input` + `output`) is actually present. If a
+post-dispatch usage object exists but a required field is absent, it is
+`volumeResolved:false` and `meteredCall` routes it into the existing
+`MODEL_SPEND_USAGE_UNRESOLVED` / `ReservationLedger` UNRESOLVED path — the
+reservation latches UNRESOLVED and blocks all further internal model spend for
+the loop until a human clears it. Missing fields are never silently read as 0.
+(The `agy`/unknown conservative path stays `volumeResolved:true` — a
+floor-safe over-count is its accepted posture.)
 
 The raw per-field breakdown (`usageBreakdownOf`) is always preserved for
-telemetry regardless of method — `reportedTotalTokens` is strictly what the
-provider reported (null otherwise); `derivedTotalTokens` is our own additive
-roll-up and is never presented as a provider figure. Every durable spend record
-carries `usageAccounting: { method, semanticsKnown, accountingClass,
-reportedTotalTokens }` provenance; telemetry surfaces `unknownSemanticsCalls`.
+telemetry regardless of method — `reportedTotalTokens` is strictly a total-ish
+field the provider reported (not necessarily the authoritative one for that
+family); `rawFieldSumTokens` is a **diagnostic** arithmetic sum, never a
+token-accounting total. Every durable spend record carries `usageAccounting:
+{ method, semanticsKnown, volumeResolved, accountingClass, reportedTotalTokens }`
+provenance; telemetry surfaces `unknownSemanticsCalls`.
 
 **Malformed provider output** (unparseable, no findings channel, invalid
 severity, empty Supervisor guidance) is never reduced to a clean empty result —

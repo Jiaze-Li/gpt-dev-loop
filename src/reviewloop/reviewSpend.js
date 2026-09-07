@@ -121,11 +121,19 @@ export function resolveReviewLoopLimits(env = process.env) {
 //                    additive and is not even mechanically a subset of input).
 //
 // Precedence for every family:
-//   1. an authoritative provider-reported total  -> use it verbatim
-//   2. else a family-specific deterministic fallback (semantics confirmed)
+//   1. an authoritative provider-reported total, ONLY from a token-total field
+//      mechanically confirmed for THIS provider/family schema -> use it verbatim
+//   2. else a family-specific deterministic fallback (semantics confirmed) —
+//      reported semanticsKnown:true ONLY when every field that fallback
+//      mechanically requires is actually present. A required field that is
+//      absent is UNKNOWN, never 0: the accounting is marked volumeResolved:false
+//      and the caller routes it into the existing UNRESOLVED / fail-closed
+//      spend path (it must not settle as precise known spend).
 //   3. else a conservative additive sum, FLAGGED semanticsKnown:false —
 //      UNKNOWN != ZERO: never under-count a safety ceiling, never pretend the
-//      number is an exact provider figure.
+//      number is an exact provider figure. This is the accepted floor-safe
+//      posture for AGY-without-total / unknown providers (volumeResolved:true,
+//      but explicitly not exact).
 //
 // The raw per-field breakdown is ALWAYS preserved for telemetry regardless of
 // which method produced the volume.
@@ -143,9 +151,35 @@ const ACCOUNTING_CLASS_BY_PROVIDER = Object.freeze({
   claude: 'anthropic',
   anthropic: 'anthropic',
   'agy-gemini': 'agy',
+  'agy-gpt-oss': 'agy',
   'agy-claude-gpt': 'agy',
   agy: 'agy',
 });
+
+// Token-total field names that are MECHANICALLY CONFIRMED to be an authoritative
+// aggregate token total for a given accounting class. A bare `total` is never
+// trusted; an unknown provider has no trusted total field at all.
+//   - openai   : OpenAI usage envelopes / Codex `token_count` events -> total_tokens
+//   - anthropic: the Anthropic Messages API returns NO aggregate token total
+//                (only input/output/cache_* categories) -> always fall through
+//   - agy      : the AGY CLI envelope surfaces a provider total (Gemini live:
+//                input 6713 + output 539 == 7252); Gemini-native is
+//                totalTokenCount
+const AUTHORITATIVE_TOTAL_ALIASES = Object.freeze({
+  openai: ['total_tokens', 'totalTokens'],
+  anthropic: [],
+  agy: ['total_tokens', 'totalTokens', 'total_token_count', 'totalTokenCount'],
+  unknown: [],
+});
+
+function pickFinite(obj, keys) {
+  if (!obj || typeof obj !== 'object') return null;
+  for (const k of keys) {
+    const v = obj[k];
+    if (Number.isFinite(v)) return v;
+  }
+  return null;
+}
 
 // Deterministic accounting class from the ACTUAL family/provider bound into the
 // CallIntent — never guessed from a model-name string.
@@ -153,8 +187,12 @@ export function accountingClassOf({ family = null, provider = null } = {}) {
   if (typeof family === 'string' && ACCOUNTING_CLASS_BY_FAMILY[family]) {
     return ACCOUNTING_CLASS_BY_FAMILY[family];
   }
-  if (typeof provider === 'string' && ACCOUNTING_CLASS_BY_PROVIDER[provider]) {
-    return ACCOUNTING_CLASS_BY_PROVIDER[provider];
+  if (typeof provider === 'string') {
+    const p = provider.toLowerCase();
+    if (ACCOUNTING_CLASS_BY_PROVIDER[p]) return ACCOUNTING_CLASS_BY_PROVIDER[p];
+    if (p.startsWith('agy')) return 'agy';
+    if (p.startsWith('codex') || p.startsWith('openai')) return 'openai';
+    if (p.startsWith('claude') || p.startsWith('anthropic')) return 'anthropic';
   }
   return 'unknown';
 }
@@ -198,52 +236,85 @@ const tok = (v) => (Number.isFinite(v) ? v : 0);
 
 // Provider/family-aware deterministic accounting. Returns the budget
 // `usageVolume`, the method used to derive it, whether the cache semantics are
-// mechanically confirmed for this family, the authoritative provider total (or
-// null), and the raw breakdown. Callers MUST pass the real family + provider
-// bound into the CallIntent.
+// mechanically confirmed for this family (`semanticsKnown`), whether a
+// mechanically-precise volume could actually be computed from the reported
+// fields (`volumeResolved` — false means a required field was absent and the
+// caller must fail closed, NOT treat the gap as 0), the authoritative provider
+// total actually trusted (or null), and the raw breakdown. Callers MUST pass
+// the real family + provider bound into the CallIntent.
 export function usageAccountingOf({ usage = null, family = null, provider = null } = {}) {
   const cls = accountingClassOf({ family, provider });
   const b = rawUsageFields(usage);
   const has = usage != null && typeof usage === 'object';
-  const build = (usageVolume, method, semanticsKnown) => ({
+  const build = (usageVolume, method, semanticsKnown, volumeResolved, trustedTotal = null) => ({
     usageVolume,
     usageAccountingMethod: method,
     semanticsKnown,
+    volumeResolved,
     accountingClass: cls,
-    reportedTotalTokens: b.reportedTotalTokens,
+    // the total actually TRUSTED for the volume (null unless method is
+    // provider_total from a confirmed alias)
+    reportedTotalTokens: Number.isFinite(trustedTotal) ? trustedTotal : null,
+    // raw diagnostic: any total-ish field the envelope carried, trusted or not
+    rawReportedTotalField: b.reportedTotalTokens,
     breakdown: b,
   });
 
-  if (!has) return build(0, 'no_usage_reported', false);
+  if (!has) return build(0, 'no_usage_reported', false, false);
 
-  // 1. authoritative provider-reported total — trusted for every family whose
-  //    envelope semantics we have confirmed carries a real aggregate total.
-  if (Number.isFinite(b.reportedTotalTokens)) {
-    return build(b.reportedTotalTokens, 'provider_total', true);
+  // 1. authoritative provider-reported total — ONLY from a token-total field
+  //    mechanically confirmed for this provider/family schema. An unknown
+  //    provider (or a bare `total`) never reaches this branch.
+  const trustedTotal = pickFinite(usage, AUTHORITATIVE_TOTAL_ALIASES[cls] ?? []);
+  if (Number.isFinite(trustedTotal)) {
+    return build(trustedTotal, 'provider_total', true, true, trustedTotal);
   }
 
-  // 2. family-specific deterministic fallback.
+  // 2. family-specific deterministic fallback. `semanticsKnown` / `volumeResolved`
+  //    are true ONLY when every field the fallback mechanically requires is
+  //    actually present — an absent required field is UNKNOWN, never 0.
   if (cls === 'openai') {
-    // cache_read ⊂ input, reasoning ⊂ output — add neither.
-    return build(tok(b.inputTokens) + tok(b.outputTokens), 'openai_input_plus_output', true);
+    // OpenAI/Codex: cache_read ⊂ input, reasoning ⊂ output — add neither.
+    // Required: input_tokens AND output_tokens.
+    const resolved = Number.isFinite(b.inputTokens) && Number.isFinite(b.outputTokens);
+    return build(
+      tok(b.inputTokens) + tok(b.outputTokens),
+      'openai_input_plus_output', resolved, resolved,
+    );
   }
   if (cls === 'anthropic') {
-    // uncached input + output + the two separate cache categories.
+    // Anthropic: uncached input + output + the two SEPARATE cache categories.
+    // The Messages API always emits input_tokens + output_tokens; the two
+    // cache_* categories appear iff prompt caching was used and their absence
+    // is a schema-defined 0 (not "unknown"). A missing input/output means the
+    // envelope is incomplete.
+    const resolved = Number.isFinite(b.inputTokens) && Number.isFinite(b.outputTokens);
     return build(
       tok(b.inputTokens) + tok(b.outputTokens) + tok(b.cacheCreationTokens) + tok(b.cacheReadTokens),
-      'anthropic_cache_additive', true,
+      'anthropic_cache_additive', resolved, resolved,
     );
   }
 
-  // 3. AGY without an authoritative total, or a fully unknown provider: we
-  //    cannot prove whether cache_read is a subset or a separate category.
-  //    Sum every reported field (conservative — never under-count a safety
-  //    ceiling) and flag the semantics UNKNOWN.
+  // 3. AGY without a confirmed total, or a fully unknown provider: we cannot
+  //    prove whether cache_read is a subset or a separate category. Sum every
+  //    reported field (conservative — never under-count a safety ceiling) and
+  //    flag the semantics UNKNOWN. This is the ACCEPTED floor-safe posture for
+  //    these families, so volumeResolved stays true (the number is usable as a
+  //    ceiling input, just never asserted as exact).
   return build(
     tok(b.inputTokens) + tok(b.outputTokens) + tok(b.thinkingTokens)
       + tok(b.cacheCreationTokens) + tok(b.cacheReadTokens),
-    'conservative_additive_unknown', false,
+    'conservative_additive_unknown', false, true,
   );
+}
+
+// True when a post-dispatch usage object IS present but the confirmed accounting
+// method for this family cannot derive a mechanically-known volume from it
+// (a required field is absent). UNKNOWN != ZERO: such a call must settle
+// UNRESOLVED, exactly like a missing usage object.
+export function usagePresentButUnresolved({ usage, family, provider }) {
+  if (usage == null || typeof usage !== 'object') return false;
+  return usageAccountingOf({ usage, family, provider }).volumeResolved === false;
 }
 
 // Back-compat helper: the budget volume alone. Pass { family, provider } for
@@ -259,7 +330,10 @@ export function accountingProvenanceOf(accounting) {
   return {
     method: accounting.usageAccountingMethod,
     semanticsKnown: accounting.semanticsKnown === true,
+    volumeResolved: accounting.volumeResolved === true,
     accountingClass: accounting.accountingClass,
+    // the token total actually TRUSTED for usageVolume (null unless method is
+    // provider_total from a confirmed alias for this family)
     reportedTotalTokens: Number.isFinite(accounting.reportedTotalTokens)
       ? accounting.reportedTotalTokens
       : null,
@@ -270,9 +344,15 @@ export function accountingProvenanceOf(accounting) {
 // provider did not report is `null`, never 0. Persisted per physical call so
 // transport-context overhead ("diff 20k chars, yet input 120k tokens") is
 // diagnosable after the fact — never estimated into a hard number.
-// `reportedTotalTokens` is STRICTLY what the provider reported (null if it did
-// not); `derivedTotalTokens` is our own additive roll-up and is never presented
-// as a provider figure.
+//   - `reportedTotalTokens` : STRICTLY a total-ish field the provider put in the
+//                             envelope (null if none). NOT necessarily the
+//                             authoritative total for this family (see
+//                             usageAccountingOf / AUTHORITATIVE_TOTAL_ALIASES),
+//                             and NOT necessarily equal to usageVolume.
+//   - `rawFieldSumTokens`   : a DIAGNOSTIC arithmetic sum of the raw numeric
+//                             usage fields. It is NOT a token-accounting total,
+//                             double-counts cache for subset-semantics
+//                             providers, and must never be read as usageVolume.
 export function usageBreakdownOf(usage) {
   const b = rawUsageFields(usage);
   const parts = [b.inputTokens, b.outputTokens, b.cacheReadTokens, b.cacheCreationTokens]
@@ -284,7 +364,7 @@ export function usageBreakdownOf(usage) {
     cacheReadTokens: b.cacheReadTokens,
     cacheCreationTokens: b.cacheCreationTokens,
     reportedTotalTokens: b.reportedTotalTokens,
-    derivedTotalTokens: parts.length ? parts.reduce((a, c) => a + c, 0) : null,
+    rawFieldSumTokens: parts.length ? parts.reduce((a, c) => a + c, 0) : null,
   };
 }
 
@@ -364,7 +444,7 @@ function foldTotals(records) {
 // durable spend records. A field only sums where it was actually reported;
 // `*Unknown` counts the calls where it was not (UNKNOWN != 0).
 function foldBreakdown(records) {
-  const F = ['inputTokens', 'outputTokens', 'thinkingTokens', 'cacheReadTokens', 'cacheCreationTokens', 'reportedTotalTokens', 'derivedTotalTokens'];
+  const F = ['inputTokens', 'outputTokens', 'thinkingTokens', 'cacheReadTokens', 'cacheCreationTokens', 'reportedTotalTokens', 'rawFieldSumTokens'];
   const sums = Object.fromEntries(F.map((k) => [k, 0]));
   const unknown = Object.fromEntries(F.map((k) => [`${k}Unknown`, 0]));
   let promptChars = 0;
@@ -627,8 +707,32 @@ export function createReviewLoopSpend({
               usage: { input_tokens: 0, output_tokens: 0 },
               preSendZeroProven: true,
             };
+          } else if (usagePresentButUnresolved({
+            usage: err?.details?.usage ?? err?.usage ?? null, family, provider,
+          })) {
+            // The provider threw WITH a usage object, but it is missing a field
+            // this family's confirmed accounting needs. UNKNOWN != ZERO: strip
+            // the partial usage so ModelSpendAuthority settles the reservation
+            // UNRESOLVED (fail closed) rather than recording a false precise
+            // spend. The business error itself still propagates.
+            if (err?.details) delete err.details.usage;
+            delete err.usage;
           }
           throw err;
+        }
+        // A post-dispatch usage object that is present but insufficient for a
+        // mechanically-known volume for this family MUST NOT settle as precise
+        // known spend. Throw WITHOUT usage so dispatch() settles the
+        // reservation UNRESOLVED — the existing MODEL_SPEND_USAGE_UNRESOLVED /
+        // fail-closed path then blocks further internal model spend until a
+        // human clears it.
+        if (usagePresentButUnresolved({ usage: out?.usage ?? null, family, provider })) {
+          const e = new Error(
+            `ReviewLoop ${loopId}: post-dispatch usage for ${provider}/${family} is present but `
+              + 'missing a field required for mechanically-known token accounting; UNKNOWN != ZERO',
+          );
+          e.code = 'PROVIDER_USAGE_INCOMPLETE';
+          throw e;
         }
         return {
           value: out?.value ?? out,
