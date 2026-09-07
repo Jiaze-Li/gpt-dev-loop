@@ -116,7 +116,7 @@ test('controller: post-dispatch AUTH_REJECTED has unknown spend and MUST NOT fai
   const reservations = Object.values(state.modelSpendReservations ?? {});
   assert.equal(reservations.length, 1);
   assert.equal(reservations[0].family, 'codex:default');
-  assert.equal(reservations[0].state, 'UNRESOLVED');
+  assert.equal(reservations[0].status, 'UNRESOLVED');
 });
 
 test('pool: locally unauthenticated CLI families are skipped deterministically before model dispatch', () => {
