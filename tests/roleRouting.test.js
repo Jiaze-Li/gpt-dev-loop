@@ -20,8 +20,13 @@ test('active roles are exactly supervisor + reviewer — no planner, no executor
   assert.deepEqual(Object.keys(DEFAULT_ROLE_POLICY).sort(), ['reviewer', 'supervisor']);
   assert.equal('planner' in DEFAULT_ROLE_POLICY, false);
   assert.equal('executor' in DEFAULT_ROLE_POLICY, false);
-  assert.equal(DEFAULT_ROLE_POLICY.supervisor[0].family, 'agy:gemini');
+  assert.equal(DEFAULT_ROLE_POLICY.supervisor[0].family, 'codex:default');
   assert.equal(DEFAULT_ROLE_POLICY.reviewer[0].family, 'agy:gpt-oss');
+  // agy:gemini stays in the policy but is last and flagged high-context.
+  assert.equal(DEFAULT_ROLE_POLICY.supervisor.at(-1).family, 'agy:gemini');
+  assert.equal(DEFAULT_ROLE_POLICY.supervisor.at(-1).highContext, true);
+  assert.equal(DEFAULT_ROLE_POLICY.reviewer.at(-1).family, 'agy:gemini');
+  assert.equal(DEFAULT_ROLE_POLICY.reviewer.at(-1).highContext, true);
 });
 
 test('production capabilities declare only supervisor/reviewer protocols', () => {
@@ -34,12 +39,24 @@ test('production capabilities declare only supervisor/reviewer protocols', () =>
   assert.equal(supportsProductionRole('codex:default', 'planner'), false);
 });
 
-test('Gemini cooldown fails supervisor over to codex; reviewer stays on gpt-oss', () => {
-  const quota = new QuotaPoolRegistry({ filePath: null });
-  quota.recordCooldown('agy-gemini');
-  const router = new RoleRouter({ quotaRegistry: quota, resolveFamily: resolver });
-  assert.equal(router.route('supervisor').requestedFamily, 'codex:default');
-  assert.equal(router.route('reviewer').requestedFamily, 'agy:gpt-oss');
+test('agy:gemini is high-context: never auto-selected, opt-in via allowHighContext', () => {
+  const router = new RoleRouter({ resolveFamily: resolver });
+  // Automatic routing never yields the high-context family for either role,
+  // even though every family resolves and is healthy here.
+  assert.notEqual(router.route('supervisor').requestedFamily, 'agy:gemini');
+  assert.notEqual(router.route('reviewer').requestedFamily, 'agy:gemini');
+
+  // With every other family health-removed, automatic routing returns null
+  // rather than falling through to the high-context family.
+  const health = new ProviderHealthRegistry();
+  for (const f of ['codex:default', 'claude:opus', 'agy:gpt-oss']) health.record(f, 'UNAVAILABLE');
+  const gated = new RoleRouter({ providerHealth: health, resolveFamily: resolver });
+  assert.equal(gated.route('supervisor'), null);
+  assert.equal(gated.route('reviewer'), null);
+
+  // An explicit caller opt-in still allows it.
+  assert.equal(gated.route('supervisor', { allowHighContext: true }).requestedFamily, 'agy:gemini');
+  assert.equal(gated.route('reviewer', { allowHighContext: true }).requestedFamily, 'agy:gemini');
 });
 
 test('reset expiry becomes UNKNOWN', () => {

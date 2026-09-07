@@ -78,6 +78,9 @@ test('reviewer + supervisor pools have eligible internal candidates', () => {
   const r = checkReviewerSupervisorPools();
   assert.equal(r.ok, true);
   assert.ok(r.eligible.reviewer.length > 0 && r.eligible.supervisor.length > 0);
+  // agy:gemini is high-context: reported separately, never in the auto pool.
+  assert.ok(!r.eligible.reviewer.includes('agy:gemini') && !r.eligible.supervisor.includes('agy:gemini'));
+  assert.ok(r.highContext.reviewer.includes('agy:gemini') && r.highContext.supervisor.includes('agy:gemini'));
 });
 
 test('runDoctor passes on core prerequisites and reports Worker as external', () => {

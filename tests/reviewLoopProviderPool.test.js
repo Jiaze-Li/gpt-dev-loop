@@ -12,15 +12,20 @@ import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 test('reviewer routes to the first eligible family; supervisor to its first', () => {
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}) });
   assert.equal(pool.route('reviewer').family, 'agy:gpt-oss');
-  assert.equal(pool.route('supervisor').family, 'agy:gemini');
+  // codex:default + claude:opus: runtime not probed -> UNAVAILABLE; agy:gemini
+  // is high-context (excluded from automatic routing) -> the degraded gpt-oss
+  // fallback is the first family actually selectable for supervisor.
+  assert.equal(pool.route('supervisor').family, 'agy:gpt-oss');
 });
 
 test('reviewer first candidate in cooldown -> next eligible family selected', () => {
   const quota = new QuotaPoolRegistry({ filePath: null });
   quota.recordCooldown('agy-claude-gpt'); // the pool backing agy:gpt-oss
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}), quotaRegistry: quota });
-  const sel = pool.route('reviewer');
-  assert.equal(sel.family, 'agy:gemini'); // codex:default skipped: runtime not probed -> UNAVAILABLE
+  // codex:default skipped (runtime not probed -> UNAVAILABLE); agy:gemini only
+  // reachable with an explicit high-context opt-in.
+  assert.equal(pool.route('reviewer'), null);
+  assert.equal(pool.route('reviewer', { allowHighContext: true }).family, 'agy:gemini');
 });
 
 test('supervisor first candidate unavailable -> next eligible selected', () => {
@@ -46,7 +51,8 @@ test('the CallIntent family matches the actually-selected family', async () => {
 
   const controller = createReviewLoopController({
     persistence,
-    routeReviewerFn: (signals) => pool.route('reviewer', signals),
+    // gemini is high-context: an explicit opt-in is required to reach it.
+    routeReviewerFn: (signals) => pool.route('reviewer', { ...signals, allowHighContext: true }),
     reviewerFn: async ({ selection }) => {
       seenIntents.push(selection.family);
       return { value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } };

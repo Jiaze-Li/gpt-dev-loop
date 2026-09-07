@@ -169,6 +169,17 @@ Corrected against this machine's durable reservation + spend ledgers under
   `codex` / `claude` Reviewer+Supervisor transports are IMPLEMENTED and are
   selectable only when the zero-token version + local-auth preflights succeed.
   Still ZERO real `codex` / `claude` Reviewer/Supervisor calls.
+- 2026-09-07 live-certification observations (from a prior controlled run,
+  not reproduced here): `agy:gpt-oss` Reviewer ~12.1k input / ~12.0k context
+  overhead (`gpt-oss-120b-medium`); `codex:default` Reviewer ~16.9k input /
+  ~10.6k cache-read; `agy:gemini` Supervisor ~150.7k input + ~656.8k
+  cache-read (**high-context** — now excluded from automatic routing);
+  `claude:opus` Reviewer failed `PROVIDER_PROTOCOL_ERROR` (`claude -p` exit 1
+  in ~491ms). Root cause: `--mcp-config '{}'` rejected by the installed CLI
+  (needs an `mcpServers` key). **Fixed 2026-09-07** (`'{"mcpServers":{}}'`
+  plus `--setting-sources '' / --tools '' / --disable-slash-commands /
+  --no-session-persistence`); argv is deterministically regression-covered but
+  a live `claude:opus` call is **still NOT certified**.
 - ReviewLoop real-provider Reviewer/Supervisor E2E over the current
   architecture = **ATTEMPTED / NOT CERTIFIED**. The one real run
   (`rl-20260906075721-c674d31f`) reached a live `agy` Reviewer with 2

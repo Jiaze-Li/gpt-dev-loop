@@ -118,15 +118,18 @@ export function checkGlobalPolicy({
 
 export function checkReviewerSupervisorPools() {
   const eligible = { reviewer: [], supervisor: [] };
+  const highContext = { reviewer: [], supervisor: [] };
   for (const role of ACTIVE_ROLES) {
     for (const cand of DEFAULT_ROLE_POLICY[role] ?? []) {
-      if ((PRODUCTION_ROLE_CAPABILITIES[cand.family] ?? []).includes(role)) eligible[role].push(cand.family);
+      if (!(PRODUCTION_ROLE_CAPABILITIES[cand.family] ?? []).includes(role)) continue;
+      if (cand.highContext) highContext[role].push(cand.family);
+      else eligible[role].push(cand.family);
     }
   }
   const issues = [];
-  if (eligible.reviewer.length === 0) issues.push('no internal Reviewer candidate available');
-  if (eligible.supervisor.length === 0) issues.push('no internal Supervisor candidate available');
-  return { name: 'model_pools', ok: issues.length === 0, eligible, issues };
+  if (eligible.reviewer.length === 0) issues.push('no auto-eligible Reviewer candidate available');
+  if (eligible.supervisor.length === 0) issues.push('no auto-eligible Supervisor candidate available');
+  return { name: 'model_pools', ok: issues.length === 0, eligible, highContext, issues };
 }
 
 // Diagnostic mirror of the MCP startup preflight. This stays zero-model:
@@ -197,6 +200,8 @@ export function runDoctor({ execSync, log, env } = {}) {
 
   const pools = checkReviewerSupervisorPools();
   write(`  ${pools.ok ? 'ok  ' : 'warn'}  model_pools: reviewer=[${pools.eligible.reviewer.join(',') || 'none'}] supervisor=[${pools.eligible.supervisor.join(',') || 'none'}]`);
+  const hc = [...new Set([...(pools.highContext?.reviewer ?? []), ...(pools.highContext?.supervisor ?? [])])];
+  if (hc.length) write(`  info  model_pools: high-context (opt-in only, not auto-selected): ${hc.join(',')}`);
   for (const i of pools.issues) write(`  warn  model_pools: ${i}`);
   write('  info  Worker = external / current coding agent (not selected, spawned, or budgeted by ReviewLoop)');
 

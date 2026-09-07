@@ -82,9 +82,13 @@ test('5: the durable reservation + spend record persist the ACTUAL resolved mode
   const persistence = new MemoryPersistence();
   const pool = createReviewLoopProviderPool({
     callAgy: async () => ({ text: '{"findings":[]}', model: 'gemini-3.8-flash-high', usage: { input_tokens: 3, output_tokens: 1 } }),
-    agyCatalog: ['gemini-3.8-flash-high'],
+    agyCatalog: ['gemini-3.8-flash-high', 'gpt-oss-999b-medium'],
   });
-  assert.equal(pool.route('supervisor').model, 'gemini-3.8-flash-high');
+  // gemini is high-context (excluded from automatic routing); with the CLI
+  // families unprobed, the degraded gpt-oss fallback is what supervisor picks,
+  // and its model still resolves from the probed catalog.
+  assert.equal(pool.route('supervisor').family, 'agy:gpt-oss');
+  assert.equal(pool.route('supervisor').model, 'gpt-oss-999b-medium');
 
   const controller = createReviewLoopController({
     persistence,
@@ -107,6 +111,9 @@ test('6: a resolution change still emits the MODEL_RESOLVED_CHANGED diagnostics 
   const events = [];
   let catalog = ['gemini-3.7-flash-high'];
   const router = new RoleRouter({
+    // gemini is last + high-context in the default policy; pin it here so the
+    // test observes its resolution-change diagnostics directly.
+    rolePolicy: { supervisor: [{ family: 'agy:gemini', effort: 'medium' }] },
     resolveFamily: (family) => resolveModelFamily(family, { env: {}, agyCatalog: catalog }),
     onEvent: (e) => events.push(e),
   });

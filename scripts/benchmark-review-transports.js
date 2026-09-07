@@ -67,7 +67,11 @@ function fakeSpawn() {
 
 const NARROW_MARKERS = {
   codex: ['--ephemeral', '--ignore-user-config', '--ignore-rules', '--skip-git-repo-check', '-s', 'read-only'],
-  claude: ['--strict-mcp-config', '--mcp-config', '{}', '--exclude-dynamic-system-prompt-sections', '--disallowedTools'],
+  claude: [
+    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+    '--exclude-dynamic-system-prompt-sections', '--setting-sources', '--tools',
+    '--disable-slash-commands', '--no-session-persistence',
+  ],
 };
 
 async function measure(name, makeTransport) {

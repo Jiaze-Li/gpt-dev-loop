@@ -73,6 +73,35 @@ the SAME strict normalization as agy — malformed → `HUMAN_REQUIRED`, never a
 clean empty result. One physical attempt per call; bounded failover lives in
 the controller, not in the transport.
 
+### Per-family context isolation (what each CLI can and cannot narrow)
+
+All argv below is verified against the installed CLIs' own `--help`; the
+`benchmark:transports` harness pins the narrow-flag set mechanically.
+
+| Family | Per-call narrowing available | Not closable per call | Measured live tax |
+| --- | --- | --- | --- |
+| `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | argv-fixed 2026-09-07; **live-cert pending** (was `PROVIDER_PROTOCOL_ERROR` — see below) |
+| `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | ~16.9k input (~10.6k cache-read), output ~9 |
+| `agy:gpt-oss` | `--disable-slash-commands`, scratch cwd — that is the entire per-call surface `agy` exposes | user config, global MCP, tool schemas, agent memory, workspace preload — `agy` has **no** `--strict-mcp-config` / `--ignore-user-config` / `--setting-sources` / tool-disable / dynamic-section flag | ~12.1k input, no cache blow-up — acceptable |
+| `agy:gemini` | same as `agy:gpt-oss` (nothing meaningful) | same as `agy:gpt-oss` | **~150.7k input + ~656.8k cache-read** — an order of magnitude worse |
+
+**`agy:gemini` is marked `highContext` in `DEFAULT_ROLE_POLICY` and excluded
+from automatic Reviewer/Supervisor routing** (`RoleRouter` skips a
+`highContext` candidate unless a caller passes `signals.allowHighContext ===
+true`). It stays last in both policy lists so a future `agy` release that adds
+a real narrowing flag can re-enable it with a one-line change. The only
+narrowing path `agy` offers today (`agy mcp disable`) mutates the user's
+global config, which ReviewLoop must not do. Routing order here follows the
+measured token cost above, not a subjective model-quality judgement.
+
+**Claude `PROVIDER_PROTOCOL_ERROR` root cause (fixed 2026-09-07)**: the
+transport passed `--mcp-config '{}'`. The installed CLI (2.1.x) validates the
+value as an object that MUST carry an `mcpServers` key and rejects a bare
+`{}` with `Invalid MCP configuration: mcpServers: Invalid input`, exiting 1 in
+~0.5s — before any model dispatch, which is why the failure looked like a
+protocol error rather than an auth or inference failure. The value is now
+`'{"mcpServers":{}}'`.
+
 **Dynamic model-family resolution** preserves family semantics without
 concrete release pins. `agy:gemini` / `agy:gpt-oss` resolve from the probed
 `agy models` catalog when available; `codex:default` omits a model flag and

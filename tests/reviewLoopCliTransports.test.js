@@ -114,16 +114,61 @@ test('claude transport: narrow argv + stable opus alias + json envelope -> text/
   const res = await transport('REVIEW');
   const { args } = spawn.calls[0];
   assert.ok(args.includes('--strict-mcp-config'));
-  assert.deepEqual([args[args.indexOf('--mcp-config')], args[args.indexOf('--mcp-config') + 1]], ['--mcp-config', '{}']);
+  // The installed Claude CLI rejects a bare "{}" ("mcpServers: Invalid input",
+  // exit 1) — the value MUST be an object carrying an mcpServers key. This was
+  // the root cause of the claude:opus PROVIDER_PROTOCOL_ERROR.
+  assert.deepEqual(
+    [args[args.indexOf('--mcp-config')], args[args.indexOf('--mcp-config') + 1]],
+    ['--mcp-config', '{"mcpServers":{}}'],
+  );
+  assert.equal(JSON.parse(args[args.indexOf('--mcp-config') + 1]).mcpServers !== undefined, true);
   assert.ok(args.includes('--exclude-dynamic-system-prompt-sections'));
-  assert.ok(args.includes('--disallowedTools'));
-  assert.match(args[args.indexOf('--disallowedTools') + 1], /Bash/);
+  // No user/project/local settings, no built-in tools, no skills, no session.
+  assert.deepEqual([args[args.indexOf('--setting-sources')], args[args.indexOf('--setting-sources') + 1]], ['--setting-sources', '']);
+  assert.deepEqual([args[args.indexOf('--tools')], args[args.indexOf('--tools') + 1]], ['--tools', '']);
+  assert.ok(args.includes('--disable-slash-commands'));
+  assert.ok(args.includes('--no-session-persistence'));
+  // Isolation / no-resume: the transport never continues a prior conversation.
+  assert.ok(!args.includes('--resume') && !args.includes('-r') && !args.includes('-c') && !args.includes('--continue') && !args.includes('--fork-session'));
+  // Unsupported / removed flags must not reappear.
+  assert.ok(!args.includes('--disallowedTools') && !args.includes('--bare'));
+  // claude:opus keeps the stable family alias, never a pinned release.
   assert.deepEqual([args[args.indexOf('--model')], args[args.indexOf('--model') + 1]], ['--model', 'opus']);
   assert.equal(res.text, '{"findings":[]}');
   assert.equal(res.usage.input_tokens, 1200);
   assert.equal(res.usage.cache_read_input_tokens, 5);
   assert.equal(res.costUsd, 0.012);
   assert.equal(res.model, 'claude-opus-current');
+});
+
+test('claude transport: final argv matches the installed CLI capability set (no unsupported flags, isolation intact)', async () => {
+  const spawn = fakeSpawn(() => ({
+    stdout: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '{"findings":[]}' }),
+  }));
+  await makeClaudeReviewTransport({ spawn, model: 'opus' })('P');
+  const { args } = spawn.calls[0];
+
+  // Every flag the transport emits is one the installed `claude --help` lists.
+  const SUPPORTED = new Set([
+    '-p', '--output-format', '--setting-sources', '--strict-mcp-config',
+    '--mcp-config', '--tools', '--disable-slash-commands',
+    '--no-session-persistence', '--exclude-dynamic-system-prompt-sections',
+    '--model',
+  ]);
+  for (const a of args) {
+    if (a.startsWith('--') || /^-[a-z]$/.test(a)) assert.ok(SUPPORTED.has(a), `unsupported flag in argv: ${a}`);
+  }
+
+  // MCP config carries the mcpServers key the CLI requires (a bare "{}" is
+  // rejected, exit 1) — the certified form.
+  assert.equal('mcpServers' in JSON.parse(args[args.indexOf('--mcp-config') + 1]), true);
+
+  // Stateless / no-resume / no-project-context, mechanically.
+  for (const forbidden of ['--resume', '-r', '-c', '--continue', '--fork-session', '--add-dir', '--ide', '--from-pr']) {
+    assert.ok(!args.includes(forbidden), `isolation break: ${forbidden}`);
+  }
+  // opus stays a stable alias, never a pinned release id.
+  assert.equal(args[args.indexOf('--model') + 1], 'opus');
 });
 
 test('claude transport: error subtype / non-JSON -> classified failure', async () => {

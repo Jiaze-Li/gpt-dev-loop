@@ -142,19 +142,36 @@ export function makeCodexReviewTransport({
 
 // ---- Claude ------------------------------------------------------------
 //
-// `claude -p` narrow-mode flags:
+// `claude -p` narrow-mode flags (all verified against the installed CLI's
+// `claude --help`, Claude Code 2.1.x):
 //   --output-format json                       machine-readable envelope
-//   --strict-mcp-config --mcp-config {}        no MCP servers
-//   --disallowedTools <all>                    no tool use
-//   --exclude-dynamic-system-prompt-sections   trims the system prompt
+//   --setting-sources ''                       load NO user/project/local
+//                                              settings: no hooks, custom
+//                                              agents, output styles, statusline
+//   --strict-mcp-config --mcp-config           no MCP servers. The value MUST
+//     '{"mcpServers":{}}'                       be an object WITH an mcpServers
+//                                              key — a bare "{}" is rejected
+//                                              ("Invalid MCP configuration:
+//                                              mcpServers: Invalid input",
+//                                              exit 1 in ~0.5s). This was the
+//                                              root cause of the claude:opus
+//                                              PROVIDER_PROTOCOL_ERROR.
+//   --tools ''                                 disable ALL built-in tools ->
+//                                              strictly read-only, no shell /
+//                                              file / web tool schemas loaded
+//   --disable-slash-commands                   no skills / slash expansion
+//   --no-session-persistence                   never write or resume a session
+//   --exclude-dynamic-system-prompt-sections   trims per-machine system-prompt
+//                                              sections (cwd/env/memory/git)
 //   (run from scratch cwd -> no CLAUDE.md / project context)
+//
+// Isolation the installed CLI does NOT provide per-call: admin/managed (policy)
+// settings still apply, and the built-in `claude -p` base system prompt cannot
+// be zeroed without --system-prompt (which would also disable the
+// dynamic-section trim). `--bare` would remove more but forces API-key-only
+// auth (OAuth / subscription creds are never read), so it is not usable here.
 // The `claude` shell alias adds --dangerously-skip-permissions; spawning the
 // binary directly (argv, not a shell) never sees that alias.
-
-const CLAUDE_DISALLOWED_TOOLS = [
-  'Bash', 'Edit', 'Write', 'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch',
-  'NotebookEdit', 'Task', 'TodoWrite', 'Agent',
-].join(',');
 
 export function makeClaudeReviewTransport({
   model = null, spawn = nodeSpawn, timeoutMs = DEFAULT_CLI_TRANSPORT_TIMEOUT_MS, env = process.env,
@@ -164,8 +181,11 @@ export function makeClaudeReviewTransport({
     const args = [
       '-p', String(prompt),
       '--output-format', 'json',
-      '--strict-mcp-config', '--mcp-config', '{}',
-      '--disallowedTools', CLAUDE_DISALLOWED_TOOLS,
+      '--setting-sources', '',
+      '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+      '--tools', '',
+      '--disable-slash-commands',
+      '--no-session-persistence',
       '--exclude-dynamic-system-prompt-sections',
     ];
     if (typeof model === 'string' && model.trim() !== '') args.push('--model', model.trim());

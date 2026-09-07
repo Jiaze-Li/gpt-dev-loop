@@ -83,7 +83,7 @@ test('pool: an unavailable CLI runtime records UNAVAILABLE health and is never s
   assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
   assert.match(pool.runtimeStatus['codex:default'].reason, /runtime unavailable: CLI not installed/);
   assert.match(pool.runtimeStatus['claude:opus'].reason, /not authenticated/);
-  assert.equal(pool.route('supervisor').family, 'agy:gemini');
+  assert.equal(pool.route('supervisor').family, 'agy:gpt-oss'); // gemini high-context: excluded from automatic routing
 });
 
 test('controller: post-dispatch AUTH_REJECTED has unknown spend and MUST NOT fail over', async () => {
@@ -132,5 +132,5 @@ test('pool: locally unauthenticated CLI families are skipped deterministically b
   assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
   assert.equal(pool.runtimeStatus['claude:opus'].runtimeAvailable, false);
   assert.equal(pool.route('reviewer').family, 'agy:gpt-oss');
-  assert.equal(pool.route('supervisor').family, 'agy:gemini');
+  assert.equal(pool.route('supervisor').family, 'agy:gpt-oss'); // gemini high-context: excluded from automatic routing
 });

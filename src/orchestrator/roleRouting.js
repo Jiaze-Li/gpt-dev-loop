@@ -8,9 +8,18 @@ import os from 'node:os';
 // The Worker (the coding agent the user is talking to) is OUTSIDE role routing
 // entirely — ReviewLoop never selects, spawns, budgets, or model-restricts it.
 // There is no `planner` and no `executor` role: execution is Worker-owned.
+// `highContext: true` families stay in the policy (a future adapter could
+// narrow them) but are NEVER chosen by automatic routing — only when a caller
+// explicitly opts in with `signals.allowHighContext === true`. `agy:gemini` is
+// marked high-context because the installed `agy` CLI exposes NO per-call lever
+// to narrow inference (no --strict-mcp-config / --ignore-user-config /
+// --setting-sources / tool-disable / dynamic-section trim); a real Supervisor
+// call was measured at ~150.7k input + ~656.8k cache-read tokens, an order of
+// magnitude above every other family. The only AGY narrowing path mutates the
+// user's global config, which ReviewLoop must not do. See docs/ARCHITECTURE.md.
 export const DEFAULT_ROLE_POLICY = Object.freeze({
-  supervisor: Object.freeze([{ family: 'agy:gemini', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gpt-oss', effort: 'medium', degraded: true }]),
-  reviewer: Object.freeze([{ family: 'agy:gpt-oss', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'agy:gemini', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }]),
+  supervisor: Object.freeze([{ family: 'codex:default', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gpt-oss', effort: 'medium', degraded: true }, { family: 'agy:gemini', effort: 'medium', highContext: true }]),
+  reviewer: Object.freeze([{ family: 'agy:gpt-oss', effort: 'medium' }, { family: 'codex:default', effort: 'medium' }, { family: 'claude:opus', effort: 'medium' }, { family: 'agy:gemini', effort: 'medium', highContext: true }]),
 });
 
 export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
@@ -134,6 +143,9 @@ export class RoleRouter {
       // unsupported too; do not turn a missing adapter into a token-bearing
       // probe.  Resolvers that predate capability metadata remain compatible.
       if (Array.isArray(resolved.capabilities?.roles) && !resolved.capabilities.roles.includes(role)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'capability' }); continue; }
+      // A high-context family is excluded from automatic selection unless a
+      // caller explicitly opts in. Purely deterministic — never a token probe.
+      if (candidate.highContext && signals.allowHighContext !== true) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'high_context' }); continue; }
       if (!this.quotaRegistry.usable(candidate.family)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'quota_cooldown', pools: this.quotaRegistry.poolsFor(candidate.family) }); continue; }
       if (!this.providerHealth.usable(candidate.family, provider)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'provider_health' }); continue; }
       const effort = this.effortPolicy.select({ candidate, capabilities: resolved.capabilities, signals });
