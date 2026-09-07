@@ -1,7 +1,6 @@
 // Stage 3 — production Codex / Claude Reviewer+Supervisor transports.
 // Narrow, stateless, single-turn; output through the SAME strict normalization
-// as agy; failures map to the RETRYABLE codes the RoleRouter already handles.
-// No real provider call: every spawn is a deterministic fake.
+// as agy. No real provider call: every spawn is a deterministic fake.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,8 +15,6 @@ import { CLI_FAILURE } from '../src/reviewloop/adapters/boundedCli.js';
 import { createReviewLoopProviderPool } from '../src/reviewloop/providerWiring.js';
 import { narrowReviewTransportCwd } from '../src/reviewloop/adapters/scratchCwd.js';
 
-// Deterministic fake `spawn`. `handler({ command, args })` returns
-// { stdout?, stderr?, code?, spawnError?, writesOutFile? }.
 function fakeSpawn(handler) {
   const calls = [];
   const spawn = (command, args) => {
@@ -30,7 +27,7 @@ function fakeSpawn(handler) {
     child.kill = () => true;
     const r = handler({ command, args }) ?? {};
     child.kill = (signal) => { (child.killCalls ??= []).push(signal); return true; };
-    if (r.neverCloses) return child; // hangs until the transport's wall-clock timeout fires
+    if (r.neverCloses) return child;
     queueMicrotask(() => {
       if (r.spawnError) { child.emit('error', Object.assign(new Error('spawn fail'), { code: r.spawnError })); return; }
       if (r.writesOutFile) {
@@ -61,16 +58,16 @@ test('codex transport: narrow argv, scratch cwd, reads the -o last message', asy
   assert.deepEqual([args[args.indexOf('-s')], args[args.indexOf('-s') + 1]], ['-s', 'read-only']);
   assert.equal(args[args.indexOf('-C') + 1], narrowReviewTransportCwd());
   assert.equal(args.at(-1), 'REVIEW THIS');
-  assert.ok(!args.includes('-m'), 'no --model when config asks for the family default');
+  assert.ok(!args.includes('-m'), 'no --model for codex:default');
   assert.match(res.text, /findings/);
   assert.equal(res.usage.input_tokens, 900);
   assert.equal(res.model, 'gpt-5-codex');
   assert.equal(res.meta.promptChars, 'REVIEW THIS'.length);
 });
 
-test('codex transport: auth / rate-limit / quota / enoent / timeout map to RETRYABLE codes', async () => {
+test('codex transport: post-dispatch auth / rate-limit / quota / enoent / protocol classify correctly', async () => {
   const cases = [
-    [{ code: 1, stderr: 'Error: 401 Unauthorized' }, CLI_FAILURE.AUTH_FAILED],
+    [{ code: 1, stderr: 'Error: 401 Unauthorized' }, CLI_FAILURE.AUTH_REJECTED],
     [{ code: 1, stderr: 'stream error: 429 rate limit exceeded' }, CLI_FAILURE.RATE_LIMITED],
     [{ code: 1, stderr: 'insufficient_quota: add billing' }, CLI_FAILURE.QUOTA_EXHAUSTED],
     [{ spawnError: 'ENOENT' }, CLI_FAILURE.UNAVAILABLE],
@@ -87,9 +84,6 @@ test('codex transport: auth / rate-limit / quota / enoent / timeout map to RETRY
 });
 
 test('codex transport: wall-clock timeout -> PROVIDER_TIMEOUT (signals intercepted, never real)', async () => {
-  // HARD SAFETY: a mock-spawn timeout test must never let a fake PID/PGID reach
-  // the real process.kill(). Intercept the signal primitive; assert no POSIX
-  // broadcast (-1) and no real signal to the fake pid.
   const originalKill = process.kill;
   const signalled = [];
   process.kill = (pid, sig) => {
@@ -101,22 +95,22 @@ test('codex transport: wall-clock timeout -> PROVIDER_TIMEOUT (signals intercept
     const transport = makeCodexReviewTransport({ spawn, timeoutMs: 40 });
     await assert.rejects(transport('x'), (err) => err.code === CLI_FAILURE.TIMEOUT);
     assert.ok(signalled.every(([pid]) => pid !== -1), 'never POSIX kill(-1) broadcast');
-    assert.ok(signalled.every(([pid]) => pid < 0), 'only negative-PGID group targets reached the (stubbed) primitive');
+    assert.ok(signalled.every(([pid]) => pid < 0), 'only negative-PGID group targets reached the stubbed primitive');
   } finally {
     process.kill = originalKill;
   }
 });
 
-test('claude transport: narrow argv + json envelope -> text/usage/cost', async () => {
+test('claude transport: narrow argv + stable opus alias + json envelope -> text/usage/cost', async () => {
   const spawn = fakeSpawn(() => ({
     stdout: JSON.stringify({
       type: 'result', subtype: 'success', is_error: false,
-      result: '{"findings":[]}', model: 'claude-sonnet-4-6',
+      result: '{"findings":[]}', model: 'claude-opus-current',
       usage: { input_tokens: 1200, output_tokens: 40, cache_read_input_tokens: 5 },
       total_cost_usd: 0.012,
     }),
   }));
-  const transport = makeClaudeReviewTransport({ spawn });
+  const transport = makeClaudeReviewTransport({ spawn, model: 'opus' });
   const res = await transport('REVIEW');
   const { args } = spawn.calls[0];
   assert.ok(args.includes('--strict-mcp-config'));
@@ -124,11 +118,12 @@ test('claude transport: narrow argv + json envelope -> text/usage/cost', async (
   assert.ok(args.includes('--exclude-dynamic-system-prompt-sections'));
   assert.ok(args.includes('--disallowedTools'));
   assert.match(args[args.indexOf('--disallowedTools') + 1], /Bash/);
+  assert.deepEqual([args[args.indexOf('--model')], args[args.indexOf('--model') + 1]], ['--model', 'opus']);
   assert.equal(res.text, '{"findings":[]}');
   assert.equal(res.usage.input_tokens, 1200);
   assert.equal(res.usage.cache_read_input_tokens, 5);
   assert.equal(res.costUsd, 0.012);
-  assert.equal(res.model, 'claude-sonnet-4-6');
+  assert.equal(res.model, 'claude-opus-current');
 });
 
 test('claude transport: error subtype / non-JSON -> classified failure', async () => {
@@ -142,14 +137,12 @@ test('claude transport: error subtype / non-JSON -> classified failure', async (
 });
 
 test('pool: an available CLI runtime is actually wired and selectable', async () => {
-  // supervisor resolves to codex:default below, so the fake must also write the
-  // codex -o last-message file (not just a claude-style stdout envelope).
   const spawn = fakeSpawn(() => ({
     writesOutFile: '{"findings":[]}',
     stdout: JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }) + '\n',
   }));
   const health = new (await import('../src/orchestrator/roleRouting.js')).ProviderHealthRegistry();
-  health.record('agy:gemini', 'UNAVAILABLE'); // push supervisor past agy:gemini
+  health.record('agy:gemini', 'UNAVAILABLE');
   const pool = createReviewLoopProviderPool({
     callAgy: async () => ({}),
     providerHealth: health,
@@ -175,10 +168,23 @@ test('pool: no runtime probe -> CLI families reported UNAVAILABLE, never phantom
   assert.equal(pool.runtimeStatus['claude:opus'].runtimeAvailable, false);
 });
 
-test('probeReviewTransportRuntime: ENOENT -> not available with a clear reason', async () => {
-  const spawn = fakeSpawn(() => ({ spawnError: 'ENOENT' }));
+test('probeReviewTransportRuntime: missing CLI or local unauthenticated status is unavailable pre-dispatch', async () => {
+  const missing = await probeReviewTransportRuntime({ spawn: fakeSpawn(() => ({ spawnError: 'ENOENT' })) });
+  assert.equal(missing['codex:default'].available, false);
+  assert.equal(missing['codex:default'].reason, 'CLI not installed');
+  assert.equal(missing['claude:opus'].available, false);
+
+  const spawn = fakeSpawn(({ command, args }) => {
+    if (args[0] === '--version') return { code: 0, stdout: `${command}-version` };
+    if (command === 'codex' && args[0] === 'login' && args[1] === 'status') return { code: 1, stderr: 'Not logged in' };
+    if (command === 'claude' && args[0] === 'auth' && args[1] === 'status') return { code: 0, stdout: '{"loggedIn":true}' };
+    return { code: 1 };
+  });
   const rt = await probeReviewTransportRuntime({ spawn });
   assert.equal(rt['codex:default'].available, false);
-  assert.equal(rt['codex:default'].reason, 'CLI not installed');
-  assert.equal(rt['claude:opus'].available, false);
+  assert.equal(rt['codex:default'].reason, 'not authenticated');
+  assert.equal(rt['claude:opus'].available, true);
+  assert.equal(rt['claude:opus'].authChecked, true);
+  assert.ok(spawn.calls.some((c) => c.command === 'codex' && c.args.join(' ') === 'login status'));
+  assert.ok(spawn.calls.some((c) => c.command === 'claude' && c.args.join(' ') === 'auth status'));
 });
