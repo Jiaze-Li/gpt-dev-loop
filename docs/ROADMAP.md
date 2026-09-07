@@ -118,13 +118,40 @@ Token-Safety P1 from the independent re-verification:
   `{0,0}`. Missing / ambiguous provenance, an ordinary provider failure, or a
   success all deny the reuse. Durable across a restart.
 
+## CLI transport implementation + safety rework
+
+- Production `codex` + `claude` Reviewer/Supervisor transports are implemented
+  as narrow, stateless, single-turn calls from an isolated scratch cwd with no
+  repo/history preload, bounded wall-clock timeout, and whole-process-group
+  teardown.
+- Runtime eligibility is checked without model spend: `--version` plus local
+  auth status (`codex login status`, `claude auth status`). Missing or locally
+  unauthenticated CLIs are marked UNAVAILABLE before ReviewLoop authorizes a
+  model dispatch, so routing can choose the next family safely.
+- An authentication-looking failure after a prompt-bearing invocation has
+  started is classified separately as `PROVIDER_AUTH_REJECTED`. It is NOT
+  treated as mechanically-zero pre-send provenance; absent reliable provider
+  usage, Token Safety fails closed and does not fail over on the same evidence.
+- Stable family semantics are preserved without concrete release pins:
+  `codex:default` delegates to the provider default; `claude:opus` passes the
+  stable `opus` alias; `agy:*` families resolve from the runtime model catalog.
+  Telemetry still records the concrete model returned by the provider.
+- `npm run benchmark:transports` is a zero-provider harness with two layers:
+  transport narrowness/overhead plus real ReviewLoop-controller state-machine
+  paths E2E-A (one-round PASS), E2E-B (REWORK → changed implementation → PASS),
+  and E2E-C (same blocker after a changed implementation → Supervisor exactly
+  once → REWORK).
+
 ## Real-provider status (needs real providers / real GitHub)
 
 Corrected against this machine's durable reservation + spend ledgers under
 `~/.reviewloop/` (not from recollection):
 
-- Deterministic/mock certification = **PASS** — `npm test` 336/336,
+- Last locally reported deterministic/mock certification before the latest
+  auth/alias/E2E rework = **PASS** — `npm test` 336/336,
   `npm run doctor` PASS, `npm run benchmark:transports` PASS (0 real spawns).
+  The latest rework must be rerun locally before merge; do not infer PASS from
+  the unchanged test count.
 - `npm run install-global` = **executed** against this machine's agent
   config / dotfiles (managed block + `reviewloop` MCP registration).
 - Real ReviewLoop provider calls with a durable record on this machine =
@@ -139,26 +166,25 @@ Corrected against this machine's durable reservation + spend ledgers under
 - Any earlier `claude:sonnet` / Executor-era real call = **UNKNOWN** — no
   durable record survives in the current runtime dir; not asserted.
 - No `codex` or `claude` real provider call has any durable record. The
-  `codex` / `claude` Reviewer+Supervisor transports are now IMPLEMENTED
-  (narrow, single-turn, `adapters/cliReviewTransports.js`) and wired into the
-  pool only when a zero-token `--version` probe finds the CLI; deterministic
-  fakes exercise every path. Still ZERO real `codex` / `claude` calls.
+  `codex` / `claude` Reviewer+Supervisor transports are IMPLEMENTED and are
+  selectable only when the zero-token version + local-auth preflights succeed.
+  Still ZERO real `codex` / `claude` Reviewer/Supervisor calls.
 - ReviewLoop real-provider Reviewer/Supervisor E2E over the current
   architecture = **ATTEMPTED / NOT CERTIFIED**. The one real run
   (`rl-20260906075721-c674d31f`) reached a live `agy` Reviewer with 2
-  successful physical calls but terminated `HUMAN_REQUIRED` — it was not
-  carried to a certified PASS/REWORK end-to-end verdict. The deterministic
-  Gate + regression suite is the accepted bar for this pass.
+  successful physical calls but terminated `HUMAN_REQUIRED`; it was not
+  carried to a certified PASS/REWORK end-to-end verdict.
 - ReviewLoop real PR external-review loop (`@codex review` / `@claude review`)
   = **NOT RUN**.
 - Real multi-provider failover = **NOT RUN** (structurally wired +
-  mock-certified).
+  deterministic/mock paths only).
 - A controlled `Worker + ReviewLoop` vs `Worker alone` wrapper benchmark
-  (ReviewLoop cannot observe Worker token usage through MCP).
+  remains future work because ReviewLoop cannot observe Worker token usage
+  through MCP.
 
 ## Later
 
 - A first LIVE `codex` / `claude` Reviewer/Supervisor call (transports are
-  implemented + mock-certified; no real invocation has been made or recorded).
+  implemented; no real invocation has been made or recorded).
 - Optional read-only ReviewLoop dashboard (removed in this migration; re-add
   only if it can stay zero-token and simple).
