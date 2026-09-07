@@ -32,7 +32,13 @@ test('1+2: the default config carries no concrete Gemini or GPT-OSS version pin'
     assert.equal(r.resolvedFrom, RESOLUTION_SOURCE.PROVIDER_DEFAULT, family);
     assert.equal(r.concreteVersionPinned, false, family);
   }
-  // the role policy itself references only stable family identities
+  // `claude:opus` is not provider-default semantics: bind the stable `opus`
+  // alias so the family remains Opus while the provider advances releases.
+  const opus = resolveModelFamily('claude:opus', { env: {}, agyCatalog: null });
+  assert.equal(opus.resolvedModel, 'opus');
+  assert.equal(opus.resolvedFrom, RESOLUTION_SOURCE.STABLE_PROVIDER_ALIAS);
+  assert.equal(opus.concreteVersionPinned, false);
+
   const families = Object.values(DEFAULT_ROLE_POLICY).flat().map((c) => c.family);
   for (const f of families) assert.match(f, /^[a-z-]+:[a-z-]+$/, f);
 });
@@ -45,7 +51,6 @@ test('3: an explicit env override pins a concrete model for tests/benchmark/repr
   assert.equal(r.concreteVersionPinned, true);
   assert.equal(r.envKey, 'AGY_REVIEWER_MODEL');
 
-  // env override beats catalog
   const r2 = resolveModelFamily('agy:gemini', {
     env: { REVIEWLOOP_SUPERVISOR_MODEL: 'gemini-3.1-pro-low' },
     agyCatalog: ['gemini-9.9-flash-high'],
