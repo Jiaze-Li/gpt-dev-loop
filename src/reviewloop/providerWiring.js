@@ -158,7 +158,7 @@ function extractEmbeddedJson(text) {
   return null;
 }
 
-function parseJsonish(res) {
+export function parseJsonish(res) {
   if (typeof res === 'string') {
     try { return { parsed: JSON.parse(stripFence(res)), raw: res }; } catch { /* embedded */ }
     const embedded = extractEmbeddedJson(res);
