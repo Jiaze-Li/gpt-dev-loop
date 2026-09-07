@@ -46,9 +46,6 @@ export function checkRuntimeDir({ root = REVIEWLOOP_RUNTIME_ROOT } = {}) {
   }
 }
 
-// Repo invariant (NOT an install state): the active architecture must present
-// exactly the reviewer + supervisor roles, no planner, no executor, and the
-// COMMON contract must be the ReviewLoop Worker Contract v1.
 export function checkRepoInvariants({ policyFile = DEFAULT_POLICY_FILE } = {}) {
   const issues = [];
   const roles = Object.keys(DEFAULT_ROLE_POLICY).sort();
@@ -78,9 +75,6 @@ export function checkRepoInvariants({ policyFile = DEFAULT_POLICY_FILE } = {}) {
   return { name: 'repo_invariants', ok: issues.length === 0, issues, commonBytes: bytes };
 }
 
-// Diagnostic only. Distinguishes "repo invariant PASS" from "external global
-// install stale/absent" — the latter is a warning, resolved by running the
-// installer, never by mutating the environment here.
 export function checkGlobalPolicy({
   homeDir = os.homedir(), configDir, env = process.env, policyFile = DEFAULT_POLICY_FILE,
 } = {}) {
@@ -135,25 +129,27 @@ export function checkReviewerSupervisorPools() {
   return { name: 'model_pools', ok: issues.length === 0, eligible, issues };
 }
 
-// Per-family Reviewer/Supervisor transport status. Distinguishes:
-//   - adapter implemented + runtime available  (wired, selectable, callable)
-//   - adapter implemented + runtime unavailable (CLI missing / not authed)
-//   - no adapter
-// plus the default model-resolution mode and whether a concrete version is
-// pinned by default (must be "no"). Zero model calls; the CLI probes are just
-// `--version` like the gh probe above.
+// Diagnostic mirror of the MCP startup preflight. This stays zero-model:
+// version checks establish CLI presence; local auth-status commands establish
+// whether the CLI family can be selected before any prompt-bearing dispatch.
 export function checkReviewTransportRuntime({ execSync, env } = {}) {
   const exec = execSync || nodeExecSync;
-  const probeVersion = (bin) => {
-    try { probe(exec, `${bin} --version`); return { available: true, reason: 'ok' }; }
+  const probeRuntime = (bin, authCommand) => {
+    try { probe(exec, `${bin} --version`); }
     catch (err) {
-      const enoent = /ENOENT|not found/i.test(err.message);
-      return { available: false, reason: enoent ? 'CLI not installed' : 'probe failed' };
+      const enoent = /ENOENT|not found|command not found/i.test(err.message);
+      return { available: false, reason: enoent ? 'CLI not installed' : 'version probe failed' };
+    }
+    try {
+      probe(exec, authCommand);
+      return { available: true, reason: 'ok' };
+    } catch {
+      return { available: false, reason: 'not authenticated' };
     }
   };
   const transportRuntime = {
-    'codex:default': probeVersion('codex'),
-    'claude:opus': probeVersion('claude'),
+    'codex:default': probeRuntime('codex', 'codex login status'),
+    'claude:opus': probeRuntime('claude', 'claude auth status'),
   };
   let runtimeStatus = {};
   try {
@@ -206,7 +202,7 @@ export function runDoctor({ execSync, log, env } = {}) {
 
   const transports = checkReviewTransportRuntime({ execSync: exec, env: environment });
   for (const [family, s] of Object.entries(transports.families)) {
-    const rt = s.runtimeAvailable ? 'runtime available' : `runtime UNAVAILABLE (${s.reason})`;
+    const rt = s.runtimeAvailable ? 'runtime available + locally authenticated' : `runtime UNAVAILABLE (${s.reason})`;
     write(`  info  transport ${family}: adapter=${s.adapterImplemented ? 'yes' : 'NO'}, ${rt}, model=${s.defaultModelResolution ?? 'n/a'}, versionPinnedByDefault=${s.concreteVersionPinnedByDefault ? 'YES' : 'no'}`);
   }
 
