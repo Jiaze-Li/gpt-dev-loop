@@ -72,10 +72,35 @@ test('catalog parsing + effort preference', () => {
   const ids = parseAgyModelCatalog('Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\ngpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n');
   assert.deepEqual(ids, ['gemini-3.8-flash-high', 'gpt-oss-120b-medium']);
   assert.equal(
-    pickCatalogModel(['gemini-3.8-flash-low', 'gemini-3.8-flash-high', 'gemini-3.9-flash-low'], MODEL_FAMILY_REGISTRY['agy:gemini']),
-    'gemini-3.8-flash-high',
-    'prefers the family default effort (high) over a newer low-effort entry',
+    pickCatalogModel(['gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gemini-3.9-flash-low'], MODEL_FAMILY_REGISTRY['agy:gemini']),
+    'gemini-3.8-flash-medium',
+    'prefers the family default effort (medium) over a newer non-medium entry',
   );
+  assert.equal(
+    pickCatalogModel(['gemini-3.8-flash-low', 'gemini-3.9-flash-high'], MODEL_FAMILY_REGISTRY['agy:gemini']),
+    'gemini-3.9-flash-high',
+    'no -medium variant -> falls back to the newest entry regardless of suffix',
+  );
+});
+
+test('agy:gemini production default effort is medium — catalog resolves the -medium variant', () => {
+  assert.equal(MODEL_FAMILY_REGISTRY['agy:gemini'].defaultEffort, 'medium');
+  const r = resolveModelFamily('agy:gemini', {
+    env: {},
+    agyCatalog: ['gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low'],
+  });
+  assert.equal(r.resolvedModel, 'gemini-3.8-flash-medium');
+  assert.equal(r.resolvedFrom, RESOLUTION_SOURCE.RUNTIME_CATALOG);
+  // env override still wins over catalog effort preference.
+  const pinned = resolveModelFamily('agy:gemini', {
+    env: { REVIEWLOOP_SUPERVISOR_MODEL: 'gemini-3.8-flash-high' },
+    agyCatalog: ['gemini-3.8-flash-medium'],
+  });
+  assert.equal(pinned.resolvedModel, 'gemini-3.8-flash-high');
+  assert.equal(pinned.resolvedFrom, RESOLUTION_SOURCE.ENV_OVERRIDE);
+  // Sonnet / GPT-OSS effort untouched.
+  assert.equal(MODEL_FAMILY_REGISTRY['agy:sonnet'].defaultEffort, null);
+  assert.equal(MODEL_FAMILY_REGISTRY['agy:gpt-oss'].defaultEffort, 'medium');
 });
 
 test('5: the durable reservation + spend record persist the ACTUAL resolved model', async () => {

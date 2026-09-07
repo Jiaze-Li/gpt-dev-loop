@@ -84,7 +84,7 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | argv-fixed 2026-09-07; **live-cert pending** (was `PROVIDER_PROTOCOL_ERROR` — see below) |
 | `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | ~16.9k input (~10.6k cache-read), output ~9 |
 | `agy:gpt-oss` | `--agent reviewloop-minimal` (workspace-local custom agent, `inheritCustomizations: false`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | ~12.1k input, ~196 output, cache-read 0, provider total ~12.3k — acceptable |
-| `agy:gemini` | same as `agy:gpt-oss` | same as `agy:gpt-oss` | minimal-agent: input 6713 + output 539 + thinking 506, cache-read 8128, **provider total 7252**, 8.4s (was ~150.7k input + ~656.8k cache-read, ~92.7s) |
+| `agy:gemini` | same as `agy:gpt-oss` (production default effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | **high smoke baseline** (`gemini-3.8-flash-high`): input 6713 + output 539 + thinking 506, cache-read 8128, **provider total 7252**, 8.4s (was ~150.7k input + ~656.8k cache-read, ~92.7s). medium real usage pending controller live certification |
 | `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | routing finalized; controller live certification pending |
 
 **AGY minimal-agent transport — production transport live-certified
@@ -100,13 +100,18 @@ subscription entitlement. If provisioning fails, the AGY families are marked
 **UNAVAILABLE** (fail closed) — ReviewLoop never silently falls back to the
 default AGY agent.
 
-A controlled `gemini-3.8-flash-high` Supervisor smoke (one real narrow-transport
-call, promptChars 502) confirms the token-context collapse:
+A controlled Supervisor smoke (one real narrow-transport call, promptChars 502)
+confirms the token-context collapse. **This baseline was run against
+`gemini-3.8-flash-high`** — the production default effort has since moved to
+`medium` (`gemini-3.8-flash-medium`); real `medium` usage is pending the
+controller live certification and the figures below must not be relabelled as
+`medium` data:
 
 ```
 before minimal agent:  input 150668, output 8078, thinking 5916,
                        cache-read 656768, duration ~92734 ms
-after minimal agent:   input 6713, output 539, thinking 506,
+after minimal agent (high smoke baseline):
+                       input 6713, output 539, thinking 506,
                        cache-read 8128, provider total 7252,
                        duration 8375 ms, promptChars 502
 ```
@@ -208,7 +213,10 @@ protocol error rather than an auth or inference failure. The value is now
 **Dynamic model-family resolution** preserves family semantics without
 concrete release pins. `agy:gemini` / `agy:gpt-oss` / `agy:sonnet` resolve from
 the probed `agy models` catalog when available (by `catalogPrefix`: `gemini-` /
-`gpt-oss-` / `claude-sonnet-`); `codex:default` omits a model flag and
+`gpt-oss-` / `claude-sonnet-`, honouring the family's `defaultEffort` —
+`agy:gemini` = `medium`, `agy:gpt-oss` = `medium`, `agy:sonnet` = none; when the
+exact effort variant is absent, resolution falls back to the newest entry,
+preferring higher effort on a version tie); `codex:default` omits a model flag and
 tracks the Codex provider default; `claude:opus` passes the stable Claude CLI
 alias `--model opus`, which tracks the current Opus release. Provider-returned
 concrete model identity is persisted by telemetry. `doctor` must report

@@ -35,7 +35,11 @@ export const MODEL_FAMILY_REGISTRY = Object.freeze({
     cli: 'agy',
     catalogPrefix: 'gemini-',
     envKeys: Object.freeze(['REVIEWLOOP_SUPERVISOR_MODEL', 'AGY_SUPERVISOR_MODEL', 'AGY_MODEL']),
-    defaultEffort: 'high',
+    // Production Supervisor default effort. `medium` is the deliberate default:
+    // catalog resolution (pickCatalogModel) prefers a `-medium` variant when the
+    // probed `agy models` catalog has one, else falls back to the newest entry
+    // for the family regardless of suffix.
+    defaultEffort: 'medium',
     stableAlias: null,
   }),
   'agy:gpt-oss': Object.freeze({
@@ -124,13 +128,26 @@ function cmpVersion(a, b) {
   return 0;
 }
 
+// Higher = preferred on a version tie when the exact defaultEffort variant is
+// absent from the catalog. Keeps the fallback deterministic and sensible
+// (never silently drops to `-low` just because it sorts first lexically).
+const EFFORT_RANK = Object.freeze({ high: 3, medium: 2, low: 1 });
+function effortRank(id) {
+  const suffix = String(id).split('-').pop();
+  return EFFORT_RANK[suffix] ?? 0;
+}
+
 export function pickCatalogModel(catalog, { catalogPrefix, defaultEffort } = {}) {
   const ids = (Array.isArray(catalog) ? catalog : parseAgyModelCatalog(catalog))
     .filter((id) => catalogPrefix && id.startsWith(catalogPrefix));
   if (ids.length === 0) return null;
   const preferred = defaultEffort ? ids.filter((id) => id.endsWith(`-${defaultEffort}`)) : [];
   const pool = preferred.length ? preferred : ids;
-  return [...pool].sort((x, y) => cmpVersion(versionTuple(y), versionTuple(x)) || (x < y ? 1 : -1))[0];
+  return [...pool].sort((x, y) => (
+    cmpVersion(versionTuple(y), versionTuple(x))
+    || (effortRank(y) - effortRank(x))
+    || (x < y ? 1 : -1)
+  ))[0];
 }
 
 /**
