@@ -110,32 +110,44 @@ test('PR: a new independent reviewloop_begin starts a fresh budget from round 1'
   assert.equal(r.status, 'PASS');
 });
 
-test('PR: a transient Supervisor failure escalates to a human but stays resumable (round not lost)', async () => {
+test('PR: a transient Supervisor failure degrades to a plain REWORK — loop not stalled, budget not spent', async () => {
   const persistence = new MemoryPersistence();
   // Same P1 on H1 and H2 -> round 2 triggers the Supervisor.
   const backend = mockPrBackend({ heads: ['H1', 'H2', 'H3', 'H4'] });
+  let supCalls = 0;
   const controller = createReviewLoopController({
     persistence,
     prBackend: backend,
-    supervisorFn: async () => { throw new Error('provider blip'); },
+    // Malformed (empty guidance) -> transient humanRequired, NOT terminal.
+    supervisorFn: async () => {
+      supCalls += 1;
+      return { value: { guidance: '', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } };
+    },
   });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
 
   assert.equal((await controller.review({ loopId })).status, 'REWORK');
   backend.advanceHead();
   const r2 = await controller.review({ loopId });
-  assert.equal(r2.status, 'HUMAN_REQUIRED');
-  assert.notEqual(r2.terminal, true, 'a transient Supervisor failure is NOT terminal');
+  assert.equal(r2.status, 'REWORK', 'a transient Supervisor failure does not stall the loop');
+  assert.equal(r2.round, 2);
+  assert.equal(r2.supervisorGuidance, null);
+  assert.ok(supCalls >= 1, 'the Supervisor was attempted');
+  assert.ok(
+    (r2.safetyEvents ?? []).some((e) => e.code === 'REVIEWLOOP_SUPERVISOR_UNAVAILABLE'),
+    'the transient Supervisor failure is surfaced as a non-blocking safety event',
+  );
 
   const persisted = await persistence.readWorkflowState(loopId);
-  assert.notEqual(persisted.reviewLoop.budgetExhausted, true);
+  assert.notEqual(persisted.reviewLoop.budgetExhausted, true, 'the budget was not spent');
+  assert.equal(persisted.reviewLoop.supervisorInvoked, false, 'a later round may retry the Supervisor');
 
-  // The Worker pushes a fix and retries — the loop re-enters and re-runs the
-  // Reviewer rather than immediately returning a terminal result.
-  const waitsBefore = backend.state.waits;
+  // Round 3 still blocking -> the round cap is still the circuit-breaker.
   backend.advanceHead();
-  await controller.review({ loopId });
-  assert.ok(backend.state.waits > waitsBefore, 'the Reviewer ran again on the new HEAD instead of an early terminal return');
+  const r3 = await controller.review({ loopId });
+  assert.equal(r3.status, 'HUMAN_REQUIRED');
+  assert.equal(r3.round, 3);
+  assert.equal(r3.terminal, true);
 });
 
 test('PR: a clean review PASSes normally', async () => {

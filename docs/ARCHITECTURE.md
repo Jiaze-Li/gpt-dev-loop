@@ -71,9 +71,10 @@ preload. The `codex` / `claude` transports additionally disable user config,
 project rules and MCP servers, run read-only with no tool use, and never
 resume a conversation; each is bounded by a wall-clock timeout with
 whole-process-tree teardown (`adapters/boundedCli.js`). Output goes through
-the SAME strict normalization as agy — malformed → `HUMAN_REQUIRED`, never a
-clean empty result. One physical attempt per call; bounded failover lives in
-the controller, not in the transport.
+the SAME strict normalization as agy — a malformed Reviewer result →
+`HUMAN_REQUIRED`, never a clean empty result (a malformed Supervisor result is
+a transient failure — see Convergence). One physical attempt per call; bounded
+failover lives in the controller, not in the transport.
 
 ### Per-family context isolation (what each CLI can and cannot narrow)
 
@@ -285,6 +286,15 @@ Default: `blockingSeverities = [P1, P2]`, `maxReviewRounds = 3`.
 - Round 3: P1/P2 still present → HUMAN_REQUIRED.
 - Any round with no P1 and no P2 → PASS. Waiting never consumes a round.
 - Identical evidence resubmitted → deterministic `NO_PROGRESS`, no model call.
+
+Only a Supervisor that actually adjudicates the loop non-convergent
+(`recommendation = "HUMAN_REQUIRED"`) ends it — that HUMAN_REQUIRED is terminal
+(`budgetExhausted`). A *transient* Supervisor failure (caller cancelled,
+transport threw, malformed output) is never valid guidance and never terminal:
+the round degrades to a plain REWORK (`REVIEWLOOP_SUPERVISOR_UNAVAILABLE`
+non-blocking safety event, `supervisorInvoked` reset so a later persistent
+round can retry). The `maxReviewRounds` cap remains the stagnation
+circuit-breaker regardless.
 
 The zero-provider `benchmark:transports` harness mechanically covers the
 controller paths E2E-A (one-round PASS), E2E-B (REWORK → changed implementation

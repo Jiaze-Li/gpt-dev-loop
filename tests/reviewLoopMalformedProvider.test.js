@@ -69,13 +69,15 @@ test('Supervisor invalid JSON -> fail closed / HUMAN_REQUIRED', () => {
   );
 });
 
-test('malformed Supervisor output is not treated as valid REWORK guidance', async () => {
+test('malformed Supervisor output is not treated as valid REWORK guidance, and does not stall the loop', async () => {
   const { controller } = makeHarness({
     deltas: [
       { fingerprint: 'd1', diff: 'a', changedFiles: ['a.js'] },
       { fingerprint: 'd2', diff: 'b', changedFiles: ['a.js'] },
+      { fingerprint: 'd3', diff: 'c', changedFiles: ['a.js'] },
     ],
     reviews: [
+      { findings: [finding('P1', 'a.js', 'same bug')] },
       { findings: [finding('P1', 'a.js', 'same bug')] },
       { findings: [finding('P1', 'a.js', 'same bug')] },
     ],
@@ -83,7 +85,14 @@ test('malformed Supervisor output is not treated as valid REWORK guidance', asyn
   });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
   await controller.review({ loopId }); // round 1 REWORK
-  const r2 = await controller.review({ loopId }); // round 2 -> supervisor -> malformed
-  assert.equal(r2.status, 'HUMAN_REQUIRED');
-  assert.match(r2.reason, /Supervisor produced no usable repair guidance/);
+  // round 2 -> Supervisor -> malformed: a TRANSIENT failure, never valid guidance,
+  // but it degrades to a plain REWORK round rather than terminating the loop.
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'REWORK');
+  assert.equal(r2.supervisorGuidance ?? null, null);
+  assert.ok((r2.safetyEvents ?? []).some((e) => e.code === 'REVIEWLOOP_SUPERVISOR_UNAVAILABLE'));
+  // The round cap still terminates the loop on a persistent finding.
+  const r3 = await controller.review({ loopId });
+  assert.equal(r3.status, 'HUMAN_REQUIRED');
+  assert.equal(r3.terminal, true);
 });

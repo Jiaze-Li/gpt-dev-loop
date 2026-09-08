@@ -404,6 +404,7 @@ export function createReviewLoopController({
       && (loopState.state !== REVIEW_LOOP_STATES.HUMAN_REQUIRED || loopState.budgetExhausted)) {
       return terminalResult(loopState);
     }
+
     if (objective.mode === REVIEW_MODES.PR) return reviewPr({ loopState, signal, onHeartbeat });
     return reviewLocal({ loopState, signal });
   }
@@ -817,20 +818,12 @@ export function createReviewLoopController({
       const sup = await runSupervisor({
         spend, loopState, objective, review, gate, signal,
       });
-      if (sup.humanRequired) {
-        // Only a real non-convergence adjudication (sup.terminal) spends the
-        // budget. A transient Supervisor failure escalates to a human but stays
-        // resumable so the unused review round is not lost.
-        if (sup.terminal) loopState.budgetExhausted = true;
-        recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
-        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
-        await store.save(loopState.loopId, loopState);
-        return humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance);
-      }
       if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
-      recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
-      supervisorGuidance = sup.guidance;
-      loopState.lastSupervisorGuidance = supervisorGuidance;
+      const outcome = await applySupervisorOutcome({
+        sup, loopState, review, spend, escalationReason: 'non-convergence escalation',
+      });
+      if (outcome.result) return outcome.result;
+      supervisorGuidance = outcome.guidance;
     }
 
     if (decision.verdict === REVIEW_VERDICTS.PASS) {
@@ -902,6 +895,39 @@ export function createReviewLoopController({
       return { humanRequired: true, terminal: true, reason: 'Supervisor recommends human involvement', guidance: raw.guidance };
     }
     return { guidance: raw.guidance };
+  }
+
+  // Apply a Supervisor result to the loop. Returns:
+  //   { result }   — ready to return from the caller (terminal HUMAN_REQUIRED)
+  //   { guidance } — continue the in-line REWORK path with this guidance
+  // A `terminal` "Supervisor recommends human involvement" spends the budget. A
+  // TRANSIENT failure (caller cancelled, transport threw, malformed output —
+  // `humanRequired` WITHOUT `terminal`) does NOT stall the loop: it degrades to
+  // a plain REWORK round (guidance: null). The Worker still has the finding, the
+  // round cap is still the stagnation circuit-breaker, and a later
+  // persistent-finding round can retry the Supervisor (supervisorInvoked reset).
+  async function applySupervisorOutcome({
+    sup, loopState, review, spend, escalationReason,
+  }) {
+    if (sup.humanRequired && sup.terminal) {
+      loopState.budgetExhausted = true;
+      recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, escalationReason);
+      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
+      await store.save(loopState.loopId, loopState);
+      return { result: humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance) };
+    }
+    if (sup.humanRequired) {
+      loopState.supervisorInvoked = false; // transient — let a later round retry
+      collectSafetyEvent({
+        code: 'REVIEWLOOP_SUPERVISOR_UNAVAILABLE', severity: 'NON_BLOCKING', role: 'supervisor',
+        taskId: loopState.loopId, reason: sup.reason,
+        actionTaken: 'Supervisor guidance skipped; proceeding as a plain REWORK round',
+      });
+      return { guidance: null };
+    }
+    recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, escalationReason);
+    loopState.lastSupervisorGuidance = sup.guidance;
+    return { guidance: sup.guidance };
   }
 
   // Resolve the GitHub review threads for prior-round findings that a trusted
@@ -1076,17 +1102,11 @@ export function createReviewLoopController({
         spend, loopState, objective, review, gate: null, signal,
       });
       if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
-      recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'PR non-convergence escalation');
-      if (sup.humanRequired) {
-        // See the LOCAL-mode path: only sup.terminal spends the budget; a
-        // transient Supervisor failure stays resumable.
-        if (sup.terminal) loopState.budgetExhausted = true;
-        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
-        await store.save(loopState.loopId, loopState);
-        return humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance);
-      }
-      supervisorGuidance = sup.guidance;
-      loopState.lastSupervisorGuidance = supervisorGuidance;
+      const outcome = await applySupervisorOutcome({
+        sup, loopState, review, spend, escalationReason: 'PR non-convergence escalation',
+      });
+      if (outcome.result) return outcome.result;
+      supervisorGuidance = outcome.guidance;
     }
 
     recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, decision.reason);
