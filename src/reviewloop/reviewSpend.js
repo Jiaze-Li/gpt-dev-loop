@@ -70,7 +70,7 @@ export const REVIEWLOOP_DEFAULTS = Object.freeze({
   // NEXT call. The Sentinel is POST-settlement: it cannot un-spend the
   // anomalous call, it fully accounts it, records a BLOCKING safety event, and
   // latches the loop so every further Reviewer/Supervisor model call fails
-  // closed (across a restart). See createReviewLoopSpend / maybeTripSentinel.
+  // closed (across a restart). See createReviewLoopSpend / settleRecord.
   MAX_SINGLE_CALL_USAGE: 40_000,
   MAX_CONTEXT_OVERHEAD_TOKENS: 30_000,
 });
@@ -438,11 +438,36 @@ export function payloadMetaOf(meta) {
   return out;
 }
 
+// The provider-billed INPUT token count that a payload-size proxy should be
+// compared against — provider/accounting-aware, because "input" is not the same
+// quantity across families:
+//   - Anthropic : the Messages API bills uncached input + cache_creation +
+//                 cache_read as three SEPARATE input categories. `input_tokens`
+//                 alone is only the uncached slice, so a call with input=2 and
+//                 cache_creation=31000 has ~31k of real input context. The two
+//                 cache_* categories are a schema-defined 0 when absent.
+//   - OpenAI/Codex : cache_read ⊂ input_tokens already — never add it.
+//   - AGY / unknown : only the confirmed semantics. AGY's cache_read is NOT
+//                 mechanically a subset of input and NOT confirmed additive —
+//                 do not guess a cache relationship; use input_tokens as-is.
+// null when input_tokens itself is UNKNOWN (never treated as 0).
+export function effectiveContextInputTokens(breakdown, { family = null, provider = null } = {}) {
+  const input = breakdown?.inputTokens;
+  if (!Number.isFinite(input)) return null;
+  const cls = accountingClassOf({ family, provider });
+  if (cls === 'anthropic') {
+    return input + tok(breakdown.cacheCreationTokens) + tok(breakdown.cacheReadTokens);
+  }
+  return input;
+}
+
 // input tokens the provider billed that are NOT explained by the payload we
 // sent — the transport context tax (system prompt, tools, workspace preload).
-// null when either side is UNKNOWN; never negative.
-export function contextOverheadTokens(breakdown, payloadMeta) {
-  const input = breakdown?.inputTokens;
+// null when either side is UNKNOWN; never negative. Provider-aware on the input
+// side (see effectiveContextInputTokens) so an Anthropic cached-context call
+// cannot report ~0 overhead while carrying tens of thousands of cache tokens.
+export function contextOverheadTokens(breakdown, payloadMeta, { family = null, provider = null } = {}) {
+  const input = effectiveContextInputTokens(breakdown, { family, provider });
   const est = payloadMeta?.estimatedPayloadTokens;
   if (!Number.isFinite(input) || !Number.isFinite(est)) return null;
   return Math.max(0, input - est);
@@ -468,6 +493,34 @@ export class ReviewLoopSpendStore {
     await this._persistence.updateWorkflowState(loopId, {
       [SPEND_STATE_KEY]: { records: [...existing, record] },
     });
+  }
+
+  // Atomic durable state transition for an ANOMALOUS metered call: the spend
+  // record and the Token Sentinel latch are written in ONE updateWorkflowState
+  // call (one underlying snapshot write), so a crash leaves BOTH or NEITHER —
+  // never "spend persisted, latch missing", which on restart would keep
+  // authorizing fresh model calls. First-write-wins on the latch: an existing
+  // tripped latch (the ORIGINAL anomaly) is never overwritten. Returns
+  // { persisted } — false only when no durable workflow-state store backs this
+  // call (a misconfiguration the caller must fail closed on).
+  async appendWithAnomalyLatch(loopId, record, anomalyRecord) {
+    const p = this._persistence;
+    if (!loopId || !p
+      || typeof p.updateWorkflowState !== 'function'
+      || typeof p.readWorkflowState !== 'function') {
+      return { persisted: false };
+    }
+    const state = await p.readWorkflowState(loopId);
+    const existingRecords = Array.isArray(state?.[SPEND_STATE_KEY]?.records)
+      ? state[SPEND_STATE_KEY].records
+      : [];
+    const existingLatch = state?.[TOKEN_ANOMALY_STATE_KEY];
+    const latch = existingLatch && existingLatch.tripped === true ? existingLatch : anomalyRecord;
+    await p.updateWorkflowState(loopId, {
+      [SPEND_STATE_KEY]: { records: [...existingRecords, record] },
+      [TOKEN_ANOMALY_STATE_KEY]: latch,
+    });
+    return { persisted: true };
   }
 }
 
@@ -596,8 +649,9 @@ export function createReviewLoopSpend({
   const anomalyStore = new ReviewLoopTokenAnomalyStore(persistence);
 
   // Post-settlement Token Sentinel latch. Once tripped it is cached (a latch
-  // never un-trips), and it is also set in-process the moment maybeTripSentinel
-  // fires so a persistence-less (unit-test) surface still blocks the next call.
+  // never un-trips), and it is also set in-process the moment settleRecord
+  // detects the anomaly so a persistence-less (unit-test) surface still blocks
+  // the next call.
   // A CLEAN result is deliberately NOT cached: the durable latch is re-read on
   // every metered call, so a latch written after this surface's first read
   // (a crash-recovered sibling, a prior round on a shared loopId) still blocks
@@ -618,8 +672,82 @@ export function createReviewLoopSpend({
         { loopId },
       );
     }
+    if (!loaded) {
+      // Defense in depth. The atomic appendWithAnomalyLatch is the PRIMARY
+      // guard, but a durable spend record written by an older build, or a torn
+      // snapshot write, could still leave an anomalous spend record on disk with
+      // no latch. Re-infer the latch from the durable spend log so a restart
+      // stays blocked — this is a backup, never the sole protection.
+      loaded = await reinferAnomalyFromSpendLog();
+    }
     if (loaded) anomalyLatched = loaded;
     return anomalyLatched || null;
+  }
+
+  // Reconstruct a Token Sentinel latch from a durable spend record that itself
+  // exceeds a per-call ceiling. Persists the reconstructed latch (fail closed if
+  // it cannot). Returns the latch record, or null when the spend log is clean.
+  async function reinferAnomalyFromSpendLog() {
+    let records;
+    try { records = await spendStore.load(loopId); } catch { return null; }
+    for (const r of records) {
+      const uv = Number.isFinite(r.usageVolume) ? r.usageVolume : null;
+      const co = Number.isFinite(r.contextOverheadTokens) ? r.contextOverheadTokens : null;
+      // Only a record whose volume settled reliably can trip on usage.
+      const volumeResolved = r.usageAccounting?.volumeResolved === true;
+      const usageTrip = volumeResolved && uv != null && uv > limits.maxSingleCallUsage;
+      const overheadTrip = co != null && co > limits.maxContextOverheadTokens;
+      if (!usageTrip && !overheadTrip) continue;
+      const record = Object.freeze({
+        tripped: true,
+        at: new Date().toISOString(),
+        role: r.role ?? null,
+        family: r.family ?? null,
+        provider: r.provider ?? null,
+        resolvedModel: r.model ?? null,
+        usageVolume: uv,
+        contextOverheadTokens: co,
+        trigger: usageTrip ? 'SINGLE_CALL_USAGE' : 'CONTEXT_OVERHEAD',
+        threshold: usageTrip ? limits.maxSingleCallUsage : limits.maxContextOverheadTokens,
+        thresholds: {
+          maxSingleCallUsage: limits.maxSingleCallUsage,
+          maxContextOverheadTokens: limits.maxContextOverheadTokens,
+        },
+        reason: `restart re-inference: a durable spend record for ${JSON.stringify(loopId)} shows a `
+          + `single ${r.role ?? 'metered'} call `
+          + `${usageTrip ? `usageVolume ${uv}` : `transport context overhead ${co} tokens`} over the `
+          + 'Token Sentinel ceiling, but no durable anomaly latch was found',
+        actionTaken: 'anomaly latch reconstructed from the durable spend log; all further ReviewLoop '
+          + 'Reviewer/Supervisor model spend for this loop is blocked until a human clears it',
+        reinferredFromSpendLog: true,
+      });
+      let res;
+      try {
+        res = await anomalyStore.latch(loopId, record);
+      } catch (error) {
+        // Could not persist the reconstructed latch. The in-process latch still
+        // blocks THIS process; make the loss of durability loud.
+        if (persistence) {
+          throw new AuthorizationError(
+            AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE,
+            `restart re-inference found a token anomaly in the durable spend log for ${JSON.stringify(loopId)} `
+              + `but could not persist the reconstructed latch (${error?.message ?? error}); this process is blocked`,
+            { loopId, anomaly: record },
+          );
+        }
+        return record;
+      }
+      if (persistence && res?.persisted !== true) {
+        throw new AuthorizationError(
+          AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE,
+          `restart re-inference found a token anomaly in the durable spend log for ${JSON.stringify(loopId)} `
+            + 'but the configured persistence cannot durably store the reconstructed latch; this process is blocked',
+          { loopId, anomaly: record },
+        );
+      }
+      return record;
+    }
+    return null;
   }
 
   // Best-effort variant for telemetry / diagnostics: never throws.
@@ -729,28 +857,17 @@ export function createReviewLoopSpend({
     };
   }
 
-  // Post-settlement single-call Token Sentinel. Called AFTER the anomalous
-  // call's durable accounting record has already been appended, so the real
-  // usage is fully accounted (never treated as 0). On a trip it:
-  //   - durably latches the anomaly for the loop (survives a restart),
-  //   - records a BLOCKING MODEL_SPEND_TOKEN_ANOMALY safety event,
-  //   - throws MODEL_SPEND_TOKEN_ANOMALY_BLOCKED (an AuthorizationError, so the
-  //     controller performs ZERO failover and never mutates provider
-  //     health/quota — it is not disguised as a provider failure).
-  async function maybeTripSentinel({
-    role, family, provider, resolvedModel, accounting, contextOverhead,
-  }) {
-    const hit = detectSingleCallTokenAnomaly({ accounting, contextOverhead, limits });
-    if (!hit) return;
+  // Build the immutable Token Sentinel latch record for a detected anomaly.
+  function buildAnomalyRecord({ hit, role, family, provider, resolvedModel }) {
     const reason = hit.trigger === 'SINGLE_CALL_USAGE'
       ? `single physical ${role} call usageVolume ${hit.usageVolume} exceeds `
         + `REVIEWLOOP_MAX_SINGLE_CALL_USAGE (${limits.maxSingleCallUsage})`
       : `single physical ${role} call transport context overhead ${hit.contextOverheadTokens} `
         + `tokens exceeds REVIEWLOOP_MAX_CONTEXT_OVERHEAD_TOKENS (${limits.maxContextOverheadTokens})`;
-    const actionTaken = 'anomalous call fully accounted; anomaly latched durably; all further '
-      + 'ReviewLoop Reviewer/Supervisor model spend for this loop is blocked (no auto-failover, '
-      + 'provider health/quota untouched) until a human clears it';
-    const record = Object.freeze({
+    const actionTaken = 'anomalous call fully accounted; anomaly latched durably in the same atomic '
+      + 'state transition as its spend record; all further ReviewLoop Reviewer/Supervisor model spend '
+      + 'for this loop is blocked (no auto-failover, provider health/quota untouched) until a human clears it';
+    return Object.freeze({
       tripped: true,
       at: new Date().toISOString(),
       role,
@@ -768,28 +885,16 @@ export function createReviewLoopSpend({
       reason,
       actionTaken,
     });
-    anomalyLatched = record;
-    // A surface constructed WITH a persistence MUST latch durably (a restart
-    // would otherwise lose the block); a bare in-memory surface has no durable
-    // state at all and the in-process latch is its whole contract.
-    const durableSurface = Boolean(persistence);
-    let latchPersisted = true;
-    let latchError = null;
-    try {
-      const res = await anomalyStore.latch(loopId, record);
-      if (durableSurface && res?.persisted !== true) latchPersisted = false;
-    } catch (error) {
-      // The in-process latch (anomalyLatched) already blocks this process, but a
-      // restart would lose it. Do NOT swallow: surface it as its own
-      // fail-closed authorization error below so the loss of durability is
-      // loud, not silent.
-      latchPersisted = false;
-      latchError = error;
-    }
+  }
+
+  // Emit the BLOCKING safety event + onEvent for a tripped anomaly, then throw
+  // the fail-closed AuthorizationError (STATE_UNAVAILABLE when the durable latch
+  // could not be persisted, otherwise BLOCKED). Never returns.
+  function emitAndThrowAnomaly({ record, latchPersisted, latchError }) {
     recordSafetyEvent?.({
       code: 'MODEL_SPEND_TOKEN_ANOMALY',
       severity: 'BLOCKING',
-      role,
+      role: record.role,
       family: record.family,
       provider: record.provider,
       resolvedModel: record.resolvedModel,
@@ -799,14 +904,14 @@ export function createReviewLoopSpend({
       threshold: record.threshold,
       thresholds: record.thresholds,
       durablyLatched: latchPersisted,
-      reason,
-      actionTaken,
+      reason: record.reason,
+      actionTaken: record.actionTaken,
     });
     onEvent?.({ type: 'MODEL_SPEND_TOKEN_ANOMALY', loopId, durablyLatched: latchPersisted, ...record });
     if (!latchPersisted) {
       throw new AuthorizationError(
         AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE,
-        `single-call token anomaly detected (${reason}) but the durable latch could not be `
+        `single-call token anomaly detected (${record.reason}) but the durable latch could not be `
           + `persisted (${latchError ? (latchError.message ?? latchError) : 'the configured persistence does not implement durable workflow state'}); `
           + 'this process is blocked; a restart is NOT guaranteed to stay blocked by this latch alone',
         { loopId, anomaly: record },
@@ -814,7 +919,7 @@ export function createReviewLoopSpend({
     }
     throw new AuthorizationError(
       AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_BLOCKED,
-      `${reason}; the call was fully accounted but further internal model spend for `
+      `${record.reason}; the call was fully accounted but further internal model spend for `
         + `${JSON.stringify(loopId)} is blocked until a human clears the token anomaly`,
       { loopId, anomaly: record },
     );
@@ -922,12 +1027,48 @@ export function createReviewLoopSpend({
       ? authority.reservationIdFor(permit)
       : null;
 
-    const appendRecord = async (rec) => {
+    // Durably settle ONE metered attempt's accounting record. When that attempt
+    // is a post-settlement single-call Token Sentinel anomaly, the spend record
+    // AND the durable anomaly latch are written in ONE atomic workflow-state
+    // transition (appendWithAnomalyLatch) — never two writes with a crash window
+    // between them — and then this throws the fail-closed AuthorizationError
+    // (fully accounted, then blocked). A non-anomalous attempt just appends.
+    // Durable-before-return either way: the aggregate must reflect this attempt
+    // even if the controller crashes before it saves loop state.
+    const settleRecord = async ({
+      record: rec, role: aRole, family: aFamily, provider: aProvider, resolvedModel,
+      accounting, contextOverhead,
+    }) => {
       const full = { ...rec, role, reservationId, at: new Date().toISOString() };
-      // Durable-before-return: the aggregate must reflect this attempt even if
-      // the controller crashes before it saves loop state.
-      await spendStore.append(loopId, full);
+      const hit = detectSingleCallTokenAnomaly({ accounting, contextOverhead, limits });
+      if (!hit) {
+        await spendStore.append(loopId, full);
+        sessionRecords.push(full);
+        return;
+      }
+      const anomalyRecord = buildAnomalyRecord({
+        hit, role: aRole, family: aFamily, provider: aProvider, resolvedModel,
+      });
+      // In-process latch first: a bare in-memory surface has no durable state
+      // and this is its whole contract; a durable surface still wants it set
+      // before any await so a re-entrant read cannot race a clean result.
+      anomalyLatched = anomalyRecord;
+      const durableSurface = Boolean(persistence);
+      let latchPersisted = true;
+      let latchError = null;
+      try {
+        const res = await spendStore.appendWithAnomalyLatch(loopId, full, anomalyRecord);
+        if (durableSurface && res?.persisted !== true) latchPersisted = false;
+      } catch (error) {
+        // The atomic write failed — neither the spend record nor the latch is on
+        // disk. The in-process record + latch still hold for THIS process (and a
+        // restart fails closed via the settled-reservation / unaccounted-spend
+        // path). Do NOT swallow: surface the loss of durability loudly.
+        latchPersisted = false;
+        latchError = error;
+      }
       sessionRecords.push(full);
+      emitAndThrowAnomaly({ record: anomalyRecord, latchPersisted, latchError });
     };
 
     let result;
@@ -1009,28 +1150,30 @@ export function createReviewLoopSpend({
         const failMeta = payloadMetaOf(err?.details?.meta ?? null);
         const failBreakdown = usageBreakdownOf(usage);
         const failAccounting = usageAccountingOf({ usage, family, provider });
-        await appendRecord({
-          model: model ?? null,
-          family,
-          provider,
-          usageKnown: usage != null,
-          usageVolume: failAccounting.usageVolume,
-          usageBreakdown: failBreakdown,
-          usageAccounting: accountingProvenanceOf(failAccounting),
-          payloadMeta: failMeta,
-          contextOverheadTokens: contextOverheadTokens(failBreakdown, failMeta),
-          costUsd: Number.isFinite(failCost) ? failCost : 0,
-          costKnown,
-          businessOutcome: 'FAILURE',
-          failureCode: err?.code ?? err?.providerFailure ?? null,
-        });
-        // Sentinel over a known-usage provider FAILURE too: the tokens were
-        // still spent. A trip throws MODEL_SPEND_TOKEN_ANOMALY_BLOCKED in
-        // place of the provider error so the controller stops (no failover).
-        await maybeTripSentinel({
+        const failOverhead = contextOverheadTokens(failBreakdown, failMeta, { family, provider });
+        // Durably settle this attempt's accounting AND, if it is a single-call
+        // token anomaly, the durable latch in ONE atomic workflow-state write —
+        // never two writes with a crash window between them. A trip throws
+        // MODEL_SPEND_TOKEN_ANOMALY_BLOCKED in place of the provider error so the
+        // controller stops (no failover); the tokens were still spent.
+        await settleRecord({
+          record: {
+            model: model ?? null,
+            family,
+            provider,
+            usageKnown: usage != null,
+            usageVolume: failAccounting.usageVolume,
+            usageBreakdown: failBreakdown,
+            usageAccounting: accountingProvenanceOf(failAccounting),
+            payloadMeta: failMeta,
+            contextOverheadTokens: failOverhead,
+            costUsd: Number.isFinite(failCost) ? failCost : 0,
+            costKnown,
+            businessOutcome: 'FAILURE',
+            failureCode: err?.code ?? err?.providerFailure ?? null,
+          },
           role, family, provider, resolvedModel: model ?? null,
-          accounting: failAccounting,
-          contextOverhead: contextOverheadTokens(failBreakdown, failMeta),
+          accounting: failAccounting, contextOverhead: failOverhead,
         });
       }
       throw err;
@@ -1039,30 +1182,33 @@ export function createReviewLoopSpend({
     const okBreakdown = usageBreakdownOf(result?.usage);
     const okMeta = payloadMetaOf(result?.meta);
     const okAccounting = usageAccountingOf({ usage: result?.usage, family, provider });
-    await appendRecord({
-      // requestedFamily -> resolvedModel: the concrete model actually used
-      // (recovered from the provider envelope when config asked for a family).
-      model: result?.model ?? model ?? null,
-      requestedFamily: family,
-      family,
-      provider,
-      usageKnown: result?.usage != null,
-      usageVolume: okAccounting.usageVolume,
-      usageAccounting: accountingProvenanceOf(okAccounting),
-      usageBreakdown: okBreakdown,
-      payloadMeta: okMeta,
-      contextOverheadTokens: contextOverheadTokens(okBreakdown, okMeta),
-      costUsd: Number.isFinite(result?.costUsd) ? result.costUsd : 0,
-      costKnown: Number.isFinite(result?.costUsd),
-      businessOutcome: 'SUCCESS',
-    });
-    // Post-settlement Token Sentinel: the call is now fully, durably accounted.
-    // If this ONE call blew past the per-call ceiling, latch the loop and throw
-    // (fully accounted, then fail closed) rather than returning its result.
-    await maybeTripSentinel({
+    const okOverhead = contextOverheadTokens(okBreakdown, okMeta, { family, provider });
+    // Durable-before-return: this attempt's accounting record AND — when this
+    // ONE call blew past the per-call ceiling — the durable Token Sentinel latch
+    // are written in ONE atomic workflow-state transition. A crash can leave
+    // BOTH or NEITHER, never "spend persisted, latch missing" (which on restart
+    // would keep authorizing new model calls). On a trip settleRecord throws
+    // (fully accounted, then fail closed) rather than returning the result.
+    await settleRecord({
+      record: {
+        // requestedFamily -> resolvedModel: the concrete model actually used
+        // (recovered from the provider envelope when config asked for a family).
+        model: result?.model ?? model ?? null,
+        requestedFamily: family,
+        family,
+        provider,
+        usageKnown: result?.usage != null,
+        usageVolume: okAccounting.usageVolume,
+        usageAccounting: accountingProvenanceOf(okAccounting),
+        usageBreakdown: okBreakdown,
+        payloadMeta: okMeta,
+        contextOverheadTokens: okOverhead,
+        costUsd: Number.isFinite(result?.costUsd) ? result.costUsd : 0,
+        costKnown: Number.isFinite(result?.costUsd),
+        businessOutcome: 'SUCCESS',
+      },
       role, family, provider, resolvedModel: result?.model ?? model ?? null,
-      accounting: okAccounting,
-      contextOverhead: contextOverheadTokens(okBreakdown, okMeta),
+      accounting: okAccounting, contextOverhead: okOverhead,
     });
     return result?.value ?? result;
   }

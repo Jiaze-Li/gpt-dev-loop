@@ -8,6 +8,7 @@ import {
   createReviewLoopSpend,
   resolveReviewLoopLimits,
   detectSingleCallTokenAnomaly,
+  contextOverheadTokens,
   REVIEWLOOP_DEFAULTS,
 } from '../src/reviewloop/reviewSpend.js';
 import {
@@ -271,11 +272,12 @@ test('a latch READ failure fails closed — never read as "no anomaly"', async (
   );
 });
 
-test('a latch WRITE failure is surfaced (not swallowed) and still fully accounts the call', async () => {
+test('an atomic spend+latch write failure is surfaced (not swallowed) and the call is still accounted in-process', async () => {
   const persistence = persistenceOf();
   const realUpdate = persistence.updateWorkflowState.bind(persistence);
   persistence.updateWorkflowState = async (id, patch) => {
-    if (patch && 'reviewLoopTokenAnomaly' in patch) throw new Error('latch write failed');
+    // the anomalous settlement writes spend record + latch in ONE call
+    if (patch && 'reviewLoopTokenAnomaly' in patch) throw new Error('atomic write failed');
     return realUpdate(id, patch);
   };
   const spend = createReviewLoopSpend({ loopId: 'L', persistence });
@@ -283,9 +285,118 @@ test('a latch WRITE failure is surfaced (not swallowed) and still fully accounts
     () => meterOnce(spend, { usage: { input_tokens: 40001, output_tokens: 0 } }),
     (e) => e.code === 'MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE',
   );
-  // the anomalous call was still fully, durably accounted
+  // Atomic transition: the durable write failed, so NEITHER the spend record nor
+  // the latch landed — never "spend persisted, latch missing".
+  const state = await persistence.readWorkflowState('L');
+  assert.equal(state.reviewLoopSpend, undefined);
+  assert.equal(state.reviewLoopTokenAnomaly, undefined);
+  // The anomalous call's real usage is still fully accounted in-process (never 0)
+  // and this process stays blocked.
+  const t = await spend.telemetry();
+  assert.equal(t.usageVolume, 40001);
+  assert.equal(t.tokenAnomalyBlocked, true);
+});
+
+test('anomalous settlement writes the spend record + anomaly latch in ONE atomic state transition', async () => {
+  const persistence = persistenceOf();
+  const writes = [];
+  const realUpdate = persistence.updateWorkflowState.bind(persistence);
+  persistence.updateWorkflowState = async (id, patch) => {
+    writes.push(Object.keys(patch ?? {}));
+    return realUpdate(id, patch);
+  };
+  const spend = createReviewLoopSpend({ loopId: 'L', persistence });
+  await assert.rejects(
+    () => meterOnce(spend, { usage: { input_tokens: 40001, output_tokens: 0 } }),
+    (e) => e.code === 'MODEL_SPEND_TOKEN_ANOMALY_BLOCKED',
+  );
+  // exactly one write carries BOTH keys; there is no write that carries the
+  // spend record without the latch (the historical crash window).
+  const bothKeys = writes.filter((k) => k.includes('reviewLoopSpend') && k.includes('reviewLoopTokenAnomaly'));
+  const spendOnly = writes.filter((k) => k.includes('reviewLoopSpend') && !k.includes('reviewLoopTokenAnomaly'));
+  assert.equal(bothKeys.length, 1);
+  assert.equal(spendOnly.length, 0);
   const state = await persistence.readWorkflowState('L');
   assert.equal(state.reviewLoopSpend.records.at(-1).usageVolume, 40001);
+  assert.equal(state.reviewLoopTokenAnomaly.tripped, true);
+});
+
+test('restart re-infers the latch from a durable anomalous spend record when the latch write was lost', async () => {
+  const persistence = persistenceOf();
+  // Simulate the historical crash window: the spend record for a 60k call is on
+  // disk, but the anomaly latch write never happened.
+  await persistence.updateWorkflowState('L', {
+    reviewLoopSpend: {
+      records: [{
+        role: 'reviewer', family: 'agy:gpt-oss', provider: 'agy', model: 'm',
+        usageKnown: true, usageVolume: 60000,
+        usageAccounting: { volumeResolved: true, semanticsKnown: true },
+        contextOverheadTokens: 0, costUsd: 0, costKnown: false,
+        businessOutcome: 'SUCCESS', reservationId: 'res-1', at: new Date().toISOString(),
+      }],
+    },
+    modelSpendReservations: {
+      'res-1': {
+        reservationId: 'res-1', status: 'SETTLED_KNOWN', role: 'reviewer', intent: { role: 'reviewer' },
+      },
+    },
+  });
+  const spend = createReviewLoopSpend({ loopId: 'L', persistence });
+  let dispatched = false;
+  await assert.rejects(
+    () => meterOnce(spend, { usage: { input_tokens: 1, output_tokens: 1 }, onCall: () => { dispatched = true; } }),
+    (e) => e.code === 'MODEL_SPEND_TOKEN_ANOMALY_BLOCKED',
+  );
+  assert.equal(dispatched, false, 'the next provider call must never run');
+  // the latch is now durably reconstructed
+  const state = await persistence.readWorkflowState('L');
+  assert.equal(state.reviewLoopTokenAnomaly.tripped, true);
+  assert.equal(state.reviewLoopTokenAnomaly.reinferredFromSpendLog, true);
+  assert.equal(state.reviewLoopTokenAnomaly.usageVolume, 60000);
+});
+
+// ---- B. context overhead is provider/accounting-aware -----------------
+
+test('Anthropic cached context counts toward context overhead (input=2 + cache >30k, total <40k) -> CONTEXT_OVERHEAD trip', async () => {
+  const persistence = persistenceOf();
+  const spend = createReviewLoopSpend({ loopId: 'L', persistence });
+  await assert.rejects(
+    () => meterOnce(spend, {
+      family: 'claude:opus', provider: 'claude',
+      // uncached input 2, output 5, cache_creation 31000 -> usageVolume 31007 (<40000)
+      // effective context input = 2 + 31000 = 31002; est payload ~1 -> overhead 31001 (>30000)
+      usage: {
+        input_tokens: 2, output_tokens: 5, cache_creation_input_tokens: 31000,
+      },
+      meta: { promptChars: 4 },
+    }),
+    (e) => e.code === 'MODEL_SPEND_TOKEN_ANOMALY_BLOCKED',
+  );
+  const state = await persistence.readWorkflowState('L');
+  assert.equal(state.reviewLoopTokenAnomaly.trigger, 'CONTEXT_OVERHEAD');
+  assert.equal(state.reviewLoopTokenAnomaly.contextOverheadTokens, 31001);
+  // usageVolume accounting semantics unchanged (input + output + cache_creation)
+  assert.equal(state.reviewLoopSpend.records.at(-1).usageVolume, 31007);
+});
+
+test('context overhead is provider-aware: Anthropic adds cache_*, OpenAI/Codex does not', () => {
+  const breakdown = { inputTokens: 2, cacheCreationTokens: 31000, cacheReadTokens: 0 };
+  const payload = { estimatedPayloadTokens: 1 };
+  // Anthropic: cache_creation is separate input -> effective 31002, overhead 31001
+  assert.equal(
+    contextOverheadTokens(breakdown, payload, { family: 'claude:opus', provider: 'claude' }),
+    31001,
+  );
+  // OpenAI/Codex: cache_read ⊂ input, never added -> effective 2, overhead 1
+  assert.equal(
+    contextOverheadTokens(
+      { inputTokens: 2, cacheReadTokens: 31000 }, payload,
+      { family: 'codex:default', provider: 'codex' },
+    ),
+    1,
+  );
+  // input UNKNOWN stays null (never 0)
+  assert.equal(contextOverheadTokens({ inputTokens: null }, payload, { family: 'claude:opus' }), null);
 });
 
 test('a persistence that cannot store durable workflow state -> anomaly fails closed (STATE_UNAVAILABLE)', async () => {

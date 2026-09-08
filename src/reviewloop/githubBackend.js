@@ -117,6 +117,19 @@ function findingsForSubmission({ state, body }) {
   };
 }
 
+// `gh api --paginate` concatenates every page's JSON body; for a list endpoint
+// that is several JSON arrays back-to-back, which `JSON.parse` cannot read as
+// one value. `--paginate --slurp` instead emits a single JSON array whose
+// elements are the per-page arrays. Parse that and flatten one level. Empty
+// output / an empty result set / a single page all collapse correctly, and a
+// defensive guard keeps an already-flat array of objects working too.
+export function flattenPaginated(out) {
+  const text = typeof out === 'string' ? out.trim() : '';
+  const parsed = JSON.parse(text || '[]');
+  if (!Array.isArray(parsed)) return [];
+  return parsed.flatMap((page) => (Array.isArray(page) ? page : [page]));
+}
+
 // Default `gh`-backed transport. Every method is overridable for tests.
 export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
   const base = repo ? ['-R', repo] : [];
@@ -130,8 +143,8 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
       return out.trim() || null;
     },
     async listReviews({ prNumber }) {
-      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/reviews`, '--paginate']);
-      const arr = JSON.parse(out || '[]');
+      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/reviews`, '--paginate', '--slurp']);
+      const arr = flattenPaginated(out);
       return arr.map((r) => ({
         login: r.user?.login,
         state: r.state,
@@ -146,8 +159,8 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
     // left ONLY inline comments still produced review evidence that must be
     // aggregated — it is not in any submission body.
     async listReviewComments({ prNumber }) {
-      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/comments`, '--paginate']);
-      const arr = JSON.parse(out || '[]');
+      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/comments`, '--paginate', '--slurp']);
+      const arr = flattenPaginated(out);
       return arr.map((c) => ({
         login: c.user?.login,
         body: c.body,
