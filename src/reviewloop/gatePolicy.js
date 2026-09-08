@@ -104,9 +104,15 @@ function runCommand(command, cwd, spawn, timeoutMs, signal) {
       resolve(result);
     };
 
+    // Keep the Gate's teardown bound tight: a hung/zombie descendant must not
+    // stretch a short Gate timeout into a many-second wait (the Gate contract is
+    // deterministic + fast). graceMs + hardBoundMs stays well under the review's
+    // own timeout budget and the test's <5s expectation.
+    const GATE_TEARDOWN = { graceMs: 1000, hardBoundMs: 1500 };
+
     const onAbort = () => {
       if (settled) return;
-      teardown = terminateProcessTree(child);
+      teardown = terminateProcessTree(child, GATE_TEARDOWN);
       void finish({
         command,
         exitCode: GATE_TIMEOUT_EXIT_CODE,
@@ -122,7 +128,7 @@ function runCommand(command, cwd, spawn, timeoutMs, signal) {
       // Whole-process-tree teardown: a Gate shell may itself have spawned a
       // long-running verification subprocess. Signalling only the direct child
       // leaves that descendant running.
-      teardown = terminateProcessTree(child);
+      teardown = terminateProcessTree(child, GATE_TEARDOWN);
       void finish({
         command,
         exitCode: GATE_TIMEOUT_EXIT_CODE,

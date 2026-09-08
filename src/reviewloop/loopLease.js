@@ -24,7 +24,7 @@
 //   * unreadable / malformed lock record -> treated as abandoned.
 
 import {
-  open, readFile, writeFile, unlink, mkdir, stat,
+  open, readFile, writeFile, unlink, mkdir, stat, rename,
 } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -164,7 +164,7 @@ export async function acquireLoopFileLease({
       // lock — never the old `unlink(path)` race where a late contender deleted
       // the winner's freshly-created replacement and then acquired its own.
       // eslint-disable-next-line no-await-in-loop
-      const reclaimed = await reclaimStaleLock(lockPath, current, clock);
+      const reclaimed = await reclaimStaleLock(lockPath, current, clock, token);
       if (!reclaimed) continue; // another contender is reclaiming / already did
       // Loop -> the exclusive `wx` create is the final arbiter of ownership.
     }
@@ -179,20 +179,27 @@ const RECLAIM_GUARD_ORPHAN_MS = 30_000;
 // Serialize stale-lock reclamation. Returns true only when THIS call unlinked
 // the stale lock (so the caller should retry the exclusive `wx` create), false
 // when another contender owns (or already finished) the reclaim.
-async function reclaimStaleLock(lockPath, staleRecord, clock) {
+async function reclaimStaleLock(lockPath, staleRecord, clock, token) {
   const guardPath = `${lockPath}.reclaim`;
   let guard;
   try {
     guard = await open(guardPath, 'wx');
   } catch (err) {
     if (err?.code !== 'EEXIST') return false;
-    // Someone else is reclaiming. If their guard is ancient, they crashed —
-    // clear it so the next attempt can proceed. Otherwise just yield.
+    // Someone else is reclaiming. If their guard is ancient, they crashed. Take
+    // ownership of the ORPHAN via an atomic rename to a uniquely-named victim
+    // path — exactly one contender can move THIS guard file aside; every other
+    // rename fails ENOENT. We then delete only our uniquely-named copy, so this
+    // is NOT the pathname-`unlink` race (a peer's freshly-created replacement
+    // guard is a different inode we never touch).
     try {
       const st = await stat(guardPath);
-      if (clock() - st.mtimeMs > RECLAIM_GUARD_ORPHAN_MS) await unlink(guardPath).catch(() => {});
-    } catch { /* gone already */ }
-    return false;
+      if (clock() - st.mtimeMs <= RECLAIM_GUARD_ORPHAN_MS) return false; // fresh — yield
+      const victim = `${guardPath}.${token}.orphan`;
+      await rename(guardPath, victim);
+      await unlink(victim).catch(() => {});
+    } catch { /* lost the orphan-takeover race, or it is gone already */ }
+    return false; // retry the loop: the guard slot is clear now
   }
   try {
     await guard.close();

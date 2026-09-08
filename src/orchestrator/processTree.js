@@ -107,7 +107,7 @@ export function killProcessTree(child, signal = 'SIGTERM', { pgid = groupIdFor(c
 export function terminateProcessTree(
   child,
   {
-    graceMs = 2000, pollMs = 25, hardBoundMs = 10_000, onKill = null,
+    graceMs = 2000, pollMs = 25, hardBoundMs = 2000, onKill = null,
     probeGroup = processGroupExists,
   } = {}
 ) {

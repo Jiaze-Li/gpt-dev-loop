@@ -283,6 +283,70 @@ test('terminateProcessTree resolves done() even if the process group never repor
 });
 
 // ---------------------------------------------------------------------------
+// Round-2 Codex findings on this change.
+// ---------------------------------------------------------------------------
+test('a transient failure to re-confirm the live PR HEAD does NOT accept the cached review (fail closed)', async () => {
+  let headCalls = 0;
+  const be = createGithubReviewBackend({
+    pollIntervalMs: 1, maxWaitMs: 10, sleep: () => Promise.resolve(),
+    transport: {
+      async getPrHead() {
+        headCalls += 1;
+        // begin() + the initial currentHead read succeed; every RECHECK fails.
+        if (headCalls <= 2) return HEAD;
+        throw new Error('transient 502 from GitHub');
+      },
+      async listReviews() {
+        return [{ login: BOT, state: 'APPROVED', commitId: HEAD, body: '```json\n{"findings":[]}\n```', submittedAt: '2026-09-08', id: 1 }];
+      },
+      async listReviewComments() { return []; },
+      async listIssueCommentReactions() { return []; },
+      async postComment() { return { id: 'https://x#issuecomment-1' }; },
+    },
+  });
+  const controller = createReviewLoopController({ persistence: new MemoryPersistence(), prBackend: be });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  const r = await controller.review({ loopId });
+  assert.notEqual(r.status, 'PASS', 'a clean review is never accepted while the live HEAD cannot be confirmed');
+  assert.ok(['WAITING_FOR_REVIEW', 'HUMAN_REQUIRED'].includes(r.status), r.status);
+});
+
+test('an ancient orphan .reclaim guard never permanently blocks lease acquisition', async () => {
+  const { acquireLoopFileLease } = await import('../src/reviewloop/loopLease.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-orphan-guard-'));
+  try {
+    const dir = path.join(root, 'L');
+    fs.mkdirSync(dir, { recursive: true });
+    // Stale lock (dead pid, this host) + an ANCIENT orphan reclaim guard.
+    fs.writeFileSync(path.join(dir, 'reviewloop.lock'), JSON.stringify({
+      token: 'stale', pid: 999_999_999, host: os.hostname(),
+      acquiredAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 1e6).toISOString(),
+    }));
+    const guard = path.join(dir, 'reviewloop.lock.reclaim');
+    fs.writeFileSync(guard, '');
+    fs.utimesSync(guard, new Date(Date.now() - 3_600_000), new Date(Date.now() - 3_600_000));
+
+    const lease = await acquireLoopFileLease({ runtimeRoot: root, loopId: 'L' });
+    assert.equal(lease.ok, true, 'the ancient orphan guard was cleared and the stale lock reclaimed');
+    await lease.release();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the Gate teardown bound keeps a short timed-out Gate well under 5s even with a stuck group', async () => {
+  // A runner-injected fake cannot exercise the real spawn path; assert the
+  // bound directly: graceMs(1000) + hardBoundMs(1500) < 5000.
+  const started = Date.now();
+  const tree = terminateProcessTree(
+    { pid: 2_000_000_999, killed: false, exitCode: null, kill() {} },
+    { graceMs: 1000, hardBoundMs: 1500, pollMs: 20, probeGroup: () => true },
+  );
+  await tree.done;
+  assert.ok(Date.now() - started < 4000, 'bounded teardown resolved well under the 5s Gate contract');
+});
+
+// ---------------------------------------------------------------------------
 // 10. baseline Gate mutation is NOT attributed to the Worker delta.
 // ---------------------------------------------------------------------------
 test('a baseline Gate that mutates a tracked file re-captures the baseline (no Worker mis-attribution)', async () => {

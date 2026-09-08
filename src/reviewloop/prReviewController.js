@@ -72,6 +72,19 @@ export function createPrReviewController({
   async function obtainReviewForCurrentHead({ objective, loopState, signal, onHeartbeat }) {
     const prNumber = objective.prNumber;
     const reviewer = objective.reviewer; // codex | claude
+
+    // Re-read the live PR HEAD, FAIL CLOSED. An inability to prove which commit
+    // is currently HEAD must never fall back to a cached SHA — that would let a
+    // stale review certify a commit that was never reviewed.
+    const readLiveHead = async () => {
+      try {
+        const h = await prBackend.getPrHead({ prNumber });
+        return { ok: Boolean(h), head: h ?? null };
+      } catch (err) {
+        return { ok: false, head: null, error: err };
+      }
+    };
+
     const currentHead = await prBackend.getPrHead({ prNumber });
     if (!currentHead) {
       return { outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED, reason: 'cannot resolve current PR HEAD' };
@@ -106,10 +119,18 @@ export function createPrReviewController({
     });
     if (existing) {
       // Re-read the live PR HEAD before accepting a pre-existing review — it may
-      // have moved between our HEAD read and this ingest.
-      const headNow = await prBackend.getPrHead({ prNumber }).catch(() => currentHead);
-      if (headNow && headNow !== currentHead) {
-        return { outcome: '__HEAD_CHANGED__', from: currentHead, to: headNow };
+      // have moved between our HEAD read and this ingest. Fail closed: if we
+      // cannot confirm the live HEAD, do NOT accept the cached review.
+      const live = await readLiveHead();
+      if (!live.ok) {
+        return {
+          outcome: PR_REVIEW_OUTCOMES.WAITING_FOR_REVIEW,
+          head: currentHead,
+          reason: 'could not re-confirm the live PR HEAD before accepting the existing review; will retry',
+        };
+      }
+      if (live.head !== currentHead) {
+        return { outcome: '__HEAD_CHANGED__', from: currentHead, to: live.head };
       }
       const trust = checkPrReviewTrust({ raw: existing, configuredReviewer: reviewer, currentHead, env });
       if (!trust.ok) {
@@ -211,10 +232,19 @@ export function createPrReviewController({
       };
     }
 
-    // Final guard: re-read the live PR HEAD before accepting this result.
-    const headNow = await prBackend.getPrHead({ prNumber }).catch(() => currentHead);
-    if (headNow && headNow !== currentHead) {
-      return { outcome: '__HEAD_CHANGED__', from: currentHead, to: headNow };
+    // Final guard: re-read the live PR HEAD before accepting this result. Fail
+    // closed — a transient failure to confirm the live HEAD must NOT certify the
+    // cached SHA.
+    const finalLive = await readLiveHead();
+    if (!finalLive.ok) {
+      return {
+        outcome: PR_REVIEW_OUTCOMES.WAITING_FOR_REVIEW,
+        head: currentHead,
+        reason: 'could not re-confirm the live PR HEAD before accepting the review result; will retry',
+      };
+    }
+    if (finalLive.head !== currentHead) {
+      return { outcome: '__HEAD_CHANGED__', from: currentHead, to: finalLive.head };
     }
 
     const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead, env });

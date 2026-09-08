@@ -500,16 +500,24 @@ export function createGithubReviewBackend({
       while (Date.now() < deadline) {
         if (signal?.aborted) return null;
         // Re-read the live PR HEAD every poll. If it moved, abandon this wait —
-        // any review/reaction we could ingest is bound to the OLD commit.
-        // eslint-disable-next-line no-await-in-loop
-        const liveHead = await gh.getPrHead({ prNumber }).catch(() => headSha);
-        if (liveHead && liveHead !== headSha) {
+        // any review/reaction we could ingest is bound to the OLD commit. If the
+        // read FAILS, do not accept a review this iteration (fail closed): keep
+        // polling rather than trusting the stale head.
+        let liveHead = null;
+        let liveHeadReadOk = true;
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          liveHead = await gh.getPrHead({ prNumber });
+        } catch {
+          liveHeadReadOk = false;
+        }
+        if (liveHeadReadOk && liveHead && liveHead !== headSha) {
           return { headChanged: true, from: headSha, to: liveHead };
         }
         // eslint-disable-next-line no-await-in-loop
-        const review = await latestTrustedReview({
+        const review = liveHeadReadOk ? await latestTrustedReview({
           prNumber, headSha, reviewer, triggerCommentId,
-        });
+        }) : null;
         if (review) return review;
         polls += 1;
         // eslint-disable-next-line no-await-in-loop
