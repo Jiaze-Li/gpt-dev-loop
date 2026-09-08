@@ -143,8 +143,18 @@ export function rehydrateObjective(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const copy = JSON.parse(JSON.stringify(raw));
   const expected = computeObjectiveFingerprint(copy);
-  if (copy.fingerprint && copy.fingerprint !== expected) {
-    throw new Error('ReviewObjective weakened: persisted objective fingerprint does not match its fields');
+  // Every objective produced by createReviewObjective carries a fingerprint. A
+  // persisted objective with the field REMOVED must NOT be treated as valid —
+  // that would let a state editor strip the fingerprint and then also drop P2
+  // from blockingSeverities / weaken constraints / rounds undetected (the
+  // second check in loadLoop compares the rehydrated copy against the same raw
+  // object and so cannot catch it either). Require it, fail closed.
+  if (!copy.fingerprint || copy.fingerprint !== expected) {
+    throw new Error(
+      copy.fingerprint
+        ? 'ReviewObjective weakened: persisted objective fingerprint does not match its fields'
+        : 'ReviewObjective invalid: persisted objective has no integrity fingerprint',
+    );
   }
   return freezeDeep(copy);
 }

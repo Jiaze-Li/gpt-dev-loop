@@ -188,23 +188,36 @@ export function createReviewLoopController({
       // B8 — baseline Gate evidence, 0 model tokens, over the FROZEN plan. Only
       // when trusted/discoverable verification exists; a failure to run it is
       // recorded as incomplete coverage, never faked as PASS.
+      let baselineGateRan = false;
       try {
         if (verificationPlan.source !== 'mechanical' && verificationPlan.commands.length) {
           const g = await runGateFn({ cwd, commands: verificationPlan.commands, runner: gateRunner, env });
+          baselineGateRan = true;
           baselineGate = {
             evidence: g.evidence ?? { results: g.results ?? [], pass: g.pass },
             pass: g.pass,
             capturedAt: new Date().toISOString(),
             source: verificationPlan.source,
           };
-          // The baseline Gate may itself mutate tracked files (a snapshot test,
-          // a codegen/format check). Re-capture the baseline AFTER it runs so
-          // those Gate-caused edits are part of the baseline and are never later
-          // attributed to the Worker's delta.
-          baseline = await captureBaselineFn({ cwd });
         }
       } catch (err) {
         baselineGate = { coverage: 'INCOMPLETE', reason: String(err?.message ?? err) };
+      }
+      // The baseline Gate may itself mutate tracked files (a snapshot test, a
+      // codegen/format check). Re-capture the baseline AFTER it runs so those
+      // Gate-caused edits are part of the baseline and are never later
+      // attributed to the Worker's delta. If this recapture FAILS we must NOT
+      // fall back to the pre-Gate baseline — that reintroduces the exact
+      // misattribution the recapture prevents. Abort reviewloop_begin instead.
+      if (baselineGateRan) {
+        try {
+          baseline = await captureBaselineFn({ cwd });
+        } catch (err) {
+          throw new Error(
+            `reviewloop_begin: the baseline Gate ran but the post-Gate baseline could not be re-captured (${err?.message ?? err}); `
+            + 'refusing to start a loop whose baseline would misattribute the Gate\'s own edits to the Worker',
+          );
+        }
       }
     } else {
       if (!prBackend) throw new Error('reviewloop_begin: PR mode requires a PR backend');

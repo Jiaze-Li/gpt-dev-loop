@@ -112,6 +112,23 @@ async function fingerprintUntracked({ cwd, filePath, lstat, readFile }) {
   } catch (err) {
     return { unreadable: true, reason: `cannot read untracked file ${filePath}: ${err?.message ?? err}` };
   }
+  // TOCTOU guard: the lstat above and this read are separate filesystem
+  // operations. If a symlink (or a different file) was swapped in between them,
+  // the read followed the replacement. Re-lstat and confirm we read the SAME
+  // regular-file inode of the SAME size; anything else fails closed rather than
+  // sending swapped-in bytes to the Reviewer.
+  let after;
+  try {
+    after = await lstat(abs);
+  } catch (err) {
+    return { unreadable: true, reason: `untracked path ${filePath} vanished mid-read: ${err?.message ?? err}` };
+  }
+  if (after.isSymbolicLink() || !after.isFile()
+    || (Number.isFinite(after.ino) && Number.isFinite(info.ino) && after.ino !== info.ino)
+    || (Number.isFinite(after.dev) && Number.isFinite(info.dev) && after.dev !== info.dev)
+    || (Number.isFinite(after.size) && after.size !== buf.length)) {
+    return { safe: false, reason: `untracked path ${filePath} changed during read — refusing to trust its contents` };
+  }
   return { safe: true, digest: sha256(buf), bytes: buf };
 }
 

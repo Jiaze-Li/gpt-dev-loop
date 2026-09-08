@@ -346,6 +346,53 @@ test('the Gate teardown bound keeps a short timed-out Gate well under 5s even wi
   assert.ok(Date.now() - started < 4000, 'bounded teardown resolved well under the 5s Gate contract');
 });
 
+test('a persisted objective with its fingerprint field removed is rejected (not treated as valid)', async () => {
+  const { createReviewObjective, rehydrateObjective } = await import('../src/reviewloop/objective.js');
+  const obj = createReviewObjective({ loopId: 'L', goal: 'do the thing', mode: 'LOCAL' });
+  const tampered = JSON.parse(JSON.stringify(obj));
+  delete tampered.fingerprint;
+  tampered.blockingSeverities = ['P1']; // silently drop P2
+  assert.throws(() => rehydrateObjective(tampered), /no integrity fingerprint|weakened/);
+});
+
+test('an untracked file swapped for a symlink between lstat and read fails closed', async () => {
+  const { collectWorkerDelta } = await import('../src/reviewloop/gitEvidence.js');
+  const regular = {
+    isSymbolicLink: () => false, isFile: () => true, isFIFO: () => false, isSocket: () => false,
+    isBlockDevice: () => false, isCharacterDevice: () => false, isDirectory: () => false,
+    ino: 111, dev: 1, size: 5,
+  };
+  const symlinked = { ...regular, isSymbolicLink: () => true, isFile: () => false, ino: 222 };
+  let lstatCall = 0;
+  let readCalls = 0;
+  // Drive collectWorkerDelta with a scripted git that reports exactly one
+  // untracked path, then a lstat that flips regular -> symlink across the read.
+  const { default: events } = await import('node:events');
+  const scripted = (_cmd, cmdArgs) => {
+    const child = new events.EventEmitter();
+    child.stdout = new events.EventEmitter();
+    child.stderr = new events.EventEmitter();
+    const key = cmdArgs.join(' ');
+    queueMicrotask(() => {
+      if (key.includes('ls-files --others')) child.stdout.emit('data', Buffer.from('leak\0'));
+      if (key.includes('rev-parse')) child.stdout.emit('data', Buffer.from('HEADSHA\n'));
+      if (key.includes('diff')) child.stdout.emit('data', Buffer.from(''));
+      if (key.includes('status')) child.stdout.emit('data', Buffer.from(''));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  const delta = await collectWorkerDelta({
+    cwd: '/repo',
+    baseline: { head: 'HEADSHA', baselineRef: 'HEADSHA', untrackedHashes: {}, evidenceComplete: true },
+    spawn: scripted,
+    lstat: async () => { lstatCall += 1; return lstatCall === 1 ? regular : symlinked; },
+    readFile: async () => { readCalls += 1; return Buffer.from('12345'); },
+  });
+  assert.equal(delta.evidenceComplete, false, 'a mid-read swap fails the evidence closed');
+  assert.ok((delta.incompleteReasons ?? []).some((r) => /changed during read|symlink/i.test(r)), JSON.stringify(delta.incompleteReasons));
+});
+
 // ---------------------------------------------------------------------------
 // 10. baseline Gate mutation is NOT attributed to the Worker delta.
 // ---------------------------------------------------------------------------
