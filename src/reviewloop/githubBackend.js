@@ -113,7 +113,8 @@ function findingsForSubmission({ state, body }) {
       line: null,
       title: `trusted reviewer left an unstructured ${upper || 'COMMENTED'} review — resolve it in the PR thread: ${firstLine(body)}`,
     }],
-    dismissed: false, clean: false,
+    dismissed: false,
+    clean: false,
   };
 }
 
@@ -357,8 +358,16 @@ export function createGithubReviewBackend({
     },
 
     // The single external write. Gated upstream by ExternalModelTriggerAuthority.
-    async postReviewTrigger({ prNumber, reviewer }) {
-      const body = reviewer === 'claude' ? '@claude review' : '@codex review';
+    async postReviewTrigger({ prNumber, reviewer, headSha }) {
+      const body = reviewer === 'claude'
+        ? '@claude review'
+        : [
+          '@codex review',
+          '',
+          `Review only the current PR HEAD${headSha ? ` (expected: ${headSha})` : ''} as the source of truth.`,
+          'Report only issues that are present in that HEAD. Do not reuse or repeat findings from earlier commits or prior review rounds unless you independently verify the issue still exists in the current HEAD.',
+          'You may inspect history and prior comments for context, but deleted, superseded, or stale code/comments are not current findings. An issue introduced earlier in the PR remains in scope if it still exists in the current HEAD.',
+        ].join('\n');
       return gh.postComment({ prNumber, body });
     },
 
