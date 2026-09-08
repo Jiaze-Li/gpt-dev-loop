@@ -30,10 +30,31 @@ function review(head, findings = []) {
   };
 }
 
+// Default live enumeration: one pure-Codex thread per finding across every
+// review this backend can serve. Tests that need a different live shape (human
+// reply, missing thread, throwing enumeration) pass `threads` explicitly.
+function defaultThreads(results, existing) {
+  const nodes = [];
+  const seen = new Set();
+  for (const rv of [...Object.values(results), ...Object.values(existing)]) {
+    for (const f of rv?.findings ?? []) {
+      if (seen.has(f.threadNodeId)) continue;
+      seen.add(f.threadNodeId);
+      nodes.push({
+        threadNodeId: f.threadNodeId,
+        isResolved: false,
+        comments: [{ authorLogin: BOT, commentDatabaseId: f.commentId }],
+      });
+    }
+  }
+  return nodes;
+}
+
 function mockBackend({
   heads = ['H1'], results = {}, existing = {}, threads, reviewer = 'codex',
   resolveFail = () => false,
 } = {}) {
+  if (threads === undefined) threads = defaultThreads(results, existing);
   const state = {
     headIdx: 0, triggers: [], resolved: [], threadListCalls: 0, resolveAttempts: [],
   };
@@ -240,6 +261,78 @@ test('a managed thread that live enumeration shows carrying a human comment is n
   assert.deepEqual(backend.state.resolved, []);
 });
 
+// 7c. Live enumeration throws -> resolveReviewThread is never called, PASS withheld.
+test('a throwing live thread enumeration fails closed: no resolve call, no PASS', async () => {
+  const backend = mockBackend({
+    heads: ['H1', 'H2'],
+    results: { H1: review('H1', [{ title: 'bug' }]), H2: review('H2', []) },
+    threads: () => { throw new Error('GraphQL 502 from GitHub'); },
+  });
+  const { controller, persistence } = build(backend);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  await controller.review({ loopId });
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'HUMAN_REQUIRED');
+  assert.deepEqual(backend.state.resolveAttempts, []);
+  assert.deepEqual(backend.state.resolved, []);
+  assert.equal((await managedThreads(persistence, loopId))[0].status, 'RESOLVE_FAILED');
+});
+
+// 7d. Live enumeration returns null / unverifiable -> fails closed.
+test('a null (unverifiable) live thread enumeration fails closed', async () => {
+  const backend = mockBackend({
+    heads: ['H1', 'H2'],
+    results: { H1: review('H1', [{ title: 'bug' }]), H2: review('H2', []) },
+    threads: null,
+  });
+  const { controller } = build(backend);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  await controller.review({ loopId });
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'HUMAN_REQUIRED');
+  assert.deepEqual(backend.state.resolveAttempts, []);
+});
+
+// 7e. The managed thread is absent from a successful live enumeration -> fails closed.
+test('a managed thread missing from the live enumeration is not resolved', async () => {
+  const backend = mockBackend({
+    heads: ['H1', 'H2'],
+    results: { H1: review('H1', [{ title: 'bug' }]), H2: review('H2', []) },
+    threads: [
+      { threadNodeId: 'T-SOMETHING-ELSE', isResolved: false, comments: [{ authorLogin: BOT }] },
+    ],
+  });
+  const { controller, persistence } = build(backend);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  await controller.review({ loopId });
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'HUMAN_REQUIRED');
+  assert.deepEqual(backend.state.resolveAttempts, []);
+  assert.equal((await managedThreads(persistence, loopId))[0].status, 'RESOLVE_FAILED');
+});
+
+// 7f. An already-resolved live thread is recorded as success with no mutation.
+test('an already-resolved live thread is recorded RESOLVED without a resolve mutation', async () => {
+  const backend = mockBackend({
+    heads: ['H1', 'H2'],
+    results: { H1: review('H1', [{ title: 'bug' }]), H2: review('H2', []) },
+    threads: [
+      { threadNodeId: 'T-H1-0', isResolved: true, comments: [{ authorLogin: BOT }] },
+    ],
+  });
+  const { controller, persistence } = build(backend);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  await controller.review({ loopId });
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'PASS');
+  assert.deepEqual(backend.state.resolveAttempts, []);
+  assert.equal((await managedThreads(persistence, loopId))[0].status, 'RESOLVED');
+});
+
 // 8. Restart between the H1 REWORK and the H2 review preserves thread identity.
 test('restart between H1 REWORK and H2 review preserves durable thread identity', async () => {
   const persistence = new MemoryPersistence();
@@ -254,7 +347,13 @@ test('restart between H1 REWORK and H2 review preserves durable thread identity'
   );
 
   // Fresh process: new controller + new backend, same persistence.
-  const b2 = mockBackend({ heads: ['H2'], results: { H2: review('H2', []) } });
+  // The H1 thread still exists on the PR (unresolved) — the live enumeration
+  // returns it even though the H2 clean review introduces no new threads.
+  const b2 = mockBackend({
+    heads: ['H2'],
+    results: { H2: review('H2', []) },
+    threads: [{ threadNodeId: 'T-H1-0', isResolved: false, comments: [{ authorLogin: BOT }] }],
+  });
   const c2 = createReviewLoopController({ persistence, prBackend: b2 });
   const r = await c2.review({ loopId });
   assert.equal(r.status, 'PASS');

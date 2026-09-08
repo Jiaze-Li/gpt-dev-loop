@@ -128,16 +128,23 @@ export function applyResolutionResult(mt, {
   return mt;
 }
 
-// Defense-in-depth scope check against a live thread enumeration. `liveThreads`
-// is the transport's listReviewThreads() output, or null when the enumeration
-// itself was unavailable.
-//   - null enumeration -> trust our own trust-gated record (proceed)
-//   - thread present    -> EVERY comment author must be an allowlisted reviewer
-//                          login; an already-resolved thread counts as success
-//   - thread absent      -> fail closed (do NOT resolve)
+// Fail-closed scope check against a live thread enumeration. ReviewLoop resolves
+// a managed thread ONLY when it can positively verify, right now, that the
+// thread still carries nothing but trusted-reviewer comments. `liveThreads` is
+// the transport's listReviewThreads() output, or null when the enumeration was
+// unavailable / failed / returned an unverifiable shape.
+//   - enumeration unavailable (null / not an array) -> fail closed (do NOT resolve)
+//   - thread absent from the live enumeration        -> fail closed
+//   - thread present, but ANY comment author is not an allowlisted reviewer
+//     login (e.g. a later human reply)               -> fail closed
+//   - thread present, identity matches, every comment author allowlisted ->
+//     resolve is permitted; an already-resolved thread counts as success with
+//     no further mutation
 export function scopeCheckThread(mt, liveThreads, { allowlist = [] } = {}) {
   if (!str(mt.threadNodeId)) return { ok: false, reason: 'no thread node id' };
-  if (!Array.isArray(liveThreads)) return { ok: true };
+  if (!Array.isArray(liveThreads)) {
+    return { ok: false, reason: 'live thread enumeration unavailable' };
+  }
   const allow = new Set((allowlist ?? []).map((s) => String(s).toLowerCase()).filter(Boolean));
   const thread = liveThreads.find((t) => str(t.threadNodeId) === str(mt.threadNodeId));
   if (!thread) return { ok: false, reason: 'thread not found in live enumeration' };
