@@ -17,6 +17,15 @@ function captureBackend() {
   };
 }
 
+function assertExactHeadScope(body, trigger, headSha) {
+  assert.match(body, new RegExp(`^${trigger.replace('@', '\\@')}\\n`));
+  assert.match(body, new RegExp(headSha));
+  assert.match(body, /current PR HEAD/);
+  assert.match(body, /Do not reuse or repeat findings from earlier commits or prior review rounds/);
+  assert.match(body, /unless you independently verify the issue still exists/);
+  assert.match(body, /An issue introduced earlier in the PR remains in scope if it still exists/);
+}
+
 test('Codex PR trigger scopes review to the exact current HEAD without suppressing still-present old bugs', async () => {
   const { backend, posted } = captureBackend();
   const headSha = 'abcdef0123456789abcdef0123456789abcdef01';
@@ -25,18 +34,16 @@ test('Codex PR trigger scopes review to the exact current HEAD without suppressi
 
   assert.equal(posted.length, 1);
   assert.equal(posted[0].prNumber, 4);
-  assert.match(posted[0].body, /^@codex review\n/);
-  assert.match(posted[0].body, new RegExp(headSha));
-  assert.match(posted[0].body, /current PR HEAD/);
-  assert.match(posted[0].body, /Do not reuse or repeat findings from earlier commits or prior review rounds/);
-  assert.match(posted[0].body, /unless you independently verify the issue still exists/);
-  assert.match(posted[0].body, /An issue introduced earlier in the PR remains in scope if it still exists/);
+  assertExactHeadScope(posted[0].body, '@codex review', headSha);
 });
 
-test('Claude PR trigger remains the standard command', async () => {
+test('Claude PR trigger uses the same exact-current-HEAD scope', async () => {
   const { backend, posted } = captureBackend();
+  const headSha = 'fedcba9876543210fedcba9876543210fedcba98';
 
-  await backend.postReviewTrigger({ prNumber: 4, reviewer: 'claude', headSha: 'HEAD' });
+  await backend.postReviewTrigger({ prNumber: 4, reviewer: 'claude', headSha });
 
-  assert.equal(posted[0].body, '@claude review');
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].prNumber, 4);
+  assertExactHeadScope(posted[0].body, '@claude review', headSha);
 });
