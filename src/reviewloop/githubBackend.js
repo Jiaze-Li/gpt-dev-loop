@@ -238,6 +238,8 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$e
         nodes{
           id isResolved isOutdated
           comments(first:100){
+            pageInfo{ hasNextPage }
+            totalCount
             nodes{
               databaseId
               author{ login }
@@ -269,6 +271,13 @@ function parseReviewThreadPages(stdout) {
         threadNodeId: identityStr(t?.id),
         isResolved: t?.isResolved === true,
         isOutdated: t?.isOutdated === true,
+        // `--paginate` advances the outer reviewThreads connection only; a
+        // thread's own comments connection is never paged past its first 100.
+        // A human reply beyond comment 100 would then be invisible to the scope
+        // check, so surface truncation and let the consumer fail closed.
+        commentsTruncated: t?.comments?.pageInfo?.hasNextPage === true
+          || (Number.isFinite(t?.comments?.totalCount)
+            && t.comments.totalCount > (t?.comments?.nodes?.length ?? 0)),
         comments: (t?.comments?.nodes ?? []).map((c) => ({
           commentDatabaseId: identityStr(c?.databaseId),
           reviewDatabaseId: identityStr(c?.pullRequestReview?.databaseId),

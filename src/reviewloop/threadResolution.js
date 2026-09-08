@@ -135,6 +135,10 @@ export function applyResolutionResult(mt, {
 // unavailable / failed / returned an unverifiable shape.
 //   - enumeration unavailable (null / not an array) -> fail closed (do NOT resolve)
 //   - thread absent from the live enumeration        -> fail closed
+//   - thread reported outdated (isOutdated) by GitHub -> fail closed (the line
+//     has moved; the module never resolves historical review state)
+//   - thread's comments connection was truncated      -> fail closed (a later
+//     human reply past the first page cannot be ruled out)
 //   - thread present, but ANY comment author is not an allowlisted reviewer
 //     login (e.g. a later human reply)               -> fail closed
 //   - thread present, identity matches, every comment author allowlisted ->
@@ -148,6 +152,10 @@ export function scopeCheckThread(mt, liveThreads, { allowlist = [] } = {}) {
   const allow = new Set((allowlist ?? []).map((s) => String(s).toLowerCase()).filter(Boolean));
   const thread = liveThreads.find((t) => str(t.threadNodeId) === str(mt.threadNodeId));
   if (!thread) return { ok: false, reason: 'thread not found in live enumeration' };
+  if (thread.isOutdated === true) return { ok: false, reason: 'thread is outdated' };
+  if (thread.commentsTruncated === true) {
+    return { ok: false, reason: 'thread comment list is truncated — cannot rule out a human reply' };
+  }
   const comments = Array.isArray(thread.comments) ? thread.comments : [];
   if (comments.length === 0) return { ok: false, reason: 'thread has no comments to attribute' };
   for (const c of comments) {

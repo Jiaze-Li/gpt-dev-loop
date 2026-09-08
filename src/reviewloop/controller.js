@@ -646,20 +646,36 @@ export function createReviewLoopController({
       ?? (collectWorkerDeltaFn === collectWorkerDelta ? collectWorkerDelta : null);
     if (postGateFn && !signal?.aborted && gate.verdict !== GATE_VERDICTS.FAIL) {
       let postDelta = null;
-      try { postDelta = await postGateFn({ cwd, baseline }); } catch { postDelta = null; }
-      if (postDelta && postDelta.fingerprint && postDelta.fingerprint !== delta.fingerprint) {
-        if (postDelta.evidenceComplete === false) {
-          recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'post-Gate attribution incomplete');
-          await store.save(loopState.loopId, loopState);
-          return {
-            status: 'HUMAN_REQUIRED',
-            loopId: loopState.loopId,
-            round: loopState.round,
-            reason: `the deterministic Gate mutated tracked files and the post-Gate Worker delta could not be attributed: ${(postDelta.incompleteReasons ?? []).join('; ')}`,
-            telemetry: await durableTelemetry(loopState.loopId),
-            safetyEvents,
-          };
-        }
+      let postGateError = null;
+      try { postDelta = await postGateFn({ cwd, baseline }); }
+      catch (err) { postGateError = err; postDelta = null; }
+
+      // Fail closed on EVERY post-Gate evidence failure — a throw, a missing
+      // result, a missing fingerprint, or incomplete attribution — before
+      // comparing fingerprints. The fingerprint excludes completeness metadata,
+      // so a Gate that creates an untracked file while this recollection fails
+      // would otherwise send stale pre-Gate evidence to the Reviewer and reach
+      // PASS without that file being reviewed.
+      if (!postDelta || !postDelta.fingerprint || postDelta.evidenceComplete === false) {
+        const why = postGateError
+          ? [`post-Gate delta collection threw: ${postGateError?.message ?? postGateError}`]
+          : !postDelta
+            ? ['post-Gate delta collection returned no result']
+            : !postDelta.fingerprint
+              ? ['post-Gate delta collection returned no fingerprint']
+              : (postDelta.incompleteReasons ?? ['post-Gate Worker delta could not be attributed']);
+        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'post-Gate attribution incomplete');
+        await store.save(loopState.loopId, loopState);
+        return {
+          status: 'HUMAN_REQUIRED',
+          loopId: loopState.loopId,
+          round: loopState.round,
+          reason: `the deterministic Gate ran and the post-Gate Worker delta could not be re-collected safely: ${why.join('; ')}`,
+          telemetry: await durableTelemetry(loopState.loopId),
+          safetyEvents,
+        };
+      }
+      if (postDelta.fingerprint !== delta.fingerprint) {
         collectSafetyEvent({
           code: 'GATE_MUTATED_TRACKED_FILES',
           severity: 'NON_BLOCKING',

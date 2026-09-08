@@ -314,6 +314,44 @@ test('a managed thread missing from the live enumeration is not resolved', async
   assert.equal((await managedThreads(persistence, loopId))[0].status, 'RESOLVE_FAILED');
 });
 
+// 7e-ii. GitHub reports the managed thread outdated -> scope check fails closed.
+test('an outdated live thread is not resolved', async () => {
+  const backend = mockBackend({
+    heads: ['H1', 'H2'],
+    results: { H1: review('H1', [{ title: 'bug' }]), H2: review('H2', []) },
+    threads: [
+      { threadNodeId: 'T-H1-0', isResolved: false, isOutdated: true, comments: [{ authorLogin: BOT, commentDatabaseId: 'c-H1-0' }] },
+    ],
+  });
+  const { controller, persistence } = build(backend);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  await controller.review({ loopId });
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'HUMAN_REQUIRED');
+  assert.deepEqual(backend.state.resolved, []);
+  assert.equal((await managedThreads(persistence, loopId))[0].status, 'RESOLVE_FAILED');
+});
+
+// 7e-iii. The thread's comment list was truncated (paging) -> fails closed:
+// a human reply past the first comment page cannot be ruled out.
+test('a truncated-comment live thread is not resolved', async () => {
+  const backend = mockBackend({
+    heads: ['H1', 'H2'],
+    results: { H1: review('H1', [{ title: 'bug' }]), H2: review('H2', []) },
+    threads: [
+      { threadNodeId: 'T-H1-0', isResolved: false, commentsTruncated: true, comments: [{ authorLogin: BOT, commentDatabaseId: 'c-H1-0' }] },
+    ],
+  });
+  const { controller } = build(backend);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  await controller.review({ loopId });
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'HUMAN_REQUIRED');
+  assert.deepEqual(backend.state.resolved, []);
+});
+
 // 7f. An already-resolved live thread is recorded as success with no mutation.
 test('an already-resolved live thread is recorded RESOLVED without a resolve mutation', async () => {
   const backend = mockBackend({
@@ -423,11 +461,31 @@ test('the gh transport exposes review-thread enumeration + resolution and nothin
   assert.equal(threads[0].threadNodeId, 'TID');
   assert.equal(threads[0].comments[0].commentDatabaseId, '42');
   assert.equal(threads[0].comments[0].reviewDatabaseId, '7');
+  assert.equal(threads[0].commentsTruncated, false);
   const res = await t.resolveReviewThread({ threadNodeId: 'TID' });
   assert.deepEqual(res, { threadNodeId: 'TID', resolved: true });
 
   const src = await import('node:fs').then((fs) => fs.promises.readFile(new URL('../src/reviewloop/threadResolution.js', import.meta.url), 'utf8'));
   assert.doesNotMatch(src, /git push|gh pr merge|forcePush|--force|commit -m/);
+});
+
+test('parseReviewThreadPages flags a thread whose comments connection is truncated', async () => {
+  const { createGhTransport } = await import('../src/reviewloop/githubBackend.js');
+  const t = createGhTransport({
+    repo: 'o/r',
+    execFile: async (_bin, args) => {
+      if (args.includes('graphql')) {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [
+          { id: 'T1', isResolved: false, isOutdated: false, comments: { pageInfo: { hasNextPage: true }, totalCount: 140, nodes: [{ databaseId: 1, author: { login: 'x' } }] } },
+          { id: 'T2', isResolved: false, isOutdated: false, comments: { pageInfo: { hasNextPage: false }, totalCount: 2, nodes: [{ databaseId: 2, author: { login: 'x' } }, { databaseId: 3, author: { login: 'y' } }] } },
+        ] } } } } }) };
+      }
+      return { stdout: '' };
+    },
+  });
+  const threads = await t.listReviewThreads({ prNumber: 4 });
+  assert.equal(threads.find((x) => x.threadNodeId === 'T1').commentsTruncated, true);
+  assert.equal(threads.find((x) => x.threadNodeId === 'T2').commentsTruncated, false);
 });
 
 test('resolveReviewThread fails closed when GitHub does not confirm resolution', async () => {
