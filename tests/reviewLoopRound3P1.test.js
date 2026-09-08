@@ -97,6 +97,23 @@ test('a post-Gate re-collect that comes back evidence-incomplete fails closed', 
   assert.match(r.reason, /post-Gate/);
 });
 
+test('a Gate that reverts the Worker delta back to baseline re-triggers the no-change guard (no empty-diff PASS)', async () => {
+  let reviewerRan = false;
+  const controller = createReviewLoopController({
+    persistence: new MemoryPersistence(),
+    captureBaselineFn: async () => ({ head: 'H', baselineRef: 'H', dirtyFiles: [], untrackedHashes: {}, evidenceComplete: true }),
+    collectWorkerDeltaFn: async () => ({ baselineHead: 'H', currentHead: 'H', evidenceComplete: true, noWorkerChangeYet: false, changedFiles: ['a.js'], fingerprint: 'PRE', diff: 'pre' }),
+    collectPostGateDeltaFn: async () => ({ baselineHead: 'H', currentHead: 'H', evidenceComplete: true, noWorkerChangeYet: true, changedFiles: [], fingerprint: 'POST-EMPTY', diff: '' }),
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['npm run format'], manifestFingerprint: 'mf' }),
+    runGateFn: async () => ({ verdict: 'PASS', pass: true, fingerprint: 'g', failureIdentities: [], results: [], evidence: { results: [], pass: true } }),
+    reviewerFn: async () => { reviewerRan = true; return { value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } }; },
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
+  const r = await controller.review({ loopId });
+  assert.equal(r.status, 'NO_PROGRESS');
+  assert.equal(reviewerRan, false);
+});
+
 for (const [label, postFn] of [
   ['throws', async () => { throw new Error('git ls-files exploded'); }],
   ['returns null', async () => null],

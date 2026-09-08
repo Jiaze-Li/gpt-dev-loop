@@ -685,6 +685,24 @@ export function createReviewLoopController({
           actionTaken: 'review proceeds over post-Gate evidence',
         });
         delta = postDelta;
+
+        // A mutating Gate (formatter, snapshot writer, …) may have reverted the
+        // Worker's only changes back to the captured baseline. Re-run the
+        // no-change guard over the adopted post-Gate delta — otherwise the
+        // Reviewer is called with an empty diff and a clean response PASSes,
+        // certifying work that no longer exists in the tree.
+        if (delta.noWorkerChangeYet) {
+          await store.save(loopState.loopId, loopState);
+          return {
+            status: 'NO_PROGRESS',
+            loopId: loopState.loopId,
+            round: loopState.round,
+            reason: 'the deterministic Gate reverted the Worker delta back to the reviewloop_begin baseline; '
+              + 'no Worker change remains to review',
+            telemetry: await durableTelemetry(loopState.loopId),
+            safetyEvents,
+          };
+        }
       }
     }
 

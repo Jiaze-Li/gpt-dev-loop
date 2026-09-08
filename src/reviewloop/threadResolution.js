@@ -149,7 +149,12 @@ export function scopeCheckThread(mt, liveThreads, { allowlist = [] } = {}) {
   if (!Array.isArray(liveThreads)) {
     return { ok: false, reason: 'live thread enumeration unavailable' };
   }
-  const allow = new Set((allowlist ?? []).map((s) => String(s).toLowerCase()).filter(Boolean));
+  // A GitHub App shows as "<slug>[bot]" in the REST API (and in our allowlist)
+  // but the GraphQL `Actor.login` on a Bot returns the bare "<slug>". A real
+  // user login can never contain "[", so stripping a trailing "[bot]" on both
+  // sides is a safe normalization and not a spoofing vector.
+  const norm = (s) => String(s ?? '').toLowerCase().replace(/\[bot\]$/, '');
+  const allow = new Set((allowlist ?? []).map(norm).filter(Boolean));
   const thread = liveThreads.find((t) => str(t.threadNodeId) === str(mt.threadNodeId));
   if (!thread) return { ok: false, reason: 'thread not found in live enumeration' };
   if (thread.isOutdated === true) return { ok: false, reason: 'thread is outdated' };
@@ -159,7 +164,7 @@ export function scopeCheckThread(mt, liveThreads, { allowlist = [] } = {}) {
   const comments = Array.isArray(thread.comments) ? thread.comments : [];
   if (comments.length === 0) return { ok: false, reason: 'thread has no comments to attribute' };
   for (const c of comments) {
-    const login = String(c.authorLogin ?? '').toLowerCase();
+    const login = norm(c.authorLogin);
     if (!login || !allow.has(login)) {
       return { ok: false, reason: `thread carries a non-reviewer comment (${c.authorLogin ?? 'unknown'})` };
     }

@@ -118,6 +118,26 @@ test('P1 on H1 cleared by a trusted clean review on H2 resolves the H1 thread', 
   assert.equal(mts[0].verificationReviewId, 'rev-H2');
 });
 
+test('scope check treats the GraphQL bare bot slug as the allowlisted "<slug>[bot]" reviewer', async () => {
+  const backend = mockBackend({
+    heads: ['H1', 'H2'],
+    results: { H1: review('H1', [{ title: 'null deref' }]), H2: review('H2', []) },
+    threads: [
+      // GraphQL Actor.login for a Bot has no "[bot]" suffix, unlike the REST allowlist entry.
+      { threadNodeId: 'T-H1-0', isResolved: false, isOutdated: false, comments: [
+        { authorLogin: 'chatgpt-codex-connector', commentDatabaseId: 'c-H1-0' },
+      ] },
+    ],
+  });
+  const { controller } = build(backend);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  await controller.review({ loopId });
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'PASS');
+  assert.deepEqual(backend.state.resolved, ['T-H1-0']);
+});
+
 // 2. P1 on H1 -> SAME finding on H2 -> H1 thread remains unresolved.
 test('the same blocking finding recurring on H2 keeps the H1 thread unresolved', async () => {
   const backend = mockBackend({
