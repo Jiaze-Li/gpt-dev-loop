@@ -42,7 +42,13 @@ test('contextOverheadTokens surfaces the transport tax; null when either side un
 
 test('the durable spend record carries the breakdown + payloadMeta + resolved model', async () => {
   const persistence = new MemoryPersistence();
-  const spend = createReviewLoopSpend({ loopId: 'L', persistence });
+  // This case deliberately exercises a high transport-tax envelope; the
+  // single-call Token Sentinel is covered separately, so lift its ceilings here.
+  const spend = createReviewLoopSpend({
+    loopId: 'L',
+    persistence,
+    env: { REVIEWLOOP_MAX_SINGLE_CALL_USAGE: '250000', REVIEWLOOP_MAX_CONTEXT_OVERHEAD_TOKENS: '200000' },
+  });
   const ev = await spend.registerEvidence({ kind: 'reviewstate', taskId: 'op', diffHash: 'D::G' });
   await spend.meteredCall({
     role: 'reviewer', family: 'agy:gpt-oss', provider: 'agy-claude-gpt', operationId: 'op', attempt: 1,

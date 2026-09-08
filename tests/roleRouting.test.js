@@ -27,25 +27,30 @@ test('active roles are exactly supervisor + reviewer — no planner, no executor
   );
   assert.deepEqual(
     DEFAULT_ROLE_POLICY.supervisor.map((c) => c.family),
-    ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus', 'agy:gpt-oss'],
+    ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus'],
   );
   // No family is high-context any more (all AGY families run reviewloop-minimal).
   for (const role of ['reviewer', 'supervisor']) {
     for (const c of DEFAULT_ROLE_POLICY[role]) assert.notEqual(c.highContext, true);
   }
-  // GPT-OSS is a deliberate low-cost 3rd Reviewer fallback (not degraded), but
-  // only a last-resort degraded Supervisor.
+  // GPT-OSS is a deliberate low-cost 3rd Reviewer fallback (not degraded). It is
+  // NOT a Supervisor candidate: its live certification passed transport /
+  // accounting / isolation but its decision output violated the Supervisor
+  // schema, so it was removed from the Supervisor production pool.
   assert.notEqual(DEFAULT_ROLE_POLICY.reviewer.find((c) => c.family === 'agy:gpt-oss').degraded, true);
-  assert.equal(DEFAULT_ROLE_POLICY.supervisor.at(-1).family, 'agy:gpt-oss');
-  assert.equal(DEFAULT_ROLE_POLICY.supervisor.at(-1).degraded, true);
+  assert.equal(DEFAULT_ROLE_POLICY.supervisor.some((c) => c.family === 'agy:gpt-oss'), false);
 });
 
 test('production capabilities declare only supervisor/reviewer protocols', () => {
   for (const [family, roles] of Object.entries(PRODUCTION_ROLE_CAPABILITIES)) {
-    assert.deepEqual([...roles].sort(), ['reviewer', 'supervisor'], family);
+    // agy:gpt-oss is Reviewer-only (Supervisor decision-schema failure).
+    const expected = family === 'agy:gpt-oss' ? ['reviewer'] : ['reviewer', 'supervisor'];
+    assert.deepEqual([...roles].sort(), expected, family);
   }
   assert.equal(supportsProductionRole('codex:default', 'reviewer'), true);
   assert.equal(supportsProductionRole('claude:opus', 'supervisor'), true);
+  assert.equal(supportsProductionRole('agy:gpt-oss', 'reviewer'), true);
+  assert.equal(supportsProductionRole('agy:gpt-oss', 'supervisor'), false);
   assert.equal(supportsProductionRole('codex:default', 'executor'), false);
   assert.equal(supportsProductionRole('codex:default', 'planner'), false);
 });
@@ -62,7 +67,7 @@ test('fixed routing: every candidate is reachable when each earlier one fails', 
   rHealth.record('agy:gpt-oss', 'UNAVAILABLE');
   assert.equal(r(), 'claude:opus');
 
-  // Supervisor: agy:gemini -> codex -> agy:sonnet -> claude:opus -> agy:gpt-oss(degraded)
+  // Supervisor: agy:gemini -> codex -> agy:sonnet -> claude:opus (then exhausted)
   const sHealth = new ProviderHealthRegistry();
   const s = () => new RoleRouter({ providerHealth: sHealth, resolveFamily: resolver }).route('supervisor');
   assert.equal(s().requestedFamily, 'agy:gemini');
@@ -73,9 +78,22 @@ test('fixed routing: every candidate is reachable when each earlier one fails', 
   sHealth.record('agy:sonnet', 'UNAVAILABLE');
   assert.equal(s().requestedFamily, 'claude:opus');
   sHealth.record('claude:opus', 'UNAVAILABLE');
-  const last = s();
-  assert.equal(last.requestedFamily, 'agy:gpt-oss');
-  assert.equal(last.degraded, true);
+  assert.equal(s(), null); // pool exhausted — agy:gpt-oss is NOT a Supervisor candidate
+});
+
+test('agy:gpt-oss is never routed as Supervisor even when every other family is down', () => {
+  const sHealth = new ProviderHealthRegistry();
+  for (const f of ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus']) sHealth.record(f, 'UNAVAILABLE');
+  const sel = new RoleRouter({ providerHealth: sHealth, resolveFamily: resolver }).route('supervisor');
+  assert.equal(sel, null);
+  // but it IS still the third Reviewer candidate
+  const rHealth = new ProviderHealthRegistry();
+  rHealth.record('codex:default', 'UNAVAILABLE');
+  rHealth.record('agy:sonnet', 'UNAVAILABLE');
+  assert.equal(
+    new RoleRouter({ providerHealth: rHealth, resolveFamily: resolver }).route('reviewer').requestedFamily,
+    'agy:gpt-oss',
+  );
 });
 
 test('agy:sonnet + agy:gpt-oss share one quota pool; agy:gemini is separate', () => {

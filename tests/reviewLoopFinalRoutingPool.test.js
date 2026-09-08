@@ -21,7 +21,7 @@ import { MINIMAL_AGY_AGENT_NAME } from '../src/reviewloop/adapters/minimalAgyAge
 import { MemoryPersistence, finding } from './helpers/reviewLoopHarness.js';
 
 const REVIEWER_ORDER = ['codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus'];
-const SUPERVISOR_ORDER = ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus', 'agy:gpt-oss'];
+const SUPERVISOR_ORDER = ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus'];
 
 const resolver = (family) => ({
   requestedFamily: family,
@@ -101,13 +101,13 @@ test('route(): Reviewer traverses all 4 candidates', () => {
   assert.equal(pick(), null); // pool exhausted, no phantom
 });
 
-test('route(): Supervisor traverses all 5 candidates; 5th is degraded', () => {
+test('route(): Supervisor traverses all 4 candidates; agy:gpt-oss is never one of them', () => {
   const health = new ProviderHealthRegistry();
   const pick = () => new RoleRouter({ providerHealth: health, resolveFamily: resolver }).route('supervisor');
   for (let i = 0; i < SUPERVISOR_ORDER.length; i += 1) {
     const sel = pick();
     assert.equal(sel.requestedFamily, SUPERVISOR_ORDER[i]);
-    if (i === SUPERVISOR_ORDER.length - 1) assert.equal(sel.degraded, true);
+    assert.notEqual(sel.requestedFamily, 'agy:gpt-oss');
     health.record(SUPERVISOR_ORDER[i], 'UNAVAILABLE');
   }
   assert.equal(pick(), null);
@@ -211,7 +211,7 @@ test('safety stop (NOT a failover): unknown post-dispatch spend fails closed, ne
   assert.equal(reservations[0].status, 'UNRESOLVED');
 });
 
-test('failover: Supervisor fifth candidate reachable after 4 safe failures', async () => {
+test('failover: Supervisor fourth candidate (claude:opus) reachable after 3 safe failures', async () => {
   const persistence = new MemoryPersistence();
   const health = new ProviderHealthRegistry();
   const quota = new QuotaPoolRegistry({ filePath: null });
@@ -222,7 +222,6 @@ test('failover: Supervisor fifth candidate reachable after 4 safe failures', asy
     'agy:gemini': 'PROVIDER_UNAVAILABLE',
     'codex:default': 'PROVIDER_UNAVAILABLE',
     'agy:sonnet': 'PROVIDER_UNAVAILABLE',
-    'claude:opus': 'PROVIDER_UNAVAILABLE',
   };
   const controller = createReviewLoopController({
     persistence,

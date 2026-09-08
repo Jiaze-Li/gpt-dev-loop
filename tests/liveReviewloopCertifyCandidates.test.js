@@ -70,12 +70,12 @@ test('parseArgs rejects a missing/invalid role and a family outside the role poo
 
 test('candidate matrix matches the required candidate set exactly', () => {
   assert.deepEqual(CANDIDATES.reviewer, ['codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus']);
-  assert.deepEqual(CANDIDATES.supervisor, ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus', 'agy:gpt-oss']);
+  assert.deepEqual(CANDIDATES.supervisor, ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus']);
   // derived straight from the production policy — no second source of truth
   for (const role of VALID_ROLES) {
     assert.deepEqual(CANDIDATES[role], DEFAULT_ROLE_POLICY[role].map((e) => e.family));
   }
-  assert.equal(ALL_CANDIDATES.length, 9);
+  assert.equal(ALL_CANDIDATES.length, 8);
 });
 
 test('no duplicate candidate within a role, and no duplicate role|family across the matrix', () => {
@@ -164,7 +164,7 @@ test('AGY candidate when custom-agent support was never probed -> ISOLATION_UNVE
     probeReviewTransportRuntime: async () => ({ 'codex:default': { available: false }, 'claude:opus': { available: false } }),
     detectAgyCustomAgentSupport: async () => null,
   };
-  const { output } = await main({ argv: ['--role', 'supervisor', '--family', 'agy:gpt-oss'], env: { [OPT_IN_ENV]: '1' }, deps });
+  const { output } = await main({ argv: ['--role', 'reviewer', '--family', 'agy:gpt-oss'], env: { [OPT_IN_ENV]: '1' }, deps });
   assert.equal(output.status, 'ISOLATION_UNVERIFIED');
   assert.equal(output.isolationVerified, false);
 });

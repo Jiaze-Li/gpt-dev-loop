@@ -132,6 +132,21 @@ export const AUTHORIZATION_ERROR_CODES = Object.freeze({
   // evidence consumption could not be durably persisted. Fail closed: zero
   // physical provider calls.
   MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE: 'MODEL_SPEND_INFORMATION_STATE_UNAVAILABLE',
+  // Post-settlement single-call Token Sentinel (reviewSpend.js). A physical
+  // Reviewer/Supervisor call's usage settled RELIABLY but a single call's
+  // usageVolume (or its known transport context overhead) exceeded the
+  // per-call ceiling. The anomalous call is fully, durably accounted; this is
+  // then latched durably for the loop so every further internal model spend
+  // fails closed across a process restart. It is an orchestrator safety stop,
+  // never provider failure: zero auto-failover, no provider health/quota
+  // mutation.
+  MODEL_SPEND_TOKEN_ANOMALY_BLOCKED: 'MODEL_SPEND_TOKEN_ANOMALY_BLOCKED',
+  // The durable single-call Token Sentinel latch could not be READ, or a
+  // detected anomaly could not be durably LATCHED. Fail closed: absence of a
+  // latch cannot be established (or cannot be guaranteed to survive a restart),
+  // so further internal model spend is refused. Never interpret unreadable
+  // state as "no anomaly".
+  MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE: 'MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE',
 });
 
 export function isAuthorizationFailure(error) {

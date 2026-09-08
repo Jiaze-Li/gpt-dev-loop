@@ -39,6 +39,8 @@ export const REVIEWLOOP_ENV = Object.freeze({
   MAX_REVIEWER_CALLS: 'REVIEWLOOP_MAX_REVIEWER_CALLS',
   MAX_SUPERVISOR_CALLS: 'REVIEWLOOP_MAX_SUPERVISOR_CALLS',
   MAX_EXTERNAL_REVIEW_TRIGGERS: 'REVIEWLOOP_MAX_EXTERNAL_REVIEW_TRIGGERS',
+  MAX_SINGLE_CALL_USAGE: 'REVIEWLOOP_MAX_SINGLE_CALL_USAGE',
+  MAX_CONTEXT_OVERHEAD_TOKENS: 'REVIEWLOOP_MAX_CONTEXT_OVERHEAD_TOKENS',
 });
 
 export const REVIEWLOOP_DEFAULTS = Object.freeze({
@@ -54,15 +56,39 @@ export const REVIEWLOOP_DEFAULTS = Object.freeze({
   // The Supervisor is invoked at most ONCE per loop (controller guards on
   // supervisorInvoked), but that single invocation drives automatic
   // provider failover across the whole Supervisor pool. This ceiling must
-  // therefore be >= the Supervisor pool candidate count (currently 5:
-  // agy:gemini, codex:default, agy:sonnet, claude:opus, agy:gpt-oss) so the
-  // tail candidate stays mechanically reachable when every earlier one fails
-  // safely. MAX_COST_USD / MAX_USAGE_VOLUME remain the real runaway guards.
-  MAX_SUPERVISOR_CALLS: 5,
+  // therefore be >= the Supervisor pool candidate count (currently 4:
+  // agy:gemini, codex:default, agy:sonnet, claude:opus) so the tail candidate
+  // stays mechanically reachable when every earlier one fails safely.
+  // MAX_COST_USD / MAX_USAGE_VOLUME remain the real runaway guards.
+  MAX_SUPERVISOR_CALLS: 4,
   MAX_EXTERNAL_REVIEW_TRIGGERS: 7,
+  // ---- post-settlement single-call Token Sentinel -------------------------
+  // A runaway guard for ONE physical call: the durable aggregate ceilings
+  // (MAX_USAGE_VOLUME / MAX_COST_USD) only fire once the running total crosses
+  // the line, so a single call that suddenly balloons (10k running total -> a
+  // 150k call) has already spent the 150k before the aggregate would block the
+  // NEXT call. The Sentinel is POST-settlement: it cannot un-spend the
+  // anomalous call, it fully accounts it, records a BLOCKING safety event, and
+  // latches the loop so every further Reviewer/Supervisor model call fails
+  // closed (across a restart). See createReviewLoopSpend / maybeTripSentinel.
+  MAX_SINGLE_CALL_USAGE: 40_000,
+  MAX_CONTEXT_OVERHEAD_TOKENS: 30_000,
+});
+
+// Env overrides for the Token Sentinel are clamped to (0, HARD_CAP]: an
+// illegal value (non-finite, <= 0, unparseable) falls back to the default and
+// NEVER disables the protection, and a value above the hard cap is clamped so
+// a misconfiguration cannot effectively turn the ceiling into infinity.
+export const TOKEN_SENTINEL_HARD_CAPS = Object.freeze({
+  MAX_SINGLE_CALL_USAGE: 250_000,
+  MAX_CONTEXT_OVERHEAD_TOKENS: 200_000,
 });
 
 const SPEND_STATE_KEY = 'reviewLoopSpend';
+// Durable, restart-surviving latch for the post-settlement Token Sentinel.
+// One record per loop; once written with `tripped: true` every further metered
+// call in the loop is refused at the authorization stage.
+const TOKEN_ANOMALY_STATE_KEY = 'reviewLoopTokenAnomaly';
 const METERED_ROLES = new Set(['reviewer', 'supervisor']);
 
 // Error codes that PROVE the physical provider call never reached the provider
@@ -96,6 +122,17 @@ function num(env, key, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+// Token Sentinel threshold: positive-finite env override, clamped to a hard
+// cap. An illegal value can never DISABLE the protection (it falls back to the
+// default) and can never be inflated past the hard cap.
+function boundedThreshold(env, key, fallback, hardCap) {
+  const raw = env?.[key];
+  if (raw == null) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(n, hardCap);
+}
+
 export function resolveReviewLoopLimits(env = process.env) {
   return {
     maxCostUsd: num(env, REVIEWLOOP_ENV.MAX_COST_USD, REVIEWLOOP_DEFAULTS.MAX_COST_USD),
@@ -105,6 +142,14 @@ export function resolveReviewLoopLimits(env = process.env) {
     maxSupervisorCalls: num(env, REVIEWLOOP_ENV.MAX_SUPERVISOR_CALLS, REVIEWLOOP_DEFAULTS.MAX_SUPERVISOR_CALLS),
     maxExternalReviewTriggers: num(
       env, REVIEWLOOP_ENV.MAX_EXTERNAL_REVIEW_TRIGGERS, REVIEWLOOP_DEFAULTS.MAX_EXTERNAL_REVIEW_TRIGGERS,
+    ),
+    maxSingleCallUsage: boundedThreshold(
+      env, REVIEWLOOP_ENV.MAX_SINGLE_CALL_USAGE,
+      REVIEWLOOP_DEFAULTS.MAX_SINGLE_CALL_USAGE, TOKEN_SENTINEL_HARD_CAPS.MAX_SINGLE_CALL_USAGE,
+    ),
+    maxContextOverheadTokens: boundedThreshold(
+      env, REVIEWLOOP_ENV.MAX_CONTEXT_OVERHEAD_TOKENS,
+      REVIEWLOOP_DEFAULTS.MAX_CONTEXT_OVERHEAD_TOKENS, TOKEN_SENTINEL_HARD_CAPS.MAX_CONTEXT_OVERHEAD_TOKENS,
     ),
   };
 }
@@ -426,6 +471,60 @@ export class ReviewLoopSpendStore {
   }
 }
 
+// Durable latch for the post-settlement Token Sentinel, over the same
+// workflow-state snapshot. Read on every metered call so the block survives a
+// process restart; written exactly once, when the anomaly is first detected.
+export class ReviewLoopTokenAnomalyStore {
+  constructor(persistence) {
+    this._persistence = persistence;
+  }
+
+  async load(loopId) {
+    if (!loopId || !this._persistence || typeof this._persistence.readWorkflowState !== 'function') return null;
+    const state = await this._persistence.readWorkflowState(loopId);
+    const raw = state?.[TOKEN_ANOMALY_STATE_KEY];
+    return raw && raw.tripped === true ? raw : null;
+  }
+
+  // Returns { persisted } — `persisted:true` ONLY when the latch is durably on
+  // record (freshly written, or already present). `persisted:false` means no
+  // durable store is backing this call: a bare in-memory surface (fine — the
+  // whole surface is ephemeral), OR a persistence object that does not
+  // implement the workflow-state interface (a misconfiguration the caller must
+  // fail closed on).
+  async latch(loopId, record) {
+    if (!loopId || !this._persistence) return { persisted: false, backed: false };
+    if (typeof this._persistence.updateWorkflowState !== 'function'
+      || typeof this._persistence.readWorkflowState !== 'function') {
+      return { persisted: false, backed: false };
+    }
+    // First write wins: never overwrite the record of the ORIGINAL anomaly.
+    const existing = await this.load(loopId);
+    if (existing) return { persisted: true, backed: true };
+    await this._persistence.updateWorkflowState(loopId, { [TOKEN_ANOMALY_STATE_KEY]: record });
+    return { persisted: true, backed: true };
+  }
+}
+
+// Post-settlement Token Sentinel decision. Runs ONLY against a call whose usage
+// settled reliably (`volumeResolved === true`) — an UNKNOWN / unresolved usage
+// keeps the existing UNRESOLVED fail-closed path and is never guessed at here.
+// Returns null (no anomaly) or the trip detail.
+export function detectSingleCallTokenAnomaly({ accounting, contextOverhead, limits }) {
+  if (!accounting || accounting.volumeResolved !== true) return null;
+  const usageVolume = Number.isFinite(accounting.usageVolume) ? accounting.usageVolume : null;
+  const overhead = Number.isFinite(contextOverhead) ? contextOverhead : null;
+  const usageTrip = usageVolume != null && usageVolume > limits.maxSingleCallUsage;
+  const overheadTrip = overhead != null && overhead > limits.maxContextOverheadTokens;
+  if (!usageTrip && !overheadTrip) return null;
+  return {
+    trigger: usageTrip ? 'SINGLE_CALL_USAGE' : 'CONTEXT_OVERHEAD',
+    usageVolume,
+    contextOverheadTokens: overhead,
+    threshold: usageTrip ? limits.maxSingleCallUsage : limits.maxContextOverheadTokens,
+  };
+}
+
 function foldTotals(records) {
   return records.reduce((acc, r) => ({
     reviewerCalls: acc.reviewerCalls + (r.role === 'reviewer' ? 1 : 0),
@@ -494,6 +593,39 @@ export function createReviewLoopSpend({
 } = {}) {
   const limits = resolveReviewLoopLimits(env);
   const spendStore = new ReviewLoopSpendStore(persistence);
+  const anomalyStore = new ReviewLoopTokenAnomalyStore(persistence);
+
+  // Post-settlement Token Sentinel latch. Once tripped it is cached (a latch
+  // never un-trips), and it is also set in-process the moment maybeTripSentinel
+  // fires so a persistence-less (unit-test) surface still blocks the next call.
+  // A CLEAN result is deliberately NOT cached: the durable latch is re-read on
+  // every metered call, so a latch written after this surface's first read
+  // (a crash-recovered sibling, a prior round on a shared loopId) still blocks
+  // — a stale "clean" cache must never outrank a durable latch.
+  let anomalyLatched = null;
+
+  // Raw read. THROWS on a durable-read failure — the caller must fail closed:
+  // "cannot read the latch" is never "no anomaly".
+  async function readAnomaly() {
+    if (anomalyLatched) return anomalyLatched;
+    let loaded;
+    try {
+      loaded = await anomalyStore.load(loopId);
+    } catch (error) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE,
+        `single-call token anomaly latch could not be read: ${error?.message ?? error}`,
+        { loopId },
+      );
+    }
+    if (loaded) anomalyLatched = loaded;
+    return anomalyLatched || null;
+  }
+
+  // Best-effort variant for telemetry / diagnostics: never throws.
+  async function loadAnomaly() {
+    try { return await readAnomaly(); } catch { return null; }
+  }
 
   // Session-local records for calls made in THIS process; prior durable
   // records are loaded lazily and cached on first budget check.
@@ -597,6 +729,97 @@ export function createReviewLoopSpend({
     };
   }
 
+  // Post-settlement single-call Token Sentinel. Called AFTER the anomalous
+  // call's durable accounting record has already been appended, so the real
+  // usage is fully accounted (never treated as 0). On a trip it:
+  //   - durably latches the anomaly for the loop (survives a restart),
+  //   - records a BLOCKING MODEL_SPEND_TOKEN_ANOMALY safety event,
+  //   - throws MODEL_SPEND_TOKEN_ANOMALY_BLOCKED (an AuthorizationError, so the
+  //     controller performs ZERO failover and never mutates provider
+  //     health/quota — it is not disguised as a provider failure).
+  async function maybeTripSentinel({
+    role, family, provider, resolvedModel, accounting, contextOverhead,
+  }) {
+    const hit = detectSingleCallTokenAnomaly({ accounting, contextOverhead, limits });
+    if (!hit) return;
+    const reason = hit.trigger === 'SINGLE_CALL_USAGE'
+      ? `single physical ${role} call usageVolume ${hit.usageVolume} exceeds `
+        + `REVIEWLOOP_MAX_SINGLE_CALL_USAGE (${limits.maxSingleCallUsage})`
+      : `single physical ${role} call transport context overhead ${hit.contextOverheadTokens} `
+        + `tokens exceeds REVIEWLOOP_MAX_CONTEXT_OVERHEAD_TOKENS (${limits.maxContextOverheadTokens})`;
+    const actionTaken = 'anomalous call fully accounted; anomaly latched durably; all further '
+      + 'ReviewLoop Reviewer/Supervisor model spend for this loop is blocked (no auto-failover, '
+      + 'provider health/quota untouched) until a human clears it';
+    const record = Object.freeze({
+      tripped: true,
+      at: new Date().toISOString(),
+      role,
+      family: family ?? null,
+      provider: provider ?? null,
+      resolvedModel: resolvedModel ?? null,
+      usageVolume: hit.usageVolume,
+      contextOverheadTokens: hit.contextOverheadTokens,
+      trigger: hit.trigger,
+      threshold: hit.threshold,
+      thresholds: {
+        maxSingleCallUsage: limits.maxSingleCallUsage,
+        maxContextOverheadTokens: limits.maxContextOverheadTokens,
+      },
+      reason,
+      actionTaken,
+    });
+    anomalyLatched = record;
+    // A surface constructed WITH a persistence MUST latch durably (a restart
+    // would otherwise lose the block); a bare in-memory surface has no durable
+    // state at all and the in-process latch is its whole contract.
+    const durableSurface = Boolean(persistence);
+    let latchPersisted = true;
+    let latchError = null;
+    try {
+      const res = await anomalyStore.latch(loopId, record);
+      if (durableSurface && res?.persisted !== true) latchPersisted = false;
+    } catch (error) {
+      // The in-process latch (anomalyLatched) already blocks this process, but a
+      // restart would lose it. Do NOT swallow: surface it as its own
+      // fail-closed authorization error below so the loss of durability is
+      // loud, not silent.
+      latchPersisted = false;
+      latchError = error;
+    }
+    recordSafetyEvent?.({
+      code: 'MODEL_SPEND_TOKEN_ANOMALY',
+      severity: 'BLOCKING',
+      role,
+      family: record.family,
+      provider: record.provider,
+      resolvedModel: record.resolvedModel,
+      usageVolume: record.usageVolume,
+      contextOverheadTokens: record.contextOverheadTokens,
+      trigger: record.trigger,
+      threshold: record.threshold,
+      thresholds: record.thresholds,
+      durablyLatched: latchPersisted,
+      reason,
+      actionTaken,
+    });
+    onEvent?.({ type: 'MODEL_SPEND_TOKEN_ANOMALY', loopId, durablyLatched: latchPersisted, ...record });
+    if (!latchPersisted) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE,
+        `single-call token anomaly detected (${reason}) but the durable latch could not be `
+          + `persisted (${latchError ? (latchError.message ?? latchError) : 'the configured persistence does not implement durable workflow state'}); `
+          + 'this process is blocked; a restart is NOT guaranteed to stay blocked by this latch alone',
+        { loopId, anomaly: record },
+      );
+    }
+    throw new AuthorizationError(
+      AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_BLOCKED,
+      `${reason}; the call was fully accounted but further internal model spend for `
+        + `${JSON.stringify(loopId)} is blocked until a human clears the token anomaly`,
+      { loopId, anomaly: record },
+    );
+  }
+
   // Aggregate deterministic ceiling policy. Runs inside authorize(), before a
   // permit is minted. Denies against the DURABLE aggregate (loaded and stashed
   // by meteredCall() immediately before authorize()), never a process-local
@@ -660,6 +883,20 @@ export function createReviewLoopSpend({
     role, family = 'agy:gpt-oss', provider = 'agy', model = null,
     operationId, attempt = 1, evidenceIds = [], call,
   }) {
+    // Fail closed: a single earlier physical call in this loop consumed an
+    // anomalous amount of tokens. It was fully accounted, but the loop is
+    // latched — no more automatic model spend. Refused at the authorization
+    // stage, before any permit/reservation, and it survives a process restart
+    // because the latch is read from durable workflow state.
+    const anomaly = await readAnomaly();
+    if (anomaly) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_BLOCKED,
+        `ReviewLoop ${JSON.stringify(loopId)} latched a single-call token anomaly `
+          + `(${anomaly.reason}); further internal model spend is blocked until a human clears it`,
+        { loopId, anomaly },
+      );
+    }
     // Fail closed: a prior physical metered call whose real usage AND cost were
     // lost to a crash cannot be reconstructed. UNKNOWN != ZERO — refuse all
     // further ReviewLoop spend until a human acknowledges it.
@@ -787,6 +1024,14 @@ export function createReviewLoopSpend({
           businessOutcome: 'FAILURE',
           failureCode: err?.code ?? err?.providerFailure ?? null,
         });
+        // Sentinel over a known-usage provider FAILURE too: the tokens were
+        // still spent. A trip throws MODEL_SPEND_TOKEN_ANOMALY_BLOCKED in
+        // place of the provider error so the controller stops (no failover).
+        await maybeTripSentinel({
+          role, family, provider, resolvedModel: model ?? null,
+          accounting: failAccounting,
+          contextOverhead: contextOverheadTokens(failBreakdown, failMeta),
+        });
       }
       throw err;
     }
@@ -811,6 +1056,14 @@ export function createReviewLoopSpend({
       costKnown: Number.isFinite(result?.costUsd),
       businessOutcome: 'SUCCESS',
     });
+    // Post-settlement Token Sentinel: the call is now fully, durably accounted.
+    // If this ONE call blew past the per-call ceiling, latch the loop and throw
+    // (fully accounted, then fail closed) rather than returning its result.
+    await maybeTripSentinel({
+      role, family, provider, resolvedModel: result?.model ?? model ?? null,
+      accounting: okAccounting,
+      contextOverhead: contextOverheadTokens(okBreakdown, okMeta),
+    });
     return result?.value ?? result;
   }
 
@@ -818,8 +1071,12 @@ export function createReviewLoopSpend({
     const t = await currentTotals();
     const prior = await loadPriorRecords();
     const breakdown = foldBreakdown([...prior, ...sessionRecords]);
+    const anomaly = await loadAnomaly();
     return {
       usageBreakdown: breakdown,
+      // Post-settlement single-call Token Sentinel latch (null = clean).
+      tokenAnomaly: anomaly,
+      tokenAnomalyBlocked: Boolean(anomaly),
       reviewerCalls: t.reviewerCalls,
       supervisorCalls: t.supervisorCalls,
       usageVolume: t.usageVolume,
@@ -848,6 +1105,7 @@ export function createReviewLoopSpend({
     meteredCall,
     currentTotals,
     hasUnaccountedSpend,
+    loadTokenAnomaly: loadAnomaly,
     telemetry,
   };
 }

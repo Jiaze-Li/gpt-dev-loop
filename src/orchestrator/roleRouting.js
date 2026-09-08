@@ -24,12 +24,15 @@ import os from 'node:os';
 // path keeps the three roles on different model families:
 //   Worker = Claude (external) / Reviewer = Codex / Supervisor = AGY Gemini.
 export const DEFAULT_ROLE_POLICY = Object.freeze({
+  // agy:gpt-oss is NOT a Supervisor candidate: its live certification passed
+  // transport / accounting / isolation but its decision output violated the
+  // Supervisor schema (recommendation must be exactly "REWORK" or
+  // "HUMAN_REQUIRED", never a disjunction). It remains a Reviewer candidate.
   supervisor: Object.freeze([
     { family: 'agy:gemini', effort: 'medium' },
     { family: 'codex:default', effort: 'medium' },
     { family: 'agy:sonnet', effort: 'medium' },
     { family: 'claude:opus', effort: 'medium' },
-    { family: 'agy:gpt-oss', effort: 'medium', degraded: true },
   ]),
   reviewer: Object.freeze([
     { family: 'codex:default', effort: 'medium' },
@@ -59,7 +62,9 @@ export const PRODUCTION_ROLE_CAPABILITIES = Object.freeze({
   'codex:default': Object.freeze(['supervisor', 'reviewer']),
   'agy:gemini': Object.freeze(['supervisor', 'reviewer']),
   'agy:sonnet': Object.freeze(['supervisor', 'reviewer']),
-  'agy:gpt-oss': Object.freeze(['supervisor', 'reviewer']),
+  // Reviewer-only: certified Supervisor transport/accounting/isolation but its
+  // decision output does not conform to the Supervisor schema.
+  'agy:gpt-oss': Object.freeze(['reviewer']),
   'claude:opus': Object.freeze(['supervisor', 'reviewer']),
 });
 

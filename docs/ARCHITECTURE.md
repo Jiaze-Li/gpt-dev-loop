@@ -139,12 +139,20 @@ simply walks the list in order.
 | 2 | `agy:sonnet` | `codex:default` |
 | 3 | `agy:gpt-oss` | `agy:sonnet` |
 | 4 | `claude:opus` | `claude:opus` |
-| 5 | — | `agy:gpt-oss` (`degraded: true`) |
 
 Normal production path keeps the three roles on different model families:
 Worker = Claude (external), Reviewer = Codex, Supervisor = AGY Gemini. GPT-OSS
-is a deliberate low-cost third Reviewer fallback (not degraded); as a Supervisor
-it is only the last-resort degraded保底 when every stronger family is down.
+is a deliberate low-cost third Reviewer fallback (not degraded).
+
+**`agy:gpt-oss` is NOT a Supervisor candidate.** Its live Supervisor
+certification succeeded on transport, token accounting and agent isolation, but
+its decision output violated the Supervisor decision schema (it returned
+`recommendation = "REWORK|HUMAN_REQUIRED"` where the schema permits exactly one
+of `"REWORK"` or `"HUMAN_REQUIRED"`). The Supervisor parser is deliberately not
+loosened; `agy:gpt-oss` was removed from the Supervisor production pool instead.
+Its family / transport / accounting support is unchanged and it remains a
+Reviewer candidate. `PRODUCTION_ROLE_CAPABILITIES['agy:gpt-oss']` is therefore
+`['reviewer']`.
 
 No family is `highContext` any more: every AGY family (`agy:gemini`,
 `agy:gpt-oss`, `agy:sonnet`) runs through the `reviewloop-minimal` agent, which
@@ -187,11 +195,10 @@ retry; the `tried` set + a null route both stop it early):
 
 The effective attempt bound is the role's own candidate count
 (`providerAttemptBudget(role)` in `controller.js`), replacing the old
-hard-coded `MAX_PROVIDER_ATTEMPTS = 3` which could leave the 4th Reviewer / 5th
-Supervisor candidate permanently unreachable. `MAX_SUPERVISOR_CALLS` is
-likewise raised to the Supervisor pool size (5) so one supervised round can
-traverse the whole pool. A `PROVIDER_ATTEMPT_HARD_CEILING` (16) remains purely
-as a runaway guard.
+hard-coded `MAX_PROVIDER_ATTEMPTS = 3` which could leave the 4th Reviewer /
+Supervisor candidate permanently unreachable. `MAX_SUPERVISOR_CALLS` tracks the
+Supervisor pool size (**4**) so one supervised round can traverse the whole
+pool. A `PROVIDER_ATTEMPT_HARD_CEILING` (16) remains purely as a runaway guard.
 
 **The one spend-safety stop that is NOT a failover:** if a physical call was
 already dispatched and its usage cannot be reliably settled
@@ -286,7 +293,9 @@ Supervisor). External `@codex/@claude review` crosses
 
 Limits (`REVIEWLOOP_*`): `MAX_COST_USD`, `MAX_USAGE_VOLUME`,
 `MAX_REVIEW_ROUNDS`, `MAX_REVIEWER_CALLS`, `MAX_SUPERVISOR_CALLS`,
-`MAX_EXTERNAL_REVIEW_TRIGGERS`, `MAX_REVIEW_DIFF_CHARS`, `MAX_REVIEW_CHUNKS`.
+`MAX_EXTERNAL_REVIEW_TRIGGERS`, `MAX_REVIEW_DIFF_CHARS`, `MAX_REVIEW_CHUNKS`,
+`MAX_SINGLE_CALL_USAGE`, `MAX_CONTEXT_OVERHEAD_TOKENS` (single-call Token
+Sentinel — see below).
 
 The aggregate budget (call counts, `usageVolume`, `costUsd`) is **durable** and
 keyed by `loopId`: it accumulates across every `reviewloop_review` round, the
@@ -294,6 +303,47 @@ Supervisor call, and a process restart. A crash after provider settlement
 cannot reset it — the reservation ledger is cross-checked on load and any
 settled/blocking metered reservation with no matching spend record is counted
 conservatively (call counted, usage UNKNOWN, never zero).
+
+### Single-call Token Sentinel (post-settlement circuit breaker)
+
+The aggregate ceilings only fire once the *running total* crosses the line, so
+one call that suddenly balloons (running total 10k → a single 150k call) has
+already spent the 150k before the aggregate blocks the *next* call. The Token
+Sentinel closes that gap. It is **post-settlement**: it cannot un-spend the
+anomalous call — its job is *anomalous call → precise accounting → explicit
+alarm → durable block → no more automatic burn*.
+
+After a physical Reviewer/Supervisor call whose usage settled **reliably**
+(`volumeResolved === true` — an UNKNOWN/unresolved call keeps the existing
+UNRESOLVED fail-closed path and is never guessed at), the Sentinel trips when
+either:
+
+- `usageVolume > REVIEWLOOP_MAX_SINGLE_CALL_USAGE` (default **40 000**), or
+- a *known* `contextOverheadTokens > REVIEWLOOP_MAX_CONTEXT_OVERHEAD_TOKENS`
+  (default **30 000**).
+
+Both are env-overridable but clamped to `(0, hard-cap]`
+(`TOKEN_SENTINEL_HARD_CAPS` — 250 000 / 200 000): an illegal value (non-finite,
+`≤ 0`, unparseable) falls back to the default and can never *disable* the
+protection, and no value can inflate the ceiling to infinity.
+
+On a trip:
+
+1. the anomalous call's real usage is **fully, durably accounted first** (never
+   treated as 0);
+2. a **BLOCKING** `MODEL_SPEND_TOKEN_ANOMALY` safety event is recorded (role,
+   family/provider, `resolvedModel`, `usageVolume`, `contextOverheadTokens`,
+   configured threshold, reason, `actionTaken`);
+3. the anomaly is **durably latched** for the loop
+   (`reviewLoopTokenAnomaly` in workflow state);
+4. `meteredCall` throws `MODEL_SPEND_TOKEN_ANOMALY_BLOCKED` (an
+   `AuthorizationError`) — every further Reviewer/Supervisor model call in the
+   loop is refused at the **authorization stage**, and the latch is re-read
+   from durable state so the block **survives a process restart**.
+
+It is an orchestrator safety stop, never provider failure: **no auto-failover**
+to the next candidate, **no** provider health/quota mutation, and it is never
+disguised as a provider health failure. Clearing it requires a human.
 
 **`usageVolume` is provider/family-aware** (`usageAccountingOf({ usage, family,
 provider })`, keyed off the actual family/provider bound into the CallIntent —

@@ -36,6 +36,29 @@
 - Baseline Gate evidence captured at `begin` (0 model tokens).
 - PR reviewer default = `codex`; `internal` can never be a PR trigger identity.
 
+## V2 pre-freeze token-safety pass (this change)
+
+Deterministic/mock `npm test` + `npm run doctor` + `npm run
+benchmark:transports` green. No real-provider calls.
+
+- `agy:gpt-oss` removed from the **Supervisor** production pool: its live
+  Supervisor certification passed transport / accounting / isolation but its
+  decision output violated the Supervisor decision schema
+  (`recommendation = "REWORK|HUMAN_REQUIRED"`). The parser was **not** loosened.
+  Final Supervisor pool: `agy:gemini → codex:default → agy:sonnet →
+  claude:opus`. It stays a Reviewer candidate; family/transport/accounting
+  support is unchanged. Supervisor provider-attempt ceiling 5 → 4.
+- **Single-call Token Sentinel** (post-settlement circuit breaker): a physical
+  Reviewer/Supervisor call whose usage settled reliably but whose
+  `usageVolume > REVIEWLOOP_MAX_SINGLE_CALL_USAGE` (default 40 000) or whose
+  known `contextOverheadTokens > REVIEWLOOP_MAX_CONTEXT_OVERHEAD_TOKENS`
+  (default 30 000) is fully accounted, raises a BLOCKING
+  `MODEL_SPEND_TOKEN_ANOMALY` event, and durably latches the loop —
+  `MODEL_SPEND_TOKEN_ANOMALY_BLOCKED` refuses all further model spend at the
+  authorization stage, across a restart. No auto-failover, no provider
+  health/quota mutation. Env overrides clamped to `(0, hard-cap]`; an illegal
+  value can never disable the protection.
+
 ## Release-hardening pass (this change)
 
 Phased on top of the blocker passes; deterministic/mock `npm test` + `npm run
