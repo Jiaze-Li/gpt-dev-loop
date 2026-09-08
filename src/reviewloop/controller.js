@@ -818,7 +818,10 @@ export function createReviewLoopController({
         spend, loopState, objective, review, gate, signal,
       });
       if (sup.humanRequired) {
-        loopState.budgetExhausted = true; // convergence policy gave up — terminal
+        // Only a real non-convergence adjudication (sup.terminal) spends the
+        // budget. A transient Supervisor failure escalates to a human but stays
+        // resumable so the unused review round is not lost.
+        if (sup.terminal) loopState.budgetExhausted = true;
         recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
         recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
         await store.save(loopState.loopId, loopState);
@@ -892,7 +895,11 @@ export function createReviewLoopController({
       return { humanRequired: true, reason: `Supervisor produced no usable repair guidance${raw?.reason ? ` (${raw.reason})` : ''}` };
     }
     if (String(raw.recommendation).toUpperCase() === 'HUMAN_REQUIRED') {
-      return { humanRequired: true, reason: 'Supervisor recommends human involvement', guidance: raw.guidance };
+      // The Supervisor actually adjudicated the loop non-convergent. Only this
+      // path is terminal — a cancellation, transport throw, or malformed
+      // response above returns `humanRequired` WITHOUT `terminal`, so the round
+      // stays resumable.
+      return { humanRequired: true, terminal: true, reason: 'Supervisor recommends human involvement', guidance: raw.guidance };
     }
     return { guidance: raw.guidance };
   }
@@ -1071,7 +1078,9 @@ export function createReviewLoopController({
       if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
       recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'PR non-convergence escalation');
       if (sup.humanRequired) {
-        loopState.budgetExhausted = true; // convergence policy gave up — terminal
+        // See the LOCAL-mode path: only sup.terminal spends the budget; a
+        // transient Supervisor failure stays resumable.
+        if (sup.terminal) loopState.budgetExhausted = true;
         recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
         await store.save(loopState.loopId, loopState);
         return humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance);

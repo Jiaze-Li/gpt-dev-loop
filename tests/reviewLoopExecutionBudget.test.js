@@ -110,6 +110,34 @@ test('PR: a new independent reviewloop_begin starts a fresh budget from round 1'
   assert.equal(r.status, 'PASS');
 });
 
+test('PR: a transient Supervisor failure escalates to a human but stays resumable (round not lost)', async () => {
+  const persistence = new MemoryPersistence();
+  // Same P1 on H1 and H2 -> round 2 triggers the Supervisor.
+  const backend = mockPrBackend({ heads: ['H1', 'H2', 'H3', 'H4'] });
+  const controller = createReviewLoopController({
+    persistence,
+    prBackend: backend,
+    supervisorFn: async () => { throw new Error('provider blip'); },
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+
+  assert.equal((await controller.review({ loopId })).status, 'REWORK');
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'HUMAN_REQUIRED');
+  assert.notEqual(r2.terminal, true, 'a transient Supervisor failure is NOT terminal');
+
+  const persisted = await persistence.readWorkflowState(loopId);
+  assert.notEqual(persisted.reviewLoop.budgetExhausted, true);
+
+  // The Worker pushes a fix and retries — the loop re-enters and re-runs the
+  // Reviewer rather than immediately returning a terminal result.
+  const waitsBefore = backend.state.waits;
+  backend.advanceHead();
+  await controller.review({ loopId });
+  assert.ok(backend.state.waits > waitsBefore, 'the Reviewer ran again on the new HEAD instead of an early terminal return');
+});
+
 test('PR: a clean review PASSes normally', async () => {
   const persistence = new MemoryPersistence();
   const backend = mockPrBackend({ heads: ['H1'], results: { H1: { findings: [{ severity: 'P3', file: 'a', title: 'nit' }] } } });
