@@ -18,8 +18,80 @@ import { DEFAULT_ROLE_POLICY, PRODUCTION_ROLE_CAPABILITIES, QuotaPoolRegistry } 
 import { createReviewLoopProviderPool } from '../src/reviewloop/providerWiring.js';
 
 const DEFAULT_POLICY_FILE = fileURLToPath(new URL('../agent-policy/COMMON.md', import.meta.url));
+// Computed from THIS repo/module — never hard-coded. This is the MCP entrypoint
+// every installed frontend's `reviewloop` server command MUST resolve to.
+const EXPECTED_MCP_BIN = fileURLToPath(new URL('../bin/reviewloop-mcp.js', import.meta.url));
 const MCP_NAME = 'reviewloop';
 const ACTIVE_ROLES = ['supervisor', 'reviewer'];
+
+// Does an MCP server command/args array point at THIS repo's reviewloop-mcp.js?
+function mcpArgsMatchExpected(parts) {
+  const flat = (Array.isArray(parts) ? parts : [parts]).map((p) => String(p ?? ''));
+  if (flat.some((p) => p === EXPECTED_MCP_BIN)) return { ok: true };
+  const stale = flat.find((p) => /reviewloop-mcp\.js$/.test(p) || /gpt-dev-loop\b/.test(p));
+  if (stale) return { ok: false, reason: 'stale-path', found: stale };
+  return { ok: false, reason: 'no-reviewloop-mcp-path', found: flat.join(' ') || '(empty)' };
+}
+
+// Inspect each installed frontend's `reviewloop` MCP registration and check its
+// command actually resolves to EXPECTED_MCP_BIN. A stale registration (pointing
+// at an old gpt-dev-loop checkout) is a WARNING with a fix hint — never fatal,
+// and never reported as an "MCP match".
+export function checkMcpServerBinding({
+  execSync, homeDir = os.homedir(), configDir, env = process.env,
+} = {}) {
+  const exec = execSync || nodeExecSync;
+  const frontends = {};
+  const issues = [];
+
+  const cliBinding = (command) => {
+    let out;
+    try {
+      out = String(exec(`${command} mcp get ${MCP_NAME}`, { stdio: ['ignore', 'pipe', 'ignore'] }));
+    } catch {
+      return null; // not installed / not registered
+    }
+    if (!out || !out.trim()) return null;
+    const m = mcpArgsMatchExpected(out.split(/\s+/));
+    return { ...m, raw: out.trim().slice(0, 400) };
+  };
+
+  for (const command of ['claude', 'codex']) {
+    const b = cliBinding(command);
+    if (!b) { frontends[command] = { ok: true, reason: 'not-registered' }; continue; }
+    frontends[command] = b;
+    if (!b.ok) {
+      issues.push(`${command} reviewloop MCP does not point at ${EXPECTED_MCP_BIN} (${b.reason}: ${b.found}) — run \`npm run install-global\``);
+    }
+  }
+
+  const agyConfigDir = configDir ?? resolveGlobalConfigDir(env, homeDir);
+  const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
+  if (existsSync(mcpConfigFile)) {
+    try {
+      const config = JSON.parse(readFileSync(mcpConfigFile, 'utf8'));
+      const server = config?.mcpServers?.[MCP_NAME];
+      if (server) {
+        const parts = [server.command, ...(Array.isArray(server.args) ? server.args : [])];
+        const m = mcpArgsMatchExpected(parts);
+        frontends.agy = { ...m, raw: parts.join(' ').slice(0, 400) };
+        if (!m.ok) {
+          issues.push(`agy reviewloop MCP does not point at ${EXPECTED_MCP_BIN} (${m.reason}: ${m.found}) — run \`npm run install-global\``);
+        }
+      } else {
+        frontends.agy = { ok: true, reason: 'not-registered' };
+      }
+    } catch (err) {
+      frontends.agy = { ok: false, reason: `mcp_config.json unreadable: ${err.message}` };
+    }
+  } else {
+    frontends.agy = { ok: true, reason: 'not-configured' };
+  }
+
+  return {
+    name: 'mcp_binding', ok: issues.length === 0, expected: EXPECTED_MCP_BIN, frontends, issues,
+  };
+}
 
 function probe(execSync, command) {
   return String(execSync(command, { stdio: ['ignore', 'pipe', 'ignore'] })).trim();
@@ -218,11 +290,22 @@ export function runDoctor({ execSync, log, env } = {}) {
   write(`  info  github: gh ${gh.gh ? 'present' : 'absent'}${gh.gh ? `, ${gh.authenticated ? 'authenticated' : 'not authenticated'}` : ''} (PR-mode diagnostic; no real trigger)`);
 
   const policy = checkGlobalPolicy({ env: environment });
-  if (policy.ok) write('  ok    global_policy (ReviewLoop managed blocks + MCP match COMMON)');
+  if (policy.ok) write('  ok    global_policy (ReviewLoop managed blocks match COMMON)');
   else if (policy.error) write(`  warn  global_policy: ${policy.error} (diagnostic only)`);
   else {
     for (const i of policy.issues) write(`  warn  global_policy: ${i}`);
     write('  info  global_policy issues are non-fatal — run `npm run install-global` to configure or refresh');
+  }
+
+  const mcpBinding = checkMcpServerBinding({ execSync: exec, env: environment });
+  if (mcpBinding.ok) {
+    const seen = Object.entries(mcpBinding.frontends)
+      .filter(([, v]) => v.ok && v.reason !== 'not-registered' && v.reason !== 'not-configured')
+      .map(([k]) => k);
+    write(`  ok    mcp_binding: reviewloop MCP command resolves to this repo${seen.length ? ` (${seen.join(',')})` : ' (none registered)'}`);
+  } else {
+    for (const i of mcpBinding.issues) write(`  warn  mcp_binding: ${i}`);
+    write('  info  mcp_binding issues are non-fatal, but ReviewLoop tools will run the OLD checkout until you run `npm run install-global`');
   }
 
   const quota = new QuotaPoolRegistry();
@@ -232,7 +315,7 @@ export function runDoctor({ execSync, log, env } = {}) {
   return {
     ok,
     status: ok ? 'pass' : 'fail',
-    results: Object.fromEntries([...core, pools, transports, policy, gh].map((r) => [r.name, r])),
+    results: Object.fromEntries([...core, pools, transports, policy, gh, mcpBinding].map((r) => [r.name, r])),
   };
 }
 

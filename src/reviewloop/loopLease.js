@@ -24,7 +24,7 @@
 //   * unreadable / malformed lock record -> treated as abandoned.
 
 import {
-  open, readFile, writeFile, unlink, mkdir,
+  open, readFile, writeFile, unlink, mkdir, stat,
 } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -138,7 +138,7 @@ export async function acquireLoopFileLease({
     await mkdir(dir, { recursive: true });
   } catch { /* fall through — write() will surface a real problem */ }
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       // eslint-disable-next-line no-await-in-loop
       await write();
@@ -153,17 +153,62 @@ export async function acquireLoopFileLease({
         // eslint-disable-next-line no-await-in-loop
         current = JSON.parse(await readFile(lockPath, 'utf8'));
       } catch { current = null; }
+      // The lock file vanished between our failed `wx` and this read — another
+      // contender reclaimed it. Loop and let the exclusive `wx` create race.
+      if (current === null) continue;
       if (!isReclaimable(current, clock())) {
         return { ok: false, heldBy: current };
       }
-      // Provably abandoned — reclaim and retry once.
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        await unlink(lockPath);
-      } catch { /* someone else may have reclaimed it — retry will re-check */ }
+      // Provably abandoned. Reclaim is SERIALIZED behind an exclusive
+      // `<lock>.reclaim` file so exactly one contender ever unlinks the stale
+      // lock — never the old `unlink(path)` race where a late contender deleted
+      // the winner's freshly-created replacement and then acquired its own.
+      // eslint-disable-next-line no-await-in-loop
+      const reclaimed = await reclaimStaleLock(lockPath, current, clock);
+      if (!reclaimed) continue; // another contender is reclaiming / already did
+      // Loop -> the exclusive `wx` create is the final arbiter of ownership.
     }
   }
   return { ok: false, heldBy: { reason: 'could not acquire the loop lease' } };
+}
+
+// Orphaned `.reclaim` guard file older than this is assumed abandoned (the
+// contender that held it crashed mid-reclaim) and is force-removed.
+const RECLAIM_GUARD_ORPHAN_MS = 30_000;
+
+// Serialize stale-lock reclamation. Returns true only when THIS call unlinked
+// the stale lock (so the caller should retry the exclusive `wx` create), false
+// when another contender owns (or already finished) the reclaim.
+async function reclaimStaleLock(lockPath, staleRecord, clock) {
+  const guardPath = `${lockPath}.reclaim`;
+  let guard;
+  try {
+    guard = await open(guardPath, 'wx');
+  } catch (err) {
+    if (err?.code !== 'EEXIST') return false;
+    // Someone else is reclaiming. If their guard is ancient, they crashed —
+    // clear it so the next attempt can proceed. Otherwise just yield.
+    try {
+      const st = await stat(guardPath);
+      if (clock() - st.mtimeMs > RECLAIM_GUARD_ORPHAN_MS) await unlink(guardPath).catch(() => {});
+    } catch { /* gone already */ }
+    return false;
+  }
+  try {
+    await guard.close();
+    // Re-validate under the guard: only unlink the lock if it is STILL the exact
+    // stale record we saw and it is still reclaimable. A racing contender may
+    // already have replaced it with a fresh, live lock.
+    let now = null;
+    try { now = JSON.parse(await readFile(lockPath, 'utf8')); } catch { now = null; }
+    if (now && now.token === staleRecord.token && isReclaimable(now, clock())) {
+      await unlink(lockPath).catch(() => {});
+      return true;
+    }
+    return false;
+  } finally {
+    await unlink(guardPath).catch(() => {});
+  }
 }
 
 async function releaseIfOwned(lockPath, token) {

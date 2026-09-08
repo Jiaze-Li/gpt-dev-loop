@@ -96,14 +96,27 @@ export function killProcessTree(child, signal = 'SIGTERM', { pgid = groupIdFor(c
 //
 // On platforms where POSIX process groups are unavailable, we retain the
 // previous best-effort direct-child fallback; callers still await child close.
+// `hardBoundMs` is the FINAL bound after SIGKILL: in a container whose PID 1
+// never reaps orphans, a zombie descendant keeps the process group "alive"
+// forever, so `processGroupExists()` would poll true indefinitely and `done`
+// would never resolve — an unbounded await that defeats the Gate timeout and
+// keeps the review lease held. After SIGKILL we have done everything POSIX
+// allows; once this bound elapses we resolve `done` regardless, with
+// `confirmed:false`, so the caller stops waiting (the Gate command is already
+// FAIL/timedOut — fail-closed).
 export function terminateProcessTree(
   child,
-  { graceMs = 2000, pollMs = 25, onKill = null } = {}
+  {
+    graceMs = 2000, pollMs = 25, hardBoundMs = 10_000, onKill = null,
+    probeGroup = processGroupExists,
+  } = {}
 ) {
   const pgid = groupIdFor(child);
   let escalationTimer = null;
   let pollTimer = null;
+  let hardBoundTimer = null;
   let settled = false;
+  let confirmedGone = false;
   let resolveDone;
 
   const done = new Promise((resolve) => { resolveDone = resolve; });
@@ -111,15 +124,18 @@ export function terminateProcessTree(
   const clearTimers = () => {
     if (escalationTimer) clearTimeout(escalationTimer);
     if (pollTimer) clearTimeout(pollTimer);
+    if (hardBoundTimer) clearTimeout(hardBoundTimer);
     escalationTimer = null;
     pollTimer = null;
+    hardBoundTimer = null;
   };
 
-  const finish = () => {
+  const finish = ({ confirmed = true } = {}) => {
     if (settled) return;
     settled = true;
+    confirmedGone = confirmed;
     clearTimers();
-    resolveDone();
+    resolveDone({ confirmed });
   };
 
   killProcessTree(child, 'SIGTERM', { pgid });
@@ -136,7 +152,7 @@ export function terminateProcessTree(
       }
     }, graceMs);
     if (typeof escalationTimer.unref === 'function') escalationTimer.unref();
-    resolveDone();
+    resolveDone({ confirmed: false });
     return {
       pgid: null,
       done,
@@ -149,7 +165,7 @@ export function terminateProcessTree(
 
   const pollUntilGone = () => {
     if (settled) return;
-    if (!processGroupExists(pgid)) {
+    if (!probeGroup(pgid)) {
       finish();
       return;
     }
@@ -163,6 +179,11 @@ export function terminateProcessTree(
     if (typeof onKill === 'function') {
       try { onKill(); } catch { /* ignore */ }
     }
+    // FINAL bound: SIGKILL has been delivered to the whole group. If a zombie
+    // descendant keeps the group nominally alive, stop waiting after this bound
+    // rather than polling forever — resolve `done` with confirmed:false.
+    hardBoundTimer = setTimeout(() => finish({ confirmed: false }), Math.max(0, hardBoundMs));
+    if (typeof hardBoundTimer.unref === 'function') hardBoundTimer.unref();
     pollUntilGone();
   }, graceMs);
 
@@ -176,7 +197,8 @@ export function terminateProcessTree(
       if (settled) return;
       settled = true;
       clearTimers();
-      resolveDone();
+      resolveDone({ confirmed: false });
     },
+    get confirmed() { return confirmedGone; },
   };
 }

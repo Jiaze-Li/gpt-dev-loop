@@ -73,8 +73,12 @@ export function discoverVerificationCommands({ cwd, configured = null } = {}) {
   return { source: 'mechanical', commands: ['git diff --check'], manifestFingerprint: planFp('mechanical') };
 }
 
-function runCommand(command, cwd, spawn, timeoutMs) {
+function runCommand(command, cwd, spawn, timeoutMs, signal) {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ command, exitCode: GATE_TIMEOUT_EXIT_CODE, aborted: true, stdout: '', stderr: 'ReviewLoop Gate: aborted before start' });
+      return;
+    }
     let child;
     try {
       child = spawn('/bin/sh', ['-c', command], {
@@ -95,9 +99,23 @@ function runCommand(command, cwd, spawn, timeoutMs) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
       if (teardown) await teardown.done;
       resolve(result);
     };
+
+    const onAbort = () => {
+      if (settled) return;
+      teardown = terminateProcessTree(child);
+      void finish({
+        command,
+        exitCode: GATE_TIMEOUT_EXIT_CODE,
+        aborted: true,
+        stdout: Buffer.concat(out).toString('utf8').slice(0, 200_000),
+        stderr: `${Buffer.concat(err).toString('utf8').slice(0, 200_000)}\nReviewLoop Gate: review was cancelled; command terminated`,
+      });
+    };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
 
     timer = setTimeout(() => {
       timedOut = true;
@@ -137,14 +155,21 @@ export async function runGate({
   baselineGateEvidence = null,
   env = process.env,
   timeoutMs = null,
+  signal = null,
 } = {}) {
   const gateTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : resolveGateTimeoutMs(env);
   const exec = runner
-    ? (cmd) => runner(cmd, cwd)
-    : (cmd) => runCommand(cmd, cwd, spawn, gateTimeoutMs);
+    ? (cmd) => runner(cmd, cwd, { signal })
+    : (cmd) => runCommand(cmd, cwd, spawn, gateTimeoutMs, signal);
 
   const results = [];
   for (const command of commands) {
+    if (signal?.aborted) {
+      // The MCP client cancelled the review. Stop launching further Gate
+      // commands and fail closed — a cancelled Gate never reports PASS.
+      results.push({ command, exitCode: GATE_TIMEOUT_EXIT_CODE, aborted: true, stdout: '', stderr: 'ReviewLoop Gate: review cancelled' });
+      break;
+    }
     // eslint-disable-next-line no-await-in-loop
     const r = await exec(command);
     results.push({

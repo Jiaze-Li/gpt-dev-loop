@@ -197,6 +197,11 @@ export function createReviewLoopController({
             capturedAt: new Date().toISOString(),
             source: verificationPlan.source,
           };
+          // The baseline Gate may itself mutate tracked files (a snapshot test,
+          // a codegen/format check). Re-capture the baseline AFTER it runs so
+          // those Gate-caused edits are part of the baseline and are never later
+          // attributed to the Worker's delta.
+          baseline = await captureBaselineFn({ cwd });
         }
       } catch (err) {
         baselineGate = { coverage: 'INCOMPLETE', reason: String(err?.message ?? err) };
@@ -365,11 +370,13 @@ export function createReviewLoopController({
       return terminalResult(loopState);
     }
     if (objective.mode === REVIEW_MODES.PR) return reviewPr({ loopState, signal, onHeartbeat });
-    return reviewLocal({ loopState });
+    return reviewLocal({ loopState, signal });
   }
 
   // ---- Reviewer over full attributed evidence (bounded or chunked) --------
-  async function runReviewerOverEvidence({ spend, loopState, objective, delta, gate }) {
+  async function runReviewerOverEvidence({
+    spend, loopState, objective, delta, gate, signal,
+  }) {
     // Round is bound to the LOGICAL review state (delta + gate fingerprint),
     // NOT to how many times reviewloop_review was invoked. A crash/resume that
     // re-enters with the SAME logical review state — its durable per-chunk
@@ -413,6 +420,18 @@ export function createReviewLoopController({
 
     const perChunk = [];
     for (const chunk of chunks) {
+      if (signal?.aborted) {
+        // The MCP client cancelled the review. Do NOT start another paid model
+        // dispatch — fail the review closed (never CLEAN/PASS on a cancel).
+        return {
+          review: {
+            status: 'FAILED', reviewer: 'internal', provider: 'internal',
+            blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0,
+            findingSignatures: [], error: { reason: 'REVIEW_CANCELLED', message: 'the review was cancelled by the caller' },
+          },
+          chunkCount: chunks.length,
+        };
+      }
       const done = checkpoint.chunks[chunk.index];
       if (done) {
         // Resume: this chunk was already reviewed in a prior (crashed) attempt.
@@ -452,6 +471,7 @@ export function createReviewLoopController({
           chunk: { index: chunk.index, total: chunk.total },
           previousFindings: loopState.lastReview?.blockingFindings ?? [],
           selection,
+          signal,
         })).then((out) => ({
           value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
         })),
@@ -496,7 +516,7 @@ export function createReviewLoopController({
   }
 
   // ---- LOCAL mode --------------------------------------------------------
-  async function reviewLocal({ loopState }) {
+  async function reviewLocal({ loopState, signal }) {
     const objective = loopState.objective;
     const cwd = objective.repository?.root;
     const baseline = objective.baseline;
@@ -585,10 +605,24 @@ export function createReviewLoopController({
       commandSource = discovered.source;
     }
     const gate = await runGateFn({
-      cwd, commands: gateCommands, runner: gateRunner, env,
+      cwd, commands: gateCommands, runner: gateRunner, env, signal,
       baselineGateEvidence: loopState.baselineGateEvidence?.evidence ?? null,
     });
     gate.commandSource = commandSource;
+
+    if (signal?.aborted) {
+      // Cancelled during the Gate — never proceed to a paid Reviewer dispatch.
+      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'review cancelled by caller');
+      await store.save(loopState.loopId, loopState);
+      return {
+        status: 'HUMAN_REQUIRED',
+        loopId: loopState.loopId,
+        round: loopState.round,
+        reason: 'the review was cancelled by the caller before the Reviewer ran',
+        telemetry: await durableTelemetry(loopState.loopId),
+        safetyEvents,
+      };
+    }
 
     const fp = reviewFingerprint({ deltaFingerprint: delta.fingerprint, gateFingerprint: gate.fingerprint });
 
@@ -630,7 +664,9 @@ export function createReviewLoopController({
 
     let reviewOut;
     try {
-      reviewOut = await runReviewerOverEvidence({ spend, loopState, objective, delta, gate });
+      reviewOut = await runReviewerOverEvidence({
+        spend, loopState, objective, delta, gate, signal,
+      });
     } catch (err) {
       return spendDenialResult(loopState, err, await spend.telemetry());
     }
@@ -664,7 +700,9 @@ export function createReviewLoopController({
 
     let supervisorGuidance = null;
     if (decision.verdict === REVIEW_VERDICTS.REWORK && decision.invokeSupervisor && !loopState.supervisorInvoked) {
-      const sup = await runSupervisor({ spend, loopState, objective, review, gate });
+      const sup = await runSupervisor({
+        spend, loopState, objective, review, gate, signal,
+      });
       if (sup.humanRequired) {
         recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
         recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
@@ -700,7 +738,12 @@ export function createReviewLoopController({
 
   // Supervisor, exception-only. Returns { guidance } | { humanRequired, reason }
   // | { denied, error }.
-  async function runSupervisor({ spend, loopState, objective, review, gate }) {
+  async function runSupervisor({
+    spend, loopState, objective, review, gate, signal,
+  }) {
+    if (signal?.aborted) {
+      return { humanRequired: true, reason: 'the review was cancelled by the caller before the Supervisor ran' };
+    }
     const findingsEvidence = await spend.registerEvidence({
       kind: 'findings', taskId: loopState.loopId, signature: review.findingSignatures.join('|') || 'none',
     });
@@ -717,7 +760,7 @@ export function createReviewLoopController({
         evidenceIds: [findingsEvidence.evidenceId],
         invoke: ({ selection }) => Promise.resolve(supervisorFn({
           objective, blockingFindings: review.blockingFindings, gate,
-          round: loopState.round, priorSignatures: loopState.findingSignatureHistory, selection,
+          round: loopState.round, priorSignatures: loopState.findingSignatureHistory, selection, signal,
         })).then((out) => ({
           value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
         })),
@@ -813,7 +856,9 @@ export function createReviewLoopController({
 
     let supervisorGuidance = null;
     if (decision.invokeSupervisor && !loopState.supervisorInvoked) {
-      const sup = await runSupervisor({ spend, loopState, objective, review, gate: null });
+      const sup = await runSupervisor({
+        spend, loopState, objective, review, gate: null, signal,
+      });
       if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
       recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'PR non-convergence escalation');
       if (sup.humanRequired) {

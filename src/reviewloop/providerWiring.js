@@ -277,7 +277,10 @@ export function createReviewLoopProviderPool({
       providerHealth.record(family, 'UNAVAILABLE', reason);
     }
   };
-  const narrow = (family) => async (prompt) => {
+  const narrow = (family) => async (prompt, { signal } = {}) => {
+    if (signal?.aborted) {
+      throw Object.assign(new Error('review cancelled before AGY dispatch'), { code: 'REVIEW_CANCELLED' });
+    }
     let logDir = null;
     let logFile = null;
     if (enforcePerCall) {
@@ -293,6 +296,7 @@ export function createReviewLoopProviderPool({
         logFile: logFile ?? undefined,
         disableSlashCommands: true,
         agent: MINIMAL_AGY_AGENT_NAME,
+        signal,
       });
       if (enforcePerCall) {
         let logText = '';
@@ -427,7 +431,7 @@ export function createReviewLoopProviderPool({
 // family into the CallIntent and drive bounded failover.
 
 function buildReviewerInvoke() {
-  return async ({ objective, diff, changedFiles, gate, transport, model }) => {
+  return async ({ objective, diff, changedFiles, gate, transport, model, signal }) => {
     const prompt = [
       'You are an INDEPENDENT code reviewer. Judge ONLY against the original objective.',
       `ORIGINAL OBJECTIVE: ${objective.goal}`,
@@ -440,7 +444,7 @@ function buildReviewerInvoke() {
       'Return JSON: {"findings":[{"severity":"P1|P2|P3","file":"","line":0,"title":""}]}.',
       'P1/P2 block completion. P3 does not.',
     ].filter(Boolean).join('\n');
-    const res = await transport(prompt);
+    const res = await transport(prompt, { signal });
     const { parsed, raw } = parseJsonish(res);
     const value = validateReviewerPayload(parsed, { raw });
     return {
@@ -458,7 +462,7 @@ function buildReviewerInvoke() {
 }
 
 function buildSupervisorInvoke() {
-  return async ({ objective, blockingFindings, transport, model }) => {
+  return async ({ objective, blockingFindings, transport, model, signal }) => {
     const prompt = [
       'You are a repair STRATEGIST, not an implementer. You cannot edit code or declare PASS.',
       `ORIGINAL OBJECTIVE: ${objective.goal}`,
@@ -466,7 +470,7 @@ function buildSupervisorInvoke() {
       'Give concise repair guidance for the Worker, or recommend HUMAN_REQUIRED.',
       'Return JSON: {"guidance":"","recommendation":"REWORK|HUMAN_REQUIRED"}.',
     ].join('\n');
-    const res = await transport(prompt);
+    const res = await transport(prompt, { signal });
     const { parsed, raw } = parseJsonish(res);
     const value = validateSupervisorPayload(parsed, { raw });
     return {

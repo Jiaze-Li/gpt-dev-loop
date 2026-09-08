@@ -11,7 +11,7 @@
 
 import { execFile as nodeExecFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { checkPrReviewTrust } from './prTrust.js';
+import { checkPrReviewTrust, reviewerLoginAllowlist } from './prTrust.js';
 import { normalizeFindingSeverity, isBlockingSeverity } from '../orchestrator/adapters/normalizedPrReview.js';
 
 const execFileP = promisify(nodeExecFile);
@@ -29,15 +29,59 @@ const REVIEW_STATE = Object.freeze({
 // without a structured findings block.
 const NL_BLOCKING_RE = /\b(p1|p2|blocker|blocking|critical|must[- ]fix|major)\b/i;
 
+// The durable trigger id is whatever `gh pr comment` printed — usually the
+// comment URL (`…/issues/4#issuecomment-5581448171`), occasionally a bare id.
+// Normalize to the numeric issue-comment id the REST reactions endpoint needs.
+export function extractCommentNumericId(commentId) {
+  const s = String(commentId ?? '').trim();
+  if (!s) return null;
+  const fromUrl = s.match(/issuecomment-(\d+)/i);
+  if (fromUrl) return fromUrl[1];
+  if (/^\d+$/.test(s)) return s;
+  return null;
+}
+
+const CLEAN_REACTION_CONTENT = '+1';
+
 function firstLine(text) {
   return String(text ?? '').split('\n').map((s) => s.trim()).find(Boolean)?.slice(0, 200)
     ?? 'trusted reviewer comment (see PR thread)';
 }
 
-// A leading "P1:" / "**P2**" severity prefix, else null.
+// A leading "P1:" / "**P2**" severity prefix, a Codex shields.io severity badge
+// (`![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)`), or null.
+// Codex inline review comments lead with the badge image, never a bare "P1:".
 function severityPrefix(text) {
-  const m = String(text ?? '').match(/(?:^|\n)\s*\*{0,2}\s*(P[123])\b/i);
+  const s = String(text ?? '');
+  const badge = s.match(/!\[\s*(P[123])\b[^\]]*\]\([^)]*\/badge\/(P[123])-/i)
+    ?? s.match(/!\[\s*(P[123])\s*badge\s*\]/i)
+    ?? s.match(/\/badge\/(P[123])-/i);
+  if (badge) return badge[1].toUpperCase();
+  const m = s.match(/(?:^|\n)\s*\*{0,2}\s*(P[123])\b/i);
   return m ? m[1].toUpperCase() : null;
+}
+
+// Strip Codex badge/markup noise from an inline comment's first line so the
+// finding title reads as prose, not `**<sub><sub>![P1 Badge](…)</sub></sub> …**`.
+function cleanCommentTitle(text) {
+  return String(text ?? '')
+    .replace(/<\/?sub>/gi, '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/^[\s*]+/, '')
+    .replace(/[\s*]+$/, '')
+    .trim();
+}
+
+// The standard Codex review-submission wrapper: `### 💡 Codex Review` + a
+// `Reviewed commit:` line (or the "About Codex in GitHub" details block) and
+// NO inline finding of its own. It is metadata, not a finding — it must never
+// become a synthetic P2, and never read as CLEAN on its own.
+function isCodexReviewWrapper(body) {
+  const s = String(body ?? '');
+  if (!/#{1,4}\s*💡\s*Codex Review/i.test(s)) return false;
+  if (severityPrefix(s)) return false; // it carries a real finding — not a bare wrapper
+  return /Reviewed commit:/i.test(s) || /About Codex in GitHub/i.test(s)
+    || /automated review suggestions/i.test(s);
 }
 
 // A ```json { "findings": [...] } ``` block, if present and well-formed.
@@ -65,6 +109,13 @@ function findingsForSubmission({ state, body }) {
   if (upper === REVIEW_STATE.PENDING) {
     // Not a real submission — the reviewer never sent it.
     return { findings: [], dismissed: false, clean: false, pending: true };
+  }
+  if (!structured && isCodexReviewWrapper(body)) {
+    // The Codex review-submission wrapper. It is a metadata envelope for the
+    // inline comments (if any) — NOT a finding and NOT a clean verdict. Do not
+    // fabricate a synthetic P2; do not PASS on it. Any real inline findings are
+    // consumed separately; a clean run is proven by the 👍 reaction, not this.
+    return { findings: [], dismissed: false, clean: false, wrapper: true };
   }
   if (upper === REVIEW_STATE.CHANGES_REQUESTED) {
     // GitHub's own review verdict. CHANGES_REQUESTED is UNCONDITIONALLY
@@ -218,6 +269,22 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
       // gh prints the comment URL; use it as the durable trigger id.
       return { id: out.trim() || `comment-${Date.now()}` };
     },
+    // Reactions on ONE exact issue-comment (the trigger comment). Codex signals
+    // "no findings" by reacting 👍 (`+1`) to the trigger comment rather than
+    // posting a review with findings. Only a `+1` by the configured Codex bot
+    // login on THIS exact comment is a clean signal.
+    async listIssueCommentReactions({ commentId }) {
+      const numeric = extractCommentNumericId(commentId);
+      if (!numeric) return [];
+      const id = encodeURIComponent(numeric);
+      let out;
+      try {
+        out = await gh(['api', `repos/{owner}/{repo}/issues/comments/${id}/reactions`, '--paginate']);
+      } catch {
+        return [];
+      }
+      return flattenPaginated(out).map((r) => ({ content: r.content, login: r.user?.login ?? null }));
+    },
   };
 }
 
@@ -235,7 +302,34 @@ export function createGithubReviewBackend({
   // comment for the exact PR HEAD. A later APPROVED never erases an earlier
   // CHANGES_REQUESTED / COMMENTED finding; a COMMENTED / DISMISSED / unparsed
   // review never silently reads as clean.
-  async function aggregateTrustedReview({ prNumber, headSha, reviewer }) {
+  // A CLEAN 👍 on the EXACT trigger comment by the configured Codex bot. The
+  // trigger comment id is durable (persisted by ExternalModelTriggerAuthority)
+  // and the caller only passes it when that trigger is itself bound to the
+  // current exact HEAD — so a `+1` here is a trustworthy "no findings for this
+  // HEAD" signal. A 👍 by the user, by any other account, `eyes`, or a `+1` on
+  // an OLD trigger comment is NOT clean.
+  async function cleanReactionBy({ triggerCommentId, reviewer }) {
+    if (!triggerCommentId || String(reviewer).toLowerCase() !== 'codex') return null;
+    if (typeof gh.listIssueCommentReactions !== 'function') return null;
+    const allow = new Set((reviewerLoginAllowlist(reviewer, env) ?? []).map((s) => String(s).toLowerCase()));
+    if (allow.size === 0) return null;
+    let reactions = [];
+    try {
+      reactions = (await gh.listIssueCommentReactions({ commentId: triggerCommentId })) ?? [];
+    } catch {
+      return null;
+    }
+    for (const r of reactions) {
+      if (String(r.content ?? '').trim() !== CLEAN_REACTION_CONTENT) continue;
+      const login = String(r.login ?? '').trim();
+      if (login && allow.has(login.toLowerCase())) return login;
+    }
+    return null;
+  }
+
+  async function aggregateTrustedReview({
+    prNumber, headSha, reviewer, triggerCommentId = null,
+  }) {
     const reviews = (await gh.listReviews({ prNumber })) ?? [];
     const inlineRaw = typeof gh.listReviewComments === 'function'
       ? ((await gh.listReviewComments({ prNumber })) ?? [])
@@ -296,15 +390,15 @@ export function createGithubReviewBackend({
       if (trust.ok) trustedInline.push(c);
     }
 
-    if (trustedSubs.length === 0 && trustedInline.length === 0) return null;
-
     const findings = [];
     let anyDismissed = false;
     let anyCleanApproval = false;
+    let sawWrapper = false;
 
     for (const sub of trustedSubs.sort((a, b) => String(a.submittedAt ?? '').localeCompare(String(b.submittedAt ?? '')))) {
       const outcome = findingsForSubmission({ state: sub.state, body: sub.body });
       if (outcome.pending) continue;
+      if (outcome.wrapper) { sawWrapper = true; continue; }
       if (outcome.dismissed) { anyDismissed = true; continue; }
       if (outcome.clean) anyCleanApproval = true;
       for (const f of outcome.findings) findings.push(f);
@@ -315,7 +409,7 @@ export function createGithubReviewBackend({
         severity: severityPrefix(c.body) ?? 'P2',
         file: c.path ?? null,
         line: Number.isInteger(c.line) ? c.line : null,
-        title: `inline review comment: ${firstLine(c.body)}`,
+        title: `inline review comment: ${cleanCommentTitle(firstLine(c.body))}`,
       });
     }
 
@@ -331,14 +425,33 @@ export function createGithubReviewBackend({
       };
     }
 
+    // No blocking evidence in the submissions/inline comments. Before we can
+    // treat this HEAD as reviewed, we need a POSITIVE clean signal.
+    const cleanBot = findings.length === 0 && !anyCleanApproval
+      ? await cleanReactionBy({ triggerCommentId, reviewer })
+      : null;
+
+    if (findings.length === 0 && !anyCleanApproval && !cleanBot) {
+      // The Codex wrapper is on the PR but no inline findings have propagated
+      // and no 👍 has landed yet: this is NOT a reviewed state — keep polling
+      // (the caller resolves an exhausted budget to WAITING_FOR_REVIEW).
+      if (sawWrapper && trustedInline.length === 0) return null;
+      // Nothing trusted at all for this HEAD.
+      if (trustedSubs.length === 0 && trustedInline.length === 0) return null;
+    }
+
+    if (trustedSubs.length === 0 && trustedInline.length === 0 && !cleanBot) return null;
+
+    const identityLogin = trustedSubs[0]?._login ?? trustedInline[0]?.login ?? cleanBot ?? null;
     return {
-      login: trustedSubs[0]?._login ?? trustedInline[0]?.login ?? null,
+      login: identityLogin,
       reviewer: String(reviewer).toLowerCase(),
-      reviewerLogin: trustedSubs[0]?._login ?? null,
+      reviewerLogin: trustedSubs[0]?._login ?? cleanBot ?? null,
       headSha,
       head_sha: headSha,
       state: 'AGGREGATED',
       findings,
+      cleanReaction: cleanBot ? { by: cleanBot, commentId: String(triggerCommentId) } : null,
       trustedSubmissions: trustedSubs.length,
       trustedInlineComments: trustedInline.length,
     };
@@ -353,8 +466,12 @@ export function createGithubReviewBackend({
 
     // Trust-boundary-checked. Returns a trusted raw review for the exact
     // current HEAD, or null.
-    async findExistingReview({ prNumber, headSha, reviewer }) {
-      return latestTrustedReview({ prNumber, headSha, reviewer });
+    async findExistingReview({
+      prNumber, headSha, reviewer, triggerCommentId = null,
+    }) {
+      return latestTrustedReview({
+        prNumber, headSha, reviewer, triggerCommentId,
+      });
     },
 
     // The single external write. Gated upstream by ExternalModelTriggerAuthority.
@@ -371,14 +488,28 @@ export function createGithubReviewBackend({
     },
 
     // Local zero-model polling. Returns a trust-checked raw review, or null if
-    // the wall-clock budget is exhausted / the caller detaches (WAITING_FOR_REVIEW).
-    async waitForReview({ prNumber, headSha, reviewer, signal, onHeartbeat }) {
+    // the wall-clock budget is exhausted / the caller detaches
+    // (WAITING_FOR_REVIEW), or { headChanged: true, from, to } when the PR HEAD
+    // moved during the wait — a review of the now-stale commit must NEVER be
+    // returned as the verdict for the new HEAD.
+    async waitForReview({
+      prNumber, headSha, reviewer, signal, onHeartbeat, triggerCommentId = null,
+    }) {
       const deadline = Date.now() + maxWaitMs;
       let polls = 0;
       while (Date.now() < deadline) {
         if (signal?.aborted) return null;
+        // Re-read the live PR HEAD every poll. If it moved, abandon this wait —
+        // any review/reaction we could ingest is bound to the OLD commit.
         // eslint-disable-next-line no-await-in-loop
-        const review = await latestTrustedReview({ prNumber, headSha, reviewer });
+        const liveHead = await gh.getPrHead({ prNumber }).catch(() => headSha);
+        if (liveHead && liveHead !== headSha) {
+          return { headChanged: true, from: headSha, to: liveHead };
+        }
+        // eslint-disable-next-line no-await-in-loop
+        const review = await latestTrustedReview({
+          prNumber, headSha, reviewer, triggerCommentId,
+        });
         if (review) return review;
         polls += 1;
         // eslint-disable-next-line no-await-in-loop

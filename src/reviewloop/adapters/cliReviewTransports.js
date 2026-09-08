@@ -106,7 +106,7 @@ function firstNumber(...vals) {
 export function makeCodexReviewTransport({
   model = null, spawn = nodeSpawn, timeoutMs = DEFAULT_CLI_TRANSPORT_TIMEOUT_MS, env = process.env,
 } = {}) {
-  return async (prompt) => {
+  return async (prompt, { signal } = {}) => {
     const cwd = narrowReviewTransportCwd();
     const tmp = mkdtempSync(path.join(os.tmpdir(), 'reviewloop-codex-'));
     const outFile = path.join(tmp, 'last-message.txt');
@@ -118,8 +118,12 @@ export function makeCodexReviewTransport({
     if (typeof model === 'string' && model.trim() !== '') args.push('-m', model.trim());
     args.push(String(prompt));
 
-    const res = await runBoundedCli({ executable: 'codex', args, cwd, timeoutMs, spawn, env });
+    const res = await runBoundedCli({ executable: 'codex', args, cwd, timeoutMs, spawn, env, signal });
 
+    if (res.spawnErrorCode === 'ABORTED') {
+      rmSync(tmp, { recursive: true, force: true });
+      throw new CliTransportError('codex exec was cancelled', 'REVIEW_CANCELLED', { stderr: res.stderr });
+    }
     if (res.timedOut) {
       rmSync(tmp, { recursive: true, force: true });
       throw new CliTransportError(`codex exec exceeded ${timeoutMs}ms`, CLI_FAILURE.TIMEOUT, { stderr: res.stderr });
@@ -206,7 +210,7 @@ export function makeCodexReviewTransport({
 export function makeClaudeReviewTransport({
   model = null, spawn = nodeSpawn, timeoutMs = DEFAULT_CLI_TRANSPORT_TIMEOUT_MS, env = process.env,
 } = {}) {
-  return async (prompt) => {
+  return async (prompt, { signal } = {}) => {
     const cwd = narrowReviewTransportCwd();
     const args = [
       '-p', String(prompt),
@@ -220,8 +224,11 @@ export function makeClaudeReviewTransport({
     ];
     if (typeof model === 'string' && model.trim() !== '') args.push('--model', model.trim());
 
-    const res = await runBoundedCli({ executable: 'claude', args, cwd, timeoutMs, spawn, env });
+    const res = await runBoundedCli({ executable: 'claude', args, cwd, timeoutMs, spawn, env, signal });
 
+    if (res.spawnErrorCode === 'ABORTED') {
+      throw new CliTransportError('claude -p was cancelled', 'REVIEW_CANCELLED', { stderr: res.stderr });
+    }
     if (res.timedOut) {
       throw new CliTransportError(`claude -p exceeded ${timeoutMs}ms`, CLI_FAILURE.TIMEOUT, { stderr: res.stderr });
     }

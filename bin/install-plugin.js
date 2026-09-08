@@ -255,10 +255,6 @@ export async function installGlobal({
       agyConfig.mcpServers[MCP_NAME] = { command: nodeBin, args: [mcpBin] };
       await writeFile(mcpConfigFile, `${JSON.stringify(agyConfig, null, 2)}\n`, 'utf8');
       await writeFile(agyPolicyFile, renderAgySkill(commonPolicy), 'utf8');
-      if (existsSync(legacyAgySkillDir)) {
-        await rm(legacyAgySkillDir, { recursive: true, force: true });
-        migrated.legacySkill = true;
-      }
     }
 
     for (const [frontend, policyPath] of [
@@ -281,6 +277,15 @@ export async function installGlobal({
       err.message = `${err.message} (rollback incomplete: ${rollbackErrors.join('; ')})`;
     }
     throw err;
+  }
+
+  // Every fallible write above has now succeeded. ONLY now delete the legacy
+  // SuperGPT skill directory — it is not in `transactionalPaths` (a dir, not a
+  // file) and cannot be snapshot-restored, so deferring its removal to here is
+  // what guarantees a rolled-back install never loses the user's prior skill.
+  if ((present.agy || existsSync(mcpConfigFile)) && existsSync(legacyAgySkillDir)) {
+    await rm(legacyAgySkillDir, { recursive: true, force: true });
+    migrated.legacySkill = true;
   }
 
   return {

@@ -52,7 +52,24 @@ export function createPrReviewController({
 
   // Obtain a trusted review for the current PR HEAD. Returns one of
   // PR_REVIEW_OUTCOMES. `loopState.lastReviewedPrHead` tracks HEAD progression.
-  async function obtainReview({ objective, loopState, signal, onHeartbeat }) {
+  // When the PR HEAD moves while we are waiting, we restart against the new
+  // HEAD (bounded) — a review of the stale commit is never returned as the
+  // verdict for the new one, and one-trigger-per-HEAD authority still holds
+  // because each distinct HEAD re-enters authorize() as its own semantic state.
+  async function obtainReview(ctx) {
+    const MAX_HEAD_RESTARTS = 5;
+    for (let i = 0; i < MAX_HEAD_RESTARTS; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await obtainReviewForCurrentHead(ctx);
+      if (r?.outcome !== '__HEAD_CHANGED__') return r;
+    }
+    return {
+      outcome: PR_REVIEW_OUTCOMES.WAITING_FOR_REVIEW,
+      reason: 'the PR HEAD kept moving during review; call reviewloop_review again',
+    };
+  }
+
+  async function obtainReviewForCurrentHead({ objective, loopState, signal, onHeartbeat }) {
     const prNumber = objective.prNumber;
     const reviewer = objective.reviewer; // codex | claude
     const currentHead = await prBackend.getPrHead({ prNumber });
@@ -72,11 +89,28 @@ export function createPrReviewController({
       };
     }
 
+    // The durable trigger comment id for THIS exact HEAD, if we have one. Only
+    // trust it as an anchor for a clean 👍 when the persisted trigger is itself
+    // bound to the current HEAD (never an old round's trigger comment).
+    const pendingForHead = loopState.pendingExternalTrigger
+      && loopState.pendingExternalTrigger.head === currentHead
+      ? loopState.pendingExternalTrigger
+      : null;
+    let triggerCommentId = pendingForHead?.commentId ?? null;
+
     // §19 — a fresh trusted review already exists for the CURRENT HEAD: ingest
     // it, do not post another trigger. Re-checked against the ReviewLoop PR
     // trust boundary here (defense in depth — the backend also checks).
-    const existing = await prBackend.findExistingReview({ prNumber, headSha: currentHead, reviewer });
+    const existing = await prBackend.findExistingReview({
+      prNumber, headSha: currentHead, reviewer, triggerCommentId,
+    });
     if (existing) {
+      // Re-read the live PR HEAD before accepting a pre-existing review — it may
+      // have moved between our HEAD read and this ingest.
+      const headNow = await prBackend.getPrHead({ prNumber }).catch(() => currentHead);
+      if (headNow && headNow !== currentHead) {
+        return { outcome: '__HEAD_CHANGED__', from: currentHead, to: headNow };
+      }
       const trust = checkPrReviewTrust({ raw: existing, configuredReviewer: reviewer, currentHead, env });
       if (!trust.ok) {
         return {
@@ -111,14 +145,19 @@ export function createPrReviewController({
       }
       if (decision.outcome === 'REUSE') {
         // A trigger for this exact semantic HEAD already dispatched — wait, do
-        // not post again.
+        // not post again. Keep the durable comment id so a clean 👍 on it can
+        // still be ingested after a restart / reattach.
+        triggerCommentId = decision.trigger?.commentId ?? triggerCommentId;
         loopState.pendingExternalTrigger = {
           head: currentHead, reviewer, status: EXTERNAL_TRIGGER_STATUS.TRIGGERED,
+          commentId: triggerCommentId ?? null,
+          triggeredAt: decision.trigger?.triggeredAt ?? null,
         };
       } else {
         permit = decision.permit;
+        let dispatched = null;
         try {
-          await authority.dispatch(permit, {
+          dispatched = await authority.dispatch(permit, {
             workflowId: loopId, prNumber, headSha: currentHead, reviewer,
           }, async () => {
             const posted = await prBackend.postReviewTrigger({ prNumber, reviewer, headSha: currentHead });
@@ -132,10 +171,15 @@ export function createPrReviewController({
           }
           throw err;
         }
+        // Persist the EXACT trigger comment id so restart/reattach can still
+        // read its reactions.
+        triggerCommentId = dispatched?.commentId ?? null;
         loopState.pendingExternalTrigger = {
           head: currentHead, reviewer, status: EXTERNAL_TRIGGER_STATUS.TRIGGERED,
+          commentId: triggerCommentId,
+          triggeredAt: dispatched?.triggeredAt ?? null,
         };
-        onEvent?.({ type: 'REVIEWLOOP_EXTERNAL_TRIGGER_POSTED', loopId, head: currentHead, reviewer });
+        onEvent?.({ type: 'REVIEWLOOP_EXTERNAL_TRIGGER_POSTED', loopId, head: currentHead, reviewer, commentId: triggerCommentId });
       }
     }
 
@@ -147,10 +191,16 @@ export function createPrReviewController({
     let raw = null;
     try {
       raw = await prBackend.waitForReview({
-        prNumber, headSha: currentHead, reviewer, signal, onHeartbeat,
+        prNumber, headSha: currentHead, reviewer, signal, onHeartbeat, triggerCommentId,
       });
     } catch (err) {
       return { outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED, reason: `review wait failed: ${err.message}`, head: currentHead };
+    }
+
+    if (raw && raw.headChanged) {
+      // The PR HEAD moved while we waited. Do NOT ingest the stale-commit
+      // review/reaction — restart the whole flow against the new HEAD.
+      return { outcome: '__HEAD_CHANGED__', from: raw.from, to: raw.to };
     }
 
     if (!raw) {
@@ -159,6 +209,12 @@ export function createPrReviewController({
         head: currentHead,
         reason: 'external review triggered; waiting for the result',
       };
+    }
+
+    // Final guard: re-read the live PR HEAD before accepting this result.
+    const headNow = await prBackend.getPrHead({ prNumber }).catch(() => currentHead);
+    if (headNow && headNow !== currentHead) {
+      return { outcome: '__HEAD_CHANGED__', from: currentHead, to: headNow };
     }
 
     const trust = checkPrReviewTrust({ raw, configuredReviewer: reviewer, currentHead, env });
