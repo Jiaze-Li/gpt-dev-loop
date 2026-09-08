@@ -119,15 +119,54 @@ function findingsForSubmission({ state, body }) {
 
 // `gh api --paginate` concatenates every page's JSON body; for a list endpoint
 // that is several JSON arrays back-to-back, which `JSON.parse` cannot read as
-// one value. `--paginate --slurp` instead emits a single JSON array whose
-// elements are the per-page arrays. Parse that and flatten one level. Empty
-// output / an empty result set / a single page all collapse correctly, and a
-// defensive guard keeps an already-flat array of objects working too.
+// one value. Scan the stream for each top-level JSON value and flatten:
+//   - N concatenated page arrays  -> every page's elements, in order
+//   - a single page array         -> its elements
+//   - `--slurp` output (one array of page arrays) -> flattened one extra level
+//   - an already-flat array of objects            -> unchanged
+// Empty output / an empty result set all collapse to []. This deliberately does
+// NOT depend on `gh --slurp` (gh >= 2.44) so PR-review evidence aggregation
+// still works on older `gh`.
+function scanTopLevelJsonValues(text) {
+  const values = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{' || ch === '[') {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === '}' || ch === ']') {
+      depth -= 1;
+      if (depth === 0 && start !== -1) {
+        values.push(JSON.parse(text.slice(start, i + 1)));
+        start = -1;
+      }
+    }
+  }
+  return values;
+}
+
 export function flattenPaginated(out) {
   const text = typeof out === 'string' ? out.trim() : '';
-  const parsed = JSON.parse(text || '[]');
-  if (!Array.isArray(parsed)) return [];
-  return parsed.flatMap((page) => (Array.isArray(page) ? page : [page]));
+  if (!text) return [];
+  const flatten1 = (arr) => arr.flatMap((el) => (Array.isArray(el) ? el : [el]));
+  const topValues = scanTopLevelJsonValues(text);
+  const elements = [];
+  for (const value of topValues) {
+    if (Array.isArray(value)) elements.push(...flatten1(value));
+    else elements.push(value);
+  }
+  return elements;
 }
 
 // Default `gh`-backed transport. Every method is overridable for tests.
@@ -143,7 +182,7 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
       return out.trim() || null;
     },
     async listReviews({ prNumber }) {
-      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/reviews`, '--paginate', '--slurp']);
+      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/reviews`, '--paginate']);
       const arr = flattenPaginated(out);
       return arr.map((r) => ({
         login: r.user?.login,
@@ -159,7 +198,7 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
     // left ONLY inline comments still produced review evidence that must be
     // aggregated — it is not in any submission body.
     async listReviewComments({ prNumber }) {
-      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/comments`, '--paginate', '--slurp']);
+      const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/comments`, '--paginate']);
       const arr = flattenPaginated(out);
       return arr.map((c) => ({
         login: c.user?.login,
