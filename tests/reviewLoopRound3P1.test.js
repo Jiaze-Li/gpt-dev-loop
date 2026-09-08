@@ -12,6 +12,12 @@ import { collectWorkerDelta, evidenceSha256 } from '../src/reviewloop/gitEvidenc
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
+// A fake fs/promises FileHandle for the O_NOFOLLOW read path in gitEvidence.
+function fakeOpen(bytes, { ino = 5, size } = {}) {
+  const st = { isSymbolicLink: () => false, isFile: () => true, ino, size: size ?? bytes.length };
+  return async () => ({ stat: async () => st, readFile: async () => bytes, close: async () => {} });
+}
+
 test('a persisted objective whose baseline was swapped is rejected on rehydrate', () => {
   const obj = createReviewObjective({
     loopId: 'L', goal: 'do the thing', mode: 'LOCAL',
@@ -57,10 +63,48 @@ test('a baseline-untracked file that was later staged does not leak into the Wor
     spawn: scripted,
     lstat: async () => regular,
     readFile: async () => Buffer.from('unchanged bytes'),
+    open: fakeOpen(Buffer.from('unchanged bytes'), { ino: 5, size: 15 }),
   });
   assert.ok(!delta.changedFiles.includes('leak.txt'), JSON.stringify(delta.changedFiles));
   assert.doesNotMatch(delta.diff, /leak\.txt/);
   assert.equal(delta.evidenceComplete, true);
+});
+
+test('a baseline-untracked file that was MODIFIED and then staged fails the evidence closed', async () => {
+  const { default: events } = await import('node:events');
+  const baselineDigest = evidenceSha256(Buffer.from('original pre-existing content'));
+  const scripted = (_cmd, cmdArgs) => {
+    const child = new events.EventEmitter();
+    child.stdout = new events.EventEmitter();
+    child.stderr = new events.EventEmitter();
+    const key = cmdArgs.join(' ');
+    queueMicrotask(() => {
+      if (key.includes('rev-parse')) child.stdout.emit('data', Buffer.from('HEADSHA\n'));
+      else if (key.includes('--name-only')) child.stdout.emit('data', Buffer.from('secrets.env\n'));
+      else if (key.includes('diff')) child.stdout.emit('data', Buffer.from('diff --git a/secrets.env b/secrets.env\n+SECRET=1'));
+      else if (key.includes('ls-files')) child.stdout.emit('data', Buffer.from(''));
+      else if (key.includes('status')) child.stdout.emit('data', Buffer.from(''));
+      child.emit('close', 0);
+    });
+    return child;
+  };
+  const regular = {
+    isSymbolicLink: () => false, isFile: () => true, isFIFO: () => false, isSocket: () => false,
+    isBlockDevice: () => false, isCharacterDevice: () => false, isDirectory: () => false,
+    ino: 9, dev: 1, size: 12,
+  };
+  const delta = await collectWorkerDelta({
+    cwd: '/repo',
+    baseline: { head: 'HEADSHA', baselineRef: 'REF', untrackedHashes: { 'secrets.env': baselineDigest }, evidenceComplete: true },
+    spawn: scripted,
+    lstat: async () => regular,
+    readFile: async () => Buffer.from('now different'),
+    open: fakeOpen(Buffer.from('now different'), { ino: 9, size: 12 }),
+  });
+  assert.equal(delta.evidenceComplete, false);
+  assert.ok((delta.incompleteReasons ?? []).some((r) => /modified and staged after baseline/.test(r)), JSON.stringify(delta.incompleteReasons));
+  assert.doesNotMatch(delta.diff, /SECRET/);
+  assert.deepEqual(delta.untrackedDeleted, []);
 });
 
 test('a review-time Gate that mutates tracked files re-collects the Worker delta before review', async () => {

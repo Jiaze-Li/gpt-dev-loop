@@ -242,7 +242,7 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$e
             totalCount
             nodes{
               databaseId
-              author{ login }
+              author{ login __typename }
               pullRequestReview{ databaseId }
               path
               originalCommit{ oid }
@@ -260,6 +260,17 @@ const RESOLVE_THREAD_MUTATION = `mutation($threadId:ID!){
 }`;
 
 // Every reviewThreads page `gh api graphql --paginate` prints, mapped to the
+// GitHub's REST API reports an App comment author as "<slug>[bot]"; GraphQL's
+// `Actor.login` returns the bare "<slug>" and only `__typename === 'Bot'`
+// distinguishes it from a same-named human. Append the suffix only for a real
+// Bot actor so the exact-match reviewer allowlist still recognizes it.
+function canonicalActorLogin(author) {
+  const login = author?.login ?? null;
+  if (!login) return null;
+  if (author?.__typename === 'Bot' && !/\[bot\]$/i.test(login)) return `${login}[bot]`;
+  return login;
+}
+
 // normalized thread shape ReviewLoop consumes.
 function parseReviewThreadPages(stdout) {
   const out = [];
@@ -281,7 +292,11 @@ function parseReviewThreadPages(stdout) {
         comments: (t?.comments?.nodes ?? []).map((c) => ({
           commentDatabaseId: identityStr(c?.databaseId),
           reviewDatabaseId: identityStr(c?.pullRequestReview?.databaseId),
-          authorLogin: c?.author?.login ?? null,
+          // Canonicalize a GitHub App actor to the REST-style "<slug>[bot]" the
+          // reviewer allowlist uses — but ONLY when GraphQL says the actor is
+          // actually a Bot. A human whose login happens to equal the app slug
+          // stays bare and is correctly rejected by the exact-match scope check.
+          authorLogin: canonicalActorLogin(c?.author),
           path: c?.path ?? null,
           originalCommitOid: c?.originalCommit?.oid ?? null,
           commitOid: c?.commit?.oid ?? null,

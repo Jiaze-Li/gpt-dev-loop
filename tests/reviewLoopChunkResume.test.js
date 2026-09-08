@@ -100,3 +100,43 @@ test('a changed diff invalidates a stale chunk checkpoint', async () => {
   // round 2 reviewed its own chunks (fresh state), not skipped by a stale checkpoint
   assert.ok(calls.some((c) => c.startsWith('2:')), `calls: ${calls.join(',')}`);
 });
+
+test('a resume under a larger chunk-size limit re-reviews the re-chunked layout (no unreviewed bytes)', async () => {
+  const persistence = new MemoryPersistence();
+  const seen = [];
+  let maxChars = '700';
+  let failChunk1 = true;
+  const build = () => createReviewLoopController({
+    persistence,
+    env: { REVIEWLOOP_MAX_REVIEW_DIFF_CHARS: maxChars, REVIEWLOOP_MAX_REVIEW_CHUNKS: '12' },
+    captureBaselineFn: async () => ({ head: 'BASE', dirtyFiles: [], evidenceComplete: true }),
+    collectWorkerDeltaFn: async () => ({
+      baselineHead: 'BASE', currentHead: 'BASE', evidenceComplete: true, noWorkerChangeYet: false,
+      changedFiles: ['file0.js', 'file1.js', 'file2.js'], fingerprint: 'DELTA_FP', diff: bigDiff(),
+    }),
+    runGateFn: async () => ({ verdict: 'PASS', pass: true, fingerprint: 'GATE_FP', failureIdentities: [], results: [] }),
+    discoverVerificationCommandsFn: () => ({ source: 'test', commands: ['echo'] }),
+    reviewerFn: async ({ chunk, diff }) => {
+      seen.push({ total: chunk.total, index: chunk.index, len: (diff ?? '').length });
+      if (chunk.index === 1 && failChunk1) throw Object.assign(new Error('blip'), { code: 'PROVIDER_UNAVAILABLE' });
+      return { value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } };
+    },
+  });
+
+  const { loopId } = await build().begin({ goal: 'g', cwd: '/r' });
+  const r1 = await build().review({ loopId });
+  assert.equal(r1.status, 'HUMAN_REQUIRED');
+  const smallLayoutTotal = seen[0].total;
+  assert.ok(smallLayoutTotal >= 3, `expected multiple small chunks, got ${smallLayoutTotal}`);
+
+  // Resume with a much larger limit: the whole diff now fits differently.
+  maxChars = '100000';
+  failChunk1 = false;
+  seen.length = 0;
+  const r2 = await build().review({ loopId });
+  assert.equal(r2.status, 'PASS');
+  // The new layout has a different chunk 0; it MUST have been re-reviewed, not
+  // served from the stale checkpoint keyed to the old boundaries.
+  assert.ok(seen.some((s) => s.index === 0), `chunk 0 was not re-reviewed on resume: ${JSON.stringify(seen)}`);
+  assert.notEqual(seen[0].total, smallLayoutTotal, 'the resume re-chunked the diff');
+});

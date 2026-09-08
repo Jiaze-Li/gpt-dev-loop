@@ -118,26 +118,6 @@ test('P1 on H1 cleared by a trusted clean review on H2 resolves the H1 thread', 
   assert.equal(mts[0].verificationReviewId, 'rev-H2');
 });
 
-test('scope check treats the GraphQL bare bot slug as the allowlisted "<slug>[bot]" reviewer', async () => {
-  const backend = mockBackend({
-    heads: ['H1', 'H2'],
-    results: { H1: review('H1', [{ title: 'null deref' }]), H2: review('H2', []) },
-    threads: [
-      // GraphQL Actor.login for a Bot has no "[bot]" suffix, unlike the REST allowlist entry.
-      { threadNodeId: 'T-H1-0', isResolved: false, isOutdated: false, comments: [
-        { authorLogin: 'chatgpt-codex-connector', commentDatabaseId: 'c-H1-0' },
-      ] },
-    ],
-  });
-  const { controller } = build(backend);
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  await controller.review({ loopId });
-  backend.advanceHead();
-  const r2 = await controller.review({ loopId });
-  assert.equal(r2.status, 'PASS');
-  assert.deepEqual(backend.state.resolved, ['T-H1-0']);
-});
-
 // 2. P1 on H1 -> SAME finding on H2 -> H1 thread remains unresolved.
 test('the same blocking finding recurring on H2 keeps the H1 thread unresolved', async () => {
   const backend = mockBackend({
@@ -487,6 +467,27 @@ test('the gh transport exposes review-thread enumeration + resolution and nothin
 
   const src = await import('node:fs').then((fs) => fs.promises.readFile(new URL('../src/reviewloop/threadResolution.js', import.meta.url), 'utf8'));
   assert.doesNotMatch(src, /git push|gh pr merge|forcePush|--force|commit -m/);
+});
+
+test('parseReviewThreadPages canonicalizes a Bot actor login but leaves a look-alike human bare', async () => {
+  const { createGhTransport } = await import('../src/reviewloop/githubBackend.js');
+  const t = createGhTransport({
+    repo: 'o/r',
+    execFile: async (_bin, args) => {
+      if (args.includes('graphql')) {
+        return { stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [
+          { id: 'T-BOT', isResolved: false, isOutdated: false, comments: { pageInfo: { hasNextPage: false }, nodes: [
+            { databaseId: 1, author: { login: 'chatgpt-codex-connector', __typename: 'Bot' } }] } },
+          { id: 'T-HUMAN', isResolved: false, isOutdated: false, comments: { pageInfo: { hasNextPage: false }, nodes: [
+            { databaseId: 2, author: { login: 'chatgpt-codex-connector', __typename: 'User' } }] } },
+        ] } } } } }) };
+      }
+      return { stdout: '' };
+    },
+  });
+  const threads = await t.listReviewThreads({ prNumber: 4 });
+  assert.equal(threads.find((x) => x.threadNodeId === 'T-BOT').comments[0].authorLogin, 'chatgpt-codex-connector[bot]');
+  assert.equal(threads.find((x) => x.threadNodeId === 'T-HUMAN').comments[0].authorLogin, 'chatgpt-codex-connector');
 });
 
 test('parseReviewThreadPages flags a thread whose comments connection is truncated', async () => {
