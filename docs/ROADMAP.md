@@ -59,6 +59,30 @@ benchmark:transports` green. No real-provider calls.
   health/quota mutation. Env overrides clamped to `(0, hard-cap]`; an illegal
   value can never disable the protection.
 
+## V2 pre-freeze final pass (this change)
+
+Deterministic/mock `npm test` (464) + `npm run doctor` + `npm run
+benchmark:transports` green. No real-provider calls.
+
+- **Token Sentinel restart re-inference** (`reinferAnomalyFromSpendLog`) no
+  longer treats a durable spend-log **read failure** as "no anomaly": it fails
+  closed with `MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE` exactly like an
+  unreadable latch — no permit, no dispatch, no failover, no health/quota
+  mutation. `UNKNOWN != ZERO`; "cannot establish clean" is not "clean".
+- Anomalous-call spend record + anomaly latch already write in one atomic
+  workflow-state transition (prior pass); this pass closes the last read-path
+  fail-open.
+- AGY isolation / routing comments + `docs/ARCHITECTURE.md` + `docs/DECISIONS.md`
+  D22 corrected to the real implementation: `reviewloop-minimal` at
+  `<isolated gemini dir>/config/agents/reviewloop-minimal/agent.md` via
+  `--gemini_dir` (not a workspace `.agents/` path), startup + per-call
+  effective-loading verification, fail-closed, never a default-agent fallback.
+  Stale ~6.7k / ~40k AGY numbers and the "`agy:gemini` excluded from routing
+  due to high-context" framing removed; no production family is `highContext`.
+- Definitive per-candidate live certification recorded (see Real-provider
+  status): all 4 Reviewer + 3 Supervisor candidates PASS; `agy:gpt-oss` as
+  Supervisor FAILs the decision schema only and is out of that pool.
+
 ## Release-hardening pass (this change)
 
 Phased on top of the blocker passes; deterministic/mock `npm test` + `npm run
@@ -170,11 +194,9 @@ Token-Safety P1 from the independent re-verification:
 Corrected against this machine's durable reservation + spend ledgers under
 `~/.reviewloop/` (not from recollection):
 
-- Last locally reported deterministic/mock certification before the latest
-  auth/alias/E2E rework = **PASS** — `npm test` 336/336,
-  `npm run doctor` PASS, `npm run benchmark:transports` PASS (0 real spawns).
-  The latest rework must be rerun locally before merge; do not infer PASS from
-  the unchanged test count.
+- Current deterministic/mock certification on `v2-routing` HEAD = **PASS** —
+  `npm test` 464/464, `npm run doctor` PASS, `npm run benchmark:transports`
+  PASS (0 real spawns), `git diff --check` clean.
 - `npm run install-global` = **executed** against this machine's agent
   config / dotfiles (managed block + `reviewloop` MCP registration).
 - Real ReviewLoop provider calls with a durable record on this machine =
@@ -188,37 +210,51 @@ Corrected against this machine's durable reservation + spend ledgers under
   calls.
 - Any earlier `claude:sonnet` / Executor-era real call = **UNKNOWN** — no
   durable record survives in the current runtime dir; not asserted.
-- No `codex` or `claude` real provider call has any durable record. The
-  `codex` / `claude` Reviewer+Supervisor transports are IMPLEMENTED and are
-  selectable only when the zero-token version + local-auth preflights succeed.
-  Still ZERO real `codex` / `claude` Reviewer/Supervisor calls.
-- 2026-09-07 live-certification observations (from a prior controlled run,
-  not reproduced here): `agy:gpt-oss` Reviewer ~12.1k input / ~12.0k context
-  overhead (`gpt-oss-120b-medium`); `codex:default` Reviewer ~16.9k input /
-  ~10.6k cache-read; `agy:gemini` Supervisor ~150.7k input + ~656.8k
-  cache-read (**high-context** — now excluded from automatic routing);
-  `claude:opus` Reviewer failed `PROVIDER_PROTOCOL_ERROR` (`claude -p` exit 1
-  in ~491ms). Root cause: `--mcp-config '{}'` rejected by the installed CLI
-  (needs an `mcpServers` key). **Fixed 2026-09-07** (`'{"mcpServers":{}}'`
-  plus `--setting-sources '' / --tools '' / --disable-slash-commands /
-  --no-session-persistence`); argv is deterministically regression-covered but
-  a live `claude:opus` call is **still NOT certified**.
-- ReviewLoop real-provider Reviewer/Supervisor E2E over the current
-  architecture = **ATTEMPTED / NOT CERTIFIED**. The one real run
-  (`rl-20260906075721-c674d31f`) reached a live `agy` Reviewer with 2
-  successful physical calls but terminated `HUMAN_REQUIRED`; it was not
-  carried to a certified PASS/REWORK end-to-end verdict.
+- **Per-candidate Reviewer/Supervisor certification (definitive)** — one
+  controlled single-call live cert per candidate, transport + accounting +
+  decision-schema + (AGY) isolation:
+
+  | Role | Family | Result | resolvedModel | usageVolume | isolation |
+  | --- | --- | --- | --- | --- | --- |
+  | Reviewer | `codex:default` | PASS | — | 16535 | — |
+  | Reviewer | `agy:sonnet` | PASS | `claude-sonnet-4-6` | 3191 | isolationVerified |
+  | Reviewer | `agy:gpt-oss` | PASS | `gpt-oss-120b-medium` | 2427 | isolationVerified |
+  | Reviewer | `claude:opus` | PASS | `opus` | 3449 | — |
+  | Supervisor | `agy:gemini` | PASS | `gemini-3.8-flash-medium` | 2933 | effectiveLoadingVerified + isolationVerified |
+  | Supervisor | `codex:default` | PASS | — | 16899 | — |
+  | Supervisor | `agy:sonnet` | PASS | `claude-sonnet-4-6` | 3303 | isolationVerified |
+  | Supervisor | `claude:opus` | PASS | `opus` | 3741 | — |
+  | Supervisor | `agy:gpt-oss` | **FAIL (schema only)** | `gpt-oss-120b-medium` | 2427 | isolationVerified |
+
+  `agy:gpt-oss` as Supervisor returned `recommendation = "REWORK|HUMAN_REQUIRED"`
+  (a disjunction the schema forbids); transport / accounting / isolation all
+  passed. The parser was **not** loosened — `agy:gpt-oss` is out of the
+  Supervisor pool and stays a Reviewer candidate.
+- `codex:default` and `claude:opus` Reviewer/Supervisor transports are now
+  **live-certified** (the earlier `claude -p` `PROVIDER_PROTOCOL_ERROR` from
+  `--mcp-config '{}'` was fixed with `'{"mcpServers":{}}'` plus
+  `--setting-sources '' / --tools '' / --disable-slash-commands /
+  --no-session-persistence`).
+- Historical AGY figures are **not** a baseline: the earlier ~40k `gemini-*`
+  Supervisor call ran the default agent (isolation not in effect); the ~6.7k
+  "minimal" smoke predated effective-loading verification. The definitive
+  isolated-agent result is `agy:gemini` Supervisor `usageVolume 2933,
+  effectiveLoadingVerified`.
+- ReviewLoop real-provider **controller-level** Reviewer/Supervisor E2E
+  (a full loop carried to a certified PASS/REWORK verdict over the current
+  architecture) = **NOT CERTIFIED**.
 - ReviewLoop real PR external-review loop (`@codex review` / `@claude review`)
   = **NOT RUN**.
-- Real multi-provider failover = **NOT RUN** (structurally wired +
-  deterministic/mock paths only).
+- Real multi-provider failover chain end-to-end = **NOT RUN** (structurally
+  wired; per-candidate certs above are single-candidate).
 - A controlled `Worker + ReviewLoop` vs `Worker alone` wrapper benchmark
   remains future work because ReviewLoop cannot observe Worker token usage
   through MCP.
 
 ## Later
 
-- A first LIVE `codex` / `claude` Reviewer/Supervisor call (transports are
-  implemented; no real invocation has been made or recorded).
+- A real-provider **controller-level** E2E carried to a certified PASS/REWORK
+  verdict, and a real multi-provider failover chain (the per-candidate
+  transports are each live-certified; the full chain is not).
 - Optional read-only ReviewLoop dashboard (removed in this migration; re-add
   only if it can stay zero-token and simple).

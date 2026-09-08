@@ -82,23 +82,24 @@ All argv below is verified against the installed CLIs' own `--help`; the
 
 | Family | Per-call narrowing available | Not closable per call | Measured live tax |
 | --- | --- | --- | --- |
-| `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | argv-fixed 2026-09-07; **live-cert pending** (was `PROVIDER_PROTOCOL_ERROR` — see below) |
-| `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | ~16.9k input (~10.6k cache-read), output ~9 |
-| `agy:gpt-oss` | `--agent reviewloop-minimal` (`inheritCustomizations: false`) discovered from an isolated **redirected gemini dir** (`--gemini_dir`, `adapters/scratchCwd.js#narrowAgyGeminiDir`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | pending re-measurement (see effective-loading note below) |
-| `agy:gemini` | same as `agy:gpt-oss` (production default effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | prior smoke was pre-fix (default agent) — pending re-measurement in the live Supervisor cert |
-| `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | routing finalized; effective-loading + controller live certification pending |
+| `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | live-certified: Reviewer usageVolume 3449, Supervisor 3741 (resolvedModel `opus`) |
+| `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | live-certified: Reviewer usageVolume 16535, Supervisor 16899 (the `codex exec` harness prompt dominates) |
+| `agy:gpt-oss` | `--agent reviewloop-minimal` (`inheritCustomizations: false`) discovered from an isolated **redirected gemini dir** (`--gemini_dir`, `adapters/scratchCwd.js#narrowAgyGeminiDir`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | live-certified Reviewer: usageVolume 2427, resolvedModel `gpt-oss-120b-medium`, isolationVerified |
+| `agy:gemini` | same as `agy:gpt-oss` (production default effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | **definitive isolated-agent live result**: Supervisor usageVolume 2933, resolvedModel `gemini-3.8-flash-medium`, effectiveLoadingVerified + isolationVerified |
+| `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | live-certified: Reviewer usageVolume 3191, Supervisor 3303, resolvedModel `claude-sonnet-4-6`, isolationVerified |
 
-**AGY minimal-agent transport — effective loading (2026-09-07 fix)**:
-ReviewLoop runs both AGY families through a `reviewloop-minimal` agent
-(`inheritCustomizations: false`) instead of AGY's ambient/default agent.
+**AGY minimal-agent transport — effective loading**:
+ReviewLoop runs every AGY family through the `reviewloop-minimal` agent
+(`inheritCustomizations: false`) instead of AGY's ambient/default agent. The
+agent lives at `<isolated gemini dir>/config/agents/reviewloop-minimal/agent.md`
+and is reached with `--gemini_dir` — **not** a workspace `.agents/` path.
 
-Root cause found 2026-09-07: agy 1.1.27 does **not** discover a custom agent
-from a workspace `.agents/agents/<name>/agent.md`. An unresolvable `--agent`
-**silently falls back to the default agent** (`session.go:81 Agent "…" not
-found, falling back to default`), so every prior AGY review call actually ran
-the full default agent — the file existing on disk proved nothing. agy *does*
-discover agents from its gemini-dir config tree. The real `~/.gemini` is
-off-limits (user data + daily `agy`), so the transport now:
+Why the redirected gemini dir: agy does **not** reliably discover a custom
+agent from a workspace `.agents/agents/<name>/agent.md`. An unresolvable
+`--agent` **silently falls back to the default agent** (`session.go:81 Agent
+"…" not found, falling back to default`), so a file merely existing on disk
+proves nothing. agy *does* discover agents from its gemini-dir config tree. The
+real `~/.gemini` is off-limits (user data + daily `agy`), so the transport:
 
 - provisions the agent at
   `<geminiDir>/config/agents/reviewloop-minimal/agent.md` in an **isolated
@@ -120,12 +121,18 @@ off-limits (user data + daily `agy`), so the transport now:
 If provisioning fails, the AGY families are marked **UNAVAILABLE** — ReviewLoop
 never silently falls back to the default AGY agent.
 
-Token-context figures are pending re-measurement: earlier "after minimal agent"
-smoke numbers were taken before this fix, i.e. against the default agent or an
-unverified path, and must not be trusted. The live Supervisor certification
-(`scripts/live-reviewloop-certify.mjs --mode supervisor`) now asserts
-`customAgentSupport.supported` and per-call effective-loading verification and
-reports the real before/after.
+Historical AGY token figures are **not** a baseline:
+
+- the earlier ~40k `gemini-*` Supervisor call had a valid controller/provider
+  path but isolation did **not** take effect — it silently ran the default
+  agent — so it is not a minimal-agent cost baseline;
+- the still-earlier ~6.7k "minimal" smoke was taken before effective loading
+  was verified, so it is not a trusted isolation baseline either.
+
+The definitive isolated-agent live result is the `agy:gemini` medium Supervisor:
+**usageVolume 2933, effectiveLoadingVerified**. The live certification
+(`scripts/live-reviewloop-certify.mjs`) asserts `customAgentSupport.supported`
+plus per-call effective-loading verification and reports the real numbers.
 
 ### Final fixed routing (deterministic — NO risk-based selection)
 
@@ -154,13 +161,14 @@ Its family / transport / accounting support is unchanged and it remains a
 Reviewer candidate. `PRODUCTION_ROLE_CAPABILITIES['agy:gpt-oss']` is therefore
 `['reviewer']`.
 
-No family is `highContext` any more: every AGY family (`agy:gemini`,
-`agy:gpt-oss`, `agy:sonnet`) runs through the `reviewloop-minimal` agent, which
-collapsed the measured `agy:gemini` tax into line with the other families, so
-`agy:gemini` participates in ordinary automatic routing. The generic
-`RoleRouter` `highContext` mechanism (skipped unless
+No production family is `highContext`: every AGY family (`agy:gemini`,
+`agy:gpt-oss`, `agy:sonnet`) runs through the isolated `reviewloop-minimal`
+agent, and the definitive `agy:gemini` Supervisor result (usageVolume 2933) is
+in line with the other families, so `agy:gemini` participates in ordinary
+automatic routing — it is **not** excluded on a high-context basis. The generic
+`RoleRouter` `highContext` mechanism (a candidate so marked is skipped unless
 `signals.allowHighContext === true`) is retained for any future family that
-needs it.
+needs it, but nothing sets the flag today.
 
 ### Shared quota topology
 

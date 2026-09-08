@@ -272,6 +272,34 @@ test('a latch READ failure fails closed — never read as "no anomaly"', async (
   );
 });
 
+test('restart re-inference: a durable spend-log READ failure fails closed (UNKNOWN != clean)', async () => {
+  const persistence = persistenceOf();
+  const spend = createReviewLoopSpend({ loopId: 'L', persistence });
+  const ev = await spend.registerEvidence({ kind: 'reviewstate', taskId: 'op', diffHash: 'op::G' });
+  // The latch read succeeds and reports clean/no-latch; the FOLLOWING durable
+  // spend-log read (the re-inference backup) then fails transiently.
+  const realRead = persistence.readWorkflowState.bind(persistence);
+  let calls = 0;
+  persistence.readWorkflowState = async (id) => {
+    calls += 1;
+    if (calls === 1) return realRead(id); // anomalyStore.load -> null (clean)
+    throw new Error('spend log read failed');
+  };
+  let dispatched = false;
+  await assert.rejects(
+    () => spend.meteredCall({
+      role: 'reviewer', family: 'agy:gpt-oss', provider: 'agy', operationId: 'op', attempt: 1,
+      evidenceIds: [ev.evidenceId],
+      call: async () => { dispatched = true; return { value: {}, usage: { input_tokens: 1, output_tokens: 1 } }; },
+    }),
+    (e) => e.code === 'MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE' && e.authorizationFailure === true,
+  );
+  assert.equal(dispatched, false, 'no physical provider dispatch');
+  const state = await realRead('L');
+  assert.equal(state?.reviewLoopSpend, undefined, 'no new spend record');
+  assert.equal(state?.modelSpendReservations, undefined, 'no permit / reservation minted');
+});
+
 test('an atomic spend+latch write failure is surfaced (not swallowed) and the call is still accounted in-process', async () => {
   const persistence = persistenceOf();
   const realUpdate = persistence.updateWorkflowState.bind(persistence);

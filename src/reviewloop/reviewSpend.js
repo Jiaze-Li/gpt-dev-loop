@@ -686,10 +686,23 @@ export function createReviewLoopSpend({
 
   // Reconstruct a Token Sentinel latch from a durable spend record that itself
   // exceeds a per-call ceiling. Persists the reconstructed latch (fail closed if
-  // it cannot). Returns the latch record, or null when the spend log is clean.
+  // it cannot). Returns the latch record, or null ONLY when the spend log was
+  // read successfully and is clean. A durable spend-log READ failure is
+  // UNKNOWN, never "clean": it fails closed (STATE_UNAVAILABLE) exactly like an
+  // unreadable latch — "cannot establish clean" is not "clean".
   async function reinferAnomalyFromSpendLog() {
     let records;
-    try { records = await spendStore.load(loopId); } catch { return null; }
+    try {
+      records = await spendStore.load(loopId);
+    } catch (error) {
+      throw new AuthorizationError(
+        AUTHORIZATION_ERROR_CODES.MODEL_SPEND_TOKEN_ANOMALY_STATE_UNAVAILABLE,
+        `token anomaly re-inference could not read the durable spend log for ${JSON.stringify(loopId)} `
+          + `(${error?.message ?? error}); whether a prior single-call anomaly exists is UNKNOWN — `
+          + 'further internal model spend is blocked until this can be established',
+        { loopId },
+      );
+    }
     for (const r of records) {
       const uv = Number.isFinite(r.usageVolume) ? r.usageVolume : null;
       const co = Number.isFinite(r.contextOverheadTokens) ? r.contextOverheadTokens : null;

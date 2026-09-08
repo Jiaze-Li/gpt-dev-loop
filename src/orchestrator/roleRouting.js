@@ -8,14 +8,17 @@ import os from 'node:os';
 // The Worker (the coding agent the user is talking to) is OUTSIDE role routing
 // entirely — ReviewLoop never selects, spawns, budgets, or model-restricts it.
 // There is no `planner` and no `executor` role: execution is Worker-owned.
-// `highContext: true` families stay in the policy (a future adapter could
-// narrow them) but are NEVER chosen by automatic routing — only when a caller
-// explicitly opts in with `signals.allowHighContext === true`. No family is
-// marked high-context today: every AGY family now runs through the workspace-
-// local `reviewloop-minimal` agent (inheritCustomizations:false), which brought
-// a real agy:gemini Supervisor call down from ~150.7k input + ~656.8k
-// cache-read tokens to ~6.7k input + ~8.1k cache-read — in line with every
-// other family. See docs/ARCHITECTURE.md.
+// The `highContext: true` mechanism still exists (a caller must opt in with
+// `signals.allowHighContext === true` for such a candidate to be chosen), but
+// NO production family is marked high-context today — nothing is excluded from
+// automatic routing on that basis. Every AGY family runs through the
+// `reviewloop-minimal` custom agent (`inheritCustomizations: false`) discovered
+// from an isolated redirected gemini dir (`--gemini_dir`), with startup +
+// per-call effective-loading verification and fail-closed on any mismatch (agy
+// never silently falls back to its ambient default agent). The definitive
+// isolated-agent live result is the agy:gemini medium Supervisor:
+// usageVolume 2933, effectiveLoadingVerified. Earlier ~150.7k / ~6.7k figures
+// were pre-verification and are NOT a baseline. See docs/ARCHITECTURE.md.
 //
 // Fixed deterministic routing (NO risk-based selection). Automatic failover
 // walks the whole list in order on any safe retryable provider/quota failure
