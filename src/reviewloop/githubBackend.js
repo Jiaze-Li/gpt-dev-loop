@@ -329,14 +329,6 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
       const out = await gh(['pr', 'view', String(prNumber), '--json', 'headRefOid', '-q', '.headRefOid']);
       return out.trim() || null;
     },
-    async getRepoIdentity() {
-      try {
-        const { owner, name } = await resolveOwnerName();
-        return `github:${owner}/${name}`;
-      } catch {
-        return null;
-      }
-    },
     async listReviews({ prNumber }) {
       const out = await gh(['api', `repos/{owner}/{repo}/pulls/${prNumber}/reviews`, '--paginate']);
       const arr = flattenPaginated(out);
@@ -619,22 +611,6 @@ export function createGithubReviewBackend({
   return {
     async getPrHead({ prNumber }) {
       return gh.getPrHead({ prNumber });
-    },
-
-    // Stable repository identity for the PR HUMAN_REQUIRED latch. Prefers the
-    // GitHub slug (independent of checkout path); falls back to whatever the
-    // shared resolver can determine.
-    async getRepoIdentity() {
-      if (env?.REVIEWLOOP_GH_REPO && String(env.REVIEWLOOP_GH_REPO).trim()) {
-        return `github:${String(env.REVIEWLOOP_GH_REPO).trim()}`;
-      }
-      if (typeof gh.getRepoIdentity === 'function') {
-        try {
-          const id = await gh.getRepoIdentity();
-          if (id) return id;
-        } catch { /* fall through */ }
-      }
-      return null;
     },
 
     // Read-only review-thread enumeration (or [] when the transport lacks it).

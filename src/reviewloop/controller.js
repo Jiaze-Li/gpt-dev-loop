@@ -43,20 +43,6 @@ import {
   scopeCheckThread,
 } from './threadResolution.js';
 import { withInProcessLoopLock, acquireLoopFileLease } from './loopLease.js';
-import {
-  prLatchKey,
-  resolveRepositoryIdentity,
-  armPrLatch,
-  consumePrLatchForBegin,
-  resolvePrLatch,
-  trustedApproverKeys,
-} from './prLatch.js';
-import {
-  appendAuditEvent,
-  readAuditChain,
-  expectedLatchState,
-  PR_LATCH_EVENTS,
-} from './prLatchAudit.js';
 import { discoverVerificationCommands, runGate, GATE_VERDICTS } from './gatePolicy.js';
 import {
   normalizeReview,
@@ -151,9 +137,6 @@ export function createReviewLoopController({
   discoverVerificationCommandsFn = discoverVerificationCommands,
   gateRunner = null,
   clock = () => Date.now(),
-  // PR-scoped repository identity for the HUMAN_REQUIRED latch. Prefers the PR
-  // backend's own identity, then a git/gh probe of the workspace, then the path.
-  resolveRepoIdentityFn = null,
 } = {}) {
   const persistence = injectedPersistence ?? new Persistence(runtimeRoot);
   const store = new ReviewLoopStore(persistence);
@@ -183,119 +166,6 @@ export function createReviewLoopController({
     } catch {
       return emptyTelemetry();
     }
-  }
-
-  // Repository identity that scopes the PR HUMAN_REQUIRED latch. Never throws —
-  // an unresolvable identity falls back to the absolute path so the latch is
-  // still enforced (erring toward MORE isolation, never toward a bypass).
-  async function repoIdentityFor(cwd) {
-    try {
-      if (typeof resolveRepoIdentityFn === 'function') {
-        const id = await resolveRepoIdentityFn({ cwd, env });
-        if (id && String(id).trim()) return String(id).trim();
-      } else if (typeof prBackend?.getRepoIdentity === 'function') {
-        const id = await prBackend.getRepoIdentity();
-        if (id && String(id).trim()) return String(id).trim();
-      } else {
-        const id = await resolveRepositoryIdentity({ cwd, env });
-        if (id && String(id).trim()) return String(id).trim();
-      }
-    } catch { /* fall through */ }
-    return `path:${cwd}`;
-  }
-
-  // Arm the PR HUMAN_REQUIRED latch for a loop that just exhausted its review
-  // rounds. Serialized against concurrent begins for the same PR. Best-effort:
-  // a persistence failure here must not swallow the HUMAN_REQUIRED result, but
-  // it IS surfaced as a safety event.
-  async function armPrLatchForLoop(loopState, objective, { reason, round, maxRounds, head }) {
-    try {
-      const cwd = objective?.repository?.root;
-      const prNumber = objective?.prNumber;
-      if (prNumber == null) return null;
-      const repositoryIdentity = await repoIdentityFor(cwd);
-      const latchKey = prLatchKey(repositoryIdentity, prNumber);
-      return await withInProcessLoopLock(latchKey, async () => {
-        const lease = await acquireLoopFileLease({ runtimeRoot: fileLeaseRoot, loopId: latchKey });
-        try {
-          const { latch, rearmed } = await armPrLatch(persistence, {
-            repositoryIdentity, prNumber,
-            exhaustedLoopId: loopState.loopId,
-            exhaustedHead: head ?? loopState.lastReviewedPrHead ?? objective?.prHead ?? null,
-            reason, round, maxRounds, clock,
-          });
-          if (rearmed) {
-            try {
-              await appendAuditEvent(fileLeaseRoot, {
-                event: PR_LATCH_EVENTS.ARMED,
-                repositoryIdentity, prNumber, latchCount: latch.latchCount,
-                meta: { exhaustedLoopId: latch.exhaustedLoopId, exhaustedHead: latch.exhaustedHead, round: latch.round },
-                clock,
-              });
-            } catch (auditErr) {
-              collectSafetyEvent({
-                code: 'REVIEWLOOP_PR_LATCH_AUDIT_APPEND_FAILED',
-                severity: 'NON_BLOCKING', role: 'controller', taskId: loopState.loopId,
-                reason: `PR-latch armed but the audit-chain event could not be appended: ${auditErr?.message ?? auditErr}`,
-                actionTaken: 'the state-file latch still blocks reviewloop_begin; the audit cross-check may report tampering until the chain is repaired',
-              });
-            }
-          }
-          onEvent?.({ type: 'REVIEWLOOP_PR_LATCH_ARMED', prNumber, repositoryIdentity, loopId: loopState.loopId });
-          return {
-            armed: true,
-            repositoryIdentity,
-            prNumber,
-            exhaustedLoopId: latch.exhaustedLoopId,
-            exhaustedHead: latch.exhaustedHead,
-            round: latch.round,
-            maxRounds: latch.maxRounds,
-            latchCount: latch.latchCount,
-            approvalCommand: `reviewloop pr-latch approve ${prNumber}`,
-          };
-        } finally {
-          await lease.release?.();
-        }
-      });
-    } catch (err) {
-      collectSafetyEvent({
-        code: 'REVIEWLOOP_PR_LATCH_ARM_FAILED',
-        severity: 'NON_BLOCKING',
-        role: 'controller',
-        taskId: loopState.loopId,
-        reason: `could not persist the PR HUMAN_REQUIRED latch: ${err?.message ?? err}`,
-        actionTaken: 'HUMAN_REQUIRED still returned; a fresh reviewloop_begin for this PR may not be blocked until the latch persists',
-      });
-      return null;
-    }
-  }
-
-  // Clear a PR HUMAN_REQUIRED latch after a (human-approved) loop converges.
-  async function clearPrLatchOnPass(loopState, objective) {
-    try {
-      const prNumber = objective?.prNumber;
-      if (prNumber == null) return;
-      const repositoryIdentity = await repoIdentityFor(objective?.repository?.root);
-      const latchKey = prLatchKey(repositoryIdentity, prNumber);
-      await withInProcessLoopLock(latchKey, async () => {
-        const lease = await acquireLoopFileLease({ runtimeRoot: fileLeaseRoot, loopId: latchKey });
-        try {
-          const resolved = await resolvePrLatch(persistence, {
-            repositoryIdentity, prNumber, byLoopId: loopState.loopId, clock,
-          });
-          if (resolved && resolved.status === 'RESOLVED') {
-            await appendAuditEvent(fileLeaseRoot, {
-              event: PR_LATCH_EVENTS.RESOLVED,
-              repositoryIdentity, prNumber, latchCount: resolved.latchCount ?? null,
-              meta: { byLoopId: loopState.loopId },
-              clock,
-            }).catch(() => {});
-          }
-        } finally {
-          await lease.release?.();
-        }
-      });
-    } catch { /* best-effort; a PASS is never blocked by latch bookkeeping */ }
   }
 
   async function begin({
@@ -367,87 +237,6 @@ export function createReviewLoopController({
       if (!prBackend) throw new Error('reviewloop_begin: PR mode requires a PR backend');
       prHead = await prBackend.getPrHead({ prNumber });
       if (!prHead) throw new Error(`reviewloop_begin: cannot resolve HEAD for PR #${prNumber}`);
-
-      // PR HUMAN_REQUIRED latch. A PR whose prior loop exhausted its review-round
-      // budget with blocking findings still open is latched: no new loop, no
-      // external review trigger, until a human explicitly approves one via
-      // a signed `reviewloop pr-latch approve <prNumber>`. A changed HEAD, edits,
-      // passing tests, a fresh MCP process, or a different reviewer do NOT clear
-      // it. This runs BEFORE any loop state is written and BEFORE any trigger.
-      const repositoryIdentity = await repoIdentityFor(cwd);
-      const latchKey = prLatchKey(repositoryIdentity, prNumber);
-      const trustedKeys = trustedApproverKeys(env);
-      const gate = await withInProcessLoopLock(latchKey, async () => {
-        const lease = await acquireLoopFileLease({ runtimeRoot: fileLeaseRoot, loopId: latchKey });
-        try {
-          // 1. Tamper check against the hash-chained audit log. If the chain is
-          //    broken, or it says this PR is latched while the state file says
-          //    otherwise, fail closed — never trust a rewritten state file.
-          const chain = await readAuditChain(fileLeaseRoot);
-          const auditExpectation = chain.ok
-            ? expectedLatchState(chain.entries, { repositoryIdentity, prNumber })
-            : null;
-
-          const decision = await consumePrLatchForBegin(persistence, {
-            repositoryIdentity, prNumber, newLoopId: loopId, trustedKeys, clock,
-          });
-
-          if (!chain.ok) {
-            return { allowed: false, tampered: true, reason: `PR-latch audit chain integrity check failed: ${chain.reason}`, latch: decision.latch };
-          }
-          if (auditExpectation?.latched && decision.allowed && !decision.consumedApprovalId) {
-            return { allowed: false, tampered: true, reason: 'PR-latch audit log shows this PR is latched but the latch state file does not — treating as tampered', latch: decision.latch };
-          }
-
-          if (decision.allowed && decision.consumedApprovalId) {
-            await appendAuditEvent(fileLeaseRoot, {
-              event: PR_LATCH_EVENTS.APPROVAL_CONSUMED,
-              repositoryIdentity, prNumber,
-              latchCount: decision.latch?.latchCount ?? null,
-              meta: { approvalId: decision.consumedApprovalId, byLoopId: loopId },
-              clock,
-            }).catch(() => {});
-          }
-          return decision;
-        } finally {
-          await lease.release?.();
-        }
-      });
-      if (!gate.allowed) {
-        onEvent?.({ type: 'REVIEWLOOP_BEGIN_BLOCKED', prNumber, repositoryIdentity, latchKey, tampered: Boolean(gate.tampered), forgedApprovalAttempt: Boolean(gate.forgedApprovalAttempt) });
-        const keyStatus = trustedKeys.size === 0
-          ? 'This ReviewLoop runtime has NO configured approver key (REVIEWLOOP_APPROVER_PUBKEYS is unset), so a human approval cannot be cryptographically verified — no command will clear this latch. A human must configure a trusted approver key and issue a signed approval, or (having independently verified the findings) remove the latch state directly.'
-          : `Clearing requires a signed approval from a trusted approver key: a human runs \`reviewloop pr-latch approve ${prNumber}\` with the private key, which produces an Ed25519 signature ReviewLoop verifies against REVIEWLOOP_APPROVER_PUBKEYS. The Worker cannot produce this signature.`;
-        return {
-          status: 'HUMAN_APPROVAL_REQUIRED',
-          blocked: true,
-          tampered: Boolean(gate.tampered),
-          loopId: null,
-          mode,
-          prNumber,
-          repositoryIdentity,
-          reviewer: reviewer ?? 'codex',
-          approverKeyConfigured: trustedKeys.size > 0,
-          latch: {
-            exhaustedLoopId: gate.latch?.exhaustedLoopId ?? null,
-            exhaustedHead: gate.latch?.exhaustedHead ?? null,
-            reason: gate.latch?.reason ?? null,
-            round: gate.latch?.round ?? null,
-            maxRounds: gate.latch?.maxRounds ?? null,
-            latchCount: gate.latch?.latchCount ?? 1,
-            createdAt: gate.latch?.createdAt ?? null,
-            status: gate.latch?.status ?? null,
-          },
-          reason: gate.tampered
-            ? `PR #${prNumber} (${repositoryIdentity}): ${gate.reason}. ReviewLoop will not start a new loop until a human resolves this.`
-            : `PR #${prNumber} is under a ReviewLoop HUMAN_REQUIRED latch: loop `
-              + `${gate.latch?.exhaustedLoopId ?? '(unknown)'} exhausted its `
-              + `${gate.latch?.maxRounds ?? 3}-round review budget on HEAD `
-              + `${(gate.latch?.exhaustedHead ?? '(unknown)').slice(0, 12)} with blocking findings still open. `
-              + `Pushing a new HEAD, editing code, passing tests, changing reviewer, or a new session does NOT clear it. `
-              + keyStatus,
-        };
-      }
     }
 
     // REVIEWLOOP_MAX_REVIEW_ROUNDS is a public tuning knob: an explicit begin
@@ -604,7 +393,15 @@ export function createReviewLoopController({
     const loopState = await loadLoop(loopId);
     const objective = loopState.objective;
 
-    if (isTerminal(loopState.state) && loopState.state !== REVIEW_LOOP_STATES.HUMAN_REQUIRED) {
+    // One user instruction buys ONE ReviewLoop execution budget (default 3
+    // review rounds). When the CONVERGENCE POLICY gives up — 3 rounds spent,
+    // findings still blocking — the loop is DONE: `budgetExhausted` is set and a
+    // further reviewloop_review returns the terminal result, never re-enters.
+    // Only a new user message (a brand-new reviewloop_begin) starts a fresh
+    // budget. A HUMAN_REQUIRED from a transient failure (a chunk-review crash, a
+    // provider blip) is NOT budget-exhausted and stays resumable.
+    if (isTerminal(loopState.state)
+      && (loopState.state !== REVIEW_LOOP_STATES.HUMAN_REQUIRED || loopState.budgetExhausted)) {
       return terminalResult(loopState);
     }
     if (objective.mode === REVIEW_MODES.PR) return reviewPr({ loopState, signal, onHeartbeat });
@@ -1021,6 +818,7 @@ export function createReviewLoopController({
         spend, loopState, objective, review, gate, signal,
       });
       if (sup.humanRequired) {
+        loopState.budgetExhausted = true; // convergence policy gave up — terminal
         recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'non-convergence escalation');
         recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
         await store.save(loopState.loopId, loopState);
@@ -1038,6 +836,7 @@ export function createReviewLoopController({
       return passResult(loopState, review, await spend.telemetry());
     }
     if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
+      loopState.budgetExhausted = true; // 3 rounds spent, still blocking — terminal
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
       await store.save(loopState.loopId, loopState);
       return humanRequiredResult(loopState, review, await spend.telemetry(), supervisorGuidance);
@@ -1255,29 +1054,13 @@ export function createReviewLoopController({
       }
       recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
       await store.save(loopState.loopId, loopState);
-      // If this PR was under a HUMAN_REQUIRED latch and a human-approved
-      // follow-up loop just converged, clear the latch. Best-effort.
-      await clearPrLatchOnPass(loopState, objective);
       return passResult(loopState, review, await spend.telemetry());
     }
     if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
+      loopState.budgetExhausted = true; // 3 rounds spent, still blocking — terminal
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
       await store.save(loopState.loopId, loopState);
-      // Review non-convergence: this loop spent its whole round budget with
-      // blocking findings still open. Arm the durable PR-level latch so the
-      // Worker cannot silently reset the counter with a fresh reviewloop_begin.
-      let latch = null;
-      if (decision.nonConvergenceExhausted) {
-        latch = await armPrLatchForLoop(loopState, objective, {
-          reason: decision.reason,
-          round: decision.exhaustedRound ?? loopState.round,
-          maxRounds: decision.maxRounds ?? (objective?.maxReviewRounds ?? 3),
-          head: result.head,
-        });
-      }
-      const out = humanRequiredResult(loopState, review, await spend.telemetry(), null);
-      if (latch) out.latch = latch;
-      return out;
+      return humanRequiredResult(loopState, review, await spend.telemetry(), null);
     }
 
     let supervisorGuidance = null;
@@ -1288,6 +1071,7 @@ export function createReviewLoopController({
       if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
       recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, 'PR non-convergence escalation');
       if (sup.humanRequired) {
+        loopState.budgetExhausted = true; // convergence policy gave up — terminal
         recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
         await store.save(loopState.loopId, loopState);
         return humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance);
@@ -1316,11 +1100,19 @@ export function createReviewLoopController({
     };
   }
   function humanRequiredResult(loopState, review, telemetry, supervisorGuidance) {
+    const budgetExhausted = loopState.budgetExhausted === true;
     return {
       status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
+      // This HUMAN_REQUIRED is TERMINAL — the loop's review-round budget is
+      // spent. The Worker must report to the user and stop: not another
+      // reviewloop_review on this loop, not a fresh reviewloop_begin in the
+      // same task. A new user instruction starts a new task and a new budget.
+      terminal: budgetExhausted || undefined,
+      budgetExhausted: budgetExhausted || undefined,
       blockingFindings: review?.blockingFindings ?? [],
       supervisorGuidance: supervisorGuidance ?? loopState.lastSupervisorGuidance ?? null,
-      reason: loopState.history?.slice(-1)[0]?.reason ?? 'review did not converge',
+      reason: (loopState.history?.slice(-1)[0]?.reason ?? 'review did not converge')
+        + (budgetExhausted ? ' — this ReviewLoop budget is spent; report to the user and stop, do not start another loop for this task' : ''),
       telemetry: telemetry ?? emptyTelemetry(), safetyEvents,
     };
   }
@@ -1338,9 +1130,17 @@ export function createReviewLoopController({
     };
   }
   async function terminalResult(loopState) {
+    const budgetExhausted = loopState.state === REVIEW_LOOP_STATES.HUMAN_REQUIRED
+      && loopState.budgetExhausted === true;
     return {
       status: loopState.state, loopId: loopState.loopId, round: loopState.round,
-      reason: 'loop already terminal', lastReview: compactLastReview(loopState),
+      terminal: true,
+      budgetExhausted: budgetExhausted || undefined,
+      reason: budgetExhausted
+        ? 'this loop already reached HUMAN_REQUIRED — its review-round budget is spent. Report to the '
+          + 'user and stop; do NOT reviewloop_begin again in this task. A new user instruction starts a fresh loop.'
+        : 'loop already terminal',
+      lastReview: compactLastReview(loopState),
       telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
     };
   }

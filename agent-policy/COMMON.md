@@ -24,16 +24,19 @@ managed block; `npm run doctor` verifies the match with zero model calls.
   - `PASS` → report completion.
   - `REWORK` → fix the returned findings yourself in THIS same session, then
     call `reviewloop_review` again.
-  - `HUMAN_REQUIRED` → **STOP.** Surface the blocker to the user and wait for a
-    new explicit instruction. Do not resume by any route — new `reviewloop_begin`,
-    other reviewer, new session, fresh HEAD/push all count as bypass.
+  - `HUMAN_REQUIRED` → **STOP.** This ends the task: report the blocker and
+    findings to the user and wait. Do not `reviewloop_begin` again, switch
+    reviewer/session, or push a new HEAD for a fresh counter — budget spent.
   - `WAITING_FOR_REVIEW` → a PR review was triggered; normal. Call
     `reviewloop_review` again later; it reattaches without re-triggering.
   - `PUSH_REQUIRED` / `NO_PROGRESS` → change or push real state first.
-- A PR `reviewloop_begin` can return `HUMAN_APPROVAL_REQUIRED` (not a `loopId`):
-  the PR's prior loop spent its round budget with blocking findings open and is
-  latched. Clearing it needs a signature from an approver key you do not hold —
-  you cannot do it. Report it and stop.
+
+## Execution budget
+
+- One user instruction buys ONE ReviewLoop budget: at most 3 automatic review
+  rounds. Three rounds without converging → `HUMAN_REQUIRED`, task over.
+- Only a NEW user message ("continue PR #4") starts a new task, which may open a
+  fresh `reviewloop_begin` with a fresh 3-round budget.
 
 ## Rules
 
@@ -45,5 +48,4 @@ managed block; `npm run doctor` verifies the match with zero model calls.
   evidence returns a deterministic no-progress result, never a fresh review.
 - Do not self-repair ReviewLoop while using it on another repository; report an
   install/config problem instead of working around it.
-- ReviewLoop never force-pushes, auto-merges, weakens the objective, or lets
-  you reset a spent review-round budget without a human.
+- ReviewLoop never force-pushes, auto-merges, or weakens the objective.

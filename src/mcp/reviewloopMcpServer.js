@@ -58,19 +58,12 @@ export function createReviewLoopMcpServer({
         reviewer: z.enum(['codex', 'claude']).optional().describe('PR-mode external reviewer (default: codex)'),
       },
       outputSchema: {
-        // 'READY' on success; 'HUMAN_APPROVAL_REQUIRED' when the PR is under a
-        // ReviewLoop HUMAN_REQUIRED latch (a prior loop exhausted its review
-        // rounds) and no human has authorized a fresh budget.
-        status: z.enum(['READY', 'HUMAN_APPROVAL_REQUIRED']),
-        loopId: z.string().nullable(),
+        loopId: z.string(),
         mode: z.enum(['LOCAL', 'PR']),
-        baseline: z.record(z.string(), z.any()).nullable().optional(),
-        prHead: z.string().nullable().optional(),
-        reviewer: z.string().optional(),
-        blocked: z.boolean().optional(),
-        reason: z.string().nullable().optional(),
-        repositoryIdentity: z.string().optional(),
-        latch: z.record(z.string(), z.any()).nullable().optional(),
+        status: z.literal('READY'),
+        baseline: z.record(z.string(), z.any()).nullable(),
+        prHead: z.string().nullable(),
+        reviewer: z.string(),
       },
     },
     async ({ goal, cwd: reqCwd, prNumber, reviewer }) => {
@@ -80,31 +73,15 @@ export function createReviewLoopMcpServer({
         prNumber: prNumber ?? null,
         reviewer: reviewer ?? null,
       });
-      const structured = res.status === 'HUMAN_APPROVAL_REQUIRED'
-        ? {
-          status: 'HUMAN_APPROVAL_REQUIRED',
-          loopId: null,
-          mode: res.mode,
-          blocked: true,
-          reason: res.reason ?? null,
-          repositoryIdentity: res.repositoryIdentity,
-          reviewer: res.reviewer,
-          latch: res.latch ?? null,
-        }
-        : {
-          status: 'READY',
-          loopId: res.loopId,
-          mode: res.mode,
-          baseline: res.baseline ?? null,
-          prHead: res.prHead ?? null,
-          reviewer: res.reviewer,
-        };
-      // HUMAN_APPROVAL_REQUIRED is a valid structured outcome the Worker must
-      // surface to the user — not a tool failure.
-      return {
-        content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }],
-        structuredContent: structured,
+      const structured = {
+        loopId: res.loopId,
+        mode: res.mode,
+        status: 'READY',
+        baseline: res.baseline ?? null,
+        prHead: res.prHead ?? null,
+        reviewer: res.reviewer,
       };
+      return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
     },
   );
 

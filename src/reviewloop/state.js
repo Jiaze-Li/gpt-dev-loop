@@ -35,7 +35,12 @@ const TRANSITIONS = Object.freeze({
   REWORK: ['REVIEWING', 'STOPPED', 'FAILED'],
   SUPERVISING: ['REWORK', 'REVIEWING', 'HUMAN_REQUIRED', 'FAILED', 'STOPPED'],
   PASS: [],
-  HUMAN_REQUIRED: ['REVIEWING'], // a later reviewloop_review with genuinely new state may reopen
+  // A HUMAN_REQUIRED from a TRANSIENT/infra failure (a chunk-review crash, a
+  // provider blip, GitHub unreachable) is resumed by re-calling
+  // reviewloop_review with the durable checkpoint. A HUMAN_REQUIRED from the
+  // convergence policy (the 3-round budget is spent) is truly terminal — the
+  // controller marks loopState.budgetExhausted and refuses to re-enter.
+  HUMAN_REQUIRED: ['REVIEWING'],
   FAILED: [],
   STOPPED: [],
 });
@@ -67,6 +72,11 @@ export function initialLoopState(objective) {
     // convergence tracking
     findingSignatureHistory: [], // [{ round, signatures: [] }]
     supervisorInvoked: false,
+    // Set true only when the CONVERGENCE POLICY ends the loop (3 review rounds
+    // spent, findings still blocking). Makes HUMAN_REQUIRED truly terminal — a
+    // further reviewloop_review returns the terminal result instead of
+    // re-entering. A transient-failure HUMAN_REQUIRED leaves this false.
+    budgetExhausted: false,
     pendingExternalTrigger: null, // { head, reviewer, triggerId, status }
     // PR mode: durable GitHub review-thread identities for every trusted inline
     // blocking finding ReviewLoop has ingested. Survives normalization,
