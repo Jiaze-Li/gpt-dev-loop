@@ -195,6 +195,10 @@ export function normalizeReviewFinding(raw) {
   normalized.resolvedBy = identity(raw.resolvedBy);
   normalized.resolvedOnHead = identity(raw.resolvedOnHead);
   normalized.verificationReviewId = identity(raw.verificationReviewId);
+  // Durable GitHub thread-identity context carried through to the controller so
+  // a cleared prior-round thread can be resolved by its GraphQL node id.
+  normalized.reviewerLogin = identity(raw.reviewerLogin ?? raw.reviewer_login);
+  normalized.reviewedHead = identity(raw.reviewedHead ?? raw.reviewed_head);
   normalized.identityReliable = hasReliableThreadIdentity(normalized);
   if (!normalized.identityReliable && normalized.lifecycle !== FINDING_LIFECYCLE.OPEN) {
     normalized.lifecycle = FINDING_LIFECYCLE.OPEN;

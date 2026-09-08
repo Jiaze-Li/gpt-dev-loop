@@ -258,11 +258,38 @@ export async function collectWorkerDelta({
     }
     // pre-existing untracked, unchanged -> NOT Worker output, excluded.
   }
+  // A file that was UNTRACKED at baseline but has since been `git add`ed shows
+  // up in `git diff <baseRef>` (baseRef never captured untracked content) even
+  // when its bytes are unchanged from baseline — that is pre-existing user
+  // work, not the Worker's. Drop any such path (in the baseline untracked set,
+  // current digest still equal to the baseline digest) from the name list AND
+  // re-scope the diff text so its hunks never reach the Reviewer.
+  const leakedStaged = [];
+  for (const filePath of trackedChanged) {
+    if (!(filePath in baselineUntracked)) continue;
+    // eslint-disable-next-line no-await-in-loop
+    const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile });
+    if (fp.safe && fp.digest === baselineUntracked[filePath]) leakedStaged.push(filePath);
+  }
+  const leaked = new Set(leakedStaged);
+  if (leakedStaged.length) {
+    trackedChanged = trackedChanged.filter((p) => !leaked.has(p));
+    if (trackedChanged.length) {
+      const scoped = await runGit(['diff', baseRef, '--', ...trackedChanged], cwd, spawn);
+      if (scoped.code === 0) trackedDiff = scoped.stdout;
+      else fail(`"git diff ${baseRef} -- <scoped>" exited ${scoped.code}`);
+    } else {
+      trackedDiff = '';
+    }
+  }
+
   // A pre-existing untracked file the Worker DELETED (git diff cannot see it).
   // Only trustworthy when the current untracked listing itself succeeded.
   if (untrackedListingOk) {
     for (const filePath of Object.keys(baselineUntracked)) {
-      if (!currentUntracked.has(filePath)) untrackedDeleted.push(filePath);
+      // A path that is now staged (leaked, unchanged) was NOT deleted — it is
+      // pre-existing user work that moved from untracked to the index.
+      if (!currentUntracked.has(filePath) && !leaked.has(filePath)) untrackedDeleted.push(filePath);
     }
   }
 

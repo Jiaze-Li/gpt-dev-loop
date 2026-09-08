@@ -34,6 +34,14 @@ import {
   isTerminal,
 } from './state.js';
 import { captureBaseline, collectWorkerDelta } from './gitEvidence.js';
+import { reviewerLoginAllowlist } from './prTrust.js';
+import {
+  registerManagedThreads,
+  clearedPriorThreads,
+  unresolvedClearedThreads,
+  applyResolutionResult,
+  scopeCheckThread,
+} from './threadResolution.js';
 import { withInProcessLoopLock, acquireLoopFileLease } from './loopLease.js';
 import { discoverVerificationCommands, runGate, GATE_VERDICTS } from './gatePolicy.js';
 import {
@@ -119,6 +127,12 @@ export function createReviewLoopController({
   triggerAuthority = null,
   captureBaselineFn = captureBaseline,
   collectWorkerDeltaFn = collectWorkerDelta,
+  // Re-collect the Worker delta AFTER the review-time Gate (a snapshot / codegen
+  // / format check can mutate tracked files). Defaults to the real collector
+  // only when the delta collector itself is the real one — an injected test
+  // fake is a fixed script that cannot observe Gate mutation, so re-invoking it
+  // there would only drift the harness. Pass explicitly to exercise this path.
+  collectPostGateDeltaFn = null,
   runGateFn = runGate,
   discoverVerificationCommandsFn = discoverVerificationCommands,
   gateRunner = null,
@@ -534,7 +548,7 @@ export function createReviewLoopController({
     const cwd = objective.repository?.root;
     const baseline = objective.baseline;
 
-    const delta = await collectWorkerDeltaFn({ cwd, baseline });
+    let delta = await collectWorkerDeltaFn({ cwd, baseline });
 
     // B7 — no Worker change since begin -> deterministic NO_PROGRESS, 0 Reviewer.
     if (delta.noWorkerChangeYet) {
@@ -622,6 +636,41 @@ export function createReviewLoopController({
       baselineGateEvidence: loopState.baselineGateEvidence?.evidence ?? null,
     });
     gate.commandSource = commandSource;
+
+    // The review-time Gate may itself have mutated tracked files. The delta was
+    // collected BEFORE it ran, so re-collect now — otherwise the Reviewer sees
+    // pre-Gate evidence and the NO_PROGRESS fingerprint no longer matches the
+    // tree. (begin-time recapture already covers the baseline Gate; this is the
+    // review path.)
+    const postGateFn = collectPostGateDeltaFn
+      ?? (collectWorkerDeltaFn === collectWorkerDelta ? collectWorkerDelta : null);
+    if (postGateFn && !signal?.aborted && gate.verdict !== GATE_VERDICTS.FAIL) {
+      let postDelta = null;
+      try { postDelta = await postGateFn({ cwd, baseline }); } catch { postDelta = null; }
+      if (postDelta && postDelta.fingerprint && postDelta.fingerprint !== delta.fingerprint) {
+        if (postDelta.evidenceComplete === false) {
+          recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'post-Gate attribution incomplete');
+          await store.save(loopState.loopId, loopState);
+          return {
+            status: 'HUMAN_REQUIRED',
+            loopId: loopState.loopId,
+            round: loopState.round,
+            reason: `the deterministic Gate mutated tracked files and the post-Gate Worker delta could not be attributed: ${(postDelta.incompleteReasons ?? []).join('; ')}`,
+            telemetry: await durableTelemetry(loopState.loopId),
+            safetyEvents,
+          };
+        }
+        collectSafetyEvent({
+          code: 'GATE_MUTATED_TRACKED_FILES',
+          severity: 'NON_BLOCKING',
+          role: 'gate',
+          taskId: loopState.loopId,
+          reason: 'the review-time Gate modified tracked files; re-collected the Worker delta over the post-Gate tree',
+          actionTaken: 'review proceeds over post-Gate evidence',
+        });
+        delta = postDelta;
+      }
+    }
 
     if (signal?.aborted) {
       // Cancelled during the Gate — never proceed to a paid Reviewer dispatch.
@@ -794,6 +843,66 @@ export function createReviewLoopController({
     return { guidance: raw.guidance };
   }
 
+  // Resolve the GitHub review threads for prior-round findings that a trusted
+  // review bound to the exact newer HEAD has independently cleared. Mutates the
+  // managed-thread records in place. `targets` overrides the default
+  // (OPEN prior-head threads cleared by `review`) — used for the PASS retry.
+  async function reconcileReviewThreads({
+    loopState, objective, review, head, targets = null,
+  }) {
+    if (!prBackend || typeof prBackend.resolveReviewThread !== 'function') return;
+    const cleared = targets
+      ?? clearedPriorThreads({ managedThreads: loopState.managedThreads, review, head });
+    if (cleared.length === 0) return;
+
+    let liveThreads = null;
+    if (typeof prBackend.listReviewThreads === 'function') {
+      try {
+        liveThreads = await prBackend.listReviewThreads({ prNumber: objective.prNumber });
+      } catch { liveThreads = null; }
+    }
+    const allowlist = reviewerLoginAllowlist(objective.reviewer, env) ?? [];
+    const verificationReviewId = review.reviewId ?? review.review_id ?? null;
+
+    for (const mt of cleared) {
+      const scope = scopeCheckThread(mt, liveThreads, { allowlist });
+      if (!scope.ok) {
+        applyResolutionResult(mt, { success: false, error: `scope check failed: ${scope.reason}` });
+        collectSafetyEvent({
+          code: 'REVIEWLOOP_THREAD_RESOLVE_SKIPPED', severity: 'NON_BLOCKING', role: 'pr-review',
+          taskId: loopState.loopId, reason: `${mt.threadNodeId}: ${scope.reason}`,
+          actionTaken: 'thread left unresolved',
+        });
+        continue;
+      }
+      if (scope.alreadyResolved) {
+        applyResolutionResult(mt, { success: true, head, verificationReviewId });
+        continue;
+      }
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await prBackend.resolveReviewThread({
+          prNumber: objective.prNumber, threadNodeId: mt.threadNodeId,
+          reviewer: objective.reviewer, headSha: head,
+        });
+        applyResolutionResult(mt, { success: true, head, verificationReviewId });
+        collectSafetyEvent({
+          code: 'REVIEWLOOP_THREAD_RESOLVED', severity: 'NON_BLOCKING', role: 'pr-review',
+          taskId: loopState.loopId,
+          reason: `resolved cleared finding ${mt.signature} (thread ${mt.threadNodeId}) on ${head}`,
+          actionTaken: 'GitHub review thread resolved',
+        });
+      } catch (err) {
+        applyResolutionResult(mt, { success: false, error: err?.message ?? err });
+        collectSafetyEvent({
+          code: 'REVIEWLOOP_THREAD_RESOLVE_FAILED', severity: 'BLOCKING', role: 'pr-review',
+          taskId: loopState.loopId, reason: `${mt.threadNodeId}: ${err?.message ?? err}`,
+          actionTaken: 'thread left unresolved; PASS withheld',
+        });
+      }
+    }
+  }
+
   // ---- PR mode ---------------------------------------------------------
   async function reviewPr({ loopState, signal, onHeartbeat }) {
     const objective = loopState.objective;
@@ -838,11 +947,25 @@ export function createReviewLoopController({
       };
     }
 
-    const newHead = result.head !== loopState.lastReviewedPrHead;
+    const priorReviewedHead = loopState.lastReviewedPrHead;
+    const newHead = result.head !== priorReviewedHead;
     if (newHead) loopState.round += 1;
     loopState.lastReviewedPrHead = result.head;
     loopState.lastReview = review;
     loopState.pendingExternalTrigger = null;
+
+    // Review-thread reconciliation. Only a trusted review bound to the EXACT
+    // newer HEAD (this `review`) can clear a prior-round thread; a recurring
+    // finding keeps its prior thread open. A REWORK round may therefore resolve
+    // old findings while introducing new open ones.
+    loopState.managedThreads = Array.isArray(loopState.managedThreads) ? loopState.managedThreads : [];
+    if (newHead && priorReviewedHead) {
+      await reconcileReviewThreads({ loopState, objective, review, head: result.head });
+    }
+    loopState.managedThreads = registerManagedThreads({
+      managedThreads: loopState.managedThreads, review, head: result.head,
+      reviewer: objective.reviewer, round: loopState.round,
+    });
 
     const spend = spendFor(loopState.loopId);
     await spend.registerEvidence({
@@ -857,6 +980,24 @@ export function createReviewLoopController({
     ];
 
     if (decision.verdict === REVIEW_VERDICTS.PASS) {
+      // Every ReviewLoop-managed blocking thread that has been independently
+      // cleared MUST be resolved before PASS. A GitHub resolution failure is an
+      // infrastructure/retry condition — never a silent PASS.
+      let stuck = unresolvedClearedThreads({ managedThreads: loopState.managedThreads, review, head: result.head });
+      if (stuck.length) {
+        await reconcileReviewThreads({ loopState, objective, review, head: result.head, targets: stuck });
+        stuck = unresolvedClearedThreads({ managedThreads: loopState.managedThreads, review, head: result.head });
+      }
+      if (stuck.length) {
+        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'ReviewLoop-managed review threads could not be resolved');
+        await store.save(loopState.loopId, loopState);
+        return {
+          status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
+          head: result.head, blockingFindings: [],
+          reason: `PASS withheld: ${stuck.length} ReviewLoop-managed review thread(s) were independently cleared but could not be resolved on GitHub (${stuck.map((s) => s.threadNodeId).join(', ')}). This is an infrastructure/retry condition — retry reviewloop_review once GitHub is reachable, or resolve the threads manually.`,
+          telemetry: await spend.telemetry(), safetyEvents,
+        };
+      }
       recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
       await store.save(loopState.loopId, loopState);
       return passResult(loopState, review, await spend.telemetry());

@@ -79,6 +79,18 @@ export function normalizeReview({
     line: f.line ?? null,
     title: (f.title ?? f.message ?? '').slice(0, 200),
     signature: f.signature,
+    // Durable GitHub review-thread identity for this finding (PR mode only;
+    // null for internal LOCAL findings). Preserved through normalization so the
+    // controller can resolve the thread once the finding is independently
+    // cleared on a newer HEAD.
+    threadIdentity: (f.threadNodeId || f.reviewId || f.commentId) ? {
+      threadNodeId: f.threadNodeId ?? null,
+      reviewId: f.reviewId ?? null,
+      commentId: f.commentId ?? null,
+      reviewedHead: f.reviewedHead ?? f.head_sha ?? null,
+      reviewerLogin: f.reviewerLogin ?? null,
+      identityReliable: Boolean(f.identityReliable),
+    } : null,
   }));
   const nonBlocking = (normalized.findings ?? [])
     .filter((f) => !blocking.some((b) => b.signature === f.signature))
@@ -90,6 +102,9 @@ export function normalizeReview({
     provider: normalized.provider ?? provider ?? null,
     reviewedFingerprint: null, // filled by the controller
     reviewedHead: requireExplicitHead ? explicitHead : (normalized.head_sha ?? head ?? null),
+    // The trusted review submission id that produced this result (PR mode);
+    // recorded as the independent verification id when a prior thread resolves.
+    reviewId: normalized.review_id ?? raw?.review_id ?? raw?.reviewId ?? null,
     blockingFindings: blocking,
     nonBlockingFindings: nonBlocking.slice(0, 8),
     nonBlockingOmitted: Math.max(0, nonBlocking.length - 8),

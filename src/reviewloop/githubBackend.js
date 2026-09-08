@@ -43,6 +43,12 @@ export function extractCommentNumericId(commentId) {
 
 const CLEAN_REACTION_CONTENT = '+1';
 
+function identityStr(v) {
+  if (typeof v === 'string' && v.trim()) return v.trim();
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return null;
+}
+
 function firstLine(text) {
   return String(text ?? '').split('\n').map((s) => s.trim()).find(Boolean)?.slice(0, 200)
     ?? 'trusted reviewer comment (see PR thread)';
@@ -221,12 +227,78 @@ export function flattenPaginated(out) {
   return elements;
 }
 
+// The standard GraphQL review-thread enumeration query. Paginated by `gh api
+// graphql --paginate`, which injects the `$endCursor` variable automatically
+// when `pageInfo { hasNextPage endCursor }` is present.
+const REVIEW_THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$endCursor:String){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      reviewThreads(first:100, after:$endCursor){
+        pageInfo{ hasNextPage endCursor }
+        nodes{
+          id isResolved isOutdated
+          comments(first:100){
+            nodes{
+              databaseId
+              author{ login }
+              pullRequestReview{ databaseId }
+              path
+              originalCommit{ oid }
+              commit{ oid }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+const RESOLVE_THREAD_MUTATION = `mutation($threadId:ID!){
+  resolveReviewThread(input:{threadId:$threadId}){ thread{ id isResolved } }
+}`;
+
+// Every reviewThreads page `gh api graphql --paginate` prints, mapped to the
+// normalized thread shape ReviewLoop consumes.
+function parseReviewThreadPages(stdout) {
+  const out = [];
+  for (const page of scanTopLevelJsonValues(String(stdout ?? ''))) {
+    const nodes = page?.data?.repository?.pullRequest?.reviewThreads?.nodes;
+    if (!Array.isArray(nodes)) continue;
+    for (const t of nodes) {
+      out.push({
+        threadNodeId: identityStr(t?.id),
+        isResolved: t?.isResolved === true,
+        isOutdated: t?.isOutdated === true,
+        comments: (t?.comments?.nodes ?? []).map((c) => ({
+          commentDatabaseId: identityStr(c?.databaseId),
+          reviewDatabaseId: identityStr(c?.pullRequestReview?.databaseId),
+          authorLogin: c?.author?.login ?? null,
+          path: c?.path ?? null,
+          originalCommitOid: c?.originalCommit?.oid ?? null,
+          commitOid: c?.commit?.oid ?? null,
+        })),
+      });
+    }
+  }
+  return out;
+}
+
 // Default `gh`-backed transport. Every method is overridable for tests.
 export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
   const base = repo ? ['-R', repo] : [];
   const gh = async (args) => {
     const { stdout } = await execFile('gh', [...base, ...args], { maxBuffer: 8 * 1024 * 1024 });
     return stdout;
+  };
+  // owner/name for GraphQL (which does not accept `{owner}/{repo}` placeholders).
+  let repoSlug = repo;
+  const resolveOwnerName = async () => {
+    if (!repoSlug) {
+      repoSlug = (await gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'])).trim();
+    }
+    const [owner, name] = String(repoSlug).split('/');
+    if (!owner || !name) throw new Error(`ReviewLoop: cannot resolve owner/name from "${repoSlug}"`);
+    return { owner, name };
   };
   return {
     async getPrHead({ prNumber }) {
@@ -285,6 +357,35 @@ export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
       }
       return flattenPaginated(out).map((r) => ({ content: r.content, login: r.user?.login ?? null }));
     },
+    // Enumerate every review thread on the PR (GraphQL). Read-only.
+    async listReviewThreads({ prNumber }) {
+      const { owner, name } = await resolveOwnerName();
+      const out = await gh([
+        'api', 'graphql', '--paginate',
+        '-f', `query=${REVIEW_THREADS_QUERY}`,
+        '-F', `owner=${owner}`, '-F', `name=${name}`, '-F', `number=${prNumber}`,
+      ]);
+      return parseReviewThreadPages(out);
+    },
+    // Resolve ONE review thread by its GraphQL node id (GraphQL mutation). This
+    // mutates review-thread resolution state ONLY — never code, commits, or the
+    // merge state.
+    async resolveReviewThread({ threadNodeId }) {
+      const id = identityStr(threadNodeId);
+      if (!id) throw new Error('resolveReviewThread: threadNodeId is required');
+      const out = await gh([
+        'api', 'graphql',
+        '-f', `query=${RESOLVE_THREAD_MUTATION}`,
+        '-F', `threadId=${id}`,
+      ]);
+      let parsed = null;
+      try { parsed = JSON.parse(out); } catch { /* fall through */ }
+      const thread = parsed?.data?.resolveReviewThread?.thread ?? null;
+      if (!thread || thread.isResolved !== true) {
+        throw new Error(`resolveReviewThread: GitHub did not confirm resolution for ${id}`);
+      }
+      return { threadNodeId: identityStr(thread.id) ?? id, resolved: true };
+    },
   };
 }
 
@@ -334,6 +435,22 @@ export function createGithubReviewBackend({
     const inlineRaw = typeof gh.listReviewComments === 'function'
       ? ((await gh.listReviewComments({ prNumber })) ?? [])
       : [];
+
+    // GraphQL review-thread node ids, correlated to inline comments by their
+    // numeric databaseId. Best-effort: when the enumeration is unavailable a
+    // finding simply carries no thread node id and is never eligible for
+    // ReviewLoop-managed resolution.
+    const threadByComment = new Map();
+    if (typeof gh.listReviewThreads === 'function') {
+      try {
+        for (const t of (await gh.listReviewThreads({ prNumber })) ?? []) {
+          for (const c of t.comments ?? []) {
+            const cid = identityStr(c.commentDatabaseId ?? c.databaseId);
+            if (cid) threadByComment.set(cid, t);
+          }
+        }
+      } catch { /* identity just won't be reliable */ }
+    }
 
     const trustedSubs = [];
     for (const r of reviews) {
@@ -405,11 +522,18 @@ export function createGithubReviewBackend({
     }
 
     for (const c of trustedInline) {
+      const thread = threadByComment.get(identityStr(c.id));
       findings.push({
         severity: severityPrefix(c.body) ?? 'P2',
         file: c.path ?? null,
         line: Number.isInteger(c.line) ? c.line : null,
         title: `inline review comment: ${cleanCommentTitle(firstLine(c.body))}`,
+        // Durable GitHub thread identity for ReviewLoop-managed resolution.
+        reviewId: identityStr(c.pullRequestReviewId ?? c.pull_request_review_id),
+        commentId: identityStr(c.id),
+        threadNodeId: thread ? thread.threadNodeId : null,
+        reviewedHead: headSha,
+        reviewerLogin: c.login ?? null,
       });
     }
 
@@ -449,6 +573,7 @@ export function createGithubReviewBackend({
       reviewerLogin: trustedSubs[0]?._login ?? cleanBot ?? null,
       headSha,
       head_sha: headSha,
+      review_id: identityStr(trustedSubs[0]?.id) ?? identityStr(triggerCommentId),
       state: 'AGGREGATED',
       findings,
       cleanReaction: cleanBot ? { by: cleanBot, commentId: String(triggerCommentId) } : null,
@@ -462,6 +587,21 @@ export function createGithubReviewBackend({
   return {
     async getPrHead({ prNumber }) {
       return gh.getPrHead({ prNumber });
+    },
+
+    // Read-only review-thread enumeration (or [] when the transport lacks it).
+    async listReviewThreads({ prNumber }) {
+      if (typeof gh.listReviewThreads !== 'function') return [];
+      return (await gh.listReviewThreads({ prNumber })) ?? [];
+    },
+
+    // Resolve ONE review thread by GraphQL node id. Kept strictly separate from
+    // code modification — ReviewLoop mutates review-thread state only.
+    async resolveReviewThread({ threadNodeId }) {
+      if (typeof gh.resolveReviewThread !== 'function') {
+        throw new Error('ReviewLoop transport does not support resolveReviewThread');
+      }
+      return gh.resolveReviewThread({ threadNodeId });
     },
 
     // Trust-boundary-checked. Returns a trusted raw review for the exact

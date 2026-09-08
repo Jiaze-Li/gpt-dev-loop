@@ -68,6 +68,12 @@ export function initialLoopState(objective) {
     findingSignatureHistory: [], // [{ round, signatures: [] }]
     supervisorInvoked: false,
     pendingExternalTrigger: null, // { head, reviewer, triggerId, status }
+    // PR mode: durable GitHub review-thread identities for every trusted inline
+    // blocking finding ReviewLoop has ingested. Survives normalization,
+    // persistence, restart, REWORK, and the next review round. Entries are
+    // resolved (not deleted) once their finding is independently cleared on a
+    // newer HEAD. See threadResolution.js.
+    managedThreads: [], // [{ threadNodeId, reviewId, commentId, head, reviewerLogin, signature, reviewer, round, status, ... }]
     lastReview: null, // compact normalized review
     lastSupervisorGuidance: null,
     history: [],

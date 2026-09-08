@@ -128,6 +128,18 @@ function fingerprintFields(o) {
     maxReviewRounds: o.maxReviewRounds,
   };
   if (o.verificationPlan) base.verificationPlan = o.verificationPlan;
+  // The captured pre-Worker baseline is load-bearing: a state editor that swaps
+  // it could hide or misattribute the Worker's delta. Fold its stable identity
+  // (never the volatile capturedAt / dirtyFiles listing) into the fingerprint.
+  // Only when present, so a pre-baseline objective keeps its original hash.
+  if (o.baseline && typeof o.baseline === 'object') {
+    base.baseline = {
+      head: o.baseline.head ?? null,
+      baselineRef: o.baseline.baselineRef ?? null,
+      untrackedHashes: o.baseline.untrackedHashes ?? {},
+      evidenceComplete: o.baseline.evidenceComplete !== false,
+    };
+  }
   return sha256(JSON.stringify(base));
 }
 
@@ -171,6 +183,17 @@ export function assertObjectiveNotWeakened(original, candidate) {
   if ((candidate.prNumber ?? null) !== (original.prNumber ?? null)) problems.push('prNumber changed');
   if (JSON.stringify(candidate.repository ?? null) !== JSON.stringify(original.repository ?? null)) {
     problems.push('repository changed');
+  }
+  const baselineIdentity = (b) => (b && typeof b === 'object'
+    ? JSON.stringify({
+      head: b.head ?? null,
+      baselineRef: b.baselineRef ?? null,
+      untrackedHashes: b.untrackedHashes ?? {},
+      evidenceComplete: b.evidenceComplete !== false,
+    })
+    : 'null');
+  if (baselineIdentity(candidate.baseline) !== baselineIdentity(original.baseline)) {
+    problems.push('baseline changed');
   }
   const origBlocking = new Set(original.blockingSeverities ?? []);
   for (const sev of origBlocking) {
