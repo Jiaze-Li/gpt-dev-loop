@@ -242,6 +242,10 @@ export function createGithubReviewBackend({
 
     const trustedSubs = [];
     for (const r of reviews) {
+      // A review submission's `commit_id` is the commit that was HEAD when the
+      // reviewer pressed "submit". GitHub does NOT remap it as the PR evolves,
+      // so it is the immutable trust/freshness anchor for the submission AND
+      // for every inline comment that belongs to it.
       const reviewedHead = r.commitId ?? r.headSha ?? r.commit_id ?? null;
       if (reviewedHead !== headSha) continue;
       // PENDING is a draft the reviewer never submitted — not review evidence.
@@ -253,12 +257,39 @@ export function createGithubReviewBackend({
       if (trust.ok) trustedSubs.push({ ...r, _login: trust.review.reviewerLogin });
     }
 
+    // Submission ids that are proven: trusted reviewer identity + submitted (not
+    // PENDING) + bound to the EXACT current HEAD by their own immutable
+    // `commit_id`. An inline comment is fresh evidence for THIS head only if it
+    // hangs off one of these — never because GitHub remapped the comment's own
+    // mutable `commit_id` forward onto the current HEAD.
+    const trustedCurrentHeadSubmissionIds = new Set(
+      trustedSubs.map((s) => s.id).filter((id) => id !== null && id !== undefined).map(String),
+    );
+
     const trustedInline = [];
     for (const c of inlineRaw) {
-      const reviewedHead = c.commitId ?? c.originalCommitId ?? c.commit_id ?? null;
-      if (reviewedHead !== headSha) continue;
+      const parentId = c.pullRequestReviewId ?? c.pull_request_review_id ?? null;
+      // Prove the comment belongs to the current HEAD WITHOUT trusting the
+      // remappable `commit_id`.
+      let provenHead = null;
+      if (parentId !== null && parentId !== undefined) {
+        // Parent review submission is the anchor. It has already passed
+        // identity + exact-HEAD + non-PENDING above. A comment whose parent
+        // review was submitted against an OLD commit stays stale even after
+        // GitHub remaps `comment.commit_id` onto the current HEAD.
+        if (trustedCurrentHeadSubmissionIds.has(String(parentId))) provenHead = headSha;
+      } else {
+        // No parent-review id (older transport / minimal test shape). The only
+        // field that proves the ORIGINAL reviewed HEAD is `original_commit_id`,
+        // which GitHub never remaps. `commit_id` alone is not acceptable — it
+        // can have been remapped forward from a stale HEAD. Evidence
+        // insufficient -> ignore as current-head evidence (fail closed).
+        const immutableHead = c.originalCommitId ?? c.original_commit_id ?? null;
+        if (immutableHead && immutableHead === headSha) provenHead = headSha;
+      }
+      if (!provenHead) continue;
       const trust = checkPrReviewTrust({
-        raw: { login: c.login, headSha: reviewedHead },
+        raw: { login: c.login, headSha: provenHead },
         configuredReviewer: reviewer, currentHead: headSha, env,
       });
       if (trust.ok) trustedInline.push(c);
