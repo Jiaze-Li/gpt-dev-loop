@@ -145,6 +145,12 @@ export function decideConvergence({ loopState, review }) {
       verdict: REVIEW_VERDICTS.HUMAN_REQUIRED,
       reason: `still ${blockingCount} blocking finding(s) after ${round} review round(s)`,
       invokeSupervisor: false,
+      // The per-loop round budget is spent with blocking findings still open.
+      // The controller uses this to arm a durable PR-level human-intervention
+      // latch so a fresh reviewloop_begin cannot silently reset the counter.
+      nonConvergenceExhausted: true,
+      exhaustedRound: round,
+      maxRounds,
     };
   }
 
