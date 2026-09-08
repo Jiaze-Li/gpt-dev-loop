@@ -32,8 +32,8 @@ managed block; `npm run doctor` verifies the match with zero model calls.
   - `PUSH_REQUIRED` / `NO_PROGRESS` → change or push real state first.
 - A PR `reviewloop_begin` can return `HUMAN_APPROVAL_REQUIRED` (not a `loopId`):
   the PR's prior loop spent its round budget with blocking findings open and is
-  latched. You cannot clear it — report it; a human runs `reviewloop pr-latch
-  approve <prNumber>` to grant one fresh budget.
+  latched. Clearing it needs a signature from an approver key you do not hold —
+  you cannot do it. Report it and stop.
 
 ## Rules
 

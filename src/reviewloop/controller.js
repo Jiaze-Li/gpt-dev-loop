@@ -49,7 +49,14 @@ import {
   armPrLatch,
   consumePrLatchForBegin,
   resolvePrLatch,
+  trustedApproverKeys,
 } from './prLatch.js';
+import {
+  appendAuditEvent,
+  readAuditChain,
+  expectedLatchState,
+  PR_LATCH_EVENTS,
+} from './prLatchAudit.js';
 import { discoverVerificationCommands, runGate, GATE_VERDICTS } from './gatePolicy.js';
 import {
   normalizeReview,
@@ -211,12 +218,29 @@ export function createReviewLoopController({
       return await withInProcessLoopLock(latchKey, async () => {
         const lease = await acquireLoopFileLease({ runtimeRoot: fileLeaseRoot, loopId: latchKey });
         try {
-          const latch = await armPrLatch(persistence, {
+          const { latch, rearmed } = await armPrLatch(persistence, {
             repositoryIdentity, prNumber,
             exhaustedLoopId: loopState.loopId,
             exhaustedHead: head ?? loopState.lastReviewedPrHead ?? objective?.prHead ?? null,
             reason, round, maxRounds, clock,
           });
+          if (rearmed) {
+            try {
+              await appendAuditEvent(fileLeaseRoot, {
+                event: PR_LATCH_EVENTS.ARMED,
+                repositoryIdentity, prNumber, latchCount: latch.latchCount,
+                meta: { exhaustedLoopId: latch.exhaustedLoopId, exhaustedHead: latch.exhaustedHead, round: latch.round },
+                clock,
+              });
+            } catch (auditErr) {
+              collectSafetyEvent({
+                code: 'REVIEWLOOP_PR_LATCH_AUDIT_APPEND_FAILED',
+                severity: 'NON_BLOCKING', role: 'controller', taskId: loopState.loopId,
+                reason: `PR-latch armed but the audit-chain event could not be appended: ${auditErr?.message ?? auditErr}`,
+                actionTaken: 'the state-file latch still blocks reviewloop_begin; the audit cross-check may report tampering until the chain is repaired',
+              });
+            }
+          }
           onEvent?.({ type: 'REVIEWLOOP_PR_LATCH_ARMED', prNumber, repositoryIdentity, loopId: loopState.loopId });
           return {
             armed: true,
@@ -256,9 +280,17 @@ export function createReviewLoopController({
       await withInProcessLoopLock(latchKey, async () => {
         const lease = await acquireLoopFileLease({ runtimeRoot: fileLeaseRoot, loopId: latchKey });
         try {
-          await resolvePrLatch(persistence, {
+          const resolved = await resolvePrLatch(persistence, {
             repositoryIdentity, prNumber, byLoopId: loopState.loopId, clock,
           });
+          if (resolved && resolved.status === 'RESOLVED') {
+            await appendAuditEvent(fileLeaseRoot, {
+              event: PR_LATCH_EVENTS.RESOLVED,
+              repositoryIdentity, prNumber, latchCount: resolved.latchCount ?? null,
+              meta: { byLoopId: loopState.loopId },
+              clock,
+            }).catch(() => {});
+          }
         } finally {
           await lease.release?.();
         }
@@ -339,31 +371,63 @@ export function createReviewLoopController({
       // PR HUMAN_REQUIRED latch. A PR whose prior loop exhausted its review-round
       // budget with blocking findings still open is latched: no new loop, no
       // external review trigger, until a human explicitly approves one via
-      // `reviewloop pr-latch approve <prNumber>`. A changed HEAD, a push, edits,
+      // a signed `reviewloop pr-latch approve <prNumber>`. A changed HEAD, edits,
       // passing tests, a fresh MCP process, or a different reviewer do NOT clear
       // it. This runs BEFORE any loop state is written and BEFORE any trigger.
       const repositoryIdentity = await repoIdentityFor(cwd);
       const latchKey = prLatchKey(repositoryIdentity, prNumber);
+      const trustedKeys = trustedApproverKeys(env);
       const gate = await withInProcessLoopLock(latchKey, async () => {
         const lease = await acquireLoopFileLease({ runtimeRoot: fileLeaseRoot, loopId: latchKey });
         try {
-          return await consumePrLatchForBegin(persistence, {
-            repositoryIdentity, prNumber, newLoopId: loopId, clock,
+          // 1. Tamper check against the hash-chained audit log. If the chain is
+          //    broken, or it says this PR is latched while the state file says
+          //    otherwise, fail closed — never trust a rewritten state file.
+          const chain = await readAuditChain(fileLeaseRoot);
+          const auditExpectation = chain.ok
+            ? expectedLatchState(chain.entries, { repositoryIdentity, prNumber })
+            : null;
+
+          const decision = await consumePrLatchForBegin(persistence, {
+            repositoryIdentity, prNumber, newLoopId: loopId, trustedKeys, clock,
           });
+
+          if (!chain.ok) {
+            return { allowed: false, tampered: true, reason: `PR-latch audit chain integrity check failed: ${chain.reason}`, latch: decision.latch };
+          }
+          if (auditExpectation?.latched && decision.allowed && !decision.consumedApprovalId) {
+            return { allowed: false, tampered: true, reason: 'PR-latch audit log shows this PR is latched but the latch state file does not — treating as tampered', latch: decision.latch };
+          }
+
+          if (decision.allowed && decision.consumedApprovalId) {
+            await appendAuditEvent(fileLeaseRoot, {
+              event: PR_LATCH_EVENTS.APPROVAL_CONSUMED,
+              repositoryIdentity, prNumber,
+              latchCount: decision.latch?.latchCount ?? null,
+              meta: { approvalId: decision.consumedApprovalId, byLoopId: loopId },
+              clock,
+            }).catch(() => {});
+          }
+          return decision;
         } finally {
           await lease.release?.();
         }
       });
       if (!gate.allowed) {
-        onEvent?.({ type: 'REVIEWLOOP_BEGIN_BLOCKED', prNumber, repositoryIdentity, latchKey });
+        onEvent?.({ type: 'REVIEWLOOP_BEGIN_BLOCKED', prNumber, repositoryIdentity, latchKey, tampered: Boolean(gate.tampered), forgedApprovalAttempt: Boolean(gate.forgedApprovalAttempt) });
+        const keyStatus = trustedKeys.size === 0
+          ? 'This ReviewLoop runtime has NO configured approver key (REVIEWLOOP_APPROVER_PUBKEYS is unset), so a human approval cannot be cryptographically verified — no command will clear this latch. A human must configure a trusted approver key and issue a signed approval, or (having independently verified the findings) remove the latch state directly.'
+          : `Clearing requires a signed approval from a trusted approver key: a human runs \`reviewloop pr-latch approve ${prNumber}\` with the private key, which produces an Ed25519 signature ReviewLoop verifies against REVIEWLOOP_APPROVER_PUBKEYS. The Worker cannot produce this signature.`;
         return {
           status: 'HUMAN_APPROVAL_REQUIRED',
           blocked: true,
+          tampered: Boolean(gate.tampered),
           loopId: null,
           mode,
           prNumber,
           repositoryIdentity,
           reviewer: reviewer ?? 'codex',
+          approverKeyConfigured: trustedKeys.size > 0,
           latch: {
             exhaustedLoopId: gate.latch?.exhaustedLoopId ?? null,
             exhaustedHead: gate.latch?.exhaustedHead ?? null,
@@ -372,15 +436,16 @@ export function createReviewLoopController({
             maxRounds: gate.latch?.maxRounds ?? null,
             latchCount: gate.latch?.latchCount ?? 1,
             createdAt: gate.latch?.createdAt ?? null,
+            status: gate.latch?.status ?? null,
           },
-          reason: `PR #${prNumber} is under a ReviewLoop HUMAN_REQUIRED latch: loop `
-            + `${gate.latch?.exhaustedLoopId ?? '(unknown)'} exhausted its `
-            + `${gate.latch?.maxRounds ?? 3}-round review budget on HEAD `
-            + `${(gate.latch?.exhaustedHead ?? '(unknown)').slice(0, 12)} with blocking findings still open `
-            + `(${gate.latch?.reason ?? 'non-convergence'}). ReviewLoop will not start a new loop or trigger `
-            + `another review for this PR. A human must run \`reviewloop pr-latch approve ${prNumber}\` `
-            + `(repository identity: ${repositoryIdentity}) to authorize exactly one fresh review budget. `
-            + `Pushing a new HEAD, editing code, passing tests, changing reviewer, or starting a new session does NOT clear this latch.`,
+          reason: gate.tampered
+            ? `PR #${prNumber} (${repositoryIdentity}): ${gate.reason}. ReviewLoop will not start a new loop until a human resolves this.`
+            : `PR #${prNumber} is under a ReviewLoop HUMAN_REQUIRED latch: loop `
+              + `${gate.latch?.exhaustedLoopId ?? '(unknown)'} exhausted its `
+              + `${gate.latch?.maxRounds ?? 3}-round review budget on HEAD `
+              + `${(gate.latch?.exhaustedHead ?? '(unknown)').slice(0, 12)} with blocking findings still open. `
+              + `Pushing a new HEAD, editing code, passing tests, changing reviewer, or a new session does NOT clear it. `
+              + keyStatus,
         };
       }
     }
