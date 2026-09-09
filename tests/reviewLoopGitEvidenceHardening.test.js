@@ -88,6 +88,40 @@ test('active path: a pre-existing untracked symlink makes the baseline evidence 
   }
 });
 
+test('fail closed: a pre-existing untracked file modified but still untracked cannot be attributed to the Worker', async () => {
+  const dir = initRepo();
+  try {
+    // Pre-existing untracked file present at baseline — only a digest is kept.
+    fs.writeFileSync(path.join(dir, 'scratch.txt'), 'PRE_EXISTING_SECRET line 1\nline 2\n');
+    const baseline = await captureBaseline({ cwd: dir });
+    assert.equal('scratch.txt' in baseline.untrackedHashes, true);
+
+    // Worker edits it but never `git add`s it — stays untracked, so it never
+    // reaches the trackedChanged / modifiedStagedBaseline guard.
+    fs.appendFileSync(path.join(dir, 'scratch.txt'), 'worker added line\n');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+
+    assert.equal(delta.evidenceComplete, false, 'fails the evidence closed');
+    assert.ok(delta.incompleteReasons.some((r) => /modified after baseline/i.test(r)));
+    assert.ok((delta.modifiedUntrackedBaseline ?? []).includes('scratch.txt'));
+    assert.equal(delta.untrackedChanged.includes('scratch.txt'), false, 'never attributed as Worker output');
+    assert.doesNotMatch(delta.diff, /PRE_EXISTING_SECRET/, 'pre-existing content never emitted as Worker evidence');
+    assert.doesNotMatch(delta.diff, /worker added line/, 'the file is not rendered as a whole-new-file block');
+
+    // The controller fails closed rather than reviewing.
+    const controller = createReviewLoopController({
+      persistence: new MemoryPersistence(),
+      captureBaselineFn: async () => baseline,
+      reviewerFn: async () => { throw new Error('reviewer must not be called'); },
+    });
+    const { loopId } = await controller.begin({ goal: 'g', cwd: dir });
+    assert.equal((await controller.review({ loopId })).status, 'HUMAN_REQUIRED');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('active path: an untracked special file (FIFO) fails the evidence closed', async () => {
   const responses = {
     'rev-parse HEAD': { code: 0, stdout: 'cur0000\n' },

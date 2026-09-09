@@ -150,6 +150,46 @@ test('reviewloop_begin({ prNumber }) with no reviewer defaults to codex', async 
   assert.deepEqual(backend.state.triggers.map((t) => t.reviewer), ['codex']);
 });
 
+test('a cancelled PR review never posts an external trigger', async () => {
+  const backend = mockPrBackend({
+    heads: ['H1'],
+    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
+  });
+  const { controller } = build({ prBackend: backend });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+  const ac = new AbortController();
+  ac.abort();
+  const r = await controller.review({ loopId, signal: ac.signal });
+  assert.equal(r.status, 'HUMAN_REQUIRED');
+  assert.notEqual(r.terminal, true, 'a cancellation is not budget-exhausted');
+  assert.equal(backend.state.triggers.length, 0, 'no @codex trigger posted for an abandoned request');
+  assert.equal(backend.state.waits, 0, 'never waited on a review');
+});
+
+test('reviewloop_begin threads the caller AbortSignal into the baseline Gate', async () => {
+  const persistence = new MemoryPersistence();
+  let gateSawSignal = 'not-called';
+  const controller = createReviewLoopController({
+    persistence,
+    captureBaselineFn: async () => ({ head: 'H', baselineRef: 'H', dirtyFiles: [], untrackedHashes: {}, evidenceComplete: true }),
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo hi'], manifestFingerprint: 'mf' }),
+    runGateFn: async ({ signal }) => { gateSawSignal = signal ? 'yes' : 'no'; return { verdict: 'PASS', pass: true, results: [], evidence: {} }; },
+  });
+  const ok = new AbortController();
+  await controller.begin({ goal: 'g', cwd: '/r', signal: ok.signal });
+  assert.equal(gateSawSignal, 'yes', 'the Gate invocation received the request signal');
+
+  // An already-cancelled begin aborts before the Gate runs at all.
+  gateSawSignal = 'not-called';
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await assert.rejects(
+    () => controller.begin({ goal: 'g', cwd: '/r', signal: cancelled.signal }),
+    /cancelled by the caller/,
+  );
+  assert.equal(gateSawSignal, 'not-called', 'the Gate never ran for a cancelled begin');
+});
+
 test('an internal identity can never be a PR reviewer', async () => {
   const { createReviewObjective } = await import('../src/reviewloop/objective.js');
   assert.throws(() => createReviewObjective({ loopId: 'l', goal: 'g', mode: 'PR', prNumber: 4, reviewer: 'internal' }), /PR reviewer must be one of/);

@@ -171,10 +171,11 @@ export function createReviewLoopController({
   async function begin({
     goal, cwd, prNumber = null, reviewer = null,
     verificationCommands = null, blockingSeverities, maxReviewRounds,
-    constraints = [],
+    constraints = [], signal = null,
   } = {}) {
     if (!goal || !String(goal).trim()) throw new Error('reviewloop_begin: goal is required');
     if (!cwd) throw new Error('reviewloop_begin: cwd is required');
+    if (signal?.aborted) throw new Error('reviewloop_begin: cancelled by the caller before the baseline was captured');
     const loopId = `rl-${new Date(clock()).toISOString().replace(/[^0-9]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}`;
     const mode = prNumber != null ? REVIEW_MODES.PR : REVIEW_MODES.LOCAL;
 
@@ -202,10 +203,13 @@ export function createReviewLoopController({
       // B8 — baseline Gate evidence, 0 model tokens, over the FROZEN plan. Only
       // when trusted/discoverable verification exists; a failure to run it is
       // recorded as incomplete coverage, never faked as PASS.
+      if (signal?.aborted) throw new Error('reviewloop_begin: cancelled by the caller before the baseline Gate ran');
       let baselineGateRan = false;
       try {
         if (verificationPlan.source !== 'mechanical' && verificationPlan.commands.length) {
-          const g = await runGateFn({ cwd, commands: verificationPlan.commands, runner: gateRunner, env });
+          const g = await runGateFn({
+            cwd, commands: verificationPlan.commands, runner: gateRunner, env, signal,
+          });
           baselineGateRan = true;
           baselineGate = {
             evidence: g.evidence ?? { results: g.results ?? [], pass: g.pass },
@@ -215,8 +219,14 @@ export function createReviewLoopController({
           };
         }
       } catch (err) {
+        // A caller cancellation is NOT "incomplete Gate coverage" — it aborts
+        // reviewloop_begin so no loop is registered for an abandoned request.
+        if (signal?.aborted) {
+          throw new Error(`reviewloop_begin: cancelled by the caller during the baseline Gate (${String(err?.message ?? err)})`);
+        }
         baselineGate = { coverage: 'INCOMPLETE', reason: String(err?.message ?? err) };
       }
+      if (signal?.aborted) throw new Error('reviewloop_begin: cancelled by the caller after the baseline Gate ran');
       // The baseline Gate may itself mutate tracked files (a snapshot test, a
       // codegen/format check). Re-capture the baseline AFTER it runs so those
       // Gate-caused edits are part of the baseline and are never later
@@ -235,6 +245,7 @@ export function createReviewLoopController({
       }
     } else {
       if (!prBackend) throw new Error('reviewloop_begin: PR mode requires a PR backend');
+      if (signal?.aborted) throw new Error('reviewloop_begin: cancelled by the caller');
       prHead = await prBackend.getPrHead({ prNumber });
       if (!prHead) throw new Error(`reviewloop_begin: cannot resolve HEAD for PR #${prNumber}`);
     }
@@ -878,6 +889,12 @@ export function createReviewLoopController({
         })),
       });
     } catch (err) {
+      // A spend/authorization denial (SPEND_DENIED, MODEL_SPEND_USAGE_UNRESOLVED
+      // — a call was dispatched but its usage could not be settled, UNKNOWN !=
+      // ZERO) is a deliberate fail-closed stop, NOT a degradable transient: it
+      // returns `denied` and the caller surfaces it as-is. Any other error
+      // (provider pool exhausted with settled accounting, non-auth non-retryable
+      // failure) is a degradable transient.
       if (isAuthorizationFailure(err)) return { denied: true, error: err };
       return { humanRequired: true, reason: `Supervisor call failed: ${err?.message ?? err}` };
     }
@@ -901,11 +918,15 @@ export function createReviewLoopController({
   //   { result }   — ready to return from the caller (terminal HUMAN_REQUIRED)
   //   { guidance } — continue the in-line REWORK path with this guidance
   // A `terminal` "Supervisor recommends human involvement" spends the budget. A
-  // TRANSIENT failure (caller cancelled, transport threw, malformed output —
-  // `humanRequired` WITHOUT `terminal`) does NOT stall the loop: it degrades to
-  // a plain REWORK round (guidance: null). The Worker still has the finding, the
-  // round cap is still the stagnation circuit-breaker, and a later
+  // degradable TRANSIENT failure (`humanRequired` WITHOUT `terminal`: caller
+  // cancelled before dispatch, provider pool exhausted with settled accounting,
+  // output unusable but the call settled) does NOT stall the loop: it degrades
+  // to a plain REWORK round (guidance: null). The Worker still has the finding,
+  // the round cap is still the stagnation circuit-breaker, and a later
   // persistent-finding round can retry the Supervisor (supervisorInvoked reset).
+  // NOTE: a dispatched call whose usage cannot be settled
+  // (MODEL_SPEND_USAGE_UNRESOLVED) never reaches here — runSupervisor returns
+  // `denied` and the caller fails closed, by design (UNKNOWN != ZERO).
   async function applySupervisorOutcome({
     sup, loopState, review, spend, escalationReason,
   }) {

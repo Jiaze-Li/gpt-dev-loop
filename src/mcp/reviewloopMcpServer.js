@@ -66,12 +66,13 @@ export function createReviewLoopMcpServer({
         reviewer: z.string(),
       },
     },
-    async ({ goal, cwd: reqCwd, prNumber, reviewer }) => {
+    async ({ goal, cwd: reqCwd, prNumber, reviewer }, extra) => {
       const res = await ctl.begin({
         goal,
         cwd: reqCwd ? path.resolve(reqCwd) : cwd,
         prNumber: prNumber ?? null,
         reviewer: reviewer ?? null,
+        signal: extra?.signal,
       });
       const structured = {
         loopId: res.loopId,

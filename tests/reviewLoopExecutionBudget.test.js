@@ -110,7 +110,7 @@ test('PR: a new independent reviewloop_begin starts a fresh budget from round 1'
   assert.equal(r.status, 'PASS');
 });
 
-test('PR: a transient Supervisor failure degrades to a plain REWORK — loop not stalled, budget not spent', async () => {
+test('PR: a settled-but-unusable Supervisor result degrades to a plain REWORK — loop not stalled, budget not spent', async () => {
   const persistence = new MemoryPersistence();
   // Same P1 on H1 and H2 -> round 2 triggers the Supervisor.
   const backend = mockPrBackend({ heads: ['H1', 'H2', 'H3', 'H4'] });
@@ -118,7 +118,8 @@ test('PR: a transient Supervisor failure degrades to a plain REWORK — loop not
   const controller = createReviewLoopController({
     persistence,
     prBackend: backend,
-    // Malformed (empty guidance) -> transient humanRequired, NOT terminal.
+    // A call that SETTLES (known usage) but yields no usable guidance -> a
+    // degradable transient failure, NOT terminal.
     supervisorFn: async () => {
       supCalls += 1;
       return { value: { guidance: '', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } };
@@ -148,6 +149,28 @@ test('PR: a transient Supervisor failure degrades to a plain REWORK — loop not
   assert.equal(r3.status, 'HUMAN_REQUIRED');
   assert.equal(r3.round, 3);
   assert.equal(r3.terminal, true);
+});
+
+test('PR: a Supervisor call dispatched with unresolvable usage is the deliberate fail-closed stop (not a degrade)', async () => {
+  const persistence = new MemoryPersistence();
+  const backend = mockPrBackend({ heads: ['H1', 'H2', 'H3', 'H4'] });
+  const controller = createReviewLoopController({
+    persistence,
+    prBackend: backend,
+    // Provider threw mid-call: the reservation cannot be settled (UNKNOWN != ZERO).
+    supervisorFn: async () => { throw new Error('socket hang up'); },
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+
+  assert.equal((await controller.review({ loopId })).status, 'REWORK');
+  backend.advanceHead();
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'HUMAN_REQUIRED', 'unresolved model spend fails closed');
+  assert.notEqual(r2.terminal, true, 'a spend-safety stop is not budget-exhausted');
+  assert.match(r2.reason, /model spend blocked/i);
+
+  const persisted = await persistence.readWorkflowState(loopId);
+  assert.notEqual(persisted.reviewLoop.budgetExhausted, true);
 });
 
 test('PR: a clean review PASSes normally', async () => {

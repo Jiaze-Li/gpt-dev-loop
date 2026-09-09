@@ -90,6 +90,17 @@ export function createPrReviewController({
       return { outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED, reason: 'cannot resolve current PR HEAD' };
     }
 
+    // Caller cancellation: never post a (potentially paid) external review
+    // trigger or spend the per-HEAD trigger budget for an abandoned request.
+    // Checked here, again immediately before authorization, and again before
+    // dispatching the trigger comment.
+    const cancelledOutcome = () => ({
+      outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED,
+      head: currentHead,
+      reason: 'the PR review was cancelled by the caller before an external trigger was dispatched',
+    });
+    if (signal?.aborted) return cancelledOutcome();
+
     // Local Worker fixes not pushed: PR HEAD unchanged since last review -> do
     // NOT request a fresh external review of the unchanged head.
     if (loopState.lastReviewedPrHead && loopState.lastReviewedPrHead === currentHead
@@ -153,6 +164,7 @@ export function createPrReviewController({
 
     let permit;
     if (!reattach) {
+      if (signal?.aborted) return cancelledOutcome();
       let decision;
       try {
         decision = await authority.authorize({
@@ -176,6 +188,7 @@ export function createPrReviewController({
         };
       } else {
         permit = decision.permit;
+        if (signal?.aborted) return cancelledOutcome();
         let dispatched = null;
         try {
           dispatched = await authority.dispatch(permit, {

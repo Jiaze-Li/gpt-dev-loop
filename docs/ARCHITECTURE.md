@@ -289,12 +289,17 @@ Default: `blockingSeverities = [P1, P2]`, `maxReviewRounds = 3`.
 
 Only a Supervisor that actually adjudicates the loop non-convergent
 (`recommendation = "HUMAN_REQUIRED"`) ends it — that HUMAN_REQUIRED is terminal
-(`budgetExhausted`). A *transient* Supervisor failure (caller cancelled,
-transport threw, malformed output) is never valid guidance and never terminal:
-the round degrades to a plain REWORK (`REVIEWLOOP_SUPERVISOR_UNAVAILABLE`
-non-blocking safety event, `supervisorInvoked` reset so a later persistent
-round can retry). The `maxReviewRounds` cap remains the stagnation
-circuit-breaker regardless.
+(`budgetExhausted`). A *degradable transient* Supervisor failure — caller
+cancelled before dispatch, provider pool exhausted with settled accounting,
+output unusable but the call settled — is never valid guidance and never
+terminal: the round degrades to a plain REWORK
+(`REVIEWLOOP_SUPERVISOR_UNAVAILABLE` non-blocking safety event,
+`supervisorInvoked` reset so a later persistent round can retry). The
+`maxReviewRounds` cap remains the stagnation circuit-breaker regardless. The one
+exception is the same spend-safety stop as everywhere else: a Supervisor call
+that was dispatched but whose usage cannot be settled
+(`MODEL_SPEND_USAGE_UNRESOLVED`, UNKNOWN ≠ ZERO) fails closed to a
+non-terminal `HUMAN_REQUIRED` and does not degrade.
 
 The zero-provider `benchmark:transports` harness mechanically covers the
 controller paths E2E-A (one-round PASS), E2E-B (REWORK → changed implementation

@@ -254,6 +254,7 @@ export async function collectWorkerDelta({
   const baselineUntracked = baseline.untrackedHashes ?? {};
   const untrackedChanged = [];
   const untrackedDeleted = [];
+  const modifiedUntrackedBaseline = [];
   const safeBytes = new Map(); // filePath -> Buffer (regular files only)
 
   for (const filePath of currentUntracked) {
@@ -264,11 +265,20 @@ export async function collectWorkerDelta({
       fail(fp.reason);
       continue;
     }
-    safeBytes.set(filePath, fp.bytes);
     if (!(filePath in baselineUntracked)) {
+      safeBytes.set(filePath, fp.bytes);
       untrackedChanged.push(filePath); // brand-new regular file -> Worker output
     } else if (fp.digest !== baselineUntracked[filePath]) {
-      untrackedChanged.push(filePath); // pre-existing untracked, content changed
+      // Pre-existing untracked file whose content changed since baseline, still
+      // untracked (so it never enters the trackedChanged / modifiedStagedBaseline
+      // path). The baseline retained only a digest, so an honest baseline->current
+      // delta cannot be built: emitting the file as Worker output would leak its
+      // unchanged pre-existing sections (possibly unrelated or sensitive) to the
+      // Reviewer. Fail closed — same rationale as modifiedStagedBaseline. Its
+      // bytes are NOT staged for evidence emission.
+      modifiedUntrackedBaseline.push(filePath);
+      fail(`pre-existing untracked file ${filePath} was modified after baseline — `
+        + 'only a baseline digest was retained, so its pre-existing content cannot be separated from the Worker\'s change');
     }
     // pre-existing untracked, unchanged -> NOT Worker output, excluded.
   }
@@ -320,7 +330,9 @@ export async function collectWorkerDelta({
   }
 
   const changedFiles = [
-    ...new Set([...trackedChanged, ...untrackedChanged, ...untrackedDeleted]),
+    ...new Set([
+      ...trackedChanged, ...untrackedChanged, ...untrackedDeleted, ...modifiedUntrackedBaseline,
+    ]),
   ].sort();
 
   // Full worker-attributed evidence text: the tracked diff, the COMPLETE
@@ -367,6 +379,7 @@ export async function collectWorkerDelta({
     trackedChanged,
     untrackedChanged,
     untrackedDeleted,
+    modifiedUntrackedBaseline,
     evidenceComplete,
     incompleteReasons,
     noWorkerChangeYet,
