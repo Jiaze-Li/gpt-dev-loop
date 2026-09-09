@@ -494,11 +494,11 @@ test('controller: a single-call token anomaly is a safety stop — no failover, 
   assert.equal(r.status, 'HUMAN_REQUIRED');
   assert.match(r.reason, /token anomaly|MODEL_SPEND_TOKEN_ANOMALY/i);
   // (12) no auto-failover to the next Reviewer candidate
-  assert.deepEqual(tried, ['agy:gemini-reviewer']);
+  assert.deepEqual(tried, ['agy:opus']);
   // (13) provider health / quota untouched
   assert.deepEqual(providerFailures, []);
-  assert.equal(health.get('agy:gemini-reviewer').status, 'UNKNOWN');
-  assert.equal(quota.usable('agy:gemini-reviewer'), true);
+  assert.equal(health.get('agy:opus').status, 'UNKNOWN');
+  assert.equal(quota.usable('agy:opus'), true);
   // BLOCKING safety event surfaced
   assert.equal(r.safetyEvents.some((e) => e.code === 'MODEL_SPEND_TOKEN_ANOMALY' && e.severity === 'BLOCKING'), true);
   // durable latch + full accounting of the anomalous call

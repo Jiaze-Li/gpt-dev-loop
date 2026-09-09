@@ -69,13 +69,13 @@ test('parseArgs rejects a missing/invalid role and a family outside the role poo
 // ---- candidate matrix: completeness + duplicate prevention --------------
 
 test('candidate matrix matches the required candidate set exactly', () => {
-  assert.deepEqual(CANDIDATES.reviewer, ['agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus']);
+  assert.deepEqual(CANDIDATES.reviewer, ['agy:opus', 'agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus']);
   assert.deepEqual(CANDIDATES.supervisor, ['agy:gemini-supervisor', 'codex:default', 'agy:sonnet', 'claude:opus']);
   // derived straight from the production policy — no second source of truth
   for (const role of VALID_ROLES) {
     assert.deepEqual(CANDIDATES[role], DEFAULT_ROLE_POLICY[role].map((e) => e.family));
   }
-  assert.equal(ALL_CANDIDATES.length, 9);
+  assert.equal(ALL_CANDIDATES.length, 10);
 });
 
 test('no duplicate candidate within a role, and no duplicate role|family across the matrix', () => {

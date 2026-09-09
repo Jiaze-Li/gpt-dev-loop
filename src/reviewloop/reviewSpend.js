@@ -197,6 +197,7 @@ const ACCOUNTING_CLASS_BY_FAMILY = Object.freeze({
   'agy:gemini-supervisor': 'agy',
   'agy:gpt-oss': 'agy',
   'agy:sonnet': 'agy',
+  'agy:opus': 'agy',
 });
 
 const ACCOUNTING_CLASS_BY_PROVIDER = Object.freeze({

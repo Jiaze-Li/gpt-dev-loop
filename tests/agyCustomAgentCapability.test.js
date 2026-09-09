@@ -159,7 +159,7 @@ test('pool: agent missing / capability unsupported -> AGY families UNAVAILABLE, 
     customAgentSupport: { supported: false, reason: 'agy fell back to the default agent' },
     callAgy: async () => { called = true; return { text: '{"findings":[]}' }; },
   });
-  for (const f of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:sonnet']) {
+  for (const f of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:sonnet', 'agy:opus']) {
     assert.equal(pool.runtimeStatus[f].runtimeAvailable, false);
     assert.equal(pool.transports[f], undefined);
     assert.match(pool.runtimeStatus[f].reason, /does not load the isolated reviewloop-minimal agent/);
@@ -185,8 +185,8 @@ test('pool: capability supported but a call fell back to the default agent -> ra
     (err) => err.code === 'AGY_ISOLATION_UNVERIFIED' && /unverified/.test(err.message),
   );
   // the whole AGY pool is now fenced off so bounded failover routes AWAY
-  for (const f of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:sonnet']) {
-    const role = (f === 'agy:gpt-oss' || f === 'agy:gemini-reviewer') ? 'reviewer' : 'supervisor';
+  for (const f of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:sonnet', 'agy:opus']) {
+    const role = (f === 'agy:gpt-oss' || f === 'agy:gemini-reviewer' || f === 'agy:opus') ? 'reviewer' : 'supervisor';
     assert.equal(pool.route(role, { allowHighContext: true })?.family?.startsWith('agy:') ?? false, false);
   }
 });

@@ -25,11 +25,13 @@ import os from 'node:os';
 // walks the whole list in order on any safe retryable provider/quota failure
 // until the pool is exhausted; every listed candidate is mechanically reachable
 // (asserted by the pool-completeness + traversal tests). Normal production
-// path: Worker = Claude (external) / Reviewer = AGY Gemini (low effort) /
-// Supervisor = AGY Gemini (medium effort). The two Gemini heads are distinct
-// role-specific family identities (agy:gemini-reviewer / agy:gemini-supervisor)
-// with a FIXED per-role reasoning effort baked into the family — see
-// modelFamilyResolver.js. They share the one `agy-gemini` quota pool.
+// path: Worker = Claude (external) / Reviewer = AGY Claude Opus (agy:opus, AGY
+// "Claude & GPT" pool) / Supervisor = AGY Gemini (medium effort, AGY Gemini
+// pool) — the two role primaries sit in DIFFERENT quota pools on purpose. The
+// two Gemini heads are distinct role-specific family identities
+// (agy:gemini-reviewer / agy:gemini-supervisor) with a FIXED per-role reasoning
+// effort baked into the family — see modelFamilyResolver.js. They share the one
+// `agy-gemini` quota pool.
 export const DEFAULT_ROLE_POLICY = Object.freeze({
   // agy:gpt-oss is NOT a Supervisor candidate: its live certification passed
   // transport / accounting / isolation but its decision output violated the
@@ -41,7 +43,14 @@ export const DEFAULT_ROLE_POLICY = Object.freeze({
     { family: 'agy:sonnet', effort: 'medium' },
     { family: 'claude:opus', effort: 'medium' },
   ]),
+  //
+  // The Reviewer first choice (agy:opus, AGY "Claude & GPT" pool) is
+  // deliberately a DIFFERENT quota pool from the Supervisor first choice
+  // (agy:gemini-supervisor, AGY Gemini pool) so a quota cooldown on one role's
+  // primary never silently disables the other role's primary too. agy:opus is
+  // Reviewer-only — it is NOT added to the Supervisor pool.
   reviewer: Object.freeze([
+    { family: 'agy:opus', effort: 'medium' },
     { family: 'agy:gemini-reviewer', effort: 'low' },
     { family: 'codex:default', effort: 'medium' },
     { family: 'agy:sonnet', effort: 'medium' },
@@ -50,9 +59,9 @@ export const DEFAULT_ROLE_POLICY = Object.freeze({
   ]),
 });
 
-// agy:sonnet + agy:gpt-oss share ONE AGY "Claude & GPT" quota pool
-// (`agy-claude-gpt`): a quota-exhaustion cooldown on either takes the other out
-// of routing without a wasted probe call. agy:gemini-reviewer +
+// agy:opus + agy:sonnet + agy:gpt-oss share ONE AGY "Claude & GPT" quota pool
+// (`agy-claude-gpt`): a quota-exhaustion cooldown on any one takes the other
+// two out of routing without a wasted probe call. agy:gemini-reviewer +
 // agy:gemini-supervisor likewise share ONE SEPARATE `agy-gemini` pool: a
 // Gemini quota/rate cooldown on either role head cools the other too.
 export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
@@ -60,6 +69,7 @@ export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
   'claude:opus': ['claude'],
   'agy:gemini-reviewer': ['agy-gemini'],
   'agy:gemini-supervisor': ['agy-gemini'],
+  'agy:opus': ['agy-claude-gpt'],
   'agy:sonnet': ['agy-claude-gpt'],
   'agy:gpt-oss': ['agy-claude-gpt'],
 });
@@ -76,6 +86,9 @@ export const PRODUCTION_ROLE_CAPABILITIES = Object.freeze({
   // a Supervisor escalation (or vice versa).
   'agy:gemini-reviewer': Object.freeze(['reviewer']),
   'agy:gemini-supervisor': Object.freeze(['supervisor']),
+  // AGY-hosted Claude Opus is enabled for the Reviewer role only for now; the
+  // Supervisor pool is deliberately left unchanged.
+  'agy:opus': Object.freeze(['reviewer']),
   'agy:sonnet': Object.freeze(['supervisor', 'reviewer']),
   // Reviewer-only: certified Supervisor transport/accounting/isolation but its
   // decision output does not conform to the Supervisor schema.

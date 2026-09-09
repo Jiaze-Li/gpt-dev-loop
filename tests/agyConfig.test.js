@@ -7,6 +7,8 @@ import {
   resolveAgySupervisorFamily,
   resolveAgyReviewerFamily,
   resolveAgyModel,
+  resolveAgyOpusModel,
+  resolveAgyOpusFamily,
   agyModelLabel,
 } from '../src/agy/agyConfig.js';
 
@@ -60,6 +62,17 @@ test('per-role vars are independent of each other', () => {
   const env = { AGY_GEMINI_SUPERVISOR_MODEL: 'gemini-3.5-flash-medium', AGY_GEMINI_REVIEWER_MODEL: 'gemini-3.5-flash-low' };
   assert.equal(resolveAgySupervisorModel(env), 'gemini-3.5-flash-medium');
   assert.equal(resolveAgyReviewerModel(env), 'gemini-3.5-flash-low');
+});
+
+test('resolveAgyOpus* resolves AGY Claude Opus dynamically from the catalog, never pinned by default', () => {
+  assert.equal(resolveAgyOpusModel({}), null);
+  assert.equal(resolveAgyOpusFamily({}).resolvedFrom, 'provider_default');
+  assert.equal(resolveAgyOpusFamily({}).concreteVersionPinned, false);
+  assert.equal(resolveAgyOpusFamily({}).provider, 'agy-claude-gpt');
+  const cat = ['claude-opus-4-6', 'claude-opus-5-0', 'claude-sonnet-4-6'];
+  assert.equal(resolveAgyOpusModel({}, { agyCatalog: cat }), 'claude-opus-5-0');
+  assert.equal(resolveAgyOpusFamily({}, { agyCatalog: cat }).resolvedFrom, 'runtime_catalog');
+  assert.equal(resolveAgyOpusModel({ REVIEWLOOP_AGY_OPUS_MODEL: 'claude-opus-4-6' }, { agyCatalog: cat }), 'claude-opus-4-6');
 });
 
 test('resolveAgyModel is an AGY_MODEL-only shared fallback (null otherwise)', () => {

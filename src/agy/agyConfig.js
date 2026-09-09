@@ -3,10 +3,11 @@
 // ReviewLoop configuration binds each role to an ordered pool of stable model
 // FAMILIES, never a concrete released version (see
 // src/orchestrator/modelFamilyResolver.js + roleRouting.js DEFAULT_ROLE_POLICY).
-// The AGY families in those pools are agy:gemini-reviewer, agy:gemini-supervisor,
-// agy:sonnet and agy:gpt-oss; the helpers below resolve the two Gemini role
-// heads (Reviewer head = agy:gemini-reviewer / -low, Supervisor head =
-// agy:gemini-supervisor / -medium) for the telemetry/label layers.
+// The AGY families in those pools are agy:opus, agy:gemini-reviewer,
+// agy:gemini-supervisor, agy:sonnet and agy:gpt-oss; the helpers below resolve
+// the two Gemini role heads (Reviewer Gemini head = agy:gemini-reviewer / -low,
+// Supervisor head = agy:gemini-supervisor / -medium) and the AGY Claude Opus
+// Reviewer primary (agy:opus) for the telemetry/label layers.
 //
 // Concrete model resolution order (never throws):
 //   1. explicit env override — pins a concrete id (tests / benchmark / repro):
@@ -56,4 +57,15 @@ export function resolveAgySupervisorFamily(env = process.env, { agyCatalog = nul
 
 export function resolveAgyReviewerFamily(env = process.env, { agyCatalog = null } = {}) {
   return resolveModelFamily('agy:gemini-reviewer', { env, agyCatalog });
+}
+
+// AGY-hosted Claude Opus (Reviewer primary / first choice). Concrete id resolves from the live
+// `agy models` catalog (`catalogPrefix: 'claude-opus-'`) at pool construction —
+// never a long-term concrete version pin. null -> provider default.
+export function resolveAgyOpusModel(env = process.env, { agyCatalog = null } = {}) {
+  return resolveModelFamily('agy:opus', { env, agyCatalog }).resolvedModel;
+}
+
+export function resolveAgyOpusFamily(env = process.env, { agyCatalog = null } = {}) {
+  return resolveModelFamily('agy:opus', { env, agyCatalog });
 }

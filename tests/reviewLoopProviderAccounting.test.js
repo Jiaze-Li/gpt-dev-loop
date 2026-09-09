@@ -21,6 +21,7 @@ test('accountingClassOf resolves from family, then provider, never a model name'
   assert.equal(accountingClassOf({ family: 'claude:opus' }), 'anthropic');
   assert.equal(accountingClassOf({ family: 'agy:gemini-supervisor' }), 'agy');
   assert.equal(accountingClassOf({ family: 'agy:gpt-oss' }), 'agy');
+  assert.equal(accountingClassOf({ family: 'agy:opus' }), 'agy');
   assert.equal(accountingClassOf({ provider: 'codex' }), 'openai');
   assert.equal(accountingClassOf({ provider: 'agy-gemini' }), 'agy');
   assert.equal(accountingClassOf({ family: 'gpt-5-codex-high' }), 'unknown');

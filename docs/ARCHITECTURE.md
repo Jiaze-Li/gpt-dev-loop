@@ -89,6 +89,7 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | `agy:gemini-reviewer` | same as `agy:gpt-oss` (fixed effort **low** → catalog resolves `gemini-*-low`) | same as `agy:gpt-oss` | Reviewer head; shares the `agy-gemini` quota pool with `agy:gemini-supervisor` |
 | `agy:gemini-supervisor` | same as `agy:gpt-oss` (fixed effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | **definitive isolated-agent live result**: Supervisor usageVolume 2933, resolvedModel `gemini-3.8-flash-medium`, effectiveLoadingVerified + isolationVerified |
 | `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | live-certified: Reviewer usageVolume 3191, Supervisor 3303, resolvedModel `claude-sonnet-4-6`, isolationVerified |
+| `agy:opus` | same as `agy:gpt-oss` (AGY-hosted Claude Opus; `catalogPrefix: 'claude-opus-'` → newest catalog Opus, currently `claude-opus-4-6`, resolved dynamically at pool construction — never a long-term version pin) | same as `agy:gpt-oss` | **Reviewer role only** — Reviewer first choice; shares the `agy-claude-gpt` quota pool with `agy:sonnet` + `agy:gpt-oss` |
 
 **AGY minimal-agent transport — effective loading**:
 ReviewLoop runs every AGY family through the `reviewloop-minimal` agent
@@ -144,18 +145,27 @@ simply walks the list in order.
 
 | Order | Reviewer | Supervisor |
 | --- | --- | --- |
-| 1 | `agy:gemini-reviewer` (effort **low**) | `agy:gemini-supervisor` (effort **medium**) |
-| 2 | `codex:default` | `codex:default` |
-| 3 | `agy:sonnet` | `agy:sonnet` |
-| 4 | `agy:gpt-oss` | `claude:opus` |
-| 5 | `claude:opus` | — |
+| 1 | `agy:opus` (AGY Claude Opus, `agy-claude-gpt` pool) | `agy:gemini-supervisor` (effort **medium**, `agy-gemini` pool) |
+| 2 | `agy:gemini-reviewer` (effort **low**) | `codex:default` |
+| 3 | `codex:default` | `agy:sonnet` |
+| 4 | `agy:sonnet` | `claude:opus` |
+| 5 | `agy:gpt-oss` | — |
+| 6 | `claude:opus` | — |
 
-Normal production path: Worker = Claude (external), Reviewer = AGY Gemini at
-**low** effort, Supervisor = AGY Gemini at **medium** effort. The two Gemini
-heads are distinct role-scoped family identities (`agy:gemini-reviewer` /
-`agy:gemini-supervisor`), each locked to one role and one effort, sharing the
-single `agy-gemini` quota pool. GPT-OSS is a deliberate low-cost Reviewer
-fallback (not degraded).
+Normal production path: Worker = Claude (external), Reviewer = AGY Claude Opus
+(`agy:opus`), Supervisor = AGY Gemini at **medium** effort. The two role
+primaries deliberately sit in **different quota pools** — the Reviewer's
+`agy:opus` in `agy-claude-gpt`, the Supervisor's `agy:gemini-supervisor` in
+`agy-gemini` — so a quota cooldown on one role's first choice never silently
+disables the other role's first choice. `agy:opus` is enabled for the Reviewer
+role only; the Supervisor pool is unchanged. It resolves its concrete Opus
+model dynamically from the AGY runtime catalog (`catalogPrefix: 'claude-opus-'`)
+and reuses the same `reviewloop-minimal` isolation / token accounting /
+ModelSpendAuthority / sentinel / bounded-failover path as every other AGY
+family. The two Gemini heads remain distinct role-scoped family identities
+(`agy:gemini-reviewer` / `agy:gemini-supervisor`), each locked to one role and
+one effort, sharing the single `agy-gemini` quota pool. GPT-OSS is a deliberate
+low-cost Reviewer fallback (not degraded).
 
 **`agy:gpt-oss` is NOT a Supervisor candidate.** Its live Supervisor
 certification succeeded on transport, token accounting and agent isolation, but
@@ -168,7 +178,7 @@ Reviewer candidate. `PRODUCTION_ROLE_CAPABILITIES['agy:gpt-oss']` is therefore
 `['reviewer']`.
 
 No production family is `highContext`: every AGY family (`agy:gemini-reviewer`,
-`agy:gemini-supervisor`, `agy:gpt-oss`, `agy:sonnet`) runs through the isolated
+`agy:gemini-supervisor`, `agy:opus`, `agy:gpt-oss`, `agy:sonnet`) runs through the isolated
 `reviewloop-minimal` agent, and the definitive `agy:gemini-supervisor` result
 (usageVolume 2933) is in line with the other families, so the Gemini heads
 participate in ordinary automatic routing — they are **not** excluded on a
@@ -180,8 +190,8 @@ needs it, but nothing sets the flag today.
 ### Shared quota topology
 
 ```
-agy:sonnet             ─┐
-                        ├─ agy-claude-gpt  (one AGY "Claude & GPT" quota pool)
+agy:opus               ─┐
+agy:sonnet             ─┼─ agy-claude-gpt  (one AGY "Claude & GPT" quota pool)
 agy:gpt-oss            ─┘
 agy:gemini-reviewer    ─┐
                         ├─ agy-gemini      (one separate Gemini quota pool —
@@ -190,11 +200,17 @@ codex:default          ── codex
 claude:opus            ── claude
 ```
 
-A `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_RATE_LIMITED` cooldown on `agy:sonnet`
-puts `agy-claude-gpt` into cooldown, so the sibling `agy:gpt-oss` is skipped at
-route time — no wasted physical call to confirm the same pool is empty. A
-model-specific `agy:sonnet` health failure that is NOT a quota failure leaves
-the shared pool healthy and `agy:gpt-oss` still selectable; family health and
+The Reviewer first choice (`agy:opus`, `agy-claude-gpt`) and the Supervisor
+first choice (`agy:gemini-supervisor`, `agy-gemini`) are in different pools by
+design: a cooldown on one role's primary pool leaves the other role's primary
+routable.
+
+A `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_RATE_LIMITED` cooldown on any one of
+`agy:opus` / `agy:sonnet` / `agy:gpt-oss` puts `agy-claude-gpt` into cooldown,
+so the other two are skipped at route time — no wasted physical call to confirm
+the same pool is empty. A model-specific health failure that is NOT a quota
+failure leaves the shared pool healthy and the siblings still selectable;
+family health and
 shared-pool health stay independent.
 
 ### Automatic failover (the user does not participate)
@@ -244,11 +260,11 @@ protocol error rather than an auth or inference failure. The value is now
 
 **Dynamic model-family resolution** preserves family semantics without
 concrete release pins. `agy:gemini-reviewer` / `agy:gemini-supervisor` /
-`agy:gpt-oss` / `agy:sonnet` resolve from the probed `agy models` catalog when
-available (by `catalogPrefix`: `gemini-` / `gemini-` / `gpt-oss-` /
-`claude-sonnet-`, honouring the family's `defaultEffort` —
+`agy:gpt-oss` / `agy:sonnet` / `agy:opus` resolve from the probed `agy models`
+catalog when available (by `catalogPrefix`: `gemini-` / `gemini-` / `gpt-oss-` /
+`claude-sonnet-` / `claude-opus-`, honouring the family's `defaultEffort` —
 `agy:gemini-reviewer` = `low`, `agy:gemini-supervisor` = `medium`,
-`agy:gpt-oss` = `medium`, `agy:sonnet` = none; when the exact effort variant is
+`agy:gpt-oss` = `medium`, `agy:sonnet` = none, `agy:opus` = none; when the exact effort variant is
 absent, resolution falls back to the newest entry, preferring higher effort on
 a version tie). The two Gemini heads are SEPARATE stable family identities, one
 per role, so the concrete `-low` / `-medium` id is bound at pool construction

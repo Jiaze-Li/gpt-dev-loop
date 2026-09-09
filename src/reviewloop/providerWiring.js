@@ -47,7 +47,7 @@ const CLI_TRANSPORT_FACTORY = Object.freeze({
 });
 
 // Every ReviewLoop-owned AGY family (agy:gemini-reviewer, agy:gemini-supervisor,
-// agy:gpt-oss, agy:sonnet, ...):
+// agy:opus, agy:gpt-oss, agy:sonnet, ...):
 // derived from the registry so a newly-registered agy:* family is wired through
 // the same isolated `reviewloop-minimal` path automatically — never left as an
 // unwired policy entry, and never silently falling back to AGY's ambient agent.

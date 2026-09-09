@@ -16,7 +16,7 @@ const resolver = (family) => ({
   capabilities: { supportsReasoningEffort: true, supportedEfforts: ['medium', 'high'], roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [] },
 });
 
-const REVIEWER_ORDER = ['agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus'];
+const REVIEWER_ORDER = ['agy:opus', 'agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus'];
 const SUPERVISOR_ORDER = ['agy:gemini-supervisor', 'codex:default', 'agy:sonnet', 'claude:opus'];
 
 test('active roles are exactly supervisor + reviewer — no planner, no executor', () => {
@@ -47,6 +47,7 @@ test('active roles are exactly supervisor + reviewer — no planner, no executor
 test('production capabilities are role-scoped as declared', () => {
   const ROLE_SCOPED = {
     'agy:gpt-oss': ['reviewer'],
+    'agy:opus': ['reviewer'],
     'agy:gemini-reviewer': ['reviewer'],
     'agy:gemini-supervisor': ['supervisor'],
   };
@@ -60,6 +61,8 @@ test('production capabilities are role-scoped as declared', () => {
   assert.equal(supportsProductionRole('agy:gpt-oss', 'supervisor'), false);
   assert.equal(supportsProductionRole('agy:gemini-reviewer', 'supervisor'), false);
   assert.equal(supportsProductionRole('agy:gemini-supervisor', 'reviewer'), false);
+  assert.equal(supportsProductionRole('agy:opus', 'reviewer'), true);
+  assert.equal(supportsProductionRole('agy:opus', 'supervisor'), false);
   assert.equal(supportsProductionRole('codex:default', 'executor'), false);
   assert.equal(supportsProductionRole('codex:default', 'planner'), false);
 });
@@ -89,6 +92,7 @@ test('agy:gpt-oss is never routed as Supervisor even when every other family is 
   assert.equal(sel, null);
   // but it IS still a Reviewer candidate
   const rHealth = new ProviderHealthRegistry();
+  rHealth.record('agy:opus', 'UNAVAILABLE');
   rHealth.record('agy:gemini-reviewer', 'UNAVAILABLE');
   rHealth.record('codex:default', 'UNAVAILABLE');
   rHealth.record('agy:sonnet', 'UNAVAILABLE');
@@ -98,23 +102,29 @@ test('agy:gpt-oss is never routed as Supervisor even when every other family is 
   );
 });
 
-test('the two Gemini heads share one agy-gemini quota pool; agy:sonnet + agy:gpt-oss share another', () => {
+test('the two Gemini heads share one agy-gemini quota pool; agy:opus + agy:sonnet + agy:gpt-oss share another', () => {
   const quota = new QuotaPoolRegistry({ filePath: null });
+  assert.deepEqual(quota.poolsFor('agy:opus'), ['agy-claude-gpt']);
   assert.deepEqual(quota.poolsFor('agy:sonnet'), ['agy-claude-gpt']);
   assert.deepEqual(quota.poolsFor('agy:gpt-oss'), ['agy-claude-gpt']);
   assert.deepEqual(quota.poolsFor('agy:gemini-reviewer'), ['agy-gemini']);
   assert.deepEqual(quota.poolsFor('agy:gemini-supervisor'), ['agy-gemini']);
 
   // A Gemini quota-exhaustion cooldown on either role head takes BOTH out of
-  // routing — one shared pool, one shared cooldown.
+  // routing — one shared pool, one shared cooldown — but never the Claude&GPT
+  // pool that the Reviewer primary (agy:opus) sits in.
   quota.recordProviderFailure('agy:gemini-reviewer', { code: 'PROVIDER_QUOTA_EXHAUSTED' });
   assert.equal(quota.usable('agy:gemini-reviewer'), false);
   assert.equal(quota.usable('agy:gemini-supervisor'), false);
+  assert.equal(quota.usable('agy:opus'), true);
   assert.equal(quota.usable('agy:sonnet'), true);
 
-  // conversely, a Claude&GPT cooldown does not touch the Gemini pool
+  // conversely, a Claude&GPT cooldown (here triggered on agy:opus) does not
+  // touch the Gemini pool, but DOES take the sibling agy:sonnet + agy:gpt-oss
+  // out of routing.
   const quota2 = new QuotaPoolRegistry({ filePath: null });
-  quota2.recordProviderFailure('agy:sonnet', { code: 'PROVIDER_QUOTA_EXHAUSTED' });
+  quota2.recordProviderFailure('agy:opus', { code: 'PROVIDER_QUOTA_EXHAUSTED' });
+  assert.equal(quota2.usable('agy:opus'), false);
   assert.equal(quota2.usable('agy:sonnet'), false);
   assert.equal(quota2.usable('agy:gpt-oss'), false);
   assert.equal(quota2.usable('agy:gemini-reviewer'), true);
@@ -132,6 +142,8 @@ test('reset expiry becomes UNKNOWN', () => {
 test('provider health failure removes a family without touching policy', () => {
   const health = new ProviderHealthRegistry();
   const router = new RoleRouter({ providerHealth: health, resolveFamily: resolver });
+  assert.equal(router.route('reviewer').requestedFamily, 'agy:opus');
+  health.record('agy:opus', 'UNAVAILABLE');
   assert.equal(router.route('reviewer').requestedFamily, 'agy:gemini-reviewer');
   health.record('agy:gemini-reviewer', 'UNAVAILABLE');
   assert.equal(router.route('reviewer').requestedFamily, 'codex:default');

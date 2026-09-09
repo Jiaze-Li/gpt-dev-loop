@@ -131,6 +131,6 @@ test('pool: locally unauthenticated CLI families are skipped deterministically b
   });
   assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
   assert.equal(pool.runtimeStatus['claude:opus'].runtimeAvailable, false);
-  assert.equal(pool.route('reviewer').family, 'agy:gemini-reviewer');
+  assert.equal(pool.route('reviewer').family, 'agy:opus');
   assert.equal(pool.route('supervisor').family, 'agy:gemini-supervisor');
 });

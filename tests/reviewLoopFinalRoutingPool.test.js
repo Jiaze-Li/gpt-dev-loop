@@ -20,7 +20,7 @@ import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MINIMAL_AGY_AGENT_NAME } from '../src/reviewloop/adapters/minimalAgyAgent.js';
 import { MemoryPersistence, finding } from './helpers/reviewLoopHarness.js';
 
-const REVIEWER_ORDER = ['agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus'];
+const REVIEWER_ORDER = ['agy:opus', 'agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus'];
 const SUPERVISOR_ORDER = ['agy:gemini-supervisor', 'codex:default', 'agy:sonnet', 'claude:opus'];
 
 const resolver = (family) => ({
@@ -78,7 +78,7 @@ test('every AGY policy family runs through the reviewloop-minimal agent', async 
     callAgy: async (opts) => { seen.push(opts); return { text: '{"findings":[]}', usage: { input_tokens: 1, output_tokens: 1 } }; },
   });
   const agyFamilies = [...new Set([...REVIEWER_ORDER, ...SUPERVISOR_ORDER])].filter((f) => f.startsWith('agy:'));
-  assert.deepEqual(agyFamilies.sort(), ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:sonnet']);
+  assert.deepEqual(agyFamilies.sort(), ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:opus', 'agy:sonnet']);
   for (const f of agyFamilies) {
     await pool.transports[f]('P');
   }
@@ -146,11 +146,12 @@ function reviewerController({ persistence, failures, quota = new QuotaPoolRegist
   return { controller, tried, quota };
 }
 
-test('failover: Gemini + Codex + Sonnet unavailable -> GPT-OSS delivers the review, no user interaction', async () => {
+test('failover: Opus + Gemini + Codex + Sonnet unavailable -> GPT-OSS delivers the review, no user interaction', async () => {
   const persistence = new MemoryPersistence();
   const { controller, tried } = reviewerController({
     persistence,
     failures: {
+      'agy:opus': 'PROVIDER_UNAVAILABLE',
       'agy:gemini-reviewer': 'PROVIDER_UNAVAILABLE',
       'codex:default': 'PROVIDER_UNAVAILABLE',
       'agy:sonnet': 'PROVIDER_UNAVAILABLE',
@@ -159,14 +160,15 @@ test('failover: Gemini + Codex + Sonnet unavailable -> GPT-OSS delivers the revi
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
   const r = await controller.review({ loopId });
   assert.equal(r.status, 'PASS');
-  assert.deepEqual(tried, ['agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss']);
+  assert.deepEqual(tried, ['agy:opus', 'agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss']);
 });
 
-test('failover: fifth Reviewer candidate is reachable after 4 safe failures', async () => {
+test('failover: sixth Reviewer candidate is reachable after 5 safe failures', async () => {
   const persistence = new MemoryPersistence();
   const { controller, tried } = reviewerController({
     persistence,
     failures: {
+      'agy:opus': 'PROVIDER_UNAVAILABLE',
       'agy:gemini-reviewer': 'PROVIDER_UNAVAILABLE',
       'codex:default': 'PROVIDER_UNAVAILABLE',
       'agy:sonnet': 'PROVIDER_UNAVAILABLE',
@@ -176,7 +178,7 @@ test('failover: fifth Reviewer candidate is reachable after 4 safe failures', as
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
   const r = await controller.review({ loopId });
   assert.equal(r.status, 'PASS');
-  assert.deepEqual(tried, ['agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus']);
+  assert.deepEqual(tried, ['agy:opus', 'agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus']);
 });
 
 test('failover: shared AGY quota cooldown skips the sibling family without a physical call', async () => {
@@ -190,9 +192,10 @@ test('failover: shared AGY quota cooldown skips the sibling family without a phy
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
   const r = await controller.review({ loopId });
   assert.equal(r.status, 'PASS');
-  // agy:sonnet AND agy:gpt-oss share the exhausted pool -> neither physically
-  // tried; routing jumps straight to claude:opus. The agy-gemini pool is
-  // separate, so agy:gemini-reviewer is still physically attempted.
+  // agy:opus, agy:sonnet AND agy:gpt-oss all share the exhausted agy-claude-gpt
+  // pool -> none physically tried; routing jumps to the agy-gemini head, then
+  // codex, then straight to claude:opus. The agy-gemini pool is separate, so
+  // agy:gemini-reviewer is still physically attempted.
   assert.deepEqual(tried, ['agy:gemini-reviewer', 'codex:default', 'claude:opus']);
 });
 
@@ -204,13 +207,13 @@ test('safety stop (NOT a failover): unknown post-dispatch spend fails closed, ne
   // pre-send-zero PROVIDER_UNAVAILABLE on the Gemini head DOES safely advance.
   const { controller, tried } = reviewerController({
     persistence,
-    failures: { 'agy:gemini-reviewer': 'PROVIDER_UNAVAILABLE', 'codex:default': 'PROVIDER_PROTOCOL_ERROR', 'agy:sonnet': undefined },
+    failures: { 'agy:opus': 'PROVIDER_UNAVAILABLE', 'agy:gemini-reviewer': 'PROVIDER_UNAVAILABLE', 'codex:default': 'PROVIDER_PROTOCOL_ERROR', 'agy:sonnet': undefined },
   });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
   const r = await controller.review({ loopId });
   assert.equal(r.status, 'HUMAN_REQUIRED');
   assert.match(r.reason, /usage could not be reliably settled|unresolved model spend/i);
-  assert.deepEqual(tried, ['agy:gemini-reviewer', 'codex:default']); // third provider never reached
+  assert.deepEqual(tried, ['agy:opus', 'agy:gemini-reviewer', 'codex:default']); // later providers never reached
   const state = await persistence.readWorkflowState(loopId);
   const reservations = Object.values(state.modelSpendReservations ?? {});
   // the Gemini pre-send-zero failure rolled its reservation back; the codex

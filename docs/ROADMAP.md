@@ -41,6 +41,21 @@
 Deterministic/mock `npm test` + `npm run doctor` + `npm run
 benchmark:transports` green. No real-provider calls.
 
+- **Split-pool Reviewer primary (D27).** New `agy:opus` (AGY-hosted Claude
+  Opus) is the Reviewer first choice, in the `agy-claude-gpt` quota pool —
+  a different pool from the Supervisor first choice (`agy:gemini-supervisor`,
+  `agy-gemini`), so a quota cooldown on one role's primary never disables the
+  other's. `agy:opus` is Reviewer-role-only (Supervisor pool untouched),
+  resolves its concrete Opus dynamically from the AGY runtime catalog
+  (`catalogPrefix: 'claude-opus-'`, no pin), shares `agy-claude-gpt` with
+  `agy:sonnet` + `agy:gpt-oss` (one cooldown skips all three), and reuses the
+  existing `reviewloop-minimal` isolation / token accounting /
+  ModelSpendAuthority / sentinel / bounded failover. Reviewer routing:
+  `agy:opus → agy:gemini-reviewer → codex:default → agy:sonnet → agy:gpt-oss →
+  claude:opus`. The live-cert main Reviewer path
+  (`scripts/live-reviewloop-certify.mjs --mode reviewer`) now targets
+  `agy:opus`; its resolvedModel must be a `claude-opus-*` id.
+
 - `agy:gpt-oss` removed from the **Supervisor** production pool: its live
   Supervisor certification passed transport / accounting / isolation but its
   decision output violated the Supervisor decision schema

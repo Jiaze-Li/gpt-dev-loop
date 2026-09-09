@@ -28,7 +28,7 @@ import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
 test('1+2: the default config carries no concrete Gemini or GPT-OSS version pin', () => {
   assert.equal(defaultConfigHasConcreteVersionPin({}), false);
-  for (const family of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss']) {
+  for (const family of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:opus']) {
     const r = resolveModelFamily(family, { env: {}, agyCatalog: null });
     assert.equal(r.resolvedModel, null, family);
     assert.equal(r.resolvedFrom, RESOLUTION_SOURCE.PROVIDER_DEFAULT, family);
@@ -118,19 +118,47 @@ test('7: the two Gemini role heads resolve to their FIXED effort variant, newest
   assert.equal(MODEL_FAMILY_REGISTRY['agy:gpt-oss'].defaultEffort, 'medium');
 });
 
+test('agy:opus is the Reviewer head, shares the agy-claude-gpt pool, and resolves Opus dynamically from the catalog (never pinned)', () => {
+  const reg = MODEL_FAMILY_REGISTRY['agy:opus'];
+  assert.equal(reg.provider, 'agy-claude-gpt');
+  assert.equal(reg.catalogPrefix, 'claude-opus-');
+  assert.equal(reg.defaultEffort, null);
+  assert.equal(reg.stableAlias, null);
+
+  // No catalog -> provider default, nothing pinned.
+  const dflt = resolveModelFamily('agy:opus', { env: {}, agyCatalog: null });
+  assert.equal(dflt.resolvedModel, null);
+  assert.equal(dflt.resolvedFrom, RESOLUTION_SOURCE.PROVIDER_DEFAULT);
+  assert.equal(dflt.concreteVersionPinned, false);
+
+  // Catalog present -> newest Opus entry, resolved from the runtime catalog,
+  // and it advances with the catalog without any source edit.
+  const a = resolveModelFamily('agy:opus', { env: {}, agyCatalog: ['claude-opus-4-6', 'claude-sonnet-4-6', 'gpt-oss-120b-medium'] });
+  assert.equal(a.resolvedModel, 'claude-opus-4-6');
+  assert.equal(a.resolvedFrom, RESOLUTION_SOURCE.RUNTIME_CATALOG);
+  assert.equal(a.concreteVersionPinned, false);
+  const b = resolveModelFamily('agy:opus', { env: {}, agyCatalog: ['claude-opus-4-6', 'claude-opus-5-0'] });
+  assert.equal(b.resolvedModel, 'claude-opus-5-0');
+
+  // Env override still pins for tests / benchmark / repro.
+  const pinned = resolveModelFamily('agy:opus', { env: { REVIEWLOOP_AGY_OPUS_MODEL: 'claude-opus-4-6' }, agyCatalog: ['claude-opus-5-0'] });
+  assert.equal(pinned.resolvedModel, 'claude-opus-4-6');
+  assert.equal(pinned.resolvedFrom, RESOLUTION_SOURCE.ENV_OVERRIDE);
+});
+
 test('5: the durable reservation + spend record persist the ACTUAL resolved model', async () => {
   const persistence = new MemoryPersistence();
   const pool = createReviewLoopProviderPool({
     callAgy: async () => ({ text: '{"findings":[]}', model: 'gemini-3.8-flash-medium', usage: { input_tokens: 3, output_tokens: 1 } }),
-    agyCatalog: ['gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gpt-oss-999b-medium'],
+    agyCatalog: ['gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'claude-opus-4-6', 'gpt-oss-999b-medium'],
   });
   // agy:gemini-supervisor is first for supervisor and wired via reviewloop-minimal;
   // its model resolves to the newest -medium entry from the probed catalog.
   assert.equal(pool.route('supervisor').family, 'agy:gemini-supervisor');
   assert.equal(pool.route('supervisor').model, 'gemini-3.8-flash-medium');
-  // agy:gemini-reviewer is first for reviewer and resolves to the newest -low entry.
-  assert.equal(pool.route('reviewer').family, 'agy:gemini-reviewer');
-  assert.equal(pool.route('reviewer').model, 'gemini-3.8-flash-low');
+  // agy:opus is first for reviewer and resolves the newest Opus from the catalog.
+  assert.equal(pool.route('reviewer').family, 'agy:opus');
+  assert.equal(pool.route('reviewer').model, 'claude-opus-4-6');
 
   const controller = createReviewLoopController({
     persistence,

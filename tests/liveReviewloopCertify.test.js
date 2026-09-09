@@ -106,11 +106,11 @@ test('2. invalid mode -> zero wiring, non-zero exit', async () => {
   assert.equal(deps.probeReviewTransportRuntime.calls.length, 0);
 });
 
-test('3. reviewer mode drives the real controller production route to agy:gemini-reviewer (isolated, -low)', async () => {
+test('3. reviewer mode drives the real controller production route to agy:opus (isolated)', async () => {
   const agyCalls = [];
   const callAgy = async (opts) => {
     agyCalls.push(opts);
-    return { text: '{"findings":[]}', usage: { input_tokens: 1200, output_tokens: 20, total_tokens: 1220 }, model: 'gemini-3.8-flash-low' };
+    return { text: '{"findings":[]}', usage: { input_tokens: 1200, output_tokens: 20, total_tokens: 1220 }, model: 'claude-opus-4-6' };
   };
   const deps = {
     createProviders: () => fakeProviders({ callAgy }),
@@ -122,14 +122,14 @@ test('3. reviewer mode drives the real controller production route to agy:gemini
   assert.equal(output.status, 'PASS', JSON.stringify(output));
   assert.equal(exitCode, 0);
   assert.equal(output.terminal, 'PASS');
-  assert.equal(output.selectedReviewerFamily, 'agy:gemini-reviewer');
+  assert.equal(output.selectedReviewerFamily, 'agy:opus');
   assert.equal(output.reviewerCalls, 1);
   assert.equal(output.supervisorCalls, 0);
   // proves the review actually went through the controller + the isolated AGY transport
   assert.equal(agyCalls.length, 1);
   assert.equal(agyCalls[0].agent, 'reviewloop-minimal');
   assert.equal(agyCalls[0].cwd, narrowReviewTransportCwd());
-  assert.match(output.resolvedModel, /-low$/);
+  assert.match(output.resolvedModel, /^claude-opus-/);
   assert.equal(output.effectiveLoadingVerified, true);
   assert.equal(output.tempRepo, true);
 });
@@ -188,13 +188,13 @@ test('5. single-call ceilings: a first-call Supervisor failure does NOT fall bac
 
 const OK_FINDINGS = () => ({ text: '{"findings":[]}', usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }, model: 'gemini-cert-low' });
 
-test('R-A. reviewer: Gemini head skipped before dispatch -> router would pick codex -> zero Codex calls, FAIL', async () => {
+test('R-A. reviewer: Opus head skipped before dispatch -> router would pick the next family -> zero calls, FAIL', async () => {
   const agyCalls = [];
   const callAgy = async (opts) => { agyCalls.push(opts); return OK_FINDINGS(); };
   const deps = {
     createProviders: () => {
       const p = fakeProviders({ callAgy });
-      p.recordProviderFailure({ role: 'reviewer', family: 'agy:gemini-reviewer', provider: 'agy-gemini' }, { code: 'PROVIDER_UNAVAILABLE' });
+      p.recordProviderFailure({ role: 'reviewer', family: 'agy:opus', provider: 'agy-claude-gpt' }, { code: 'PROVIDER_UNAVAILABLE' });
       return p;
     },
     probeAgyModelCatalog: () => null,
@@ -205,16 +205,16 @@ test('R-A. reviewer: Gemini head skipped before dispatch -> router would pick co
   assert.equal(exitCode, 1);
   assert.equal(output.status, 'FAIL', JSON.stringify(output));
   assert.notEqual(output.terminal, 'PASS');
-  assert.deepEqual(output.suppressedFallbackFamilies, ['codex:default'], 'production routing would next choose codex:default');
+  assert.deepEqual(output.suppressedFallbackFamilies, ['agy:gemini-reviewer'], 'production routing would next choose agy:gemini-reviewer');
   assert.equal(agyCalls.length, 0, 'zero physical calls when the target is skipped before dispatch');
   assert.equal(output.reviewerCalls, 0);
 });
 
-test('R-B. reviewer: Gemini head selected -> retryable pre-send failure -> router advances to codex -> one Gemini call, zero Codex calls, FAIL', async () => {
+test('R-B. reviewer: Opus head selected -> retryable pre-send failure -> router advances -> one Opus call, zero fallback calls, FAIL', async () => {
   const agyCalls = [];
   const callAgy = async (opts) => {
     agyCalls.push(opts);
-    throw Object.assign(new Error('gemini pre-send failure'), { code: 'PROVIDER_UNAVAILABLE' });
+    throw Object.assign(new Error('opus pre-send failure'), { code: 'PROVIDER_UNAVAILABLE' });
   };
   const deps = {
     createProviders: () => fakeProviders({ callAgy }),
@@ -225,8 +225,8 @@ test('R-B. reviewer: Gemini head selected -> retryable pre-send failure -> route
   const { exitCode, output } = await main({ argv: ['--mode', 'reviewer'], env: { [OPT_IN_ENV]: '1' }, deps });
   assert.equal(exitCode, 1);
   assert.equal(output.status, 'FAIL', JSON.stringify(output));
-  assert.equal(agyCalls.length, 1, 'Gemini physicalInvocations = 1');
-  assert.deepEqual(output.suppressedFallbackFamilies, ['codex:default']);
+  assert.equal(agyCalls.length, 1, 'Opus physicalInvocations = 1');
+  assert.deepEqual(output.suppressedFallbackFamilies, ['agy:gemini-reviewer']);
 });
 
 test('S-A. supervisor: gemini unavailable -> router would pick codex -> zero Codex calls, FAIL', async () => {

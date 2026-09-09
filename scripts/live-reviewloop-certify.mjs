@@ -14,13 +14,14 @@
 //
 // Mode A (reviewer): certifies the normal production main path end to end —
 //   real temp git repo -> reviewloop_begin -> Worker delta -> deterministic
-//   Gate PASS -> production RoleRouter -> agy:gemini-reviewer (the Reviewer
-//   head, fixed to -low effort) -> real isolated reviewloop-minimal AGY
+//   Gate PASS -> production RoleRouter -> agy:opus (the Reviewer head — AGY
+//   Claude Opus, resolved dynamically from the AGY runtime catalog, AGY
+//   "Claude & GPT" quota pool) -> real isolated reviewloop-minimal AGY
 //   transport -> ModelSpendAuthority -> reservation -> provider-aware usage
 //   accounting -> ReviewPolicy -> terminal PASS. ANY failover to a second
 //   Reviewer family is a certification FAILURE (failover already has
 //   deterministic fake coverage; this run must not burn a second provider).
-//   resolvedModel MUST be a `gemini-*-low` id.
+//   resolvedModel MUST be a `claude-opus-*` id (or null = provider default).
 //
 // Mode B (supervisor): certifies the Gemini Medium Supervisor's controller
 //   integration with the least possible token spend. The Reviewer is a
@@ -146,18 +147,18 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     // Certification target isolation. Production RoleRouter still picks the
     // candidate (health / quota-cooldown aware), but this harness refuses to
     // physically dispatch anything outside the Reviewer certification scope
-    // (agy:gemini-reviewer — the production Reviewer head, fixed to -low effort,
-    // reached through the isolated reviewloop-minimal AGY transport). If the
-    // router would advance to a fallback family — because the Gemini head was
-    // skipped before dispatch, or because a first real call failed safely and
-    // failover re-routed — we record the family name only and hand the
-    // controller a null selection, which stops the failover loop with ZERO
-    // fallback-provider physical calls. Certification then FAILs on the missing
-    // terminal PASS / missing agy:gemini-reviewer selection.
+    // (agy:opus — the production Reviewer head, AGY Claude Opus reached through
+    // the isolated reviewloop-minimal AGY transport). If the router would
+    // advance to a fallback family — because the Opus head was skipped before
+    // dispatch, or because a first real call failed safely and failover
+    // re-routed — we record the family name only and hand the controller a null
+    // selection, which stops the failover loop with ZERO fallback-provider
+    // physical calls. Certification then FAILs on the missing terminal PASS /
+    // missing agy:opus selection.
     const routeReviewerFn = (signals) => {
       const sel = providers.routeReviewerFn(signals);
       if (!sel?.family) return sel;
-      if (sel.family !== 'agy:gemini-reviewer') {
+      if (sel.family !== 'agy:opus') {
         suppressedFallbackFamilies.push(sel.family);
         return null;
       }
@@ -191,8 +192,8 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     );
 
     if (res.status !== 'PASS') failures.push(`terminal is ${res.status}, expected PASS (${res.reason ?? ''})`);
-    if (selectedReviewerFamily !== 'agy:gemini-reviewer') {
-      failures.push(`selected Reviewer family is ${selectedReviewerFamily ?? 'none'}, expected agy:gemini-reviewer`);
+    if (selectedReviewerFamily !== 'agy:opus') {
+      failures.push(`selected Reviewer family is ${selectedReviewerFamily ?? 'none'}, expected agy:opus`);
     }
     if (reviewerSelections.length !== 1) failures.push(`Reviewer routed ${reviewerSelections.length} times (${reviewerSelections.join(' -> ')}); a single certification call must not failover`);
     if (suppressedFallbackFamilies.length) failures.push(`production routing would have dispatched an out-of-scope fallback Reviewer family: ${suppressedFallbackFamilies.join(', ')}`);
@@ -201,11 +202,11 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     if ((tel.supervisorCalls ?? 0) !== 0) failures.push(`supervisorCalls=${tel.supervisorCalls}, expected 0`);
     if (!usageResolved) failures.push('Reviewer usage was not resolved by provider-aware accounting');
     if (customAgentSupport?.supported !== true) failures.push(`agy custom-agent capability probe did not confirm isolated-agent loading: ${customAgentSupport?.reason ?? 'unknown'}`);
-    if (providers.runtimeStatus?.['agy:gemini-reviewer']?.effectiveLoadingVerified !== true) failures.push('agy:gemini-reviewer effective-loading verification is not active');
+    if (providers.runtimeStatus?.['agy:opus']?.effectiveLoadingVerified !== true) failures.push('agy:opus effective-loading verification is not active');
     const reviewerResolvedModel = reviewerRecord?.model
-      ?? providers.pool?.resolution?.['agy:gemini-reviewer']?.resolvedModel ?? null;
-    if (reviewerResolvedModel && !/-low$/.test(reviewerResolvedModel)) {
-      failures.push(`Reviewer resolvedModel ${reviewerResolvedModel} is not a -low Gemini variant (telemetry must never say low while calling another effort)`);
+      ?? providers.pool?.resolution?.['agy:opus']?.resolvedModel ?? null;
+    if (reviewerResolvedModel && !/^claude-opus-/.test(reviewerResolvedModel)) {
+      failures.push(`Reviewer resolvedModel ${reviewerResolvedModel} is not a claude-opus-* id (telemetry must record the concrete Opus actually called)`);
     }
 
     const status = failures.length ? 'FAIL' : 'PASS';
@@ -217,8 +218,8 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
         terminal: res.status,
         selectedReviewerFamily,
         resolvedModel: reviewerRecord?.model
-          ?? providers.pool?.resolution?.['agy:gemini-reviewer']?.resolvedModel ?? null,
-        effectiveLoadingVerified: providers.runtimeStatus?.['agy:gemini-reviewer']?.effectiveLoadingVerified === true,
+          ?? providers.pool?.resolution?.['agy:opus']?.resolvedModel ?? null,
+        effectiveLoadingVerified: providers.runtimeStatus?.['agy:opus']?.effectiveLoadingVerified === true,
         customAgentSupport: { supported: customAgentSupport?.supported === true, reason: customAgentSupport?.reason ?? null },
         reviewerCalls: tel.reviewerCalls ?? 0,
         supervisorCalls: tel.supervisorCalls ?? 0,

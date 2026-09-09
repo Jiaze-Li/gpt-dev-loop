@@ -37,7 +37,7 @@ export const MODEL_FAMILY_REGISTRY = Object.freeze({
   // and share the one `agy-gemini` quota pool (see roleRouting.js
   // DEFAULT_QUOTA_TOPOLOGY) — the split is purely effort + role intent.
   //
-  //   agy:gemini-reviewer   -> newest `gemini-*-low`     (Reviewer head)
+  //   agy:gemini-reviewer   -> newest `gemini-*-low`     (Reviewer Gemini head)
   //   agy:gemini-supervisor -> newest `gemini-*-medium`  (Supervisor head)
   //
   // TELEMETRY stays honest: the concrete `-low` / `-medium` id is what the AGY
@@ -74,11 +74,32 @@ export const MODEL_FAMILY_REGISTRY = Object.freeze({
     defaultEffort: 'medium',
     stableAlias: null,
   }),
+  // AGY-hosted Claude Opus — Reviewer head only (see roleRouting.js
+  // PRODUCTION_ROLE_CAPABILITIES). Shares the AGY "Claude & GPT" quota pool
+  // (`agy-claude-gpt`) with agy:sonnet + agy:gpt-oss, so a quota cooldown on
+  // that pool takes all three out of routing without a wasted probe.
+  // `catalogPrefix: 'claude-opus-'` resolves the newest Opus in the live
+  // `agy models` catalog at pool-construction time (currently
+  // `claude-opus-4-6`) — deliberately NOT a long-term concrete version pin, so
+  // ReviewLoop source needs no edit when AGY advances its Opus release. No
+  // reasoning-effort suffix variants exist for it, so `defaultEffort` is null.
+  // Same isolated `reviewloop-minimal` AGY transport / token accounting /
+  // ModelSpendAuthority / sentinel / bounded-failover path as the other AGY
+  // families.
+  'agy:opus': Object.freeze({
+    family: 'agy:opus',
+    provider: 'agy-claude-gpt',
+    cli: 'agy',
+    catalogPrefix: 'claude-opus-',
+    envKeys: Object.freeze(['REVIEWLOOP_AGY_OPUS_MODEL', 'AGY_OPUS_MODEL', 'AGY_MODEL']),
+    defaultEffort: null,
+    stableAlias: null,
+  }),
   // AGY-hosted Claude Sonnet. Shares the AGY "Claude & GPT" quota pool with
-  // agy:gpt-oss (provider === 'agy-claude-gpt'); agy:gemini is a SEPARATE pool.
-  // `catalogPrefix: 'claude-sonnet-'` selects the newest Sonnet in the live
-  // `agy models` catalog (currently `claude-sonnet-4-6`); no reasoning-effort
-  // suffix variants exist for it, so `defaultEffort` is null.
+  // agy:gpt-oss + agy:opus (provider === 'agy-claude-gpt'); agy:gemini is a
+  // SEPARATE pool. `catalogPrefix: 'claude-sonnet-'` selects the newest Sonnet
+  // in the live `agy models` catalog (currently `claude-sonnet-4-6`); no
+  // reasoning-effort suffix variants exist for it, so `defaultEffort` is null.
   'agy:sonnet': Object.freeze({
     family: 'agy:sonnet',
     provider: 'agy-claude-gpt',
