@@ -122,6 +122,66 @@ test('fail closed: a pre-existing untracked file modified but still untracked ca
   }
 });
 
+test('fail closed: a renamed pre-existing untracked file is not attributed as brand-new Worker output', async () => {
+  const dir = initRepo();
+  try {
+    fs.writeFileSync(path.join(dir, 'old-name.txt'), 'PRE_EXISTING_SECRET\nkeep me\n');
+    const baseline = await captureBaseline({ cwd: dir });
+
+    // Worker renames it (bytes unchanged) -> destination absent from the
+    // baseline untracked set, source now gone.
+    fs.renameSync(path.join(dir, 'old-name.txt'), path.join(dir, 'new-name.txt'));
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+
+    assert.equal(delta.evidenceComplete, false);
+    assert.ok(delta.incompleteReasons.some((r) => /byte-identical to a file that was untracked at baseline/i.test(r)));
+    assert.ok((delta.renamedUntrackedBaseline ?? []).includes('new-name.txt'));
+    assert.equal(delta.untrackedChanged.includes('new-name.txt'), false, 'the rename target is never emitted whole');
+    assert.doesNotMatch(delta.diff, /PRE_EXISTING_SECRET/, 'pre-existing content never leaks as Worker evidence');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fail closed: a pre-existing untracked file that the Worker modifies then git-ignores is not reported deleted', async () => {
+  const dir = initRepo();
+  try {
+    fs.writeFileSync(path.join(dir, 'scratch.log'), 'PRE_EXISTING_SECRET\n');
+    const baseline = await captureBaseline({ cwd: dir });
+    assert.equal('scratch.log' in baseline.untrackedHashes, true);
+
+    // Worker edits it AND adds it to .gitignore -> `git ls-files --others
+    // --exclude-standard` no longer lists it, but the file is still on disk.
+    fs.appendFileSync(path.join(dir, 'scratch.log'), 'worker line\n');
+    fs.writeFileSync(path.join(dir, '.gitignore'), 'scratch.log\n');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+
+    assert.equal(delta.evidenceComplete, false, 'fails closed rather than PASSing without reviewing it');
+    assert.ok(delta.incompleteReasons.some((r) => /git-ignored after baseline/i.test(r)));
+    assert.equal(delta.untrackedDeleted.includes('scratch.log'), false, 'a still-present file is not reported deleted');
+    assert.ok((delta.modifiedUntrackedBaseline ?? []).includes('scratch.log'));
+    assert.doesNotMatch(delta.diff, /PRE_EXISTING_SECRET/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a pre-existing untracked file that the Worker genuinely deletes is still reported deleted', async () => {
+  const dir = initRepo();
+  try {
+    fs.writeFileSync(path.join(dir, 'gone.txt'), 'temp\n');
+    const baseline = await captureBaseline({ cwd: dir });
+    fs.rmSync(path.join(dir, 'gone.txt'));
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, true);
+    assert.ok(delta.untrackedDeleted.includes('gone.txt'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('active path: an untracked special file (FIFO) fails the evidence closed', async () => {
   const responses = {
     'rev-parse HEAD': { code: 0, stdout: 'cur0000\n' },

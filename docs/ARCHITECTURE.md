@@ -493,10 +493,17 @@ runaway guard.
 **Untracked evidence** is never silently truncated: a Worker-touched untracked
 text file's full content reaches the Reviewer via the chunker; a binary or
 unreadable Worker-created file marks the evidence incomplete → `HUMAN_REQUIRED`;
-a deleted pre-existing untracked file is recognised as a Worker change. Every
-untracked path is `lstat`'d before it is read — a symlink, FIFO, socket, or
-device is never followed (it would fold an out-of-tree target's bytes into
-Reviewer evidence) and fails the evidence closed. Any git command that feeds
+a deleted pre-existing untracked file is recognised as a Worker change. A file
+that was untracked at baseline (only a digest was kept) but is now modified —
+whether still untracked, staged, or newly `.gitignore`d — cannot yield an
+honest baseline→current delta and fails the evidence closed rather than
+emitting its whole content; likewise a brand-new untracked path whose bytes are
+identical to a baseline-untracked file (a rename or copy of pre-existing
+content). A baseline-untracked path missing from the current listing is only
+called *deleted* after its absence from disk is confirmed. Every untracked path
+is `lstat`'d before it is read — a symlink, FIFO, socket, or device is never
+followed (it would fold an out-of-tree target's bytes into Reviewer evidence)
+and fails the evidence closed. Any git command that feeds
 baseline / diff / HEAD / untracked attribution fails closed on a non-zero exit
 — never absorbed as an empty diff, an empty set, or a fallback HEAD.
 

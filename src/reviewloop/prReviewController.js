@@ -194,12 +194,21 @@ export function createPrReviewController({
           dispatched = await authority.dispatch(permit, {
             workflowId: loopId, prNumber, headSha: currentHead, reviewer,
           }, async () => {
+            // authority.dispatch performs an awaited durable DISPATCHING write
+            // before this callback runs; the caller may have aborted in that
+            // window. Re-check immediately before the (potentially paid) post.
+            if (signal?.aborted) {
+              const e = new Error('the PR review was cancelled by the caller before the trigger comment was posted');
+              e.code = 'REVIEWLOOP_TRIGGER_CANCELLED';
+              throw e;
+            }
             const posted = await prBackend.postReviewTrigger({ prNumber, reviewer, headSha: currentHead });
             // The External Model Trigger Authority settles on a durable comment
             // id — never on a bare "it returned".
             return { id: posted?.id ?? posted?.commentId ?? posted?.triggerId ?? null, createdAt: posted?.createdAt };
           });
         } catch (err) {
+          if (signal?.aborted) return cancelledOutcome();
           if (isExternalTriggerFailure(err)) {
             return { outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED, reason: err.message, head: currentHead };
           }

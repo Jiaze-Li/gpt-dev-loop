@@ -252,9 +252,17 @@ export async function collectWorkerDelta({
   }
 
   const baselineUntracked = baseline.untrackedHashes ?? {};
+  // digest -> [baseline paths that had it], to catch a rename/copy of
+  // pre-existing untracked content into a name absent from the baseline set.
+  const baselineUntrackedDigests = new Map();
+  for (const [p, d] of Object.entries(baselineUntracked)) {
+    if (!baselineUntrackedDigests.has(d)) baselineUntrackedDigests.set(d, []);
+    baselineUntrackedDigests.get(d).push(p);
+  }
   const untrackedChanged = [];
   const untrackedDeleted = [];
   const modifiedUntrackedBaseline = [];
+  const renamedUntrackedBaseline = [];
   const safeBytes = new Map(); // filePath -> Buffer (regular files only)
 
   for (const filePath of currentUntracked) {
@@ -266,8 +274,18 @@ export async function collectWorkerDelta({
       continue;
     }
     if (!(filePath in baselineUntracked)) {
-      safeBytes.set(filePath, fp.bytes);
-      untrackedChanged.push(filePath); // brand-new regular file -> Worker output
+      if (baselineUntrackedDigests.has(fp.digest)) {
+        // Byte-identical to a file that was untracked at baseline under another
+        // name — a rename or copy of pre-existing content, not Worker-authored.
+        // Emitting it whole would leak all of that pre-existing content (and the
+        // old path would separately be reported deleted). Fail closed.
+        renamedUntrackedBaseline.push(filePath);
+        fail(`untracked file ${filePath} is byte-identical to a file that was untracked at baseline `
+          + `(${baselineUntrackedDigests.get(fp.digest).join(', ')}) — a rename/copy of pre-existing content, not Worker output`);
+      } else {
+        safeBytes.set(filePath, fp.bytes);
+        untrackedChanged.push(filePath); // brand-new regular file -> Worker output
+      }
     } else if (fp.digest !== baselineUntracked[filePath]) {
       // Pre-existing untracked file whose content changed since baseline, still
       // untracked (so it never enters the trackedChanged / modifiedStagedBaseline
@@ -325,13 +343,35 @@ export async function collectWorkerDelta({
     for (const filePath of Object.keys(baselineUntracked)) {
       // A path that is now staged (leaked, unchanged) was NOT deleted — it is
       // pre-existing user work that moved from untracked to the index.
-      if (!currentUntracked.has(filePath) && !leaked.has(filePath)) untrackedDeleted.push(filePath);
+      if (currentUntracked.has(filePath) || leaked.has(filePath) || trackedChanged.includes(filePath)) continue;
+      // Absent from the untracked listing but not staged/tracked. It is EITHER
+      // genuinely gone OR still on disk and now git-ignored (which hides it from
+      // `git ls-files --exclude-standard`). Classify it as deleted only after
+      // confirming it is actually gone — otherwise a modified-then-ignored file
+      // would be reported deleted while PASS proceeds without reviewing it.
+      // eslint-disable-next-line no-await-in-loop
+      const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
+      if (fp.unreadable) {
+        untrackedDeleted.push(filePath); // gone / unreadable -> a real deletion
+      } else if (!fp.safe) {
+        fail(fp.reason); // a symlink/special now sits where a regular file was
+      } else if (fp.digest === baselineUntracked[filePath]) {
+        // still present, unchanged, just newly ignored -> pre-existing user
+        // work, neither deleted nor Worker output; exclude it entirely.
+      } else {
+        // still present, content changed, now ignored -> the same leak as a
+        // modified-but-still-untracked file; fail closed.
+        modifiedUntrackedBaseline.push(filePath);
+        fail(`pre-existing untracked file ${filePath} was modified and then git-ignored after baseline — `
+          + 'only a baseline digest was retained, so its current content cannot be separated from the pre-existing bytes');
+      }
     }
   }
 
   const changedFiles = [
     ...new Set([
-      ...trackedChanged, ...untrackedChanged, ...untrackedDeleted, ...modifiedUntrackedBaseline,
+      ...trackedChanged, ...untrackedChanged, ...untrackedDeleted,
+      ...modifiedUntrackedBaseline, ...renamedUntrackedBaseline,
     ]),
   ].sort();
 
@@ -380,6 +420,7 @@ export async function collectWorkerDelta({
     untrackedChanged,
     untrackedDeleted,
     modifiedUntrackedBaseline,
+    renamedUntrackedBaseline,
     evidenceComplete,
     incompleteReasons,
     noWorkerChangeYet,

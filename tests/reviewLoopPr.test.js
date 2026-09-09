@@ -166,6 +166,32 @@ test('a cancelled PR review never posts an external trigger', async () => {
   assert.equal(backend.state.waits, 0, 'never waited on a review');
 });
 
+test('the trigger dispatch callback rechecks cancellation before posting', async () => {
+  const backend = mockPrBackend({
+    heads: ['H1'],
+    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
+  });
+  const sig = { aborted: false };
+  // A trigger authority that lets the pre-dispatch checks pass, then models the
+  // caller aborting during dispatch()'s durable write — just before the callback.
+  const triggerAuthority = {
+    async authorize() { return { outcome: 'DISPATCH', permit: { id: 'p1' } }; },
+    reservationIdFor() { return 'r1'; },
+    async dispatch(_permit, _intent, cb) { sig.aborted = true; return cb(); },
+    async recordResult() {},
+  };
+  const controller = createReviewLoopController({
+    persistence: new MemoryPersistence(),
+    prBackend: backend,
+    triggerAuthority,
+    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }),
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+  const r = await controller.review({ loopId, signal: sig });
+  assert.equal(r.status, 'HUMAN_REQUIRED');
+  assert.equal(backend.state.triggers.length, 0, 'the callback bailed before postReviewTrigger');
+});
+
 test('reviewloop_begin threads the caller AbortSignal into the baseline Gate', async () => {
   const persistence = new MemoryPersistence();
   let gateSawSignal = 'not-called';
