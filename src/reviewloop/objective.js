@@ -22,6 +22,25 @@ function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
 
+// The stable identity of the begin-time baseline Gate evidence — the exact
+// input to FAIL->WARN baseline-diff suppression at review time. `capturedAt` is
+// volatile and excluded; the failure evidence is hashed rather than embedded so
+// a large results payload never bloats the objective fingerprint. Returns null
+// when no baseline Gate ran (PR mode, or no discoverable verification), which
+// keeps a pre-existing objective's fingerprint unchanged.
+export function baselineGateEvidenceIdentity(bg) {
+  if (!bg || typeof bg !== 'object') return null;
+  const hasEvidence = bg.evidence && typeof bg.evidence === 'object';
+  const hasCoverage = typeof bg.coverage === 'string';
+  if (!hasEvidence && !hasCoverage) return null;
+  return {
+    pass: bg.pass ?? null,
+    source: bg.source ?? null,
+    coverage: bg.coverage ?? null,
+    evidenceHash: hasEvidence ? sha256(JSON.stringify(bg.evidence)) : null,
+  };
+}
+
 function freezeDeep(value) {
   if (value && typeof value === 'object') {
     for (const key of Object.keys(value)) freezeDeep(value[key]);
@@ -46,6 +65,7 @@ export function createReviewObjective({
   blockingSeverities = DEFAULT_BLOCKING_SEVERITIES,
   maxReviewRounds = DEFAULT_MAX_REVIEW_ROUNDS,
   verificationPlan = null,
+  baselineGateEvidence = null,
   createdAt = new Date().toISOString(),
 } = {}) {
   if (!loopId) throw new Error('createReviewObjective: loopId is required');
@@ -105,6 +125,11 @@ export function createReviewObjective({
         frozenAt: verificationPlan.frozenAt ?? createdAt,
       }
       : null,
+    // The begin-time baseline Gate evidence identity. Folded into the
+    // fingerprint so a state editor cannot rewrite loopState.baselineGateEvidence
+    // to make a newly-introduced test failure compare as pre-existing (FAIL ->
+    // WARN -> PASS). Only stored when a baseline Gate actually ran.
+    baselineGateEvidence: baselineGateEvidenceIdentity(baselineGateEvidence),
     createdAt,
   };
 
@@ -139,6 +164,11 @@ function fingerprintFields(o) {
       untrackedHashes: o.baseline.untrackedHashes ?? {},
       evidenceComplete: o.baseline.evidenceComplete !== false,
     };
+  }
+  // Baseline Gate evidence identity — load-bearing for FAIL->WARN suppression.
+  // Only folded in when present, so a pre-baselineGate objective keeps its hash.
+  if (o.baselineGateEvidence && typeof o.baselineGateEvidence === 'object') {
+    base.baselineGateEvidence = o.baselineGateEvidence;
   }
   return sha256(JSON.stringify(base));
 }
@@ -194,6 +224,10 @@ export function assertObjectiveNotWeakened(original, candidate) {
     : 'null');
   if (baselineIdentity(candidate.baseline) !== baselineIdentity(original.baseline)) {
     problems.push('baseline changed');
+  }
+  if (JSON.stringify(candidate.baselineGateEvidence ?? null)
+    !== JSON.stringify(original.baselineGateEvidence ?? null)) {
+    problems.push('baseline Gate evidence identity changed');
   }
   const origBlocking = new Set(original.blockingSeverities ?? []);
   for (const sev of origBlocking) {

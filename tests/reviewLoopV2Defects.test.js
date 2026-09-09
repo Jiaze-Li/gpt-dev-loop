@@ -265,6 +265,48 @@ test('cancelling a LOCAL reviewloop_review stops it before the Reviewer is dispa
   assert.equal(spend.filter((x) => x.role === 'reviewer').length, 0, 'zero paid Reviewer spend records');
 });
 
+test('baseline Gate evidence is bound to the objective; a tampered copy is ignored for FAIL->WARN suppression', async () => {
+  const realEvidence = { results: [{ command: 'npm test', exitCode: 1, pass: false }], pass: false };
+  let seenAtReview;
+  const mk = (persistence) => createReviewLoopController({
+    persistence,
+    captureBaselineFn: async () => ({ head: 'H', baselineRef: 'H', dirtyFiles: [], untrackedHashes: {}, evidenceComplete: true }),
+    collectWorkerDeltaFn: async () => ({
+      baselineHead: 'H', currentHead: 'H', evidenceComplete: true, noWorkerChangeYet: false,
+      changedFiles: ['a.js'], fingerprint: 'FP', diff: 'diff',
+    }),
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['npm test'], manifestFingerprint: 'mf' }),
+    runGateFn: async ({ baselineGateEvidence }) => {
+      seenAtReview = baselineGateEvidence;
+      return { verdict: 'FAIL', pass: false, fingerprint: 'G', failureIdentities: ['npm-test'], results: [], evidence: realEvidence };
+    },
+    reviewerFn: async () => ({ value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } }),
+  });
+
+  const persistence = new MemoryPersistence();
+  const controller = mk(persistence);
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r' });
+
+  // Untampered: the objective-bound identity matches, so the real evidence flows.
+  await controller.review({ loopId });
+  assert.deepEqual(seenAtReview, realEvidence, 'genuine baseline Gate evidence is passed through');
+
+  // Tamper the persisted evidence (a state editor injecting the current failure).
+  const st = await persistence.readWorkflowState(loopId);
+  st.reviewLoop.baselineGateEvidence.evidence = {
+    results: [{ command: 'npm test', exitCode: 1, pass: false, injected: true }], pass: false,
+  };
+  await persistence.writeWorkflowState(loopId, st);
+
+  seenAtReview = 'unset';
+  const r = await mk(persistence).review({ loopId });
+  assert.equal(seenAtReview, null, 'tampered baseline Gate evidence is NOT used for suppression');
+  assert.ok(
+    (r.safetyEvents ?? []).some((e) => e.code === 'REVIEWLOOP_BASELINE_GATE_EVIDENCE_UNVERIFIED'),
+    JSON.stringify(r.safetyEvents),
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 9. Gate zombie teardown is hard-bounded (never an unbounded await).
 // ---------------------------------------------------------------------------

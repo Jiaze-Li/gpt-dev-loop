@@ -23,6 +23,7 @@ import {
   createReviewObjective,
   rehydrateObjective,
   assertObjectiveNotWeakened,
+  baselineGateEvidenceIdentity,
   REVIEW_MODES,
 } from './objective.js';
 import {
@@ -263,6 +264,7 @@ export function createReviewLoopController({
       loopId, goal, repository, mode, prNumber, reviewer, baseline, prHead,
       constraints, blockingSeverities, maxReviewRounds: resolvedMaxRounds,
       verificationPlan,
+      baselineGateEvidence: baselineGate,
     });
 
     const loopState = initialLoopState(objective);
@@ -661,9 +663,35 @@ export function createReviewLoopController({
       gateCommands = discovered.commands;
       commandSource = discovered.source;
     }
+    // The baseline Gate evidence can downgrade a review-time FAIL to WARN by
+    // treating shared failures as pre-existing. It lives in workflow.json,
+    // OUTSIDE the tamper-checked objective — so a state editor could inject the
+    // CURRENT failures into it and mask a real regression. Use it ONLY when its
+    // identity still matches the objective-bound fingerprint captured at begin;
+    // otherwise ignore it (no suppression → a real regression stays FAIL).
+    let trustedBaselineGateEvidence = null;
+    const persistedBaselineGate = loopState.baselineGateEvidence ?? null;
+    if (persistedBaselineGate?.evidence) {
+      const boundIdentity = objective.baselineGateEvidence ?? null;
+      const currentIdentity = baselineGateEvidenceIdentity(persistedBaselineGate);
+      if (boundIdentity && JSON.stringify(boundIdentity) === JSON.stringify(currentIdentity)) {
+        trustedBaselineGateEvidence = persistedBaselineGate.evidence;
+      } else {
+        collectSafetyEvent({
+          code: 'REVIEWLOOP_BASELINE_GATE_EVIDENCE_UNVERIFIED',
+          severity: 'NON_BLOCKING',
+          role: 'gate',
+          taskId: loopState.loopId,
+          reason: boundIdentity
+            ? 'baseline Gate evidence no longer matches the objective-bound identity captured at reviewloop_begin'
+            : 'objective carries no baseline Gate evidence binding (legacy loop)',
+          actionTaken: 'ignoring baseline Gate evidence for FAIL->WARN suppression this review',
+        });
+      }
+    }
     const gate = await runGateFn({
       cwd, commands: gateCommands, runner: gateRunner, env, signal,
-      baselineGateEvidence: loopState.baselineGateEvidence?.evidence ?? null,
+      baselineGateEvidence: trustedBaselineGateEvidence,
     });
     gate.commandSource = commandSource;
 

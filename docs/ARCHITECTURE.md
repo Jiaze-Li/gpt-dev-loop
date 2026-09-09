@@ -444,6 +444,19 @@ objective. `reviewloop_review` runs those exact frozen commands; any manifest
 drift since `begin` blocks the review (REWORK) rather than trusting a Gate the
 Worker can edit mid-loop.
 
+**Baseline-diff suppression is objective-bound**: a review-time Gate FAIL is
+downgraded to WARN only for failures the begin-time baseline Gate already had.
+That begin-time evidence lives in `workflow.json` (outside the tamper-checked
+objective), so its stable identity (`pass`, `source`, a hash of the failure
+evidence) is folded into the objective fingerprint. At review the persisted
+evidence is used for suppression only when it still matches that bound identity;
+otherwise it is ignored (a real regression stays FAIL) and a
+`REVIEWLOOP_BASELINE_GATE_EVIDENCE_UNVERIFIED` safety event is recorded.
+
+**Bounded Gate output**: each verification command's stdout/stderr is capped as
+chunks arrive (not only sliced after concat), so a runaway command that streams
+hundreds of MB cannot OOM the MCP host before the Gate timeout fires.
+
 **Baseline attribution**: `git stash create` snapshots the exact pre-Worker
 tracked state without touching the tree; the review diff is `baseline..current`
 (never `HEAD..current`), so pre-existing staged/unstaged/untracked user work is
@@ -499,9 +512,18 @@ whether still untracked, staged, or newly `.gitignore`d — cannot yield an
 honest baseline→current delta and fails the evidence closed rather than
 emitting its whole content; likewise a brand-new untracked path whose bytes are
 identical to a baseline-untracked file (a rename or copy of pre-existing
-content), and — since the baseline kept only digests — a brand-new untracked
-path appearing in the same review where a baseline-untracked path disappeared
-(an undetectable rename+edit). A baseline-untracked path missing from the
+content). The same protections extend to a brand-new **tracked** addition
+(`git diff --diff-filter=A`) that was neither tracked nor untracked at baseline
+— a rename/copy of a baseline-untracked file into a staged new name would
+otherwise be rendered as a wholly-new file and leak its pre-existing bytes:
+an exact-digest match fails closed, and — since the baseline kept only digests
+— a brand-new file (tracked or untracked) appearing in the same review where a
+baseline-untracked path disappeared (an undetectable rename+edit) fails closed.
+For the *edited copy with the source left in place*, the baseline additionally
+retains the full text of every untracked file ≤ 1 MiB: a brand-new Worker file
+that reproduces a substantial contiguous run of that text (or any
+baseline-untracked file whose content could not be retained — binary-and-gone,
+oversized) fails the evidence closed. A baseline-untracked path missing from the
 current listing is called *deleted* only when its absence is definitively
 confirmed (`ENOENT`); any other `lstat`/read failure (`EACCES`, a mid-read
 race) fails the evidence closed instead. Every untracked path

@@ -88,8 +88,23 @@ function runCommand(command, cwd, spawn, timeoutMs, signal) {
       resolve({ command, exitCode: 127, stdout: '', stderr: String(e?.message ?? e) });
       return;
     }
+    // Cap stdout/stderr AS chunks arrive — not only when slicing the joined
+    // string at the end. A verification command that streams hundreds of MB
+    // (a runaway test loop, a progress spinner) would otherwise pin all of it
+    // in memory until the process exits and could OOM the MCP host before the
+    // Gate timeout fires. 400_000 bytes per stream is 2x the 200_000-char
+    // result cap — enough headroom for multi-byte UTF-8 — and no more.
+    const STREAM_CAP_BYTES = 400_000;
     const out = [];
     const err = [];
+    const outRun = { n: 0 };
+    const errRun = { n: 0 };
+    const capture = (buckets, running, chunk) => {
+      if (running.n >= STREAM_CAP_BYTES) return;
+      const room = STREAM_CAP_BYTES - running.n;
+      buckets.push(chunk.length <= room ? chunk : chunk.subarray(0, room));
+      running.n += chunk.length;
+    };
     let settled = false;
     let timer = null;
     let teardown = null;
@@ -139,8 +154,8 @@ function runCommand(command, cwd, spawn, timeoutMs, signal) {
     }, timeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
 
-    child.stdout?.on('data', (d) => out.push(d));
-    child.stderr?.on('data', (d) => err.push(d));
+    child.stdout?.on('data', (d) => capture(out, outRun, d));
+    child.stderr?.on('data', (d) => capture(err, errRun, d));
     child.on('error', (e) => finish({ command, exitCode: 127, stdout: '', stderr: String(e?.message ?? e), timedOut }));
     child.on('close', (code) => finish({
       command,

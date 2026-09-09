@@ -37,6 +37,59 @@ import path from 'node:path';
 // O_NOFOLLOW is a POSIX flag; 0 (no-op) on platforms that lack it.
 const O_NOFOLLOW = fsConstants.O_NOFOLLOW || 0;
 
+// Per-file cap on the baseline-untracked *content* retained (beyond the digest)
+// so a real baseline->current delta can be built for a Worker file that copies
+// pre-existing untracked text. Larger text files, and binary files, keep only
+// the digest — a brand-new Worker file then cannot be proven free of their
+// bytes and fails the evidence closed.
+const UNTRACKED_CONTENT_CAP_BYTES = 1_048_576;
+
+// A brand-new Worker file "reproduces" a baseline-untracked file when it
+// contains that file whole, is contained within it, or shares a contiguous run
+// of at least this many consecutive non-blank lines. Short runs compare by
+// exact content only (already handled by the digest match) to avoid flagging
+// incidental boilerplate.
+const SHARED_RUN_MIN_LINES = 6;
+const SHARED_RUN_MIN_CHARS = 160;
+const MAX_RUNS_INDEXED = 50_000;
+
+function runAt(lines, start) {
+  const slice = lines.slice(start, start + SHARED_RUN_MIN_LINES);
+  if (slice.length < SHARED_RUN_MIN_LINES) return null;
+  const joined = slice.join('\n');
+  if (joined.trim().length < SHARED_RUN_MIN_CHARS) return null;
+  if (slice.filter((l) => l.trim().length > 0).length < Math.ceil(SHARED_RUN_MIN_LINES / 2)) return null;
+  return joined;
+}
+
+// Index the substantial contiguous line-runs of a baseline text once, so every
+// candidate is a linear pass of Set lookups rather than a quadratic substring
+// scan.
+function indexContentRuns(text) {
+  const lines = text.split('\n');
+  const runs = new Set();
+  for (let i = 0; i + SHARED_RUN_MIN_LINES <= lines.length && runs.size < MAX_RUNS_INDEXED; i += 1) {
+    const run = runAt(lines, i);
+    if (run) runs.add(run);
+  }
+  return runs;
+}
+
+// Does `candidate` reproduce a substantial contiguous section of the indexed
+// baseline text?
+function reproducesBaselineContent(candidate, baselineText, baselineRuns) {
+  if (!candidate || !baselineText) return false;
+  if (candidate === baselineText) return true;
+  if (baselineText.length >= SHARED_RUN_MIN_CHARS
+    && (candidate.includes(baselineText) || baselineText.includes(candidate))) return true;
+  if (!baselineRuns.size) return false;
+  const lines = candidate.split('\n');
+  for (let i = 0; i + SHARED_RUN_MIN_LINES <= lines.length; i += 1) {
+    if (baselineRuns.has(lines.slice(i, i + SHARED_RUN_MIN_LINES).join('\n'))) return true;
+  }
+  return false;
+}
+
 function sha256(value) {
   return createHash('sha256').update(Buffer.isBuffer(value) ? value : String(value)).digest('hex');
 }
@@ -190,6 +243,13 @@ export async function captureBaseline({
 
   const untracked = await listUntracked(cwd, spawn, 'baseline');
   const untrackedHashes = {};
+  // Full text of each retained baseline-untracked file (<= cap, non-binary),
+  // keyed by path. Used at review time to build an honest delta for a Worker
+  // file that copies pre-existing untracked content, and to detect the leak
+  // when it cannot. Binary paths are listed so review can tell "genuinely
+  // uncomparable" from "content stripped after baseline".
+  const untrackedContent = {};
+  const untrackedContentBinary = [];
   let evidenceComplete = true;
   const incompleteReasons = [];
   for (const filePath of untracked) {
@@ -197,6 +257,11 @@ export async function captureBaseline({
     const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
     if (fp.safe) {
       untrackedHashes[filePath] = fp.digest;
+      if (fp.bytes && fp.bytes.includes(0)) {
+        untrackedContentBinary.push(filePath);
+      } else if (fp.bytes && fp.bytes.length <= UNTRACKED_CONTENT_CAP_BYTES) {
+        untrackedContent[filePath] = fp.bytes.toString('utf8');
+      }
     } else {
       evidenceComplete = false;
       incompleteReasons.push(fp.reason);
@@ -209,6 +274,8 @@ export async function captureBaseline({
     capturedAt: new Date().toISOString(),
     dirtyFiles,
     untrackedHashes,
+    untrackedContent,
+    untrackedContentBinary,
     evidenceComplete,
     incompleteReasons,
   };
@@ -451,6 +518,71 @@ export async function collectWorkerDelta({
     renamedUntrackedBaseline.push(...untrackedDeleted);
     untrackedChanged.length = 0;
     untrackedDeleted.length = 0;
+  }
+
+  // (3) Edited / partial copy. A brand-new Worker file (tracked addition or
+  //     untracked) that reproduces a substantial contiguous section of a
+  //     baseline-untracked file leaks that file's pre-existing bytes even
+  //     though its digest differs and its source may still be on disk. The
+  //     baseline retained capped text content for exactly this comparison; when
+  //     a baseline-untracked file's content is NOT available (binary that has
+  //     since vanished, oversized text, or stripped from state) the file cannot
+  //     be cleared and every brand-new Worker file fails closed.
+  if (Object.keys(baseline.untrackedHashes ?? {}).length) {
+    const retained = baseline.untrackedContent ?? {};
+    const declaredBinary = new Set(baseline.untrackedContentBinary ?? []);
+    const comparableTexts = [];
+    let uncomparableBaseline = null;
+    for (const [bp, digest] of Object.entries(baseline.untrackedHashes ?? {})) {
+      const text = retained[bp];
+      if (typeof text === 'string' && sha256(Buffer.from(text, 'utf8')) === digest) {
+        comparableTexts.push({ text, runs: indexContentRuns(text) });
+        continue;
+      }
+      if (declaredBinary.has(bp)) {
+        // Trust the "binary" label only if the file is still on disk AND still
+        // binary; a vanished or now-text path may have been relabelled.
+        // eslint-disable-next-line no-await-in-loop
+        const fp = await fingerprintUntracked({ cwd, filePath: bp, lstat, readFile, open });
+        if (fp.safe && fp.bytes && fp.bytes.includes(0)) continue;
+      }
+      uncomparableBaseline = uncomparableBaseline ?? bp;
+    }
+
+    const candidates = [
+      ...untrackedChanged.map((p) => ({ p, tracked: false })),
+      ...brandNewTracked.filter((p) => !droppedTracked.has(p) && trackedChanged.includes(p))
+        .map((p) => ({ p, tracked: true })),
+    ];
+    for (const { p, tracked } of candidates) {
+      let text = null;
+      if (tracked) {
+        // eslint-disable-next-line no-await-in-loop
+        const fp = await fingerprintUntracked({ cwd, filePath: p, lstat, readFile, open });
+        text = fp.safe && fp.bytes && !fp.bytes.includes(0) ? fp.bytes.toString('utf8') : null;
+      } else {
+        const buf = safeBytes.get(p);
+        text = buf && !buf.includes(0) ? buf.toString('utf8') : null;
+      }
+      if (text == null) continue; // binary Worker files fail closed at emission
+      const reproduced = comparableTexts.some((b) => reproducesBaselineContent(text, b.text, b.runs));
+      if (reproduced || uncomparableBaseline) {
+        renamedUntrackedBaseline.push(p);
+        if (tracked) {
+          droppedTracked.add(p);
+        } else {
+          safeBytes.delete(p);
+          const idx = untrackedChanged.indexOf(p);
+          if (idx !== -1) untrackedChanged.splice(idx, 1);
+        }
+        fail(reproduced
+          ? `brand-new file ${p} reproduces a substantial contiguous section of a baseline-untracked file `
+            + '— the baseline retained only a digest/capped content, so the pre-existing bytes cannot be '
+            + 'separated from Worker authorship'
+          : `brand-new file ${p} cannot be cleared: baseline-untracked file ${uncomparableBaseline} `
+            + 'had no comparable content retained (binary-and-vanished, oversized, or stripped)');
+      }
+    }
   }
 
   // Re-scope the tracked diff so no dropped brand-new tracked file's bytes

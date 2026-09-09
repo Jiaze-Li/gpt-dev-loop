@@ -334,10 +334,35 @@ test('fail closed: a staged copy of a baseline-untracked file (source left in pl
   }
 });
 
-test('a genuinely new tracked file is still normal Worker output when no baseline-untracked file vanished', async () => {
+test('fail closed: an EDITED copy of a baseline-untracked file (source left in place) does not leak its bytes', async () => {
   const dir = initRepo();
   try {
     const git = (...a) => execFileSync('git', a, { cwd: dir });
+    const secret = Array.from({ length: 12 }, (_, i) => `SECRET_CONFIG_LINE_${i} = value-${i}`).join('\n') + '\n';
+    fs.writeFileSync(path.join(dir, 'config.secret'), secret);
+    const baseline = await captureBaseline({ cwd: dir });
+    assert.equal(baseline.untrackedContent['config.secret'], secret, 'baseline retained the text for comparison');
+
+    // Copy, then edit (append) — digest now differs — and stage. Source stays.
+    fs.writeFileSync(path.join(dir, 'config.js'), `// generated\n${secret}\nexport default {};\n`);
+    git('add', 'config.js');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+
+    assert.equal(delta.evidenceComplete, false, 'fails the evidence closed');
+    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section/i.test(r)));
+    assert.equal(delta.trackedChanged.includes('config.js'), false);
+    assert.doesNotMatch(delta.diff, /SECRET_CONFIG_LINE_5/, 'pre-existing bytes never reach the Reviewer');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a genuinely new tracked file is still normal Worker output even with an unrelated baseline-untracked file present', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'scratch.notes'), 'my unrelated todo list\n- item one\n- item two\n');
     const baseline = await captureBaseline({ cwd: dir });
     fs.writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;\n');
     git('add', 'feature.js');
