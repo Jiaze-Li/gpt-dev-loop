@@ -280,15 +280,17 @@ reattaches to the pending external trigger without re-posting.
 per semantic HEAD (workflow + PR + HEAD), caps the total distinct review rounds
 (`MAX_EXTERNAL_REVIEW_TRIGGERS`), and puts a **per-round** wall clock on the
 external-review wait: it is armed when a round's trigger is authorized and
-**re-armed for each genuinely new reviewable HEAD once the previous round has
-settled**. It deliberately does not span the Worker's between-round
-implementation time or the whole multi-round loop (the review-round budget is
-that runaway guard); within one unsettled round every authorize keeps sharing
-the same deadline. A reviewer that accepted the trigger and then hung is caught
-whether the next `reviewloop_review` re-authorizes a new HEAD or resumes polling
-the same one — the reattach path checks the in-flight round's deadline
-(`checkInFlightDeadline`) explicitly, since it never calls authorize. A late
-review that eventually lands is still ingested on the next call (the
+**re-armed every time `authorize()` runs for a genuinely new reviewable HEAD**
+(a new HEAD means the Worker moved on, so the old round's deadline no longer
+applies — this does not depend on historical trigger records being "settled", so
+a lost best-effort `recordResult()` write can't wedge later HEADs). It
+deliberately does not span the Worker's between-round implementation time or the
+whole multi-round loop (the review-round budget is that runaway guard). A
+reviewer that accepted the trigger for a HEAD and then hung is still caught per
+round: a same-HEAD re-authorize hits the deadline check before REUSE, and the
+reattach poll path (which never calls authorize) checks the in-flight round's
+deadline via `checkInFlightDeadline`. A late review that eventually lands is
+still ingested on the next call (the
 existing-review check runs first).
 
 ## Convergence
@@ -536,8 +538,10 @@ an exact-digest match fails closed, and — since the baseline kept only digests
 baseline-untracked path disappeared (an undetectable rename+edit) fails closed.
 For the *edited copy with the source left in place*, the baseline additionally
 retains the full text of every untracked file ≤ 1 MiB: a brand-new Worker file
-that reproduces a substantial contiguous run of that text (or any
-baseline-untracked file whose content could not be retained — binary-and-gone,
+that reproduces a substantial contiguous character run of that text — a
+byte-oriented check, so a large single-line file (minified JSON, a lockfile
+fragment) is covered exactly like a multi-line one — or that cannot be cleared
+because a baseline-untracked file's content was not retained (binary-and-gone,
 oversized) fails the evidence closed. A baseline-untracked path missing from the
 current listing is called *deleted* only when its absence is definitively
 confirmed (`ENOENT`); any other `lstat`/read failure (`EACCES`, a mid-read

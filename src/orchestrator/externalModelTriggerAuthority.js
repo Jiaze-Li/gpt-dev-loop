@@ -81,9 +81,8 @@ export function isDispatchOrLaterStatus(status) {
 }
 
 // A trigger record in one of these statuses is fully settled: its round has
-// closed and nothing further is expected for it. When EVERY existing trigger
-// record for a subject is settled and a brand-new reviewable HEAD arrives, the
-// external-review wall clock is re-armed for that new round (see authorize()).
+// closed and nothing further is expected for it. Used by checkInFlightDeadline()
+// to tell an in-flight (possibly hung) review from one that already resolved.
 const SETTLED_TRIGGER_STATUSES = new Set([
   EXTERNAL_TRIGGER_STATUS.RESULT_RECEIVED,
   EXTERNAL_TRIGGER_STATUS.UNRESOLVED,
@@ -124,8 +123,8 @@ export const DEFAULT_MAX_EXTERNAL_MODEL_TRIGGERS = DEFAULT_MAX_EXTERNAL_REVIEW_R
 // tighter 30s-per-reviewer budget) already bounds a SINGLE poll for a review
 // result. This is a separate, OUTER ceiling on ONE review round's total
 // external-review wait — armed when a round's trigger is authorized and
-// re-armed for each genuinely new reviewable HEAD once the previous round has
-// settled (see authorize()). It deliberately does NOT span the Worker's
+// re-armed each time authorize() runs for a genuinely new reviewable HEAD
+// (see authorize()). It deliberately does NOT span the Worker's
 // between-round implementation time or the whole multi-round loop — the
 // review-ROUND budget (DEFAULT_MAX_EXTERNAL_REVIEW_ROUNDS) is that runaway
 // guard. One hour is several multiples of the per-request poll wait, enough
@@ -311,27 +310,28 @@ export class ExternalModelTriggerAuthority {
     // on the whole multi-round loop (the review-ROUND budget is that runaway
     // guard). So it is:
     //   * armed on the first authorize() for this subject, and
-    //   * RE-ARMED whenever a genuinely new reviewable HEAD arrives AND every
-    //     existing trigger record is already settled (the previous round has
-    //     fully closed).
-    // Within an unsettled round every authorize() keeps sharing one deadline,
-    // so a hung / never-returning reviewer in the current round is still caught.
-    // A process restart never resets an in-round deadline (the settled-records
-    // check is a pure function of durable state, so a restart mid-round
-    // recomputes the same "not a fresh round" answer).
-    const triggerRecords = Object.values(bucket.triggers ?? {});
-    const isFreshRoundHead = !bucket.triggers?.[intent.headSha]
-      && triggerRecords.length > 0
-      && triggerRecords.every((r) => SETTLED_TRIGGER_STATUSES.has(r.status));
-    if (!bucket.wallClock?.startedAt || isFreshRoundHead) {
+    //   * RE-ARMED whenever authorize() runs for a genuinely new reviewable
+    //     HEAD (one with no trigger record of its own) — a new HEAD means the
+    //     Worker moved on from the previous round, so that round's deadline no
+    //     longer applies.
+    // This deliberately does NOT depend on every historical trigger record
+    // being "settled": a best-effort recordResult() write that transiently
+    // failed leaves a stale TRIGGERED record, and gating re-arm on it would
+    // wedge every future HEAD once the old deadline passed. A reviewer that
+    // accepted a trigger and then hung is still caught per round —
+    //   * same HEAD, reattach poll: prReviewController calls
+    //     checkInFlightDeadline() (this class), which enforces the deadline;
+    //   * same HEAD, re-authorize: the deadline check below runs before the
+    //     duplicate/REUSE check.
+    const isNewReviewableHead = !bucket.triggers?.[intent.headSha]
+      && Object.keys(bucket.triggers ?? {}).length > 0;
+    if (!bucket.wallClock?.startedAt || isNewReviewableHead) {
       try {
         bucket = await this._mutateWorkflow(intent.workflowId, (candidateMap) => {
           const b = getOrInitBucket(candidateMap, subjectKey);
-          const recs = Object.values(b.triggers ?? {});
-          const freshRound = !b.triggers?.[intent.headSha]
-            && recs.length > 0
-            && recs.every((r) => SETTLED_TRIGGER_STATUSES.has(r.status));
-          if (freshRound || !b.wallClock?.startedAt) {
+          const newHead = !b.triggers?.[intent.headSha]
+            && Object.keys(b.triggers ?? {}).length > 0;
+          if (newHead || !b.wallClock?.startedAt) {
             b.wallClock = { startedAt: iso(now), deadlineAt: iso(now + this._wallClockMs) };
           }
           return b;

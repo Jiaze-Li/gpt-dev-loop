@@ -45,47 +45,42 @@ const O_NOFOLLOW = fsConstants.O_NOFOLLOW || 0;
 const UNTRACKED_CONTENT_CAP_BYTES = 1_048_576;
 
 // A brand-new Worker file "reproduces" a baseline-untracked file when it
-// contains that file whole, is contained within it, or shares a contiguous run
-// of at least this many consecutive non-blank lines. Short runs compare by
-// exact content only (already handled by the digest match) to avoid flagging
-// incidental boilerplate.
-const SHARED_RUN_MIN_LINES = 6;
-const SHARED_RUN_MIN_CHARS = 160;
-const MAX_RUNS_INDEXED = 50_000;
+// contains that file whole, is contained within it, or shares a contiguous
+// run of at least this many identical characters. Byte/character oriented (not
+// line oriented) so a large single-line file — minified JSON, a lockfile
+// fragment, an env line — is covered exactly like a multi-line one, and an
+// internal one-byte edit only breaks the single window it falls in. A shorter
+// coincidental overlap (a license header, a long import) is not flagged.
+const SHARED_RUN_MIN_CHARS = 96;
+const GRAM_INDEX_STRIDE = 24; // <= SHARED_RUN_MIN_CHARS/4 so any copied run this long lands on an indexed window
+const MAX_GRAMS_INDEXED = 400_000;
 
-function runAt(lines, start) {
-  const slice = lines.slice(start, start + SHARED_RUN_MIN_LINES);
-  if (slice.length < SHARED_RUN_MIN_LINES) return null;
-  const joined = slice.join('\n');
-  if (joined.trim().length < SHARED_RUN_MIN_CHARS) return null;
-  if (slice.filter((l) => l.trim().length > 0).length < Math.ceil(SHARED_RUN_MIN_LINES / 2)) return null;
-  return joined;
-}
-
-// Index the substantial contiguous line-runs of a baseline text once, so every
-// candidate is a linear pass of Set lookups rather than a quadratic substring
-// scan.
-function indexContentRuns(text) {
-  const lines = text.split('\n');
-  const runs = new Set();
-  for (let i = 0; i + SHARED_RUN_MIN_LINES <= lines.length && runs.size < MAX_RUNS_INDEXED; i += 1) {
-    const run = runAt(lines, i);
-    if (run) runs.add(run);
+// Index the fixed-width character windows of a baseline text once, so every
+// candidate is a single linear pass of Set lookups rather than a quadratic
+// substring scan. Windows are strided on the baseline side and slid by one on
+// the candidate side, so a copy shifted by any offset still matches.
+function indexContentGrams(text) {
+  const grams = new Set();
+  if (text.length < SHARED_RUN_MIN_CHARS) return grams;
+  for (let i = 0; i + SHARED_RUN_MIN_CHARS <= text.length && grams.size < MAX_GRAMS_INDEXED; i += GRAM_INDEX_STRIDE) {
+    grams.add(text.slice(i, i + SHARED_RUN_MIN_CHARS));
   }
-  return runs;
+  grams.add(text.slice(text.length - SHARED_RUN_MIN_CHARS)); // always cover the tail
+  return grams;
 }
 
 // Does `candidate` reproduce a substantial contiguous section of the indexed
 // baseline text?
-function reproducesBaselineContent(candidate, baselineText, baselineRuns) {
+function reproducesBaselineContent(candidate, baselineText, baselineGrams) {
   if (!candidate || !baselineText) return false;
   if (candidate === baselineText) return true;
-  if (baselineText.length >= SHARED_RUN_MIN_CHARS
-    && (candidate.includes(baselineText) || baselineText.includes(candidate))) return true;
-  if (!baselineRuns.size) return false;
-  const lines = candidate.split('\n');
-  for (let i = 0; i + SHARED_RUN_MIN_LINES <= lines.length; i += 1) {
-    if (baselineRuns.has(lines.slice(i, i + SHARED_RUN_MIN_LINES).join('\n'))) return true;
+  // A baseline (or candidate) shorter than one window can only be compared
+  // whole — there is nothing to gram-index.
+  if (baselineText.length < SHARED_RUN_MIN_CHARS) return candidate.includes(baselineText);
+  if (candidate.length < SHARED_RUN_MIN_CHARS) return baselineText.includes(candidate);
+  if (!baselineGrams.size) return false;
+  for (let i = 0; i + SHARED_RUN_MIN_CHARS <= candidate.length; i += 1) {
+    if (baselineGrams.has(candidate.slice(i, i + SHARED_RUN_MIN_CHARS))) return true;
   }
   return false;
 }
@@ -536,7 +531,7 @@ export async function collectWorkerDelta({
     for (const [bp, digest] of Object.entries(baseline.untrackedHashes ?? {})) {
       const text = retained[bp];
       if (typeof text === 'string' && sha256(Buffer.from(text, 'utf8')) === digest) {
-        comparableTexts.push({ text, runs: indexContentRuns(text) });
+        comparableTexts.push({ text, grams: indexContentGrams(text) });
         continue;
       }
       if (declaredBinary.has(bp)) {
@@ -565,7 +560,7 @@ export async function collectWorkerDelta({
         text = buf && !buf.includes(0) ? buf.toString('utf8') : null;
       }
       if (text == null) continue; // binary Worker files fail closed at emission
-      const reproduced = comparableTexts.some((b) => reproducesBaselineContent(text, b.text, b.runs));
+      const reproduced = comparableTexts.some((b) => reproducesBaselineContent(text, b.text, b.grams));
       if (reproduced || uncomparableBaseline) {
         renamedUntrackedBaseline.push(p);
         if (tracked) {

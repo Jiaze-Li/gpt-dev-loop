@@ -358,6 +358,32 @@ test('fail closed: an EDITED copy of a baseline-untracked file (source left in p
   }
 });
 
+test('fail closed: an edited copy of a LARGE SINGLE-LINE baseline-untracked file (no newlines) does not leak', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    // One long line — minified JSON shape, well over the window size, no \n.
+    const blob = `{${Array.from({ length: 60 }, (_, i) => `"key_${i}":"secret-value-${i}-xxxxxxxx"`).join(',')}}`;
+    assert.equal(blob.includes('\n'), false);
+    fs.writeFileSync(path.join(dir, 'creds.min.json'), blob);
+    const baseline = await captureBaseline({ cwd: dir });
+
+    // Copy it into a new tracked file, change ONE byte in the middle, stage it.
+    const edited = `${blob.slice(0, 400)}X${blob.slice(401)}`;
+    fs.writeFileSync(path.join(dir, 'bundled-config.json'), edited);
+    git('add', 'bundled-config.json');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+
+    assert.equal(delta.evidenceComplete, false, 'a one-line file is compared like any other');
+    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section/i.test(r)));
+    assert.equal(delta.trackedChanged.includes('bundled-config.json'), false);
+    assert.doesNotMatch(delta.diff, /secret-value-40/, 'pre-existing bytes never reach the Reviewer');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a genuinely new tracked file is still normal Worker output even with an unrelated baseline-untracked file present', async () => {
   const dir = initRepo();
   try {

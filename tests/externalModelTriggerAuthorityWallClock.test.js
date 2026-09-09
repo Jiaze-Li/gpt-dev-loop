@@ -96,7 +96,7 @@ test('the production wedge: two settled rounds then a third new HEAD hours later
   assert.equal(subjectBucket(store).dispatchCount, 3);
 });
 
-test('within an unsettled round a new HEAD past the deadline is still blocked (a hung reviewer is caught)', async () => {
+test('a hung reviewer on the SAME in-flight HEAD past the deadline is caught (re-authorize and checkInFlightDeadline)', async () => {
   const nowRef = { t: Date.parse('2026-09-09T02:00:00.000Z') };
   const store = makeStore();
   const events = [];
@@ -107,19 +107,43 @@ test('within an unsettled round a new HEAD past the deadline is still blocked (a
   await auth.dispatch(d1.permit, intent('H1'), async () => ({
     id: 'comment-H1', createdAt: new Date(nowRef.t).toISOString(),
   }));
+  const armedDeadline = subjectBucket(store).wallClock.deadlineAt;
 
   nowRef.t += DEFAULT_EXTERNAL_REVIEW_WALL_CLOCK_MS + 60_000;
 
+  // The reattach path in prReviewController relies on this pure read.
+  const check = await auth.checkInFlightDeadline({ workflowId: WF, prNumber: PR, headSha: 'H1' });
+  assert.equal(check.ok, false);
+  assert.equal(check.code, EXTERNAL_TRIGGER_ERROR_CODES.EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED);
+  assert.ok(events.some((e) => e.code === 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED' && /in-flight review/.test(e.reason)));
+
+  // A same-HEAD re-authorize (defense in depth) also rejects, before REUSE.
   await assert.rejects(
-    auth.authorize(intent('H2')),
+    auth.authorize(intent('H1')),
     (err) => err.code === EXTERNAL_TRIGGER_ERROR_CODES.EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED,
-    'a new HEAD does not re-arm while the current round is still in flight',
   );
-  assert.ok(events.some((e) => e.code === 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED'));
+  assert.equal(subjectBucket(store).wallClock.deadlineAt, armedDeadline, 'a same-HEAD retry never moved the deadline');
+});
+
+test('a stale TRIGGERED record (a lost recordResult write) does not wedge later HEADs', async () => {
+  const nowRef = { t: Date.parse('2026-09-09T02:00:00.000Z') };
+  const store = makeStore();
+  const auth = makeAuthority(nowRef, store);
+
+  // Round 1: triggered, but recordResult() is never applied (transient write
+  // loss) — the record is stuck at TRIGGERED even though the review was seen.
+  const d1 = await auth.authorize(intent('H1'));
+  await auth.dispatch(d1.permit, intent('H1'), async () => ({
+    id: 'comment-H1', createdAt: new Date(nowRef.t).toISOString(),
+  }));
+
+  nowRef.t += DEFAULT_EXTERNAL_REVIEW_WALL_CLOCK_MS + (45 * 60 * 1000);
+
+  const decision = await auth.authorize(intent('H2'));
+  assert.equal(decision.outcome, 'ALLOW', 'a genuinely new HEAD re-arms regardless of a stale historical record');
   assert.equal(
     Date.parse(subjectBucket(store).wallClock.deadlineAt),
-    Date.parse('2026-09-09T02:00:00.000Z') + DEFAULT_EXTERNAL_REVIEW_WALL_CLOCK_MS,
-    'the in-round deadline was not moved',
+    nowRef.t + DEFAULT_EXTERNAL_REVIEW_WALL_CLOCK_MS,
   );
 });
 
@@ -149,7 +173,7 @@ test('re-authorizing the SAME in-flight HEAD reuses the trigger and never re-arm
   assert.equal(subjectBucket(store).wallClock.deadlineAt, deadlineBefore, 'still not re-armed');
 });
 
-test('a process restart mid-round recomputes the same in-round deadline (never resets it)', async () => {
+test('a process restart does not spuriously re-arm the deadline for the SAME in-flight HEAD', async () => {
   const nowRef = { t: Date.parse('2026-09-09T02:00:00.000Z') };
   const store = makeStore();
   const auth1 = makeAuthority(nowRef, store);
@@ -161,15 +185,15 @@ test('a process restart mid-round recomputes the same in-round deadline (never r
   const armedDeadline = Date.parse(subjectBucket(store).wallClock.deadlineAt);
 
   // Fresh authority (restart), same durable store, clock advanced but still
-  // within the armed deadline. A new HEAD while round 1 is unsettled must share
-  // the ORIGINAL deadline, not a restart-fresh one.
+  // within the armed deadline. Resuming the SAME in-flight HEAD must not move
+  // its deadline.
   nowRef.t += 20 * 60 * 1000;
   const auth2 = makeAuthority(nowRef, store);
-  const d2 = await auth2.authorize(intent('H2'));
-  assert.equal(d2.outcome, 'ALLOW', 'still within the original in-round deadline');
+  const again = await auth2.authorize(intent('H1'));
+  assert.equal(again.outcome, 'REUSE', 'the same in-flight HEAD is reused, not re-triggered');
   assert.equal(
     Date.parse(subjectBucket(store).wallClock.deadlineAt),
     armedDeadline,
-    'the restart did not move the in-round deadline',
+    'the restart did not move the in-flight HEAD deadline',
   );
 });
