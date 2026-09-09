@@ -16,28 +16,33 @@ import os from 'node:os';
 // from an isolated redirected gemini dir (`--gemini_dir`), with startup +
 // per-call effective-loading verification and fail-closed on any mismatch (agy
 // never silently falls back to its ambient default agent). The definitive
-// isolated-agent live result is the agy:gemini medium Supervisor:
-// usageVolume 2933, effectiveLoadingVerified. Earlier ~150.7k / ~6.7k figures
-// were pre-verification and are NOT a baseline. See docs/ARCHITECTURE.md.
+// isolated-agent live result is the medium-effort Gemini Supervisor
+// (family agy:gemini-supervisor): usageVolume 2933, effectiveLoadingVerified.
+// Earlier ~150.7k / ~6.7k figures were pre-verification and are NOT a baseline.
+// See docs/ARCHITECTURE.md.
 //
 // Fixed deterministic routing (NO risk-based selection). Automatic failover
 // walks the whole list in order on any safe retryable provider/quota failure
 // until the pool is exhausted; every listed candidate is mechanically reachable
 // (asserted by the pool-completeness + traversal tests). Normal production
-// path keeps the three roles on different model families:
-//   Worker = Claude (external) / Reviewer = Codex / Supervisor = AGY Gemini.
+// path: Worker = Claude (external) / Reviewer = AGY Gemini (low effort) /
+// Supervisor = AGY Gemini (medium effort). The two Gemini heads are distinct
+// role-specific family identities (agy:gemini-reviewer / agy:gemini-supervisor)
+// with a FIXED per-role reasoning effort baked into the family — see
+// modelFamilyResolver.js. They share the one `agy-gemini` quota pool.
 export const DEFAULT_ROLE_POLICY = Object.freeze({
   // agy:gpt-oss is NOT a Supervisor candidate: its live certification passed
   // transport / accounting / isolation but its decision output violated the
   // Supervisor schema (recommendation must be exactly "REWORK" or
   // "HUMAN_REQUIRED", never a disjunction). It remains a Reviewer candidate.
   supervisor: Object.freeze([
-    { family: 'agy:gemini', effort: 'medium' },
+    { family: 'agy:gemini-supervisor', effort: 'medium' },
     { family: 'codex:default', effort: 'medium' },
     { family: 'agy:sonnet', effort: 'medium' },
     { family: 'claude:opus', effort: 'medium' },
   ]),
   reviewer: Object.freeze([
+    { family: 'agy:gemini-reviewer', effort: 'low' },
     { family: 'codex:default', effort: 'medium' },
     { family: 'agy:sonnet', effort: 'medium' },
     { family: 'agy:gpt-oss', effort: 'medium' },
@@ -47,11 +52,14 @@ export const DEFAULT_ROLE_POLICY = Object.freeze({
 
 // agy:sonnet + agy:gpt-oss share ONE AGY "Claude & GPT" quota pool
 // (`agy-claude-gpt`): a quota-exhaustion cooldown on either takes the other out
-// of routing without a wasted probe call. agy:gemini is a SEPARATE pool.
+// of routing without a wasted probe call. agy:gemini-reviewer +
+// agy:gemini-supervisor likewise share ONE SEPARATE `agy-gemini` pool: a
+// Gemini quota/rate cooldown on either role head cools the other too.
 export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
   'codex:default': ['codex'],
   'claude:opus': ['claude'],
-  'agy:gemini': ['agy-gemini'],
+  'agy:gemini-reviewer': ['agy-gemini'],
+  'agy:gemini-supervisor': ['agy-gemini'],
   'agy:sonnet': ['agy-claude-gpt'],
   'agy:gpt-oss': ['agy-claude-gpt'],
 });
@@ -63,7 +71,11 @@ export const DEFAULT_QUOTA_TOPOLOGY = Object.freeze({
 // adapter without pretending it exists today.
 export const PRODUCTION_ROLE_CAPABILITIES = Object.freeze({
   'codex:default': Object.freeze(['supervisor', 'reviewer']),
-  'agy:gemini': Object.freeze(['supervisor', 'reviewer']),
+  // Role-scoped by design: each Gemini head carries a fixed effort for exactly
+  // one role, so the router must never select the low-effort Reviewer head for
+  // a Supervisor escalation (or vice versa).
+  'agy:gemini-reviewer': Object.freeze(['reviewer']),
+  'agy:gemini-supervisor': Object.freeze(['supervisor']),
   'agy:sonnet': Object.freeze(['supervisor', 'reviewer']),
   // Reviewer-only: certified Supervisor transport/accounting/isolation but its
   // decision output does not conform to the Supervisor schema.

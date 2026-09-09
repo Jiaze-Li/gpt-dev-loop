@@ -8,6 +8,8 @@
 //   4. a different runtime catalog -> a different concrete model, no policy edit
 //   5. telemetry / reservation persists the ACTUAL resolved model
 //   6. a model-resolution change still emits the existing diagnostics event
+//   7. the two role-specific Gemini heads resolve to their FIXED effort variant
+//      (agy:gemini-reviewer -> -low, agy:gemini-supervisor -> -medium)
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,7 +28,7 @@ import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
 test('1+2: the default config carries no concrete Gemini or GPT-OSS version pin', () => {
   assert.equal(defaultConfigHasConcreteVersionPin({}), false);
-  for (const family of ['agy:gemini', 'agy:gpt-oss']) {
+  for (const family of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss']) {
     const r = resolveModelFamily(family, { env: {}, agyCatalog: null });
     assert.equal(r.resolvedModel, null, family);
     assert.equal(r.resolvedFrom, RESOLUTION_SOURCE.PROVIDER_DEFAULT, family);
@@ -51,19 +53,20 @@ test('3: an explicit env override pins a concrete model for tests/benchmark/repr
   assert.equal(r.concreteVersionPinned, true);
   assert.equal(r.envKey, 'AGY_REVIEWER_MODEL');
 
-  const r2 = resolveModelFamily('agy:gemini', {
-    env: { REVIEWLOOP_SUPERVISOR_MODEL: 'gemini-3.1-pro-low' },
+  const r2 = resolveModelFamily('agy:gemini-supervisor', {
+    env: { REVIEWLOOP_GEMINI_SUPERVISOR_MODEL: 'gemini-3.1-pro-low' },
     agyCatalog: ['gemini-9.9-flash-high'],
   });
   assert.equal(r2.resolvedModel, 'gemini-3.1-pro-low');
+  assert.equal(r2.envKey, 'REVIEWLOOP_GEMINI_SUPERVISOR_MODEL');
 });
 
 test('4: a different runtime catalog yields a different concrete model with no policy edit', () => {
   const policyBefore = JSON.stringify(DEFAULT_ROLE_POLICY);
-  const a = resolveModelFamily('agy:gemini', { env: {}, agyCatalog: ['gemini-3.7-flash-high', 'gemini-3.8-flash-high'] });
-  const b = resolveModelFamily('agy:gemini', { env: {}, agyCatalog: ['gemini-3.7-flash-high', 'gemini-4.2-flash-high'] });
-  assert.equal(a.resolvedModel, 'gemini-3.8-flash-high');
-  assert.equal(b.resolvedModel, 'gemini-4.2-flash-high');
+  const a = resolveModelFamily('agy:gemini-supervisor', { env: {}, agyCatalog: ['gemini-3.7-flash-medium', 'gemini-3.8-flash-medium'] });
+  const b = resolveModelFamily('agy:gemini-supervisor', { env: {}, agyCatalog: ['gemini-3.7-flash-medium', 'gemini-4.2-flash-medium'] });
+  assert.equal(a.resolvedModel, 'gemini-3.8-flash-medium');
+  assert.equal(b.resolvedModel, 'gemini-4.2-flash-medium');
   assert.equal(a.resolvedFrom, RESOLUTION_SOURCE.RUNTIME_CATALOG);
   assert.equal(JSON.stringify(DEFAULT_ROLE_POLICY), policyBefore, 'policy untouched by resolution');
 });
@@ -72,32 +75,44 @@ test('catalog parsing + effort preference', () => {
   const ids = parseAgyModelCatalog('Fetching available models...\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\ngpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n');
   assert.deepEqual(ids, ['gemini-3.8-flash-high', 'gpt-oss-120b-medium']);
   assert.equal(
-    pickCatalogModel(['gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gemini-3.9-flash-low'], MODEL_FAMILY_REGISTRY['agy:gemini']),
+    pickCatalogModel(['gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gemini-3.9-flash-low'], MODEL_FAMILY_REGISTRY['agy:gemini-supervisor']),
     'gemini-3.8-flash-medium',
-    'prefers the family default effort (medium) over a newer non-medium entry',
+    'supervisor head prefers its default effort (medium) over a newer non-medium entry',
   );
   assert.equal(
-    pickCatalogModel(['gemini-3.8-flash-low', 'gemini-3.9-flash-high'], MODEL_FAMILY_REGISTRY['agy:gemini']),
+    pickCatalogModel(['gemini-3.8-flash-medium', 'gemini-3.8-flash-low', 'gemini-3.9-flash-medium'], MODEL_FAMILY_REGISTRY['agy:gemini-reviewer']),
+    'gemini-3.8-flash-low',
+    'reviewer head prefers its default effort (low) over a newer non-low entry',
+  );
+  assert.equal(
+    pickCatalogModel(['gemini-3.8-flash-low', 'gemini-3.9-flash-high'], MODEL_FAMILY_REGISTRY['agy:gemini-supervisor']),
     'gemini-3.9-flash-high',
     'no -medium variant -> falls back to the newest entry regardless of suffix',
   );
 });
 
-test('agy:gemini production default effort is medium — catalog resolves the -medium variant', () => {
-  assert.equal(MODEL_FAMILY_REGISTRY['agy:gemini'].defaultEffort, 'medium');
-  const r = resolveModelFamily('agy:gemini', {
-    env: {},
-    agyCatalog: ['gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low'],
-  });
-  assert.equal(r.resolvedModel, 'gemini-3.8-flash-medium');
-  assert.equal(r.resolvedFrom, RESOLUTION_SOURCE.RUNTIME_CATALOG);
-  // env override still wins over catalog effort preference.
-  const pinned = resolveModelFamily('agy:gemini', {
-    env: { REVIEWLOOP_SUPERVISOR_MODEL: 'gemini-3.8-flash-high' },
-    agyCatalog: ['gemini-3.8-flash-medium'],
+test('7: the two Gemini role heads resolve to their FIXED effort variant, newest version', () => {
+  assert.equal(MODEL_FAMILY_REGISTRY['agy:gemini-reviewer'].defaultEffort, 'low');
+  assert.equal(MODEL_FAMILY_REGISTRY['agy:gemini-supervisor'].defaultEffort, 'medium');
+  assert.equal(MODEL_FAMILY_REGISTRY['agy:gemini-reviewer'].provider, 'agy-gemini');
+  assert.equal(MODEL_FAMILY_REGISTRY['agy:gemini-supervisor'].provider, 'agy-gemini');
+
+  const catalog = ['gemini-3.7-flash-low', 'gemini-3.7-flash-medium', 'gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-high'];
+  const reviewer = resolveModelFamily('agy:gemini-reviewer', { env: {}, agyCatalog: catalog });
+  const supervisor = resolveModelFamily('agy:gemini-supervisor', { env: {}, agyCatalog: catalog });
+  assert.equal(reviewer.resolvedModel, 'gemini-3.8-flash-low');
+  assert.equal(supervisor.resolvedModel, 'gemini-3.8-flash-medium');
+  assert.equal(reviewer.resolvedFrom, RESOLUTION_SOURCE.RUNTIME_CATALOG);
+  assert.equal(supervisor.resolvedFrom, RESOLUTION_SOURCE.RUNTIME_CATALOG);
+
+  // env override still wins over the catalog effort preference.
+  const pinned = resolveModelFamily('agy:gemini-reviewer', {
+    env: { REVIEWLOOP_GEMINI_REVIEWER_MODEL: 'gemini-3.8-flash-high' },
+    agyCatalog: catalog,
   });
   assert.equal(pinned.resolvedModel, 'gemini-3.8-flash-high');
   assert.equal(pinned.resolvedFrom, RESOLUTION_SOURCE.ENV_OVERRIDE);
+
   // Sonnet / GPT-OSS effort untouched.
   assert.equal(MODEL_FAMILY_REGISTRY['agy:sonnet'].defaultEffort, null);
   assert.equal(MODEL_FAMILY_REGISTRY['agy:gpt-oss'].defaultEffort, 'medium');
@@ -106,13 +121,16 @@ test('agy:gemini production default effort is medium — catalog resolves the -m
 test('5: the durable reservation + spend record persist the ACTUAL resolved model', async () => {
   const persistence = new MemoryPersistence();
   const pool = createReviewLoopProviderPool({
-    callAgy: async () => ({ text: '{"findings":[]}', model: 'gemini-3.8-flash-high', usage: { input_tokens: 3, output_tokens: 1 } }),
-    agyCatalog: ['gemini-3.8-flash-high', 'gpt-oss-999b-medium'],
+    callAgy: async () => ({ text: '{"findings":[]}', model: 'gemini-3.8-flash-medium', usage: { input_tokens: 3, output_tokens: 1 } }),
+    agyCatalog: ['gemini-3.8-flash-low', 'gemini-3.8-flash-medium', 'gpt-oss-999b-medium'],
   });
-  // agy:gemini is first for supervisor and wired via reviewloop-minimal; its
-  // model still resolves from the probed catalog.
-  assert.equal(pool.route('supervisor').family, 'agy:gemini');
-  assert.equal(pool.route('supervisor').model, 'gemini-3.8-flash-high');
+  // agy:gemini-supervisor is first for supervisor and wired via reviewloop-minimal;
+  // its model resolves to the newest -medium entry from the probed catalog.
+  assert.equal(pool.route('supervisor').family, 'agy:gemini-supervisor');
+  assert.equal(pool.route('supervisor').model, 'gemini-3.8-flash-medium');
+  // agy:gemini-reviewer is first for reviewer and resolves to the newest -low entry.
+  assert.equal(pool.route('reviewer').family, 'agy:gemini-reviewer');
+  assert.equal(pool.route('reviewer').model, 'gemini-3.8-flash-low');
 
   const controller = createReviewLoopController({
     persistence,
@@ -133,18 +151,18 @@ test('5: the durable reservation + spend record persist the ACTUAL resolved mode
 
 test('6: a resolution change still emits the MODEL_RESOLVED_CHANGED diagnostics event', () => {
   const events = [];
-  let catalog = ['gemini-3.7-flash-high'];
+  let catalog = ['gemini-3.7-flash-medium'];
   const router = new RoleRouter({
-    // gemini is last + high-context in the default policy; pin it here so the
-    // test observes its resolution-change diagnostics directly.
-    rolePolicy: { supervisor: [{ family: 'agy:gemini', effort: 'medium' }] },
+    // Scope to the Supervisor Gemini head so the test observes its
+    // resolution-change diagnostics directly.
+    rolePolicy: { supervisor: [{ family: 'agy:gemini-supervisor', effort: 'medium' }] },
     resolveFamily: (family) => resolveModelFamily(family, { env: {}, agyCatalog: catalog }),
     onEvent: (e) => events.push(e),
   });
-  assert.equal(router.route('supervisor').resolvedModel, 'gemini-3.7-flash-high');
-  catalog = ['gemini-3.7-flash-high', 'gemini-4.0-flash-high'];
+  assert.equal(router.route('supervisor').resolvedModel, 'gemini-3.7-flash-medium');
+  catalog = ['gemini-3.7-flash-medium', 'gemini-4.0-flash-medium'];
   router.route('supervisor');
   assert.ok(events.some((e) => e.type === 'MODEL_RESOLVED_CHANGED'
-    && e.previousResolvedModel === 'gemini-3.7-flash-high'
-    && e.resolvedModel === 'gemini-4.0-flash-high'));
+    && e.previousResolvedModel === 'gemini-3.7-flash-medium'
+    && e.resolvedModel === 'gemini-4.0-flash-medium'));
 });

@@ -61,21 +61,21 @@ test('parseArgs rejects a missing/invalid role and a family outside the role poo
   assert.throws(() => parseArgs([]), /--role must be one of/);
   assert.throws(() => parseArgs(['--role', 'planner', '--family', 'codex:default']), /--role must be one of/);
   assert.throws(() => parseArgs(['--role', 'reviewer']), /--family for role reviewer/);
-  assert.throws(() => parseArgs(['--role', 'reviewer', '--family', 'agy:gemini']), /--family for role reviewer/);
+  assert.throws(() => parseArgs(['--role', 'reviewer', '--family', 'agy:gemini-supervisor']), /--family for role reviewer/);
   assert.deepEqual(parseArgs(['--role', 'reviewer', '--family', 'agy:sonnet']), { role: 'reviewer', family: 'agy:sonnet' });
-  assert.deepEqual(parseArgs(['--role=supervisor', '--family=agy:gemini']), { role: 'supervisor', family: 'agy:gemini' });
+  assert.deepEqual(parseArgs(['--role=supervisor', '--family=agy:gemini-supervisor']), { role: 'supervisor', family: 'agy:gemini-supervisor' });
 });
 
 // ---- candidate matrix: completeness + duplicate prevention --------------
 
 test('candidate matrix matches the required candidate set exactly', () => {
-  assert.deepEqual(CANDIDATES.reviewer, ['codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus']);
-  assert.deepEqual(CANDIDATES.supervisor, ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus']);
+  assert.deepEqual(CANDIDATES.reviewer, ['agy:gemini-reviewer', 'codex:default', 'agy:sonnet', 'agy:gpt-oss', 'claude:opus']);
+  assert.deepEqual(CANDIDATES.supervisor, ['agy:gemini-supervisor', 'codex:default', 'agy:sonnet', 'claude:opus']);
   // derived straight from the production policy — no second source of truth
   for (const role of VALID_ROLES) {
     assert.deepEqual(CANDIDATES[role], DEFAULT_ROLE_POLICY[role].map((e) => e.family));
   }
-  assert.equal(ALL_CANDIDATES.length, 8);
+  assert.equal(ALL_CANDIDATES.length, 9);
 });
 
 test('no duplicate candidate within a role, and no duplicate role|family across the matrix', () => {

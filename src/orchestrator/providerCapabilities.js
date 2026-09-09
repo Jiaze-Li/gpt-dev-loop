@@ -157,11 +157,30 @@ export const PROVIDER_CAPABILITIES = deepFreeze({
     soft: { reasoningEffort: field(T.SOFT, ['low', 'medium', 'high']), verbosity: field(T.UNAVAILABLE) },
     unknownUsagePolicy: 'FAIL_CLOSED',
   }),
-  'agy:gemini': entry({
-    family: 'agy:gemini',
+  // Two role-scoped Gemini heads (fixed effort per role). Same isolated
+  // `reviewloop-minimal` AGY transport and same `agy-gemini` quota pool; they
+  // differ only in the catalog-resolved effort variant (-low / -medium). No
+  // executor adapter is declared for either (roleRouting.js
+  // PRODUCTION_ROLE_CAPABILITIES has no 'executor' entry).
+  'agy:gemini-reviewer': entry({
+    family: 'agy:gemini-reviewer',
     provider: 'agy-gemini',
-    // No executor adapter is declared for this family at all (roleRouting.js
-    // PRODUCTION_ROLE_CAPABILITIES has no 'executor' entry for agy:gemini).
+    executorEligible: false,
+    live: {
+      maxTurns: field(T.UNAVAILABLE),
+      runtimeLimit: field(T.UNAVAILABLE),
+      providerBudget: field(T.UNAVAILABLE),
+      thinkingLimit: field(T.UNAVAILABLE),
+      outputLimit: field(T.UNAVAILABLE),
+    },
+    preDispatch: { inputLimit: field(T.UNAVAILABLE) },
+    postRun: { usageGuard: field(T.UNAVAILABLE) },
+    soft: { reasoningEffort: field(T.UNAVAILABLE), verbosity: field(T.UNAVAILABLE) },
+    unknownUsagePolicy: 'FAIL_CLOSED',
+  }),
+  'agy:gemini-supervisor': entry({
+    family: 'agy:gemini-supervisor',
+    provider: 'agy-gemini',
     executorEligible: false,
     live: {
       maxTurns: field(T.UNAVAILABLE),

@@ -57,7 +57,7 @@ export const REVIEWLOOP_DEFAULTS = Object.freeze({
   // supervisorInvoked), but that single invocation drives automatic
   // provider failover across the whole Supervisor pool. This ceiling must
   // therefore be >= the Supervisor pool candidate count (currently 4:
-  // agy:gemini, codex:default, agy:sonnet, claude:opus) so the tail candidate
+  // agy:gemini-supervisor, codex:default, agy:sonnet, claude:opus) so the tail candidate
   // stays mechanically reachable when every earlier one fails safely.
   // MAX_COST_USD / MAX_USAGE_VOLUME remain the real runaway guards.
   MAX_SUPERVISOR_CALLS: 4,
@@ -193,7 +193,8 @@ export function resolveReviewLoopLimits(env = process.env) {
 const ACCOUNTING_CLASS_BY_FAMILY = Object.freeze({
   'codex:default': 'openai',
   'claude:opus': 'anthropic',
-  'agy:gemini': 'agy',
+  'agy:gemini-reviewer': 'agy',
+  'agy:gemini-supervisor': 'agy',
   'agy:gpt-oss': 'agy',
   'agy:sonnet': 'agy',
 });

@@ -86,7 +86,8 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | `claude:opus` | `--setting-sources ''` (no user/project/local settings → no hooks, custom agents, output styles, statusline), `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP), `--tools ''` (no built-in tools/schemas), `--disable-slash-commands` (no skills), `--no-session-persistence` (no resume/write), `--exclude-dynamic-system-prompt-sections`, scratch cwd | admin/managed (policy) settings; the built-in `claude -p` base system prompt (zeroing it needs `--system-prompt`, which also kills the dynamic-section trim). `--bare` would remove more but forces API-key-only auth. | live-certified: Reviewer usageVolume 3449, Supervisor 3741 (resolvedModel `opus`) |
 | `codex:default` | `--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only`, scratch cwd | the `codex exec` harness system prompt + built-in tool schemas (apply_patch/shell) — no flag lever | live-certified: Reviewer usageVolume 16535, Supervisor 16899 (the `codex exec` harness prompt dominates) |
 | `agy:gpt-oss` | `--agent reviewloop-minimal` (`inheritCustomizations: false`) discovered from an isolated **redirected gemini dir** (`--gemini_dir`, `adapters/scratchCwd.js#narrowAgyGeminiDir`), `--disable-slash-commands`, scratch cwd | the `agy` base agent/system prompt and built-in tool schemas — no flag lever; admin/managed config | live-certified Reviewer: usageVolume 2427, resolvedModel `gpt-oss-120b-medium`, isolationVerified |
-| `agy:gemini` | same as `agy:gpt-oss` (production default effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | **definitive isolated-agent live result**: Supervisor usageVolume 2933, resolvedModel `gemini-3.8-flash-medium`, effectiveLoadingVerified + isolationVerified |
+| `agy:gemini-reviewer` | same as `agy:gpt-oss` (fixed effort **low** → catalog resolves `gemini-*-low`) | same as `agy:gpt-oss` | Reviewer head; shares the `agy-gemini` quota pool with `agy:gemini-supervisor` |
+| `agy:gemini-supervisor` | same as `agy:gpt-oss` (fixed effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | **definitive isolated-agent live result**: Supervisor usageVolume 2933, resolvedModel `gemini-3.8-flash-medium`, effectiveLoadingVerified + isolationVerified |
 | `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | live-certified: Reviewer usageVolume 3191, Supervisor 3303, resolvedModel `claude-sonnet-4-6`, isolationVerified |
 
 **AGY minimal-agent transport — effective loading**:
@@ -130,8 +131,8 @@ Historical AGY token figures are **not** a baseline:
 - the still-earlier ~6.7k "minimal" smoke was taken before effective loading
   was verified, so it is not a trusted isolation baseline either.
 
-The definitive isolated-agent live result is the `agy:gemini` medium Supervisor:
-**usageVolume 2933, effectiveLoadingVerified**. The live certification
+The definitive isolated-agent live result is the `agy:gemini-supervisor` medium
+Supervisor: **usageVolume 2933, effectiveLoadingVerified**. The live certification
 (`scripts/live-reviewloop-certify.mjs`) asserts `customAgentSupport.supported`
 plus per-call effective-loading verification and reports the real numbers.
 
@@ -143,14 +144,18 @@ simply walks the list in order.
 
 | Order | Reviewer | Supervisor |
 | --- | --- | --- |
-| 1 | `codex:default` | `agy:gemini` |
-| 2 | `agy:sonnet` | `codex:default` |
-| 3 | `agy:gpt-oss` | `agy:sonnet` |
-| 4 | `claude:opus` | `claude:opus` |
+| 1 | `agy:gemini-reviewer` (effort **low**) | `agy:gemini-supervisor` (effort **medium**) |
+| 2 | `codex:default` | `codex:default` |
+| 3 | `agy:sonnet` | `agy:sonnet` |
+| 4 | `agy:gpt-oss` | `claude:opus` |
+| 5 | `claude:opus` | — |
 
-Normal production path keeps the three roles on different model families:
-Worker = Claude (external), Reviewer = Codex, Supervisor = AGY Gemini. GPT-OSS
-is a deliberate low-cost third Reviewer fallback (not degraded).
+Normal production path: Worker = Claude (external), Reviewer = AGY Gemini at
+**low** effort, Supervisor = AGY Gemini at **medium** effort. The two Gemini
+heads are distinct role-scoped family identities (`agy:gemini-reviewer` /
+`agy:gemini-supervisor`), each locked to one role and one effort, sharing the
+single `agy-gemini` quota pool. GPT-OSS is a deliberate low-cost Reviewer
+fallback (not degraded).
 
 **`agy:gpt-oss` is NOT a Supervisor candidate.** Its live Supervisor
 certification succeeded on transport, token accounting and agent isolation, but
@@ -162,11 +167,12 @@ Its family / transport / accounting support is unchanged and it remains a
 Reviewer candidate. `PRODUCTION_ROLE_CAPABILITIES['agy:gpt-oss']` is therefore
 `['reviewer']`.
 
-No production family is `highContext`: every AGY family (`agy:gemini`,
-`agy:gpt-oss`, `agy:sonnet`) runs through the isolated `reviewloop-minimal`
-agent, and the definitive `agy:gemini` Supervisor result (usageVolume 2933) is
-in line with the other families, so `agy:gemini` participates in ordinary
-automatic routing — it is **not** excluded on a high-context basis. The generic
+No production family is `highContext`: every AGY family (`agy:gemini-reviewer`,
+`agy:gemini-supervisor`, `agy:gpt-oss`, `agy:sonnet`) runs through the isolated
+`reviewloop-minimal` agent, and the definitive `agy:gemini-supervisor` result
+(usageVolume 2933) is in line with the other families, so the Gemini heads
+participate in ordinary automatic routing — they are **not** excluded on a
+high-context basis. The generic
 `RoleRouter` `highContext` mechanism (a candidate so marked is skipped unless
 `signals.allowHighContext === true`) is retained for any future family that
 needs it, but nothing sets the flag today.
@@ -174,12 +180,14 @@ needs it, but nothing sets the flag today.
 ### Shared quota topology
 
 ```
-agy:sonnet  ─┐
-             ├─ agy-claude-gpt  (one AGY "Claude & GPT" quota pool)
-agy:gpt-oss ─┘
-agy:gemini  ─── agy-gemini      (separate Gemini quota pool)
-codex:default ─ codex
-claude:opus  ── claude
+agy:sonnet             ─┐
+                        ├─ agy-claude-gpt  (one AGY "Claude & GPT" quota pool)
+agy:gpt-oss            ─┘
+agy:gemini-reviewer    ─┐
+                        ├─ agy-gemini      (one separate Gemini quota pool —
+agy:gemini-supervisor  ─┘                   both role heads share its cooldown)
+codex:default          ── codex
+claude:opus            ── claude
 ```
 
 A `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_RATE_LIMITED` cooldown on `agy:sonnet`
@@ -235,12 +243,18 @@ protocol error rather than an auth or inference failure. The value is now
 `'{"mcpServers":{}}'`.
 
 **Dynamic model-family resolution** preserves family semantics without
-concrete release pins. `agy:gemini` / `agy:gpt-oss` / `agy:sonnet` resolve from
-the probed `agy models` catalog when available (by `catalogPrefix`: `gemini-` /
-`gpt-oss-` / `claude-sonnet-`, honouring the family's `defaultEffort` —
-`agy:gemini` = `medium`, `agy:gpt-oss` = `medium`, `agy:sonnet` = none; when the
-exact effort variant is absent, resolution falls back to the newest entry,
-preferring higher effort on a version tie); `codex:default` omits a model flag and
+concrete release pins. `agy:gemini-reviewer` / `agy:gemini-supervisor` /
+`agy:gpt-oss` / `agy:sonnet` resolve from the probed `agy models` catalog when
+available (by `catalogPrefix`: `gemini-` / `gemini-` / `gpt-oss-` /
+`claude-sonnet-`, honouring the family's `defaultEffort` —
+`agy:gemini-reviewer` = `low`, `agy:gemini-supervisor` = `medium`,
+`agy:gpt-oss` = `medium`, `agy:sonnet` = none; when the exact effort variant is
+absent, resolution falls back to the newest entry, preferring higher effort on
+a version tie). The two Gemini heads are SEPARATE stable family identities, one
+per role, so the concrete `-low` / `-medium` id is bound at pool construction
+from the family's own effort and can never drift: the id the AGY transport
+passes as `--model` is exactly what telemetry persists — a `-low` family never
+dispatches a `-medium` model. `codex:default` omits a model flag and
 tracks the Codex provider default; `claude:opus` passes the stable Claude CLI
 alias `--model opus`, which tracks the current Opus release. Provider-returned
 concrete model identity is persisted by telemetry. `doctor` must report

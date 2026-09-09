@@ -192,7 +192,7 @@ test('pool: an available CLI runtime is actually wired and selectable', async ()
     stdout: JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } }) + '\n',
   }));
   const health = new (await import('../src/orchestrator/roleRouting.js')).ProviderHealthRegistry();
-  health.record('agy:gemini', 'UNAVAILABLE');
+  health.record('agy:gemini-supervisor', 'UNAVAILABLE');
   const pool = createReviewLoopProviderPool({
     callAgy: async () => ({}),
     providerHealth: health,
@@ -213,7 +213,7 @@ test('pool: an available CLI runtime is actually wired and selectable', async ()
 
 test('pool: no runtime probe -> CLI families reported UNAVAILABLE, never phantom-selected', () => {
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}) });
-  assert.equal(pool.route('reviewer').family, 'agy:sonnet');
+  assert.equal(pool.route('reviewer').family, 'agy:gemini-reviewer');
   assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
   assert.equal(pool.runtimeStatus['claude:opus'].runtimeAvailable, false);
 });

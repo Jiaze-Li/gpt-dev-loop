@@ -50,7 +50,7 @@ test('pool: gemini unavailable + codex runtime available -> supervisor selects c
     stdout: JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 3, output_tokens: 2 } }) + '\n',
   }));
   const health = new ProviderHealthRegistry();
-  health.record('agy:gemini', 'UNAVAILABLE');
+  health.record('agy:gemini-supervisor', 'UNAVAILABLE');
   const pool = createReviewLoopProviderPool({
     callAgy: async () => ({}), providerHealth: health, transportRuntime: RUNTIME_BOTH, spawn,
   });
@@ -83,7 +83,7 @@ test('pool: an unavailable CLI runtime records UNAVAILABLE health and is never s
   assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
   assert.match(pool.runtimeStatus['codex:default'].reason, /runtime unavailable: CLI not installed/);
   assert.match(pool.runtimeStatus['claude:opus'].reason, /not authenticated/);
-  assert.equal(pool.route('supervisor').family, 'agy:gemini'); // first supervisor candidate, wired via reviewloop-minimal
+  assert.equal(pool.route('supervisor').family, 'agy:gemini-supervisor'); // first supervisor candidate, wired via reviewloop-minimal
 });
 
 test('controller: post-dispatch AUTH_REJECTED has unknown spend and MUST NOT fail over', async () => {
@@ -131,6 +131,6 @@ test('pool: locally unauthenticated CLI families are skipped deterministically b
   });
   assert.equal(pool.runtimeStatus['codex:default'].runtimeAvailable, false);
   assert.equal(pool.runtimeStatus['claude:opus'].runtimeAvailable, false);
-  assert.equal(pool.route('reviewer').family, 'agy:sonnet');
-  assert.equal(pool.route('supervisor').family, 'agy:gemini');
+  assert.equal(pool.route('reviewer').family, 'agy:gemini-reviewer');
+  assert.equal(pool.route('supervisor').family, 'agy:gemini-supervisor');
 });

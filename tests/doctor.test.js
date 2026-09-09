@@ -81,7 +81,7 @@ test('reviewer + supervisor pools have eligible internal candidates', () => {
   // No family is high-context any more: every policy candidate is auto-eligible.
   assert.deepEqual(r.highContext.reviewer, []);
   assert.deepEqual(r.highContext.supervisor, []);
-  assert.ok(r.eligible.reviewer.includes('agy:sonnet') && r.eligible.supervisor.includes('agy:gemini'));
+  assert.ok(r.eligible.reviewer.includes('agy:gemini-reviewer') && r.eligible.supervisor.includes('agy:gemini-supervisor'));
 });
 
 test('runDoctor passes on core prerequisites and reports Worker as external', () => {

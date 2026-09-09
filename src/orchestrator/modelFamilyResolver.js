@@ -29,16 +29,39 @@
 // provider-default path — it never throws.
 
 export const MODEL_FAMILY_REGISTRY = Object.freeze({
-  'agy:gemini': Object.freeze({
-    family: 'agy:gemini',
+  // Gemini is split into two ROLE-SPECIFIC stable family identities, each with a
+  // FIXED reasoning effort. They deliberately do NOT share one family: the
+  // concrete model is resolved and bound at provider-pool construction from the
+  // family's own `defaultEffort`, so a single `agy:gemini` family could only
+  // ever carry one effort. Both resolve from the same `gemini-` catalog prefix
+  // and share the one `agy-gemini` quota pool (see roleRouting.js
+  // DEFAULT_QUOTA_TOPOLOGY) — the split is purely effort + role intent.
+  //
+  //   agy:gemini-reviewer   -> newest `gemini-*-low`     (Reviewer head)
+  //   agy:gemini-supervisor -> newest `gemini-*-medium`  (Supervisor head)
+  //
+  // TELEMETRY stays honest: the concrete `-low` / `-medium` id is what the AGY
+  // transport passes as `--model` and what the durable spend record persists —
+  // a `-low` family can never silently dispatch a `-medium` model.
+  'agy:gemini-reviewer': Object.freeze({
+    family: 'agy:gemini-reviewer',
     provider: 'agy-gemini',
     cli: 'agy',
     catalogPrefix: 'gemini-',
-    envKeys: Object.freeze(['REVIEWLOOP_SUPERVISOR_MODEL', 'AGY_SUPERVISOR_MODEL', 'AGY_MODEL']),
-    // Production Supervisor default effort. `medium` is the deliberate default:
-    // catalog resolution (pickCatalogModel) prefers a `-medium` variant when the
-    // probed `agy models` catalog has one, else falls back to the newest entry
-    // for the family regardless of suffix.
+    envKeys: Object.freeze(['REVIEWLOOP_GEMINI_REVIEWER_MODEL', 'AGY_GEMINI_REVIEWER_MODEL', 'AGY_MODEL']),
+    // Fixed Reviewer effort. `low` is deliberate: catalog resolution
+    // (pickCatalogModel) selects the newest `gemini-*-low` variant.
+    defaultEffort: 'low',
+    stableAlias: null,
+  }),
+  'agy:gemini-supervisor': Object.freeze({
+    family: 'agy:gemini-supervisor',
+    provider: 'agy-gemini',
+    cli: 'agy',
+    catalogPrefix: 'gemini-',
+    envKeys: Object.freeze(['REVIEWLOOP_GEMINI_SUPERVISOR_MODEL', 'AGY_GEMINI_SUPERVISOR_MODEL', 'AGY_MODEL']),
+    // Fixed Supervisor effort. `medium` is deliberate: catalog resolution
+    // selects the newest `gemini-*-medium` variant.
     defaultEffort: 'medium',
     stableAlias: null,
   }),

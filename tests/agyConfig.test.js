@@ -21,43 +21,45 @@ test('no concrete version pin by default — provider-default resolution', () =>
 test('explicit env override pins a concrete model (Supervisor precedence)', () => {
   assert.equal(resolveAgySupervisorModel({ AGY_MODEL: 'gemini-3.1-pro-high' }), 'gemini-3.1-pro-high');
   assert.equal(
-    resolveAgySupervisorModel({ AGY_MODEL: 'gemini-3.1-pro-high', AGY_SUPERVISOR_MODEL: 'gemini-3.6-flash-low' }),
+    resolveAgySupervisorModel({ AGY_MODEL: 'gemini-3.1-pro-high', AGY_GEMINI_SUPERVISOR_MODEL: 'gemini-3.6-flash-low' }),
     'gemini-3.6-flash-low',
   );
   assert.equal(
-    resolveAgySupervisorModel({ REVIEWLOOP_SUPERVISOR_MODEL: 'gemini-9.9-flash-high', AGY_SUPERVISOR_MODEL: 'x' }),
+    resolveAgySupervisorModel({ REVIEWLOOP_GEMINI_SUPERVISOR_MODEL: 'gemini-9.9-flash-high', AGY_GEMINI_SUPERVISOR_MODEL: 'x' }),
     'gemini-9.9-flash-high',
   );
-  assert.equal(resolveAgySupervisorModel({ AGY_SUPERVISOR_MODEL: '   ' }), null);
+  assert.equal(resolveAgySupervisorModel({ AGY_GEMINI_SUPERVISOR_MODEL: '   ' }), null);
   assert.equal(resolveAgySupervisorFamily({ AGY_MODEL: 'gemini-3.1-pro-high' }).pinnedByEnv, true);
 });
 
 test('explicit env override pins a concrete model (Reviewer precedence)', () => {
   assert.equal(resolveAgyReviewerModel({ AGY_MODEL: 'gemini-3.1-pro-high' }), 'gemini-3.1-pro-high');
   assert.equal(
-    resolveAgyReviewerModel({ AGY_MODEL: 'gemini-3.1-pro-high', AGY_REVIEWER_MODEL: 'gpt-oss-120b-medium' }),
-    'gpt-oss-120b-medium',
+    resolveAgyReviewerModel({ AGY_MODEL: 'gemini-3.1-pro-high', AGY_GEMINI_REVIEWER_MODEL: 'gemini-3.6-flash-low' }),
+    'gemini-3.6-flash-low',
   );
 });
 
-test('runtime catalog resolves the newest family entry without any config edit', () => {
+test('runtime catalog resolves the newest family entry at the role-fixed effort', () => {
   const agyCatalog = [
-    'gemini-3.8-flash-high', 'gemini-3.8-flash-low', 'gemini-3.7-flash-high',
-    'gpt-oss-120b-medium', 'gpt-oss-200b-medium',
+    'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low',
+    'gemini-3.7-flash-medium', 'gemini-3.7-flash-low',
   ];
-  assert.equal(resolveAgySupervisorModel({}, { agyCatalog }), 'gemini-3.8-flash-high');
-  assert.equal(resolveAgyReviewerModel({}, { agyCatalog }), 'gpt-oss-200b-medium');
+  // Supervisor head is fixed to -medium, Reviewer head to -low.
+  assert.equal(resolveAgySupervisorModel({}, { agyCatalog }), 'gemini-3.8-flash-medium');
+  assert.equal(resolveAgyReviewerModel({}, { agyCatalog }), 'gemini-3.8-flash-low');
   assert.equal(resolveAgySupervisorFamily({}, { agyCatalog }).resolvedFrom, 'runtime_catalog');
 
   // a newer catalog -> a different concrete model, still zero config edits
-  const newer = [...agyCatalog, 'gemini-4.1-flash-high'];
-  assert.equal(resolveAgySupervisorModel({}, { agyCatalog: newer }), 'gemini-4.1-flash-high');
+  const newer = [...agyCatalog, 'gemini-4.1-flash-medium', 'gemini-4.1-flash-low'];
+  assert.equal(resolveAgySupervisorModel({}, { agyCatalog: newer }), 'gemini-4.1-flash-medium');
+  assert.equal(resolveAgyReviewerModel({}, { agyCatalog: newer }), 'gemini-4.1-flash-low');
 });
 
 test('per-role vars are independent of each other', () => {
-  const env = { AGY_SUPERVISOR_MODEL: 'gemini-3.5-flash-high', AGY_REVIEWER_MODEL: 'gpt-oss-120b-medium' };
-  assert.equal(resolveAgySupervisorModel(env), 'gemini-3.5-flash-high');
-  assert.equal(resolveAgyReviewerModel(env), 'gpt-oss-120b-medium');
+  const env = { AGY_GEMINI_SUPERVISOR_MODEL: 'gemini-3.5-flash-medium', AGY_GEMINI_REVIEWER_MODEL: 'gemini-3.5-flash-low' };
+  assert.equal(resolveAgySupervisorModel(env), 'gemini-3.5-flash-medium');
+  assert.equal(resolveAgyReviewerModel(env), 'gemini-3.5-flash-low');
 });
 
 test('resolveAgyModel is an AGY_MODEL-only shared fallback (null otherwise)', () => {

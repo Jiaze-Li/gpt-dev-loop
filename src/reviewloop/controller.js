@@ -944,7 +944,7 @@ export function createReviewLoopController({
         spend,
         role: 'supervisor',
         routeFn: routeSupervisorFn,
-        defaultFamily: 'agy:gemini',
+        defaultFamily: 'agy:gemini-supervisor',
         defaultProvider: 'agy',
         operationId: `${loopState.loopId}:supervise`,
         workflowId: loopState.loopId,

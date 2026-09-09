@@ -46,7 +46,8 @@ const CLI_TRANSPORT_FACTORY = Object.freeze({
   'claude:opus': makeClaudeReviewTransport,
 });
 
-// Every ReviewLoop-owned AGY family (agy:gemini, agy:gpt-oss, agy:sonnet, ...):
+// Every ReviewLoop-owned AGY family (agy:gemini-reviewer, agy:gemini-supervisor,
+// agy:gpt-oss, agy:sonnet, ...):
 // derived from the registry so a newly-registered agy:* family is wired through
 // the same isolated `reviewloop-minimal` path automatically — never left as an
 // unwired policy entry, and never silently falling back to AGY's ambient agent.
@@ -397,8 +398,12 @@ export function createReviewLoopProviderPool({
         provider: r.provider ?? (family.startsWith('agy:') ? family.replace(':', '-') : family.split(':')[0]),
         capabilities: {
           roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [],
+          // Effort is NOT selected at route time for these families — each AGY
+          // family's concrete model (and thus its effort) is bound once at pool
+          // construction from the family's own `defaultEffort`. Report that
+          // fixed effort so telemetry/inspection never implies a mutable knob.
           supportsReasoningEffort: false,
-          supportedEfforts: ['medium'],
+          supportedEfforts: [MODEL_FAMILY_REGISTRY[family]?.defaultEffort ?? 'medium'],
         },
       };
     },

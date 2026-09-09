@@ -3,7 +3,7 @@
 //
 // Why: AGY's ambient/default agent inherits the user's skills, rules, plugins,
 // subagents and MCP servers. For a narrow single-turn review that context is
-// pure tax (the live agy:gemini Supervisor was seen carrying ~38.9k input
+// pure tax (the live Gemini Supervisor was seen carrying ~38.9k input
 // tokens — the full default agent). A Markdown custom agent with
 // `inheritCustomizations: false` adopts NONE of those ambient customizations.
 //

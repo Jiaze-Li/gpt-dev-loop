@@ -159,7 +159,7 @@ test('pool: agent missing / capability unsupported -> AGY families UNAVAILABLE, 
     customAgentSupport: { supported: false, reason: 'agy fell back to the default agent' },
     callAgy: async () => { called = true; return { text: '{"findings":[]}' }; },
   });
-  for (const f of ['agy:gemini', 'agy:gpt-oss', 'agy:sonnet']) {
+  for (const f of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:sonnet']) {
     assert.equal(pool.runtimeStatus[f].runtimeAvailable, false);
     assert.equal(pool.transports[f], undefined);
     assert.match(pool.runtimeStatus[f].reason, /does not load the isolated reviewloop-minimal agent/);
@@ -185,8 +185,9 @@ test('pool: capability supported but a call fell back to the default agent -> ra
     (err) => err.code === 'AGY_ISOLATION_UNVERIFIED' && /unverified/.test(err.message),
   );
   // the whole AGY pool is now fenced off so bounded failover routes AWAY
-  for (const f of ['agy:gemini', 'agy:gpt-oss', 'agy:sonnet']) {
-    assert.equal(pool.route(f === 'agy:gpt-oss' ? 'reviewer' : 'supervisor', { allowHighContext: true })?.family?.startsWith('agy:') ?? false, false);
+  for (const f of ['agy:gemini-reviewer', 'agy:gemini-supervisor', 'agy:gpt-oss', 'agy:sonnet']) {
+    const role = (f === 'agy:gpt-oss' || f === 'agy:gemini-reviewer') ? 'reviewer' : 'supervisor';
+    assert.equal(pool.route(role, { allowHighContext: true })?.family?.startsWith('agy:') ?? false, false);
   }
 });
 
@@ -207,7 +208,7 @@ test('pool: capability supported and the call is verified isolated -> allowed th
   assert.equal(seen[0].agent, MINIMAL_AGY_AGENT_NAME);
   assert.ok(typeof seen[0].geminiDir === 'string' && seen[0].geminiDir.length > 0);
   assert.ok(typeof seen[0].logFile === 'string' && seen[0].logFile.length > 0);
-  assert.equal(pool.runtimeStatus['agy:gemini'].effectiveLoadingVerified, true);
+  assert.equal(pool.runtimeStatus['agy:gemini-reviewer'].effectiveLoadingVerified, true);
 });
 
 test('pool: no capability verdict (null) -> AGY wired, per-call verification skipped (inspection/test mode)', async () => {
@@ -217,5 +218,5 @@ test('pool: no capability verdict (null) -> AGY wired, per-call verification ski
   await sel.transport('P');
   assert.equal(seen.length, 1);
   assert.equal(seen[0].logFile, undefined, 'no --log-file requested when not enforcing');
-  assert.equal(pool.runtimeStatus['agy:gemini'].effectiveLoadingVerified, false);
+  assert.equal(pool.runtimeStatus['agy:gemini-reviewer'].effectiveLoadingVerified, false);
 });

@@ -19,7 +19,7 @@ import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 test('accountingClassOf resolves from family, then provider, never a model name', () => {
   assert.equal(accountingClassOf({ family: 'codex:default' }), 'openai');
   assert.equal(accountingClassOf({ family: 'claude:opus' }), 'anthropic');
-  assert.equal(accountingClassOf({ family: 'agy:gemini' }), 'agy');
+  assert.equal(accountingClassOf({ family: 'agy:gemini-supervisor' }), 'agy');
   assert.equal(accountingClassOf({ family: 'agy:gpt-oss' }), 'agy');
   assert.equal(accountingClassOf({ provider: 'codex' }), 'openai');
   assert.equal(accountingClassOf({ provider: 'agy-gemini' }), 'agy');
@@ -63,7 +63,7 @@ test('AGY Gemini: provider-reported total is authoritative (7252, never 15380)',
     input_tokens: 6713, output_tokens: 539, thinking_tokens: 506,
     cache_read_input_tokens: 8128, cache_creation_input_tokens: null, total_tokens: 7252,
   };
-  const a = usageAccountingOf({ usage, family: 'agy:gemini', provider: 'agy-gemini' });
+  const a = usageAccountingOf({ usage, family: 'agy:gemini-supervisor', provider: 'agy-gemini' });
   assert.equal(a.usageVolume, 7252);
   assert.notEqual(a.usageVolume, 15380);
   assert.ok(a.usageVolume < 6713 + 8128); // never reconstructed larger than the provider total
@@ -136,7 +136,7 @@ test('UNKNOWN != ZERO: no usage object -> volume 0, semantics unknown, total nul
 test('accountingProvenanceOf is compact and prompt-free', () => {
   const p = accountingProvenanceOf(usageAccountingOf({
     usage: { input_tokens: 6713, output_tokens: 539, total_tokens: 7252 },
-    family: 'agy:gemini', provider: 'agy-gemini',
+    family: 'agy:gemini-supervisor', provider: 'agy-gemini',
   }));
   assert.deepEqual(p, {
     method: 'provider_total', semanticsKnown: true, volumeResolved: true,
@@ -229,7 +229,7 @@ test('full envelopes still resolve to the corrected volumes', () => {
   }).usageVolume, 16931);
   assert.equal(usageAccountingOf({
     usage: { input_tokens: 6713, output_tokens: 539, total_tokens: 7252 },
-    family: 'agy:gemini', provider: 'agy-gemini',
+    family: 'agy:gemini-supervisor', provider: 'agy-gemini',
   }).usageVolume, 7252);
   assert.equal(usageAccountingOf({
     usage: { input_tokens: 2, output_tokens: 1549, cache_read_input_tokens: 2168, cache_creation_input_tokens: 1285 },
@@ -337,7 +337,7 @@ test('Anthropic has no authoritative token-total alias -> always cache-additive'
 test('AGY accepts the Gemini-native totalTokenCount alias', () => {
   const a = usageAccountingOf({
     usage: { input_tokens: 6713, output_tokens: 539, totalTokenCount: 7252 },
-    family: 'agy:gemini', provider: 'agy-gemini',
+    family: 'agy:gemini-supervisor', provider: 'agy-gemini',
   });
   assert.equal(a.usageAccountingMethod, 'provider_total');
   assert.equal(a.usageVolume, 7252);

@@ -45,9 +45,17 @@ benchmark:transports` green. No real-provider calls.
   Supervisor certification passed transport / accounting / isolation but its
   decision output violated the Supervisor decision schema
   (`recommendation = "REWORK|HUMAN_REQUIRED"`). The parser was **not** loosened.
-  Final Supervisor pool: `agy:gemini → codex:default → agy:sonnet →
+  Final Supervisor pool: `agy:gemini-supervisor → codex:default → agy:sonnet →
   claude:opus`. It stays a Reviewer candidate; family/transport/accounting
   support is unchanged. Supervisor provider-attempt ceiling 5 → 4.
+- **Role-specific Gemini effort (D24).** Gemini split into two role-scoped
+  stable family identities with a FIXED per-role effort: `agy:gemini-reviewer`
+  (`-low`) is now the Reviewer head, `agy:gemini-supervisor` (`-medium`) the
+  Supervisor head. Both share the one `agy-gemini` quota pool. Reviewer routing:
+  `agy:gemini-reviewer → codex:default → agy:sonnet → agy:gpt-oss →
+  claude:opus`. The live-result table below predates the split; its
+  `agy:gemini` Supervisor row is the same model/transport now labelled
+  `agy:gemini-supervisor`.
 - **Single-call Token Sentinel** (post-settlement circuit breaker): a physical
   Reviewer/Supervisor call whose usage settled reliably but whose
   `usageVolume > REVIEWLOOP_MAX_SINGLE_CALL_USAGE` (default 40 000) or whose

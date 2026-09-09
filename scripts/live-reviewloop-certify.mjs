@@ -14,17 +14,19 @@
 //
 // Mode A (reviewer): certifies the normal production main path end to end —
 //   real temp git repo -> reviewloop_begin -> Worker delta -> deterministic
-//   Gate PASS -> production RoleRouter -> codex:default -> real Codex Reviewer
+//   Gate PASS -> production RoleRouter -> agy:gemini-reviewer (the Reviewer
+//   head, fixed to -low effort) -> real isolated reviewloop-minimal AGY
 //   transport -> ModelSpendAuthority -> reservation -> provider-aware usage
 //   accounting -> ReviewPolicy -> terminal PASS. ANY failover to a second
 //   Reviewer family is a certification FAILURE (failover already has
 //   deterministic fake coverage; this run must not burn a second provider).
+//   resolvedModel MUST be a `gemini-*-low` id.
 //
 // Mode B (supervisor): certifies the Gemini Medium Supervisor's controller
 //   integration with the least possible token spend. The Reviewer is a
 //   SYNTHETIC deterministic precondition (injected) that constructs a
 //   persistent-blocker state; the Supervisor itself goes through real
-//   production routing + real AGY transport (agy:gemini -> runtime catalog ->
+//   production routing + real AGY transport (agy:gemini-supervisor -> runtime catalog ->
 //   reviewloop-minimal agent -> real physical call -> usage accounting ->
 //   controller transition). It is NOT a full controller E2E. If the first
 //   real Gemini call fails, the script FAILS rather than trying Codex.
@@ -144,16 +146,18 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     // Certification target isolation. Production RoleRouter still picks the
     // candidate (health / quota-cooldown aware), but this harness refuses to
     // physically dispatch anything outside the Reviewer certification scope
-    // (codex:default). If the router would advance to a fallback family —
-    // because codex was skipped before dispatch, or because a first real codex
-    // attempt failed safely and failover re-routed — we record the family name
-    // only and hand the controller a null selection, which stops the failover
-    // loop with ZERO fallback-provider physical calls. Certification then FAILs
-    // on the missing terminal PASS / missing codex:default selection.
+    // (agy:gemini-reviewer — the production Reviewer head, fixed to -low effort,
+    // reached through the isolated reviewloop-minimal AGY transport). If the
+    // router would advance to a fallback family — because the Gemini head was
+    // skipped before dispatch, or because a first real call failed safely and
+    // failover re-routed — we record the family name only and hand the
+    // controller a null selection, which stops the failover loop with ZERO
+    // fallback-provider physical calls. Certification then FAILs on the missing
+    // terminal PASS / missing agy:gemini-reviewer selection.
     const routeReviewerFn = (signals) => {
       const sel = providers.routeReviewerFn(signals);
       if (!sel?.family) return sel;
-      if (sel.family !== 'codex:default') {
+      if (sel.family !== 'agy:gemini-reviewer') {
         suppressedFallbackFamilies.push(sel.family);
         return null;
       }
@@ -187,9 +191,8 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     );
 
     if (res.status !== 'PASS') failures.push(`terminal is ${res.status}, expected PASS (${res.reason ?? ''})`);
-    if (selectedReviewerFamily !== 'codex:default') {
-      failures.push(`selected Reviewer family is ${selectedReviewerFamily ?? 'none'}, expected codex:default`
-        + ` (codex:default runtime: ${JSON.stringify(transportRuntime?.['codex:default'] ?? null)})`);
+    if (selectedReviewerFamily !== 'agy:gemini-reviewer') {
+      failures.push(`selected Reviewer family is ${selectedReviewerFamily ?? 'none'}, expected agy:gemini-reviewer`);
     }
     if (reviewerSelections.length !== 1) failures.push(`Reviewer routed ${reviewerSelections.length} times (${reviewerSelections.join(' -> ')}); a single certification call must not failover`);
     if (suppressedFallbackFamilies.length) failures.push(`production routing would have dispatched an out-of-scope fallback Reviewer family: ${suppressedFallbackFamilies.join(', ')}`);
@@ -197,6 +200,13 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
     if ((tel.reviewerCalls ?? 0) !== 1) failures.push(`reviewerCalls=${tel.reviewerCalls}, expected 1`);
     if ((tel.supervisorCalls ?? 0) !== 0) failures.push(`supervisorCalls=${tel.supervisorCalls}, expected 0`);
     if (!usageResolved) failures.push('Reviewer usage was not resolved by provider-aware accounting');
+    if (customAgentSupport?.supported !== true) failures.push(`agy custom-agent capability probe did not confirm isolated-agent loading: ${customAgentSupport?.reason ?? 'unknown'}`);
+    if (providers.runtimeStatus?.['agy:gemini-reviewer']?.effectiveLoadingVerified !== true) failures.push('agy:gemini-reviewer effective-loading verification is not active');
+    const reviewerResolvedModel = reviewerRecord?.model
+      ?? providers.pool?.resolution?.['agy:gemini-reviewer']?.resolvedModel ?? null;
+    if (reviewerResolvedModel && !/-low$/.test(reviewerResolvedModel)) {
+      failures.push(`Reviewer resolvedModel ${reviewerResolvedModel} is not a -low Gemini variant (telemetry must never say low while calling another effort)`);
+    }
 
     const status = failures.length ? 'FAIL' : 'PASS';
     return {
@@ -207,7 +217,9 @@ export async function runReviewerCertification({ env = process.env, deps = {} } 
         terminal: res.status,
         selectedReviewerFamily,
         resolvedModel: reviewerRecord?.model
-          ?? providers.pool?.resolution?.['codex:default']?.resolvedModel ?? null,
+          ?? providers.pool?.resolution?.['agy:gemini-reviewer']?.resolvedModel ?? null,
+        effectiveLoadingVerified: providers.runtimeStatus?.['agy:gemini-reviewer']?.effectiveLoadingVerified === true,
+        customAgentSupport: { supported: customAgentSupport?.supported === true, reason: customAgentSupport?.reason ?? null },
         reviewerCalls: tel.reviewerCalls ?? 0,
         supervisorCalls: tel.supervisorCalls ?? 0,
         usageVolume: tel.usageVolume ?? 0,
@@ -267,7 +279,7 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
     });
 
     // Certification target isolation — same contract as the Reviewer wrapper,
-    // scoped to agy:gemini. Production RoleRouter still chooses the candidate;
+    // scoped to agy:gemini-supervisor. Production RoleRouter still chooses the candidate;
     // the harness refuses to physically dispatch any Supervisor family outside
     // certification scope. A skipped-before-dispatch Gemini, or a first real
     // Gemini call that fails safely and re-routes, yields a null selection
@@ -275,7 +287,7 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
     const routeSupervisorFn = (signals) => {
       const sel = providers.routeSupervisorFn(signals);
       if (!sel?.family) return sel;
-      if (sel.family !== 'agy:gemini') {
+      if (sel.family !== 'agy:gemini-supervisor') {
         suppressedFallbackFamilies.push(sel.family);
         return null;
       }
@@ -317,9 +329,14 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
     if (r1.status !== 'REWORK') failures.push(`round 1 terminal is ${r1.status}, expected REWORK (${r1.reason ?? ''})`);
     if (!['REWORK', 'PASS'].includes(r2.status)) failures.push(`round 2 terminal is ${r2.status} (${r2.reason ?? ''})`);
     if (!r2.supervisorGuidance) failures.push('controller did not surface Supervisor guidance — Supervisor path did not complete');
-    if (selectedSupervisorFamily !== 'agy:gemini') failures.push(`selected Supervisor family is ${selectedSupervisorFamily ?? 'none'}, expected agy:gemini`);
+    if (selectedSupervisorFamily !== 'agy:gemini-supervisor') failures.push(`selected Supervisor family is ${selectedSupervisorFamily ?? 'none'}, expected agy:gemini-supervisor`);
     if (customAgentSupport?.supported !== true) failures.push(`agy custom-agent capability probe did not confirm isolated-agent loading: ${customAgentSupport?.reason ?? 'unknown'}`);
-    if (providers.runtimeStatus?.['agy:gemini']?.effectiveLoadingVerified !== true) failures.push('agy:gemini effective-loading verification is not active');
+    if (providers.runtimeStatus?.['agy:gemini-supervisor']?.effectiveLoadingVerified !== true) failures.push('agy:gemini-supervisor effective-loading verification is not active');
+    const supervisorResolvedModel = supervisorRecord?.model
+      ?? providers.pool?.resolution?.['agy:gemini-supervisor']?.resolvedModel ?? null;
+    if (supervisorResolvedModel && !/-medium$/.test(supervisorResolvedModel)) {
+      failures.push(`Supervisor resolvedModel ${supervisorResolvedModel} is not a -medium Gemini variant`);
+    }
     if (suppressedFallbackFamilies.length) failures.push(`production routing would have dispatched an out-of-scope fallback Supervisor family: ${suppressedFallbackFamilies.join(', ')}`);
     if ((tel.supervisorCalls ?? 0) !== 1) failures.push(`supervisorCalls=${tel.supervisorCalls}, expected 1`);
     if (supervisorFallback.length) failures.push(`Supervisor failover/failure recorded (certification does not fall back to Codex): ${JSON.stringify(supervisorFallback)}`);
@@ -334,13 +351,13 @@ export async function runSupervisorCertification({ env = process.env, deps = {} 
         status,
         selectedSupervisorFamily,
         resolvedModel: supervisorRecord?.model
-          ?? providers.pool?.resolution?.['agy:gemini']?.resolvedModel ?? null,
+          ?? providers.pool?.resolution?.['agy:gemini-supervisor']?.resolvedModel ?? null,
         supervisorCalls: tel.supervisorCalls ?? 0,
         usageVolume: tel.usageVolume ?? 0,
         usageAccounting: supervisorRecord?.usageAccounting ?? {},
         usageBreakdown: tel.usageBreakdown ?? {},
-        minimalAgent: providers.runtimeStatus?.['agy:gemini']?.runtimeAvailable === true,
-        effectiveLoadingVerified: providers.runtimeStatus?.['agy:gemini']?.effectiveLoadingVerified === true,
+        minimalAgent: providers.runtimeStatus?.['agy:gemini-supervisor']?.runtimeAvailable === true,
+        effectiveLoadingVerified: providers.runtimeStatus?.['agy:gemini-supervisor']?.effectiveLoadingVerified === true,
         customAgentSupport: { supported: customAgentSupport?.supported === true, reason: customAgentSupport?.reason ?? null },
         reviewerPrecondition: 'synthetic',
         ...(suppressedFallbackFamilies.length ? { suppressedFallbackFamilies } : {}),

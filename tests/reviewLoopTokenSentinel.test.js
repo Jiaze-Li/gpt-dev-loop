@@ -29,7 +29,7 @@ import { MemoryPersistence, finding } from './helpers/reviewLoopHarness.js';
 test('Supervisor production pool is EXACTLY the 4 certified candidates', () => {
   assert.deepEqual(
     DEFAULT_ROLE_POLICY.supervisor.map((c) => c.family),
-    ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus'],
+    ['agy:gemini-supervisor', 'codex:default', 'agy:sonnet', 'claude:opus'],
   );
   const eligible = DEFAULT_ROLE_POLICY.supervisor
     .filter((c) => (PRODUCTION_ROLE_CAPABILITIES[c.family] ?? []).includes('supervisor'))
@@ -48,11 +48,11 @@ test('agy:gpt-oss is not Supervisor-eligible and never routes as Supervisor', ()
     capabilities: { roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [], supportsReasoningEffort: false, supportedEfforts: ['medium'] },
   });
   const health = new ProviderHealthRegistry();
-  for (const f of ['agy:gemini', 'codex:default', 'agy:sonnet', 'claude:opus']) health.record(f, 'UNAVAILABLE');
+  for (const f of ['agy:gemini-supervisor', 'codex:default', 'agy:sonnet', 'claude:opus']) health.record(f, 'UNAVAILABLE');
   assert.equal(new RoleRouter({ providerHealth: health, resolveFamily: resolver }).route('supervisor'), null);
 });
 
-test('agy:gpt-oss is still the third Reviewer candidate', () => {
+test('agy:gpt-oss is still a Reviewer candidate', () => {
   assert.equal(DEFAULT_ROLE_POLICY.reviewer.map((c) => c.family).includes('agy:gpt-oss'), true);
   assert.equal(supportsProductionRole('agy:gpt-oss', 'reviewer'), true);
 });
@@ -494,11 +494,11 @@ test('controller: a single-call token anomaly is a safety stop — no failover, 
   assert.equal(r.status, 'HUMAN_REQUIRED');
   assert.match(r.reason, /token anomaly|MODEL_SPEND_TOKEN_ANOMALY/i);
   // (12) no auto-failover to the next Reviewer candidate
-  assert.deepEqual(tried, ['codex:default']);
+  assert.deepEqual(tried, ['agy:gemini-reviewer']);
   // (13) provider health / quota untouched
   assert.deepEqual(providerFailures, []);
-  assert.equal(health.get('codex:default').status, 'UNKNOWN');
-  assert.equal(quota.usable('codex:default'), true);
+  assert.equal(health.get('agy:gemini-reviewer').status, 'UNKNOWN');
+  assert.equal(quota.usable('agy:gemini-reviewer'), true);
   // BLOCKING safety event surfaced
   assert.equal(r.safetyEvents.some((e) => e.code === 'MODEL_SPEND_TOKEN_ANOMALY' && e.severity === 'BLOCKING'), true);
   // durable latch + full accounting of the anomalous call

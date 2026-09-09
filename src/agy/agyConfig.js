@@ -3,14 +3,15 @@
 // ReviewLoop configuration binds each role to an ordered pool of stable model
 // FAMILIES, never a concrete released version (see
 // src/orchestrator/modelFamilyResolver.js + roleRouting.js DEFAULT_ROLE_POLICY).
-// The AGY families in those pools are agy:gemini, agy:sonnet and agy:gpt-oss;
-// the helpers below resolve the two primary ones (Supervisor head = agy:gemini,
-// Reviewer low-cost fallback = agy:gpt-oss) for the telemetry/label layers.
+// The AGY families in those pools are agy:gemini-reviewer, agy:gemini-supervisor,
+// agy:sonnet and agy:gpt-oss; the helpers below resolve the two Gemini role
+// heads (Reviewer head = agy:gemini-reviewer / -low, Supervisor head =
+// agy:gemini-supervisor / -medium) for the telemetry/label layers.
 //
 // Concrete model resolution order (never throws):
 //   1. explicit env override — pins a concrete id (tests / benchmark / repro):
-//        Supervisor: REVIEWLOOP_SUPERVISOR_MODEL -> AGY_SUPERVISOR_MODEL -> AGY_MODEL
-//        Reviewer:   REVIEWLOOP_REVIEWER_MODEL   -> AGY_REVIEWER_MODEL   -> AGY_MODEL
+//        Supervisor: REVIEWLOOP_GEMINI_SUPERVISOR_MODEL -> AGY_GEMINI_SUPERVISOR_MODEL -> AGY_MODEL
+//        Reviewer:   REVIEWLOOP_GEMINI_REVIEWER_MODEL   -> AGY_GEMINI_REVIEWER_MODEL   -> AGY_MODEL
 //   2. runtime catalog (`agy models`) — newest entry for the family
 //   3. provider default — null; the transport omits --model and the CLI picks
 //      its own current default. The concrete model is recovered from the reply
@@ -40,19 +41,19 @@ export function resolveAgyModel(env = process.env) {
 // `agyCatalog` (ids array / raw `agy models` stdout) enables runtime catalog
 // resolution; omit it in deterministic tests.
 export function resolveAgySupervisorModel(env = process.env, { agyCatalog = null } = {}) {
-  return resolveModelFamily('agy:gemini', { env, agyCatalog }).resolvedModel;
+  return resolveModelFamily('agy:gemini-supervisor', { env, agyCatalog }).resolvedModel;
 }
 
 export function resolveAgyReviewerModel(env = process.env, { agyCatalog = null } = {}) {
-  return resolveModelFamily('agy:gpt-oss', { env, agyCatalog }).resolvedModel;
+  return resolveModelFamily('agy:gemini-reviewer', { env, agyCatalog }).resolvedModel;
 }
 
 // Full resolution record (provider, resolvedFrom, pinnedByEnv, ...) for the
 // telemetry / wiring layers.
 export function resolveAgySupervisorFamily(env = process.env, { agyCatalog = null } = {}) {
-  return resolveModelFamily('agy:gemini', { env, agyCatalog });
+  return resolveModelFamily('agy:gemini-supervisor', { env, agyCatalog });
 }
 
 export function resolveAgyReviewerFamily(env = process.env, { agyCatalog = null } = {}) {
-  return resolveModelFamily('agy:gpt-oss', { env, agyCatalog });
+  return resolveModelFamily('agy:gemini-reviewer', { env, agyCatalog });
 }
