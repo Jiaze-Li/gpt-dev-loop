@@ -140,6 +140,26 @@ test('an empty lock file (zero-length write) is reclaimed', async () => {
   }
 });
 
+test('concurrent acquires of the same loop -> exactly one winner; the loser never reclaims the winner', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-conc-'));
+  try {
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => acquireLoopFileLease({ runtimeRoot: root, loopId: 'LOOPC' })),
+    );
+    const winners = results.filter((r) => r.ok);
+    assert.equal(winners.length, 1, `exactly one winner, got ${winners.length}`);
+    // Every loser sees the winner's full record, never an empty/partial one.
+    for (const loser of results.filter((r) => !r.ok)) {
+      assert.equal(typeof loser.heldBy?.token, 'string', JSON.stringify(loser.heldBy));
+    }
+    const onDisk = JSON.parse(fs.readFileSync(path.join(root, 'LOOPC', 'reviewloop.lock'), 'utf8'));
+    assert.equal(typeof onDisk.token, 'string');
+    await winners[0].release();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a lock held by a dead pid on THIS host is reclaimed regardless of TTL', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-dead-'));
   try {

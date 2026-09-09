@@ -689,66 +689,83 @@ export function createReviewLoopController({
         });
       }
     }
-    const gate = await runGateFn({
+    let gate = await runGateFn({
       cwd, commands: gateCommands, runner: gateRunner, env, signal,
       baselineGateEvidence: trustedBaselineGateEvidence,
     });
     gate.commandSource = commandSource;
 
-    // The review-time Gate may itself have mutated tracked files. The delta was
-    // collected BEFORE it ran, so re-collect now — otherwise the Reviewer sees
-    // pre-Gate evidence and the NO_PROGRESS fingerprint no longer matches the
-    // tree. (begin-time recapture already covers the baseline Gate; this is the
+    // The review-time Gate may itself have mutated tracked files (a formatter, a
+    // snapshot writer, a codegen step). The delta was collected BEFORE it ran,
+    // so re-collect. If the Gate DID change the tree, adopt the post-Gate tree
+    // AND re-run the frozen Gate over it, repeating until the tree stops
+    // changing — otherwise a later PASS could pair test evidence from the
+    // pre-mutation tree with Reviewer evidence from the post-mutation tree,
+    // leaving the actual final code unverified. A Gate that never converges, or
+    // whose post-Gate delta cannot be re-collected safely, fails closed.
+    // (begin-time recapture already covers the baseline Gate; this is the
     // review path.)
     const postGateFn = collectPostGateDeltaFn
       ?? (collectWorkerDeltaFn === collectWorkerDelta ? collectWorkerDelta : null);
     if (postGateFn && !signal?.aborted && gate.verdict !== GATE_VERDICTS.FAIL) {
-      let postDelta = null;
-      let postGateError = null;
-      try { postDelta = await postGateFn({ cwd, baseline }); }
-      catch (err) { postGateError = err; postDelta = null; }
-
-      // Fail closed on EVERY post-Gate evidence failure — a throw, a missing
-      // result, a missing fingerprint, or incomplete attribution — before
-      // comparing fingerprints. The fingerprint excludes completeness metadata,
+      // Collect + validate the post-Gate Worker delta. Fail closed on EVERY
+      // failure — a throw, a missing result, a missing fingerprint, or
+      // incomplete attribution. The fingerprint excludes completeness metadata,
       // so a Gate that creates an untracked file while this recollection fails
-      // would otherwise send stale pre-Gate evidence to the Reviewer and reach
-      // PASS without that file being reviewed.
-      if (!postDelta || !postDelta.fingerprint || postDelta.evidenceComplete === false) {
-        const why = postGateError
-          ? [`post-Gate delta collection threw: ${postGateError?.message ?? postGateError}`]
-          : !postDelta
-            ? ['post-Gate delta collection returned no result']
-            : !postDelta.fingerprint
-              ? ['post-Gate delta collection returned no fingerprint']
-              : (postDelta.incompleteReasons ?? ['post-Gate Worker delta could not be attributed']);
-        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'post-Gate attribution incomplete');
+      // would otherwise send stale evidence to the Reviewer and reach PASS
+      // without that file being reviewed.
+      const collectPostGate = async () => {
+        let d = null;
+        let e = null;
+        try { d = await postGateFn({ cwd, baseline }); } catch (err) { e = err; }
+        if (!d || !d.fingerprint || d.evidenceComplete === false) {
+          const why = e
+            ? `post-Gate delta collection threw: ${e?.message ?? e}`
+            : !d
+              ? 'post-Gate delta collection returned no result'
+              : !d.fingerprint
+                ? 'post-Gate delta collection returned no fingerprint'
+                : (d.incompleteReasons ?? ['post-Gate Worker delta could not be attributed']).join('; ');
+          return { ok: false, why };
+        }
+        return { ok: true, delta: d };
+      };
+
+      const humanRequired = async (reason, transitionLabel = 'post-Gate attribution incomplete') => {
+        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, transitionLabel);
         await store.save(loopState.loopId, loopState);
         return {
           status: 'HUMAN_REQUIRED',
           loopId: loopState.loopId,
           round: loopState.round,
-          reason: `the deterministic Gate ran and the post-Gate Worker delta could not be re-collected safely: ${why.join('; ')}`,
+          reason,
           telemetry: await durableTelemetry(loopState.loopId),
           safetyEvents,
         };
+      };
+
+      let pg = await collectPostGate();
+      if (!pg.ok) {
+        return humanRequired(`the deterministic Gate ran and the post-Gate Worker delta could not be re-collected safely: ${pg.why}`);
       }
-      if (postDelta.fingerprint !== delta.fingerprint) {
+
+      const MAX_GATE_STABILISE = 3;
+      let stabiliseRuns = 0;
+      while (pg.delta.fingerprint !== delta.fingerprint) {
         collectSafetyEvent({
           code: 'GATE_MUTATED_TRACKED_FILES',
           severity: 'NON_BLOCKING',
           role: 'gate',
           taskId: loopState.loopId,
-          reason: 'the review-time Gate modified tracked files; re-collected the Worker delta over the post-Gate tree',
-          actionTaken: 'review proceeds over post-Gate evidence',
+          reason: 'the review-time Gate modified tracked files; re-running the frozen Gate over the post-Gate tree',
+          actionTaken: 'review proceeds only once the Gate and the tree agree',
         });
-        delta = postDelta;
+        delta = pg.delta;
 
-        // A mutating Gate (formatter, snapshot writer, …) may have reverted the
-        // Worker's only changes back to the captured baseline. Re-run the
-        // no-change guard over the adopted post-Gate delta — otherwise the
-        // Reviewer is called with an empty diff and a clean response PASSes,
-        // certifying work that no longer exists in the tree.
+        // A mutating Gate may have reverted the Worker's only changes back to
+        // the captured baseline — the Reviewer would then be called with an
+        // empty diff and a clean response would PASS, certifying work that no
+        // longer exists in the tree.
         if (delta.noWorkerChangeYet) {
           await store.save(loopState.loopId, loopState);
           return {
@@ -760,6 +777,29 @@ export function createReviewLoopController({
             telemetry: await durableTelemetry(loopState.loopId),
             safetyEvents,
           };
+        }
+
+        stabiliseRuns += 1;
+        if (stabiliseRuns > MAX_GATE_STABILISE) {
+          return humanRequired(
+            `the deterministic Gate keeps modifying tracked files and never converged after ${MAX_GATE_STABILISE} re-runs; `
+            + 'run the mutating verification step (formatter / codegen / snapshot writer) yourself, commit its output, then re-review',
+            'review-time Gate never stabilised',
+          );
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        gate = await runGateFn({
+          cwd, commands: gateCommands, runner: gateRunner, env, signal,
+          baselineGateEvidence: trustedBaselineGateEvidence,
+        });
+        gate.commandSource = commandSource;
+        if (signal?.aborted || gate.verdict === GATE_VERDICTS.FAIL) break; // handled downstream
+
+        // eslint-disable-next-line no-await-in-loop
+        pg = await collectPostGate();
+        if (!pg.ok) {
+          return humanRequired(`the frozen Gate was re-run over the post-Gate tree and the delta could not be re-collected safely: ${pg.why}`);
         }
       }
     }

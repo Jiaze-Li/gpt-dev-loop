@@ -24,7 +24,7 @@
 //   * unreadable / malformed lock record -> treated as abandoned.
 
 import {
-  open, readFile, writeFile, unlink, mkdir, rename,
+  open, readFile, writeFile, unlink, mkdir, rename, link,
 } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
@@ -92,17 +92,24 @@ export async function acquireLoopFileLease({
   const lockPath = path.join(dir, 'reviewloop.lock');
   const token = randomUUID();
 
+  // Publish the lock ATOMICALLY, already fully populated: write the complete
+  // record to a private temp file, then `link()` it into place. `link` fails
+  // with EEXIST if the lock already exists (same exclusive-create guarantee as
+  // `open(…, 'wx')`), and the lock is NEVER observable empty or half-written —
+  // so a concurrent contender can never mistake an in-progress initial write
+  // for an abandoned malformed lock.
   const write = async () => {
-    const handle = await open(lockPath, 'wx');
+    const tmp = `${lockPath}.new.${token}`;
+    await writeFile(tmp, JSON.stringify({
+      token, pid: process.pid, host: os.hostname(),
+      acquiredAt: new Date(clock()).toISOString(),
+      renewedAt: new Date(clock()).toISOString(),
+      expiresAt: new Date(clock() + ttlMs).toISOString(),
+    }));
     try {
-      await handle.writeFile(JSON.stringify({
-        token, pid: process.pid, host: os.hostname(),
-        acquiredAt: new Date(clock()).toISOString(),
-        renewedAt: new Date(clock()).toISOString(),
-        expiresAt: new Date(clock() + ttlMs).toISOString(),
-      }));
+      await link(tmp, lockPath);
     } finally {
-      await handle.close();
+      await unlink(tmp).catch(() => {});
     }
   };
 
@@ -114,7 +121,12 @@ export async function acquireLoopFileLease({
       if (current?.token !== token) return false;
       current.renewedAt = new Date(clock()).toISOString();
       current.expiresAt = new Date(clock() + ttlMs).toISOString();
-      await writeFile(lockPath, JSON.stringify(current));
+      // Atomic in-place replace: a crash mid-renew can never truncate the lock,
+      // and a concurrent reader sees either the whole old record or the whole
+      // new one.
+      const tmp = `${lockPath}.renew.${token}`;
+      await writeFile(tmp, JSON.stringify(current));
+      await rename(tmp, lockPath);
       return true;
     } catch {
       return false;
@@ -156,11 +168,12 @@ export async function acquireLoopFileLease({
         try {
           current = JSON.parse(raw);
         } catch {
-          // The file EXISTS but its JSON is unparseable — a process that died
-          // mid-write during renew()'s in-place rewrite, or corruption. It has
-          // no identifiable owner and merely retrying the exclusive `wx` create
-          // would loop on EEXIST until the attempt budget is spent, wedging the
-          // loop with no live owner. Reclaim it instead.
+          // The file EXISTS but its JSON is unparseable. Our own writes are
+          // atomic (link on create, rename on renew), so this is external
+          // corruption, a stale/legacy record, or manual tampering — no
+          // identifiable owner. Merely retrying the exclusive create would loop
+          // on EEXIST until the attempt budget is spent, wedging the loop with
+          // no live owner. Reclaim it instead.
           malformed = true;
         }
       } catch (readErr) {
