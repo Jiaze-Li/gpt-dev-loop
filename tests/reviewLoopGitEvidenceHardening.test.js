@@ -310,6 +310,30 @@ test('fail closed: a baseline-untracked file renamed+edited AND staged under the
   }
 });
 
+test('fail closed: a staged copy of a baseline-untracked file (source left in place) does not leak its bytes', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'secret.txt'), 'PRE_EXISTING_SECRET\ntoken=abc\n');
+    const baseline = await captureBaseline({ cwd: dir });
+
+    // Worker copies it to a staged new path WITHOUT deleting the original, so
+    // nothing vanishes from the untracked listing.
+    fs.copyFileSync(path.join(dir, 'secret.txt'), path.join(dir, 'copy.txt'));
+    git('add', 'copy.txt');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+
+    assert.equal(delta.evidenceComplete, false);
+    assert.ok(delta.incompleteReasons.some((r) => /byte-identical to a file that was untracked at baseline/i.test(r)));
+    assert.equal(delta.trackedChanged.includes('copy.txt'), false);
+    assert.ok((delta.renamedUntrackedBaseline ?? []).includes('copy.txt'));
+    assert.doesNotMatch(delta.diff, /PRE_EXISTING_SECRET/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a genuinely new tracked file is still normal Worker output when no baseline-untracked file vanished', async () => {
   const dir = initRepo();
   try {

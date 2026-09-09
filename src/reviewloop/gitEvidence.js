@@ -397,19 +397,40 @@ export async function collectWorkerDelta({
     }
   }
 
-  // A brand-new file appearing while a pre-existing untracked file disappeared
-  // cannot be told apart from a rename (+ edit) of it — and the baseline kept
-  // only digests, so an honest baseline->current delta cannot be built. The
-  // exact-digest check above already caught unchanged untracked renames; this
-  // catches rename+edit. The "new" side is every brand-new untracked file AND
-  // every brand-new *tracked* addition that was neither tracked nor untracked
-  // at baseline (a rename+edit+`git add` of a baseline-untracked file would
-  // otherwise be emitted whole, leaking its pre-existing bytes with
-  // evidenceComplete=true). Drop every such path from emitted evidence and fail
-  // closed.
+  // Brand-new *tracked* additions (`git diff --diff-filter=A`) that were
+  // neither tracked nor untracked at baseline. A rename/copy (+ optional edit)
+  // of a baseline-untracked file into a staged new name lands here — not in
+  // `currentUntracked`, not in `baselineUntracked` — so none of the untracked
+  // guards above see it, and `git diff <baseRef>` renders it as a wholly-new
+  // file, leaking its pre-existing bytes with evidenceComplete=true. Mirror the
+  // two untracked-side protections for these paths.
   const brandNewTracked = addedTracked.filter(
     (p) => trackedChanged.includes(p) && !leaked.has(p) && !(p in baselineUntracked),
   );
+  const droppedTracked = new Set();
+
+  // (1) Exact digest match against a baseline-untracked file -> a copy/rename
+  //     of pre-existing content. No vanished source required (the Worker may
+  //     copy without deleting the original). Mirrors the untracked
+  //     `renamedUntrackedBaseline` check.
+  for (const p of brandNewTracked) {
+    // eslint-disable-next-line no-await-in-loop
+    const fp = await fingerprintUntracked({ cwd, filePath: p, lstat, readFile, open });
+    if (fp.safe && baselineUntrackedDigests.has(fp.digest)) {
+      droppedTracked.add(p);
+      renamedUntrackedBaseline.push(p);
+      fail(`staged new file ${p} is byte-identical to a file that was untracked at baseline `
+        + `(${baselineUntrackedDigests.get(fp.digest).join(', ')}) — a copy/rename of pre-existing content, not Worker output`);
+    } else if (!fp.safe) {
+      droppedTracked.add(p);
+      fail(fp.reason);
+    }
+  }
+
+  // (2) Any baseline-untracked path vanished while a brand-new file (untracked
+  //     OR tracked) appeared -> a rename+edit cannot be told apart from a
+  //     delete+create, and the baseline kept only digests. Fail closed and
+  //     drop every candidate destination.
   if (untrackedDeleted.length && (untrackedChanged.length || brandNewTracked.length)) {
     const appeared = [...untrackedChanged, ...brandNewTracked];
     fail(`brand-new file(s) [${appeared.join(', ')}] appeared while pre-existing untracked `
@@ -419,16 +440,10 @@ export async function collectWorkerDelta({
       renamedUntrackedBaseline.push(p);
       safeBytes.delete(p);
     }
-    if (brandNewTracked.length) {
-      const drop = new Set(brandNewTracked);
-      renamedUntrackedBaseline.push(...brandNewTracked);
-      trackedChanged = trackedChanged.filter((p) => !drop.has(p));
-      if (trackedChanged.length) {
-        const scoped = await runGit(['diff', baseRef, '--', ...trackedChanged], cwd, spawn);
-        if (scoped.code === 0) trackedDiff = scoped.stdout;
-        else fail(`"git diff ${baseRef} -- <scoped>" exited ${scoped.code}`);
-      } else {
-        trackedDiff = '';
+    for (const p of brandNewTracked) {
+      if (!droppedTracked.has(p)) {
+        droppedTracked.add(p);
+        renamedUntrackedBaseline.push(p);
       }
     }
     // The disappeared paths are no longer "clean deletions" either — fold them
@@ -436,6 +451,19 @@ export async function collectWorkerDelta({
     renamedUntrackedBaseline.push(...untrackedDeleted);
     untrackedChanged.length = 0;
     untrackedDeleted.length = 0;
+  }
+
+  // Re-scope the tracked diff so no dropped brand-new tracked file's bytes
+  // reach the Reviewer.
+  if (droppedTracked.size) {
+    trackedChanged = trackedChanged.filter((p) => !droppedTracked.has(p));
+    if (trackedChanged.length) {
+      const scoped = await runGit(['diff', baseRef, '--', ...trackedChanged], cwd, spawn);
+      if (scoped.code === 0) trackedDiff = scoped.stdout;
+      else fail(`"git diff ${baseRef} -- <scoped>" exited ${scoped.code}`);
+    } else {
+      trackedDiff = '';
+    }
   }
 
   const changedFiles = [
