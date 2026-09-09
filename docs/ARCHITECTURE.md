@@ -284,7 +284,12 @@ external-review wait: it is armed when a round's trigger is authorized and
 settled**. It deliberately does not span the Worker's between-round
 implementation time or the whole multi-round loop (the review-round budget is
 that runaway guard); within one unsettled round every authorize keeps sharing
-the same deadline, so a hung / never-returning reviewer is still caught.
+the same deadline. A reviewer that accepted the trigger and then hung is caught
+whether the next `reviewloop_review` re-authorizes a new HEAD or resumes polling
+the same one — the reattach path checks the in-flight round's deadline
+(`checkInFlightDeadline`) explicitly, since it never calls authorize. A late
+review that eventually lands is still ingested on the next call (the
+existing-review check runs first).
 
 ## Convergence
 

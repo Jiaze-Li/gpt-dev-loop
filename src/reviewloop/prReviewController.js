@@ -163,6 +163,26 @@ export function createPrReviewController({
     const reattach = pending && pending.head === currentHead;
 
     let permit;
+    if (reattach) {
+      // The reattach path never calls authority.authorize(), so the wall-clock
+      // guard there cannot catch a reviewer that accepted the trigger for THIS
+      // HEAD and then hung. Check the in-flight round's deadline explicitly:
+      // once a triggered review has not returned within one round's ceiling,
+      // stop re-polling it forever and hand back to the human. A late review
+      // that does eventually land is still ingested by the findExistingReview
+      // check above on the next reviewloop_review.
+      let deadline;
+      try {
+        deadline = await authority.checkInFlightDeadline({
+          workflowId: loopId, prNumber, headSha: currentHead,
+        });
+      } catch (err) {
+        return { outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED, reason: `review deadline check failed: ${err.message}`, head: currentHead };
+      }
+      if (!deadline.ok) {
+        return { outcome: PR_REVIEW_OUTCOMES.HUMAN_REQUIRED, reason: deadline.reason, head: currentHead };
+      }
+    }
     if (!reattach) {
       if (signal?.aborted) return cancelledOutcome();
       let decision;

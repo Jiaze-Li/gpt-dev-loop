@@ -674,6 +674,53 @@ export class ExternalModelTriggerAuthority {
   // already holds regardless of whether this succeeds (TRIGGERED itself is
   // already untriggerable), so a persistence hiccup here must never mask the
   // otherwise-successful review result reaching the caller.
+  // Pure read: has the in-flight review round for this subject blown its
+  // wall-clock deadline? The reattach path in prReviewController resumes
+  // polling for a same-HEAD trigger WITHOUT calling authorize(), so this is the
+  // only guard that catches a reviewer that accepted the trigger and then hung
+  // forever. Never mutates; records the same BLOCKING safety event authorize()
+  // would, and returns { ok: false, code, reason } instead of throwing so the
+  // caller can map it to a review outcome.
+  async checkInFlightDeadline({
+    workflowId, prNumber, headSha, triggerKind = 'PR_REVIEW',
+  }) {
+    const subjectKey = makeSubjectKey({ workflowId, prNumber, triggerKind });
+    const now = this._now();
+    let map;
+    try {
+      map = await this._loadWorkflow(workflowId);
+    } catch (error) {
+      // Unreadable state must never be read as "deadline fine" — fail closed.
+      return {
+        ok: false,
+        code: EXTERNAL_TRIGGER_ERROR_CODES.EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE,
+        reason: `external trigger state could not be read while checking the review deadline: ${error?.message ?? error}`,
+      };
+    }
+    const bucket = map.get(subjectKey);
+    const deadlineMs = Date.parse(bucket?.wallClock?.deadlineAt ?? '');
+    if (!Number.isFinite(deadlineMs) || now <= deadlineMs) return { ok: true };
+
+    // Only treat it as a blown deadline when there really is an unsettled
+    // in-flight trigger for this HEAD (a settled/absent record is not "hung").
+    const rec = bucket.triggers?.[headSha];
+    if (!rec || SETTLED_TRIGGER_STATUSES.has(rec.status)) return { ok: true };
+
+    this._recordSafetyEvent?.({
+      code: 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED',
+      severity: 'BLOCKING',
+      role: 'external-review',
+      reason: `external review wall-clock ceiling exceeded for ${subjectKey} @ ${headSha} while awaiting an in-flight review`,
+      actionTaken: 'no new external model trigger posted; the in-flight review is treated as not returning',
+    });
+    return {
+      ok: false,
+      code: EXTERNAL_TRIGGER_ERROR_CODES.EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED,
+      reason: `external review wall-clock ceiling (${this._wallClockMs}ms) exceeded for ${subjectKey} @ ${headSha}; `
+        + 'the triggered review has not returned within one round\'s deadline',
+    };
+  }
+
   async recordResult({
     workflowId, prNumber, headSha, triggerKind = 'PR_REVIEW', resultMeta = {},
   }) {

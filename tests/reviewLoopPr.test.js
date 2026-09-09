@@ -90,6 +90,52 @@ test('detached wait -> WAITING_FOR_REVIEW is durable and does not re-trigger on 
   assert.equal(backend.state.triggers.length, 1);
 });
 
+test('a triggered same-HEAD reviewer that hangs past the wall clock is caught on the reattach path (not polled forever)', async () => {
+  const persistence = new MemoryPersistence();
+  const existing = {};
+  const backend = mockPrBackend({ heads: ['H1'], results: { H1: null }, existing });
+  const nowRef = { t: Date.parse('2026-09-09T02:00:00.000Z') };
+  const events = [];
+  const triggerAuthority = new ExternalModelTriggerAuthority({
+    store: new ExternalTriggerStore(persistence),
+    maxExternalModelTriggers: 7,
+    maxExternalReviewRounds: 7,
+    clock: { now: () => nowRef.t },
+    recordSafetyEvent: (e) => events.push(e),
+  });
+  const controller = createReviewLoopController({
+    persistence,
+    prBackend: backend,
+    triggerAuthority,
+    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }),
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+
+  // Round 1: trigger posted for H1, no result yet -> WAITING (reattach primed).
+  assert.equal((await controller.review({ loopId })).status, 'WAITING_FOR_REVIEW');
+  assert.equal(backend.state.triggers.length, 1);
+
+  // Still within the round's deadline: reattach keeps waiting, no dead-end.
+  nowRef.t += 50 * 60 * 1000;
+  assert.equal((await controller.review({ loopId })).status, 'WAITING_FOR_REVIEW');
+
+  // The triggered reviewer never returns; past one round's wall-clock ceiling.
+  nowRef.t += 20 * 60 * 1000; // now 70 min in, deadline was 60 min
+  const timedOut = await controller.review({ loopId });
+  assert.equal(timedOut.status, 'HUMAN_REQUIRED', 'a hung same-HEAD reviewer is not polled forever');
+  assert.match(timedOut.reason, /wall-clock ceiling/);
+  assert.ok(events.some((e) => e.code === 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED'
+    && /in-flight review/.test(e.reason)));
+  assert.equal(backend.state.triggers.length, 1, 'no new trigger was posted');
+
+  // Not a permanent dead-end: a late review that finally lands is still ingested
+  // (findExistingReview runs before the reattach deadline check).
+  existing.H1 = { findings: [{ severity: 'P1', file: 'a.js', title: 'late bug' }], head_sha: 'H1' };
+  const late = await controller.review({ loopId });
+  assert.equal(late.status, 'REWORK');
+  assert.equal(backend.state.triggers.length, 1, 'the late review was ingested without a new trigger');
+});
+
 test('local fix not pushed (PR head unchanged, prior actionable) -> PUSH_REQUIRED, no re-review', async () => {
   const backend = mockPrBackend({
     heads: ['H1'],
