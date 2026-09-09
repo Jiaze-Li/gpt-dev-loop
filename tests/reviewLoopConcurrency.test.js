@@ -107,6 +107,39 @@ test('an expired lock file from another host is reclaimed', async () => {
   }
 });
 
+test('a malformed (truncated) lock file is reclaimed, not retried into a wedge', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-malformed-'));
+  try {
+    const dir = path.join(root, 'LOOPM');
+    fs.mkdirSync(dir, { recursive: true });
+    // A process died mid-write during renew()'s in-place rewrite.
+    fs.writeFileSync(path.join(dir, 'reviewloop.lock'), '{"token":"old","pi');
+    const lease = await acquireLoopFileLease({ runtimeRoot: root, loopId: 'LOOPM' });
+    assert.equal(lease.ok, true, 'a lock with unparseable content has no owner and is reclaimed');
+    const held = JSON.parse(fs.readFileSync(path.join(dir, 'reviewloop.lock'), 'utf8'));
+    assert.equal(typeof held.token, 'string');
+    assert.notEqual(held.token, 'old');
+    await lease.release();
+    assert.equal(fs.existsSync(path.join(dir, 'reviewloop.lock')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an empty lock file (zero-length write) is reclaimed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-empty-'));
+  try {
+    const dir = path.join(root, 'LOOPE');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'reviewloop.lock'), '');
+    const lease = await acquireLoopFileLease({ runtimeRoot: root, loopId: 'LOOPE' });
+    assert.equal(lease.ok, true);
+    await lease.release();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a lock held by a dead pid on THIS host is reclaimed regardless of TTL', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-dead-'));
   try {

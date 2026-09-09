@@ -149,13 +149,36 @@ export async function acquireLoopFileLease({
         return { ok: false, heldBy: { reason: `lock unavailable: ${err?.message ?? err}` } };
       }
       let current = null;
+      let malformed = false;
       try {
         // eslint-disable-next-line no-await-in-loop
-        current = JSON.parse(await readFile(lockPath, 'utf8'));
-      } catch { current = null; }
-      // The lock file vanished between our failed `wx` and this read — another
-      // contender reclaimed it. Loop and let the exclusive `wx` create race.
-      if (current === null) continue;
+        const raw = await readFile(lockPath, 'utf8');
+        try {
+          current = JSON.parse(raw);
+        } catch {
+          // The file EXISTS but its JSON is unparseable — a process that died
+          // mid-write during renew()'s in-place rewrite, or corruption. It has
+          // no identifiable owner and merely retrying the exclusive `wx` create
+          // would loop on EEXIST until the attempt budget is spent, wedging the
+          // loop with no live owner. Reclaim it instead.
+          malformed = true;
+        }
+      } catch (readErr) {
+        if (readErr?.code === 'ENOENT') {
+          // Vanished between our failed `wx` and this read — another contender
+          // reclaimed it. Loop and let the exclusive `wx` create race.
+          continue;
+        }
+        // EACCES / EIO / ... — we can prove nothing about the owner; do not
+        // silently proceed unserialised.
+        return { ok: false, heldBy: { reason: `lock unreadable: ${readErr?.message ?? readErr}` } };
+      }
+      if (malformed) {
+        // eslint-disable-next-line no-await-in-loop
+        await reclaimMalformedLock(lockPath, clock, token);
+        continue; // the exclusive `wx` create on the next attempt is the arbiter
+      }
+      if (current === null) continue; // literal `null` payload — treat as absent
       if (!isReclaimable(current, clock())) {
         return { ok: false, heldBy: current };
       }
@@ -190,31 +213,31 @@ const RECLAIM_GUARD_ORPHAN_MS = 30_000;
 //     still OURS (never a peer's replacement);
 //   * an orphaned (ancient) guard is taken over by an atomic rename to a
 //     UNIQUELY-named victim path, and we delete only that unique copy.
-async function reclaimStaleLock(lockPath, staleRecord, clock, token) {
+// Run `criticalSection` while holding the exclusive `<lock>.reclaim` guard.
+// Returns whatever `criticalSection` returns, or false when the guard is held
+// by a live contender. An ancient (orphaned) guard whose holder crashed
+// mid-reclaim is taken over via an atomic rename to a token-unique victim name
+// (exactly one contender wins; the rest get ENOENT) and this call yields so the
+// next attempt sees a clear slot. The guard is removed on exit ONLY when it is
+// still ours (a peer's replacement is a different inode we never touch).
+// Correctness does NOT depend on the guard being perfectly exclusive — the
+// atomic `wx` create of the lock itself is the sole arbiter of ownership; the
+// guard only reduces the reclaim thundering herd.
+async function withReclaimGuard(lockPath, clock, token, criticalSection) {
   const guardPath = `${lockPath}.reclaim`;
-  const guardBody = JSON.stringify({ token, at: new Date(clock()).toISOString() });
-  let guard;
   try {
-    guard = await open(guardPath, 'wx');
-    await guard.writeFile(guardBody);
+    const guard = await open(guardPath, 'wx');
+    await guard.writeFile(JSON.stringify({ token, at: new Date(clock()).toISOString() }));
     await guard.close();
   } catch (err) {
     if (err?.code !== 'EEXIST') return false;
-    // A guard exists. If it is provably ancient, its holder crashed mid-reclaim:
-    // take the orphan over via an atomic rename to a token-unique victim name
-    // (exactly one contender wins the rename; the rest get ENOENT), then delete
-    // only that unique copy. A peer's freshly-created replacement guard is a
-    // different inode we never name and never touch. We do NOT proceed this
-    // call — the next attempt sees a clear slot.
     let orphan = false;
     try {
       const cur = JSON.parse(await readFile(guardPath, 'utf8'));
       const stamped = Date.parse(cur?.at ?? '');
-      // Ancient guard, or one with no usable timestamp -> its holder is gone.
       orphan = !Number.isFinite(stamped) || (clock() - stamped > RECLAIM_GUARD_ORPHAN_MS);
     } catch {
-      // Unreadable / non-JSON / already gone -> abandoned garbage.
-      orphan = true;
+      orphan = true; // unreadable / non-JSON / already gone -> abandoned garbage
     }
     if (!orphan) return false; // a live holder owns it — yield
     try {
@@ -225,6 +248,17 @@ async function reclaimStaleLock(lockPath, staleRecord, clock, token) {
     return false;
   }
   try {
+    return await criticalSection();
+  } finally {
+    try {
+      const g = JSON.parse(await readFile(guardPath, 'utf8'));
+      if (g?.token === token) await unlink(guardPath).catch(() => {});
+    } catch { /* already gone / not readable / taken over by a peer */ }
+  }
+}
+
+async function reclaimStaleLock(lockPath, staleRecord, clock, token) {
+  return withReclaimGuard(lockPath, clock, token, async () => {
     // Re-validate under the guard: only unlink the lock if it is STILL the exact
     // stale record we saw and it is still reclaimable. A racing contender may
     // already have replaced it with a fresh, live lock — whose different token
@@ -236,15 +270,26 @@ async function reclaimStaleLock(lockPath, staleRecord, clock, token) {
       return true;
     }
     return false;
-  } finally {
-    // Ownership-checked: remove the guard ONLY if it is still ours. If a peer
-    // took it over (renamed it away and created its own), we must not delete
-    // the peer's replacement.
+  });
+}
+
+// Reclaim a lock file whose content is unparseable. Under the guard, unlink it
+// ONLY if it is STILL present and STILL unparseable — a racing contender that
+// wrote a fresh, valid lock (parse succeeds) is left untouched.
+async function reclaimMalformedLock(lockPath, clock, token) {
+  return withReclaimGuard(lockPath, clock, token, async () => {
+    let stillMalformed = false;
     try {
-      const g = JSON.parse(await readFile(guardPath, 'utf8'));
-      if (g?.token === token) await unlink(guardPath).catch(() => {});
-    } catch { /* already gone / not readable */ }
-  }
+      JSON.parse(await readFile(lockPath, 'utf8'));
+    } catch (e) {
+      stillMalformed = e?.code !== 'ENOENT'; // exists but unparseable
+    }
+    if (stillMalformed) {
+      await unlink(lockPath).catch(() => {});
+      return true;
+    }
+    return false;
+  });
 }
 
 async function releaseIfOwned(lockPath, token) {
