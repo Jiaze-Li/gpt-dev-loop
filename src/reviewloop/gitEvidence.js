@@ -39,48 +39,74 @@ const O_NOFOLLOW = fsConstants.O_NOFOLLOW || 0;
 
 // Per-file cap on the baseline-untracked *content* retained (beyond the digest)
 // so a real baseline->current delta can be built for a Worker file that copies
-// pre-existing untracked text. Larger text files, and binary files, keep only
-// the digest — a brand-new Worker file then cannot be proven free of their
-// bytes and fails the evidence closed.
-const UNTRACKED_CONTENT_CAP_BYTES = 1_048_576;
+// pre-existing untracked text. It is also the exact ceiling below which the
+// windowed copy check (below) can index EVERY offset — a retained file always
+// gets complete coverage. Larger text files, and binary files, keep only the
+// digest — a brand-new Worker file then cannot be proven free of their bytes
+// and fails the evidence closed (`uncomparableBaseline`).
+const UNTRACKED_CONTENT_CAP_BYTES = 400_000;
 
 // A brand-new Worker file "reproduces" a baseline-untracked file when it
 // contains that file whole, is contained within it, or shares a contiguous
-// run of at least this many identical characters. Byte/character oriented (not
-// line oriented) so a large single-line file — minified JSON, a lockfile
-// fragment, an env line — is covered exactly like a multi-line one, and an
-// internal one-byte edit only breaks the single window it falls in. A shorter
+// run of at least this many identical characters. Character oriented (not line
+// oriented) so a large single-line file — minified JSON, a lockfile fragment,
+// an env line — is covered exactly like a multi-line one, and an internal
+// one-byte edit only breaks the single window it falls in. A shorter
 // coincidental overlap (a license header, a long import) is not flagged.
-const SHARED_RUN_MIN_CHARS = 96;
-const GRAM_INDEX_STRIDE = 24; // <= SHARED_RUN_MIN_CHARS/4 so any copied run this long lands on an indexed window
-const MAX_GRAMS_INDEXED = 400_000;
+const COPY_WINDOW_CHARS = 96;
+// Hard cap on indexed windows (== UNTRACKED_CONTENT_CAP_BYTES worth, one per
+// offset). A retained file never exceeds it; a larger text would produce an
+// empty index and the caller must fail closed rather than read "no match" as
+// "safe".
+const MAX_COPY_WINDOWS = UNTRACKED_CONTENT_CAP_BYTES;
+const RH_MOD = 2147483647; // 2^31 - 1 (prime)
+const RH_BASE = 257;
+// RH_BASE^(COPY_WINDOW_CHARS - 1) mod RH_MOD — the weight of the char leaving
+// the window on each roll.
+const RH_DROP = (() => {
+  let p = 1;
+  for (let i = 0; i < COPY_WINDOW_CHARS - 1; i += 1) p = (p * RH_BASE) % RH_MOD;
+  return p;
+})();
 
-// Index the fixed-width character windows of a baseline text once, so every
-// candidate is a single linear pass of Set lookups rather than a quadratic
-// substring scan. Windows are strided on the baseline side and slid by one on
-// the candidate side, so a copy shifted by any offset still matches.
-function indexContentGrams(text) {
-  const grams = new Set();
-  if (text.length < SHARED_RUN_MIN_CHARS) return grams;
-  for (let i = 0; i + SHARED_RUN_MIN_CHARS <= text.length && grams.size < MAX_GRAMS_INDEXED; i += GRAM_INDEX_STRIDE) {
-    grams.add(text.slice(i, i + SHARED_RUN_MIN_CHARS));
+// Polynomial rolling hash of EVERY COPY_WINDOW_CHARS-wide window of `text`
+// (stride 1), so a copied run of exactly the window length is still caught
+// regardless of alignment. Returns an empty set when the text cannot be fully
+// covered — the caller treats that as "uncomparable" and fails closed.
+function indexCopyWindows(text) {
+  const hashes = new Set();
+  const n = text.length;
+  if (n < COPY_WINDOW_CHARS) return hashes;
+  if (n - COPY_WINDOW_CHARS + 1 > MAX_COPY_WINDOWS) return hashes; // too big to fully index
+  let h = 0;
+  for (let i = 0; i < COPY_WINDOW_CHARS; i += 1) h = (h * RH_BASE + text.charCodeAt(i)) % RH_MOD;
+  hashes.add(h);
+  for (let i = COPY_WINDOW_CHARS; i < n; i += 1) {
+    h = (h - (text.charCodeAt(i - COPY_WINDOW_CHARS) * RH_DROP) % RH_MOD + RH_MOD) % RH_MOD;
+    h = (h * RH_BASE + text.charCodeAt(i)) % RH_MOD;
+    hashes.add(h);
   }
-  grams.add(text.slice(text.length - SHARED_RUN_MIN_CHARS)); // always cover the tail
-  return grams;
+  return hashes;
 }
 
 // Does `candidate` reproduce a substantial contiguous section of the indexed
-// baseline text?
-function reproducesBaselineContent(candidate, baselineText, baselineGrams) {
+// baseline text? A hash hit is confirmed with a direct substring check so a
+// hash collision can never produce a false positive.
+function reproducesBaselineContent(candidate, baselineText, baselineWindows) {
   if (!candidate || !baselineText) return false;
   if (candidate === baselineText) return true;
   // A baseline (or candidate) shorter than one window can only be compared
-  // whole — there is nothing to gram-index.
-  if (baselineText.length < SHARED_RUN_MIN_CHARS) return candidate.includes(baselineText);
-  if (candidate.length < SHARED_RUN_MIN_CHARS) return baselineText.includes(candidate);
-  if (!baselineGrams.size) return false;
-  for (let i = 0; i + SHARED_RUN_MIN_CHARS <= candidate.length; i += 1) {
-    if (baselineGrams.has(candidate.slice(i, i + SHARED_RUN_MIN_CHARS))) return true;
+  // whole — there is nothing to window-index.
+  if (baselineText.length < COPY_WINDOW_CHARS) return candidate.includes(baselineText);
+  if (candidate.length < COPY_WINDOW_CHARS) return baselineText.includes(candidate);
+  if (!baselineWindows.size) return true; // baseline too large to fully index -> fail closed
+  let h = 0;
+  for (let i = 0; i < COPY_WINDOW_CHARS; i += 1) h = (h * RH_BASE + candidate.charCodeAt(i)) % RH_MOD;
+  if (baselineWindows.has(h) && baselineText.includes(candidate.slice(0, COPY_WINDOW_CHARS))) return true;
+  for (let i = COPY_WINDOW_CHARS; i < candidate.length; i += 1) {
+    h = (h - (candidate.charCodeAt(i - COPY_WINDOW_CHARS) * RH_DROP) % RH_MOD + RH_MOD) % RH_MOD;
+    h = (h * RH_BASE + candidate.charCodeAt(i)) % RH_MOD;
+    if (baselineWindows.has(h) && baselineText.includes(candidate.slice(i - COPY_WINDOW_CHARS + 1, i + 1))) return true;
   }
   return false;
 }
@@ -531,7 +557,7 @@ export async function collectWorkerDelta({
     for (const [bp, digest] of Object.entries(baseline.untrackedHashes ?? {})) {
       const text = retained[bp];
       if (typeof text === 'string' && sha256(Buffer.from(text, 'utf8')) === digest) {
-        comparableTexts.push({ text, grams: indexContentGrams(text) });
+        comparableTexts.push({ text, windows: indexCopyWindows(text) });
         continue;
       }
       if (declaredBinary.has(bp)) {
@@ -560,7 +586,7 @@ export async function collectWorkerDelta({
         text = buf && !buf.includes(0) ? buf.toString('utf8') : null;
       }
       if (text == null) continue; // binary Worker files fail closed at emission
-      const reproduced = comparableTexts.some((b) => reproducesBaselineContent(text, b.text, b.grams));
+      const reproduced = comparableTexts.some((b) => reproducesBaselineContent(text, b.text, b.windows));
       if (reproduced || uncomparableBaseline) {
         renamedUntrackedBaseline.push(p);
         if (tracked) {

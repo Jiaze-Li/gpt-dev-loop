@@ -384,6 +384,48 @@ test('fail closed: an edited copy of a LARGE SINGLE-LINE baseline-untracked file
   }
 });
 
+test('fail closed: a new file copying a NON-ALIGNED window-length slice of a baseline-untracked file is caught', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    // Distinct characters so any 96-char slice is unambiguous.
+    const secret = Array.from({ length: 500 }, (_, i) => String.fromCharCode(33 + (i % 90))).join('');
+    fs.writeFileSync(path.join(dir, 'vault.txt'), secret);
+    const baseline = await captureBaseline({ cwd: dir });
+
+    // Copy EXACTLY 96 chars starting at baseline offset 1 (not a stride boundary)
+    // into an otherwise-unrelated new file.
+    const lifted = secret.slice(1, 97);
+    assert.equal(lifted.length, 96);
+    fs.writeFileSync(path.join(dir, 'helper.js'), `const noise = "aaaaaaaaaa";\n// ${lifted}\nmodule.exports = {};\n`);
+    git('add', 'helper.js');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, false, 'a 96-char non-aligned copy is still detected');
+    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section/i.test(r)));
+    assert.equal(delta.trackedChanged.includes('helper.js'), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a small coincidental overlap with a baseline-untracked file is NOT flagged', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'old.env'), 'DATABASE_URL=postgres://localhost/app\nAPI_KEY=zzzzzzzzzzzzzzzzzzzz\n');
+    const baseline = await captureBaseline({ cwd: dir });
+    // Shares only the short common token "DATABASE_URL=" (< 96 chars).
+    fs.writeFileSync(path.join(dir, 'config.example'), 'DATABASE_URL=postgres://example/db\n');
+    git('add', 'config.example');
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, true);
+    assert.ok(delta.trackedChanged.includes('config.example'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a genuinely new tracked file is still normal Worker output even with an unrelated baseline-untracked file present', async () => {
   const dir = initRepo();
   try {
