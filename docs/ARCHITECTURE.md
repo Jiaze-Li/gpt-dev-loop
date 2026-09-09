@@ -544,23 +544,23 @@ honest baseline→current delta and fails the evidence closed rather than
 emitting its whole content; likewise a brand-new untracked path whose bytes are
 identical to a baseline-untracked file (a rename or copy of pre-existing
 content). The same protections extend to a brand-new **tracked** addition
-(`git diff --diff-filter=A`) that was neither tracked nor untracked at baseline
-— a rename/copy of a baseline-untracked file into a staged new name would
-otherwise be rendered as a wholly-new file and leak its pre-existing bytes:
-an exact-digest match fails closed, and — since the baseline kept only digests
-— a brand-new file (tracked or untracked) appearing in the same review where a
-baseline-untracked path disappeared (an undetectable rename+edit) fails closed.
-For the *edited copy with the source left in place*, the baseline additionally
-retains the full bytes (latin1) of every **non-binary** untracked file ≤ 400 KB:
-a brand-new Worker file that reproduces a substantial contiguous character run
-of that content — a rolling hash over *every* window offset, confirmed with a
-direct substring check, so a large single-line file (minified JSON, a lockfile
-fragment) is covered exactly like a multi-line one and a non-aligned copy cannot
-slip between strides — fails the evidence closed. A baseline-untracked file
-whose content was **not** retained — binary (re-encodable, e.g. NUL bytes
-stripped, so no contiguous run survives a clean comparison), oversized, or
-stripped from state so it no longer matches its fingerprinted digest — makes the
-baseline *uncomparable*: every brand-new Worker file then fails closed. A baseline-untracked path missing from the
+(`git diff --diff-filter=A`) that was neither tracked nor untracked at baseline.
+Attribution of any brand-new Worker file (tracked or untracked) is **structural,
+not content-based**: an exact-digest match against a baseline-untracked file
+fails closed (a verbatim copy/rename), and — because ReviewLoop keeps only a
+digest per baseline-untracked file and cannot subtract an arbitrary lossless
+transform of that content (base64, gzip, hex, NUL-stripping, …) — **if any file
+was untracked at baseline, every brand-new Worker file is treated as
+unattributable and the evidence fails closed.** A Worker starting from a clean
+tree is unaffected; a pre-existing untracked file must be committed or removed
+before ReviewLoop can isolate new work. Any **git submodule** in the Worker's
+tracked diff — new submodule commits *or* a merely-dirty submodule worktree,
+which `git diff` renders only as a lone `Subproject commit …-dirty` line —
+fails the evidence closed: ReviewLoop does not recurse into submodules, so the
+real change is unreviewable text. A single untracked file is read into memory
+only up to an 8 MiB cap; a larger one is digested with a bounded streaming read
+and, if it is brand-new Worker output, fails the evidence closed rather than
+OOMing the process. A baseline-untracked path missing from the
 current listing is called *deleted* only when its absence is definitively
 confirmed (`ENOENT`); any other `lstat`/read failure (`EACCES`, a mid-read
 race) fails the evidence closed instead. Every untracked path

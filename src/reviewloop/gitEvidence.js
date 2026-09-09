@@ -27,6 +27,18 @@
 //     out-of-tree target's bytes into Reviewer evidence. Any such path fails
 //     the evidence closed. (Mirrors the hardened collector in
 //     src/adapters/gate/git-evidence/index.js.)
+//   * A single untracked file is read into memory only up to MAX_UNTRACKED_BYTES;
+//     a larger one is digested with a bounded streaming read and, if it is
+//     brand-new Worker output, fails the evidence closed (unreviewable as text)
+//     rather than OOMing the process.
+//   * ReviewLoop does not recurse into git submodules. Any gitlink in the
+//     Worker's tracked diff (new submodule commits OR a merely-dirty submodule
+//     worktree) fails the evidence closed — the real change is unreviewable text.
+//   * Attribution of a BRAND-NEW Worker file is structural, not content-based:
+//     if ANY file was untracked at baseline, every brand-new Worker file is
+//     unattributable (an arbitrary lossless transform of pre-existing untracked
+//     content cannot be subtracted) and the evidence fails closed. A Worker
+//     starting from a clean tree is unaffected.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -37,78 +49,28 @@ import path from 'node:path';
 // O_NOFOLLOW is a POSIX flag; 0 (no-op) on platforms that lack it.
 const O_NOFOLLOW = fsConstants.O_NOFOLLOW || 0;
 
-// Per-file cap on the baseline-untracked *content* retained (beyond the digest)
-// so a real baseline->current delta can be built for a Worker file that copies
-// pre-existing untracked text. It is also the exact ceiling below which the
-// windowed copy check (below) can index EVERY offset — a retained file always
-// gets complete coverage. Larger text files, and binary files, keep only the
-// digest — a brand-new Worker file then cannot be proven free of their bytes
-// and fails the evidence closed (`uncomparableBaseline`).
-const UNTRACKED_CONTENT_CAP_BYTES = 400_000;
+// Hard ceiling on how many bytes of a single untracked file ReviewLoop will
+// pull into memory (digest + evidence). A larger untracked file is digested
+// with a bounded streaming read and never materialised whole, so a multi-GB
+// artifact in the working tree cannot OOM the MCP process during
+// `reviewloop_begin` or delta collection. A brand-new Worker file above this
+// size cannot be reviewed as text and fails the evidence closed.
+const MAX_UNTRACKED_BYTES = 8 * 1024 * 1024;
 
-// A brand-new Worker file "reproduces" a baseline-untracked file when it
-// contains that file whole, is contained within it, or shares a contiguous
-// run of at least this many identical characters. Character oriented (not line
-// oriented) so a large single-line file — minified JSON, a lockfile fragment,
-// an env line — is covered exactly like a multi-line one, and an internal
-// one-byte edit only breaks the single window it falls in. A shorter
-// coincidental overlap (a license header, a long import) is not flagged.
-const COPY_WINDOW_CHARS = 96;
-// Hard cap on indexed windows (== UNTRACKED_CONTENT_CAP_BYTES worth, one per
-// offset). A retained file never exceeds it; a larger text would produce an
-// empty index and the caller must fail closed rather than read "no match" as
-// "safe".
-const MAX_COPY_WINDOWS = UNTRACKED_CONTENT_CAP_BYTES;
-const RH_MOD = 2147483647; // 2^31 - 1 (prime)
-const RH_BASE = 257;
-// RH_BASE^(COPY_WINDOW_CHARS - 1) mod RH_MOD — the weight of the char leaving
-// the window on each roll.
-const RH_DROP = (() => {
-  let p = 1;
-  for (let i = 0; i < COPY_WINDOW_CHARS - 1; i += 1) p = (p * RH_BASE) % RH_MOD;
-  return p;
-})();
-
-// Polynomial rolling hash of EVERY COPY_WINDOW_CHARS-wide window of `text`
-// (stride 1), so a copied run of exactly the window length is still caught
-// regardless of alignment. Returns an empty set when the text cannot be fully
-// covered — the caller treats that as "uncomparable" and fails closed.
-function indexCopyWindows(text) {
-  const hashes = new Set();
-  const n = text.length;
-  if (n < COPY_WINDOW_CHARS) return hashes;
-  if (n - COPY_WINDOW_CHARS + 1 > MAX_COPY_WINDOWS) return hashes; // too big to fully index
-  let h = 0;
-  for (let i = 0; i < COPY_WINDOW_CHARS; i += 1) h = (h * RH_BASE + text.charCodeAt(i)) % RH_MOD;
-  hashes.add(h);
-  for (let i = COPY_WINDOW_CHARS; i < n; i += 1) {
-    h = (h - (text.charCodeAt(i - COPY_WINDOW_CHARS) * RH_DROP) % RH_MOD + RH_MOD) % RH_MOD;
-    h = (h * RH_BASE + text.charCodeAt(i)) % RH_MOD;
-    hashes.add(h);
+// SHA-256 of a file descriptor's full contents via a bounded, reused buffer —
+// the whole file is never held in memory at once.
+async function streamDigest(fh) {
+  const hash = createHash('sha256');
+  const buf = Buffer.allocUnsafe(1024 * 1024);
+  let pos = 0;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
+    if (bytesRead <= 0) break;
+    hash.update(buf.subarray(0, bytesRead));
+    pos += bytesRead;
   }
-  return hashes;
-}
-
-// Does `candidate` reproduce a substantial contiguous section of the indexed
-// baseline text? A hash hit is confirmed with a direct substring check so a
-// hash collision can never produce a false positive.
-function reproducesBaselineContent(candidate, baselineText, baselineWindows) {
-  if (!candidate || !baselineText) return false;
-  if (candidate === baselineText) return true;
-  // A baseline (or candidate) shorter than one window can only be compared
-  // whole — there is nothing to window-index.
-  if (baselineText.length < COPY_WINDOW_CHARS) return candidate.includes(baselineText);
-  if (candidate.length < COPY_WINDOW_CHARS) return baselineText.includes(candidate);
-  if (!baselineWindows.size) return true; // baseline too large to fully index -> fail closed
-  let h = 0;
-  for (let i = 0; i < COPY_WINDOW_CHARS; i += 1) h = (h * RH_BASE + candidate.charCodeAt(i)) % RH_MOD;
-  if (baselineWindows.has(h) && baselineText.includes(candidate.slice(0, COPY_WINDOW_CHARS))) return true;
-  for (let i = COPY_WINDOW_CHARS; i < candidate.length; i += 1) {
-    h = (h - (candidate.charCodeAt(i - COPY_WINDOW_CHARS) * RH_DROP) % RH_MOD + RH_MOD) % RH_MOD;
-    h = (h * RH_BASE + candidate.charCodeAt(i)) % RH_MOD;
-    if (baselineWindows.has(h) && baselineText.includes(candidate.slice(i - COPY_WINDOW_CHARS + 1, i + 1))) return true;
-  }
-  return false;
+  return hash.digest('hex');
 }
 
 function sha256(value) {
@@ -217,6 +179,15 @@ async function fingerprintUntracked({
     if (st.isSymbolicLink() || !st.isFile()) {
       return { safe: false, reason: `untracked path ${filePath} is not a regular file when opened — refusing to read it` };
     }
+    if (Number.isFinite(Number(st.size)) && Number(st.size) > MAX_UNTRACKED_BYTES) {
+      // Too large to hold in memory. Digest it with a bounded streaming read so
+      // attribution (rename/copy detection) still works, but never retain its
+      // bytes — a brand-new Worker file this size fails the evidence closed.
+      const digest = await streamDigest(fh);
+      return {
+        safe: true, digest, bytes: null, oversized: true, byteLength: Number(st.size),
+      };
+    }
     const buf = await fh.readFile();
     const st2 = await fh.stat();
     if ((Number.isFinite(st2.ino) && Number.isFinite(st.ino) && st2.ino !== st.ino)
@@ -263,16 +234,13 @@ export async function captureBaseline({
   }));
 
   const untracked = await listUntracked(cwd, spawn, 'baseline');
+  // Only a digest is kept per baseline-untracked file — never its bytes.
+  // ReviewLoop cannot subtract an arbitrary lossless transform (base64, gzip,
+  // hex, NUL-stripping, ...) of pre-existing untracked content from a brand-new
+  // Worker file, so it does not try: any file untracked at baseline makes every
+  // brand-new Worker file unattributable and fails the evidence closed
+  // (see collectWorkerDelta).
   const untrackedHashes = {};
-  // Raw bytes of each retained baseline-untracked file, latin1-encoded so the
-  // round-trip is lossless for any byte sequence. Retained only for a
-  // non-binary file within the cap: a binary file can be re-encoded (NUL bytes
-  // stripped, base64, hex) into a Worker text file with no contiguous run
-  // surviving, so a clean window comparison cannot clear it — it is left
-  // unretained and makes the baseline uncomparable (any brand-new Worker file
-  // then fails the evidence closed). Oversized or stripped content is treated
-  // the same way.
-  const untrackedContent = {};
   let evidenceComplete = true;
   const incompleteReasons = [];
   for (const filePath of untracked) {
@@ -280,9 +248,6 @@ export async function captureBaseline({
     const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
     if (fp.safe) {
       untrackedHashes[filePath] = fp.digest;
-      if (fp.bytes && fp.bytes.length <= UNTRACKED_CONTENT_CAP_BYTES && !fp.bytes.includes(0)) {
-        untrackedContent[filePath] = fp.bytes.toString('latin1');
-      }
     } else {
       evidenceComplete = false;
       incompleteReasons.push(fp.reason);
@@ -295,7 +260,6 @@ export async function captureBaseline({
     capturedAt: new Date().toISOString(),
     dirtyFiles,
     untrackedHashes,
-    untrackedContent,
     evidenceComplete,
     incompleteReasons,
   };
@@ -336,6 +300,20 @@ export async function collectWorkerDelta({
     trackedChanged = nameRes.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
   } else {
     fail(`"git diff --name-only ${baseRef}" exited ${nameRes.code}`);
+  }
+
+  // Submodule / gitlink delta. `git diff` renders any change inside a checked-out
+  // submodule — new commits OR a merely-dirty worktree — as a lone
+  // "Subproject commit <sha>[-dirty]" hunk over a 160000-mode gitlink; the
+  // modified files and their contents never reach the Reviewer, so a CLEAN
+  // review could PASS an entirely unreviewed implementation. ReviewLoop does not
+  // recurse into submodules, so any gitlink in the Worker's tracked diff fails
+  // the evidence closed. Detected structurally from the diff text git already
+  // produced (mode 160000 line and/or the "Subproject commit" body).
+  if (/^(?:(?:old|new|deleted file|new file) mode |index [0-9a-f]+\.\.[0-9a-f]+ )160000\b/m.test(trackedDiff)
+    || /^[+-]Subproject commit [0-9a-f]+/m.test(trackedDiff)) {
+    fail('the Worker delta changes a git submodule (gitlink) — ReviewLoop cannot see inside a submodule, '
+      + 'so a change there (new commits or a dirty worktree) cannot be reviewed as text');
   }
 
   // Paths `git diff <baseRef>` renders as wholly-new additions (no blob in the
@@ -394,6 +372,12 @@ export async function collectWorkerDelta({
         renamedUntrackedBaseline.push(filePath);
         fail(`untracked file ${filePath} is byte-identical to a file that was untracked at baseline `
           + `(${baselineUntrackedDigests.get(fp.digest).join(', ')}) — a rename/copy of pre-existing content, not Worker output`);
+      } else if (fp.oversized) {
+        // Brand-new but too large to read into evidence (digest was streamed).
+        // Cannot be reviewed as text — fail closed instead of OOMing on it.
+        renamedUntrackedBaseline.push(filePath);
+        fail(`brand-new untracked file ${filePath} is ${fp.byteLength} bytes — above the `
+          + `${MAX_UNTRACKED_BYTES}-byte cap, so it cannot be read into evidence and reviewed as text`);
       } else {
         safeBytes.set(filePath, fp.bytes);
         untrackedChanged.push(filePath); // brand-new regular file -> Worker output
@@ -540,60 +524,34 @@ export async function collectWorkerDelta({
     untrackedDeleted.length = 0;
   }
 
-  // (3) Edited / partial copy. A brand-new Worker file (tracked addition or
-  //     untracked) that reproduces a substantial contiguous section of a
-  //     baseline-untracked file leaks that file's pre-existing bytes even
-  //     though its digest differs and its source may still be on disk. The
-  //     comparison is byte-level (latin1). A baseline-untracked file whose
-  //     content was NOT retained — binary (re-encodable so no run survives),
-  //     oversized, or stripped from state so it no longer matches its
-  //     fingerprinted digest — cannot be cleared: every brand-new Worker file
-  //     then fails the evidence closed.
-  if (Object.keys(baseline.untrackedHashes ?? {}).length) {
-    const retained = baseline.untrackedContent ?? {};
-    const comparable = [];
-    let uncomparableBaseline = null;
-    for (const [bp, digest] of Object.entries(baseline.untrackedHashes ?? {})) {
-      const content = retained[bp];
-      if (typeof content === 'string' && sha256(Buffer.from(content, 'latin1')) === digest) {
-        comparable.push({ text: content, windows: indexCopyWindows(content) });
-      } else {
-        uncomparableBaseline = uncomparableBaseline ?? bp;
-      }
-    }
-
+  // (3) Any brand-new Worker file (tracked addition or untracked) is
+  //     unattributable when ANY file was untracked at baseline. The exact-digest
+  //     and vanished-source guards above catch verbatim copies and rename+edits;
+  //     an arbitrary lossless transform of pre-existing untracked content
+  //     (base64, gzip, hex, NUL-stripping, ...) leaves no contiguous run to
+  //     match and deletes no source, so no content comparison can reliably clear
+  //     it. Rather than chase encodings, close the surface structurally: fail
+  //     the evidence closed and drop every brand-new candidate. A Worker
+  //     starting from a clean tree is unaffected; a pre-existing untracked file
+  //     must be committed or removed before ReviewLoop can isolate new work.
+  if (Object.keys(baselineUntracked).length) {
     const candidates = [
       ...untrackedChanged.map((p) => ({ p, tracked: false })),
       ...brandNewTracked.filter((p) => !droppedTracked.has(p) && trackedChanged.includes(p))
         .map((p) => ({ p, tracked: true })),
     ];
     for (const { p, tracked } of candidates) {
-      let bytes = null;
+      renamedUntrackedBaseline.push(p);
       if (tracked) {
-        // eslint-disable-next-line no-await-in-loop
-        const fp = await fingerprintUntracked({ cwd, filePath: p, lstat, readFile, open });
-        bytes = fp.safe && fp.bytes ? fp.bytes : null;
+        droppedTracked.add(p);
       } else {
-        bytes = safeBytes.get(p) ?? null;
+        safeBytes.delete(p);
+        const idx = untrackedChanged.indexOf(p);
+        if (idx !== -1) untrackedChanged.splice(idx, 1);
       }
-      if (bytes == null) continue; // unreadable Worker files fail closed at emission
-      const text = bytes.toString('latin1');
-      const reproduced = comparable.some((b) => reproducesBaselineContent(text, b.text, b.windows));
-      if (reproduced || uncomparableBaseline) {
-        renamedUntrackedBaseline.push(p);
-        if (tracked) {
-          droppedTracked.add(p);
-        } else {
-          safeBytes.delete(p);
-          const idx = untrackedChanged.indexOf(p);
-          if (idx !== -1) untrackedChanged.splice(idx, 1);
-        }
-        fail(reproduced
-          ? `brand-new file ${p} reproduces a substantial contiguous section of a baseline-untracked file `
-            + '— the pre-existing bytes cannot be separated from Worker authorship'
-          : `brand-new file ${p} cannot be cleared: baseline-untracked file ${uncomparableBaseline} `
-            + 'had no comparable content retained (binary, oversized, or stripped from state)');
-      }
+      fail(`brand-new file ${p} cannot be cleared: one or more files were untracked at baseline and an `
+        + 'arbitrary transform of their content cannot be separated from Worker authorship — failing '
+        + 'closed rather than guessing attribution');
     }
   }
 

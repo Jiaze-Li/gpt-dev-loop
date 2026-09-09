@@ -341,7 +341,7 @@ test('fail closed: an EDITED copy of a baseline-untracked file (source left in p
     const secret = Array.from({ length: 12 }, (_, i) => `SECRET_CONFIG_LINE_${i} = value-${i}`).join('\n') + '\n';
     fs.writeFileSync(path.join(dir, 'config.secret'), secret);
     const baseline = await captureBaseline({ cwd: dir });
-    assert.equal(baseline.untrackedContent['config.secret'], secret, 'baseline retained the text for comparison');
+    assert.equal('config.secret' in baseline.untrackedHashes, true, 'baseline digested the untracked file');
 
     // Copy, then edit (append) — digest now differs — and stage. Source stays.
     fs.writeFileSync(path.join(dir, 'config.js'), `// generated\n${secret}\nexport default {};\n`);
@@ -350,7 +350,7 @@ test('fail closed: an EDITED copy of a baseline-untracked file (source left in p
     const delta = await collectWorkerDelta({ cwd: dir, baseline });
 
     assert.equal(delta.evidenceComplete, false, 'fails the evidence closed');
-    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section/i.test(r)));
+    assert.ok(delta.incompleteReasons.some((r) => /cannot be cleared: one or more files were untracked at baseline/i.test(r)));
     assert.equal(delta.trackedChanged.includes('config.js'), false);
     assert.doesNotMatch(delta.diff, /SECRET_CONFIG_LINE_5/, 'pre-existing bytes never reach the Reviewer');
   } finally {
@@ -376,7 +376,7 @@ test('fail closed: an edited copy of a LARGE SINGLE-LINE baseline-untracked file
     const delta = await collectWorkerDelta({ cwd: dir, baseline });
 
     assert.equal(delta.evidenceComplete, false, 'a one-line file is compared like any other');
-    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section/i.test(r)));
+    assert.ok(delta.incompleteReasons.some((r) => /cannot be cleared: one or more files were untracked at baseline/i.test(r)));
     assert.equal(delta.trackedChanged.includes('bundled-config.json'), false);
     assert.doesNotMatch(delta.diff, /secret-value-40/, 'pre-existing bytes never reach the Reviewer');
   } finally {
@@ -402,7 +402,7 @@ test('fail closed: a new file copying a NON-ALIGNED window-length slice of a bas
 
     const delta = await collectWorkerDelta({ cwd: dir, baseline });
     assert.equal(delta.evidenceComplete, false, 'a 96-char non-aligned copy is still detected');
-    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section/i.test(r)));
+    assert.ok(delta.incompleteReasons.some((r) => /cannot be cleared: one or more files were untracked at baseline/i.test(r)));
     assert.equal(delta.trackedChanged.includes('helper.js'), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -427,7 +427,7 @@ test('fail closed: a baseline-untracked BINARY file copied to a new text file (N
 
     const delta = await collectWorkerDelta({ cwd: dir, baseline });
     assert.equal(delta.evidenceComplete, false, 'the de-NUL-ed copy is caught');
-    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section|cannot be cleared/i.test(r)));
+    assert.ok(delta.incompleteReasons.some((r) => /cannot be cleared: one or more files were untracked at baseline/i.test(r)));
     assert.equal(delta.trackedChanged.includes('extracted.txt'), false);
     assert.doesNotMatch(delta.diff, /EMBEDDED_SECRET_TOKEN_15/, 'pre-existing bytes never reach the Reviewer');
   } finally {
@@ -435,35 +435,80 @@ test('fail closed: a baseline-untracked BINARY file copied to a new text file (N
   }
 });
 
-test('a small coincidental overlap with a baseline-untracked file is NOT flagged', async () => {
+test('conservative: ANY baseline-untracked file makes a brand-new Worker file unattributable (fail closed)', async () => {
   const dir = initRepo();
   try {
     const git = (...a) => execFileSync('git', a, { cwd: dir });
+    // Even an unrelated pre-existing untracked file — an arbitrary lossless
+    // transform of its content into a brand-new file cannot be ruled out, so
+    // ReviewLoop fails closed rather than guessing attribution.
     fs.writeFileSync(path.join(dir, 'old.env'), 'DATABASE_URL=postgres://localhost/app\nAPI_KEY=zzzzzzzzzzzzzzzzzzzz\n');
     const baseline = await captureBaseline({ cwd: dir });
-    // Shares only the short common token "DATABASE_URL=" (< 96 chars).
     fs.writeFileSync(path.join(dir, 'config.example'), 'DATABASE_URL=postgres://example/db\n');
     git('add', 'config.example');
     const delta = await collectWorkerDelta({ cwd: dir, baseline });
-    assert.equal(delta.evidenceComplete, true);
-    assert.ok(delta.trackedChanged.includes('config.example'));
+    assert.equal(delta.evidenceComplete, false);
+    assert.ok(delta.incompleteReasons.some((r) => /cannot be cleared: one or more files were untracked at baseline/i.test(r)));
+    assert.equal(delta.trackedChanged.includes('config.example'), false);
+    assert.ok((delta.renamedUntrackedBaseline ?? []).includes('config.example'));
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('a genuinely new tracked file is still normal Worker output even with an unrelated baseline-untracked file present', async () => {
+test('a genuinely new tracked file from a CLEAN baseline is normal Worker output', async () => {
   const dir = initRepo();
   try {
     const git = (...a) => execFileSync('git', a, { cwd: dir });
-    fs.writeFileSync(path.join(dir, 'scratch.notes'), 'my unrelated todo list\n- item one\n- item two\n');
     const baseline = await captureBaseline({ cwd: dir });
+    assert.equal(Object.keys(baseline.untrackedHashes).length, 0, 'no untracked files at baseline');
     fs.writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;\n');
     git('add', 'feature.js');
     const delta = await collectWorkerDelta({ cwd: dir, baseline });
     assert.equal(delta.evidenceComplete, true);
     assert.ok(delta.trackedChanged.includes('feature.js'));
     assert.match(delta.diff, /export const x = 1/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fail closed: the Worker delta changes a git submodule (dirty submodule worktree)', async () => {
+  const parent = initRepo();
+  const sub = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: parent });
+    fs.writeFileSync(path.join(sub, 'lib.txt'), 'v1\n');
+    execFileSync('git', ['add', '-A'], { cwd: sub });
+    execFileSync('git', ['commit', '-qm', 'sub v1'], { cwd: sub });
+    git('-c', 'protocol.file.allow=always', 'submodule', 'add', sub, 'vendor');
+    git('commit', '-qm', 'add submodule');
+
+    const baseline = await captureBaseline({ cwd: parent });
+    // Worker edits a file INSIDE the submodule; the parent gitlink is untouched.
+    fs.writeFileSync(path.join(parent, 'vendor', 'lib.txt'), 'v1\nworker edit\n');
+
+    const delta = await collectWorkerDelta({ cwd: parent, baseline });
+    assert.equal(delta.evidenceComplete, false, 'a dirty submodule fails the evidence closed');
+    assert.ok(delta.incompleteReasons.some((r) => /submodule|gitlink/i.test(r)));
+    assert.doesNotMatch(delta.diff, /worker edit/, 'submodule contents never reach the Reviewer');
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.rmSync(sub, { recursive: true, force: true });
+  }
+});
+
+test('fail closed: a brand-new untracked file above the read cap is not OOM-read and is not emitted', async () => {
+  const dir = initRepo();
+  try {
+    const baseline = await captureBaseline({ cwd: dir });
+    // 9 MiB > MAX_UNTRACKED_BYTES (8 MiB).
+    fs.writeFileSync(path.join(dir, 'huge.txt'), Buffer.alloc(9 * 1024 * 1024, 0x61));
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, false);
+    assert.ok(delta.incompleteReasons.some((r) => /above the .*cap|too large/i.test(r)));
+    assert.equal(delta.untrackedChanged.includes('huge.txt'), false);
+    assert.doesNotMatch(delta.diff, /aaaaaaaa/, 'the oversized file is never emitted into evidence');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
