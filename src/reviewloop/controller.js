@@ -67,6 +67,17 @@ const RUNTIME_ROOT = REVIEWLOOP_RUNTIME_ROOT;
 // exhausted; this ceiling only exists so a pathological policy can never spin.
 const PROVIDER_ATTEMPT_HARD_CEILING = 16;
 
+// Thrown when this process resumes a review after its cross-host lease was
+// reclaimed by another owner. Caught in review() and converted to a read-only
+// "wait and re-call" result — never surfaced as a failure that writes state.
+class LeaseLostError extends Error {
+  constructor(loopId) {
+    super(`ReviewLoop lease for ${loopId} was reclaimed by another owner; this call must not dispatch or persist`);
+    this.name = 'LeaseLostError';
+    this.code = 'REVIEWLOOP_LEASE_LOST';
+  }
+}
+
 function providerAttemptBudget(role) {
   const n = DEFAULT_ROLE_POLICY[role]?.length ?? 0;
   return Math.min(Math.max(n, 1), PROVIDER_ATTEMPT_HARD_CEILING);
@@ -145,6 +156,23 @@ export function createReviewLoopController({
   // filesystem-backed persistence has one; an in-memory test persistence does
   // not, and there the in-process lock chain is the whole guarantee.
   const fileLeaseRoot = typeof persistence?.workflowDir === 'function' ? runtimeRoot : null;
+
+  // Cross-host lease safety: while a reviewloop_review runs, its loopId maps to
+  // a "do I still hold the lease?" probe. If a remote contender reclaims the
+  // (apparently expired) lease mid-review, the displaced owner must fail closed
+  // — no further paid model dispatch, no further durable ReviewLoop state
+  // write. `assertLeaseHeld` is called at exactly those two boundaries; a lost
+  // lease throws LeaseLostError, which review() turns into a strictly read-only
+  // result (the new owner is the one entitled to reconcile state).
+  const activeLeaseGuards = new Map(); // loopId -> async () => boolean (still held)
+  async function assertLeaseHeld(loopId) {
+    const probe = activeLeaseGuards.get(loopId);
+    if (probe && !(await probe())) throw new LeaseLostError(loopId);
+  }
+  async function saveLoop(loopState) {
+    await assertLeaseHeld(loopState.loopId);
+    return store.save(loopState.loopId, loopState);
+  }
   // Safety events are scoped to ONE reviewloop_review invocation. The array is
   // replaced (never appended-to across calls) at the top of review() so a
   // long-lived controller (one per MCP process, shared by every loopId) never
@@ -344,6 +372,11 @@ export function createReviewLoopController({
       const family = selection?.family ?? defaultFamily;
       const provider = selection?.provider ?? defaultProvider;
       try {
+        // Fail closed if we no longer hold the loop lease: never start a new
+        // paid provider attempt on behalf of a review another owner has taken
+        // over. (LeaseLostError is not retryable — it propagates to review().)
+        // eslint-disable-next-line no-await-in-loop
+        await assertLeaseHeld(workflowId);
         // eslint-disable-next-line no-await-in-loop
         return await spend.meteredCall({
           role, family, provider, model: selection?.model ?? null,
@@ -392,9 +425,27 @@ export function createReviewLoopController({
           safetyEvents: [],
         };
       }
+      activeLeaseGuards.set(loopId, lease.verifyHeld ?? (async () => true));
       try {
         return await reviewInner({ loopId, signal, onHeartbeat });
+      } catch (err) {
+        if (err instanceof LeaseLostError) {
+          // The lease was reclaimed by another owner while this call ran. We
+          // stopped before any further paid dispatch or durable write. Return a
+          // strictly read-only result — the new owner reconciles state.
+          safetyEvents = [];
+          return {
+            status: 'WAITING_FOR_REVIEW',
+            loopId,
+            reason: `${err.message}; wait for the current owner to finish, then call reviewloop_review again`,
+            nextAction: 'Wait for the in-flight review of this loop to finish, then call reviewloop_review again.',
+            telemetry: { ...emptyTelemetry(), note: 'lease lost to another owner mid-review; state left for the new owner' },
+            safetyEvents: [],
+          };
+        }
+        throw err;
       } finally {
+        activeLeaseGuards.delete(loopId);
         await lease.release();
       }
     });
@@ -541,7 +592,7 @@ export function createReviewLoopController({
       // the round completes does not re-call the model for it on resume.
       checkpoint.chunks[chunk.index] = normalized;
       // eslint-disable-next-line no-await-in-loop
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       // Any chunk we could not review successfully fails the whole review closed.
       if (normalized.status === 'FAILED') {
         return { review: normalized, chunkCount: chunks.length, failedChunk: chunk.index };
@@ -584,7 +635,7 @@ export function createReviewLoopController({
 
     // B7 — no Worker change since begin -> deterministic NO_PROGRESS, 0 Reviewer.
     if (delta.noWorkerChangeYet) {
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         status: 'NO_PROGRESS',
         loopId: loopState.loopId,
@@ -601,7 +652,7 @@ export function createReviewLoopController({
     // must not be sent to the Reviewer as Worker output.
     if (delta.evidenceComplete === false) {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'baseline attribution incomplete');
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         status: 'HUMAN_REQUIRED',
         loopId: loopState.loopId,
@@ -643,7 +694,7 @@ export function createReviewLoopController({
           });
           loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
           recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'verification plan drift');
-          await store.save(loopState.loopId, loopState);
+          await saveLoop(loopState);
           return {
             ...compactReworkPayload({
               loopState,
@@ -733,7 +784,7 @@ export function createReviewLoopController({
 
       const humanRequired = async (reason, transitionLabel = 'post-Gate attribution incomplete') => {
         recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, transitionLabel);
-        await store.save(loopState.loopId, loopState);
+        await saveLoop(loopState);
         return {
           status: 'HUMAN_REQUIRED',
           loopId: loopState.loopId,
@@ -767,7 +818,7 @@ export function createReviewLoopController({
         // empty diff and a clean response would PASS, certifying work that no
         // longer exists in the tree.
         if (delta.noWorkerChangeYet) {
-          await store.save(loopState.loopId, loopState);
+          await saveLoop(loopState);
           return {
             status: 'NO_PROGRESS',
             loopId: loopState.loopId,
@@ -807,7 +858,7 @@ export function createReviewLoopController({
     if (signal?.aborted) {
       // Cancelled during the Gate — never proceed to a paid Reviewer dispatch.
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'review cancelled by caller');
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         status: 'HUMAN_REQUIRED',
         loopId: loopState.loopId,
@@ -821,7 +872,7 @@ export function createReviewLoopController({
     const fp = reviewFingerprint({ deltaFingerprint: delta.fingerprint, gateFingerprint: gate.fingerprint });
 
     if (loopState.lastReviewedFingerprint && loopState.lastReviewedFingerprint === fp) {
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         status: 'NO_PROGRESS',
         loopId: loopState.loopId,
@@ -842,7 +893,7 @@ export function createReviewLoopController({
       loopState.lastReviewedFingerprint = fp;
       loopState.lastGateFingerprint = gate.fingerprint;
       recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'gate regression');
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         ...compactReworkPayload({ loopState, review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 }, gate }),
         reason: 'deterministic Gate failed with a new regression; fix it before Reviewer runs',
@@ -862,6 +913,7 @@ export function createReviewLoopController({
         spend, loopState, objective, delta, gate, signal,
       });
     } catch (err) {
+      if (err instanceof LeaseLostError) throw err; // read-only exit in review()
       return spendDenialResult(loopState, err, await spend.telemetry());
     }
     const review = reviewOut.review;
@@ -875,7 +927,7 @@ export function createReviewLoopController({
 
     if (review.status === 'FAILED') {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, review.error?.reason ?? 'review failed');
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         status: 'HUMAN_REQUIRED',
         loopId: loopState.loopId,
@@ -907,18 +959,18 @@ export function createReviewLoopController({
 
     if (decision.verdict === REVIEW_VERDICTS.PASS) {
       recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return passResult(loopState, review, await spend.telemetry());
     }
     if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
       loopState.budgetExhausted = true; // 3 rounds spent, still blocking — terminal
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return humanRequiredResult(loopState, review, await spend.telemetry(), supervisorGuidance);
     }
 
     recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, decision.reason);
-    await store.save(loopState.loopId, loopState);
+    await saveLoop(loopState);
     return {
       ...compactReworkPayload({ loopState, review, gate, supervisorGuidance }),
       reason: decision.reason,
@@ -963,6 +1015,7 @@ export function createReviewLoopController({
       // returns `denied` and the caller surfaces it as-is. Any other error
       // (provider pool exhausted with settled accounting, non-auth non-retryable
       // failure) is a degradable transient.
+      if (err instanceof LeaseLostError) throw err; // read-only exit in review()
       if (isAuthorizationFailure(err)) return { denied: true, error: err };
       return { humanRequired: true, reason: `Supervisor call failed: ${err?.message ?? err}` };
     }
@@ -1002,7 +1055,7 @@ export function createReviewLoopController({
       loopState.budgetExhausted = true;
       recordTransition(loopState, REVIEW_LOOP_STATES.SUPERVISING, escalationReason);
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, sup.reason);
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return { result: humanRequiredResult(loopState, review, await spend.telemetry(), sup.guidance) };
     }
     if (sup.humanRequired) {
@@ -1089,22 +1142,25 @@ export function createReviewLoopController({
       recordSafetyEvent: collectSafetyEvent, triggerAuthority,
     });
 
+    // Fail closed before any external-review trigger dispatch or PR state write
+    // if this process no longer holds the lease.
+    await assertLeaseHeld(loopState.loopId);
     const result = await prCtl.obtainReview({ objective, loopState, signal, onHeartbeat });
 
     if (result.outcome === PR_REVIEW_OUTCOMES.PUSH_REQUIRED) {
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return { status: 'PUSH_REQUIRED', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: await durableTelemetry(loopState.loopId), safetyEvents };
     }
     if (result.outcome === PR_REVIEW_OUTCOMES.WAITING_FOR_REVIEW) {
       recordTransition(loopState, REVIEW_LOOP_STATES.WAITING_FOR_REVIEW, 'external review pending');
       loopState.pendingExternalTrigger = loopState.pendingExternalTrigger
         ?? { head: result.head, reviewer: objective.reviewer, status: 'TRIGGERED' };
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return { status: 'WAITING_FOR_REVIEW', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: await durableTelemetry(loopState.loopId), safetyEvents };
     }
     if (result.outcome === PR_REVIEW_OUTCOMES.HUMAN_REQUIRED) {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, result.reason);
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head ?? null, reason: result.reason,
         blockingFindings: loopState.lastReview?.blockingFindings ?? [], telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
@@ -1115,7 +1171,7 @@ export function createReviewLoopController({
     const review = result.review;
     if (review.status === 'FAILED') {
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, review.error?.reason ?? 'pr review failed');
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return {
         status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head,
         reason: `trusted PR review was not usable (${review.error?.reason}): ${review.error?.message ?? ''}`,
@@ -1166,7 +1222,7 @@ export function createReviewLoopController({
       }
       if (stuck.length) {
         recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'ReviewLoop-managed review threads could not be resolved');
-        await store.save(loopState.loopId, loopState);
+        await saveLoop(loopState);
         return {
           status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
           head: result.head, blockingFindings: [],
@@ -1175,13 +1231,13 @@ export function createReviewLoopController({
         };
       }
       recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return passResult(loopState, review, await spend.telemetry());
     }
     if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
       loopState.budgetExhausted = true; // 3 rounds spent, still blocking — terminal
       recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
-      await store.save(loopState.loopId, loopState);
+      await saveLoop(loopState);
       return humanRequiredResult(loopState, review, await spend.telemetry(), null);
     }
 
@@ -1199,7 +1255,7 @@ export function createReviewLoopController({
     }
 
     recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, decision.reason);
-    await store.save(loopState.loopId, loopState);
+    await saveLoop(loopState);
     return {
       ...compactReworkPayload({ loopState, review, gate: null, supervisorGuidance }),
       head: result.head,
@@ -1240,7 +1296,7 @@ export function createReviewLoopController({
   // while the loop stayed at REVIEWING on disk.)
   async function spendDenialResult(loopState, err, telemetry) {
     recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, `model spend blocked: ${err?.code ?? err?.message ?? err}`);
-    try { await store.save(loopState.loopId, loopState); } catch { /* best effort; the returned status still reflects intent */ }
+    try { await saveLoop(loopState); } catch { /* best effort; the returned status still reflects intent */ }
     return {
       status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
       reason: `ReviewLoop model spend blocked: ${err?.message ?? err}`,

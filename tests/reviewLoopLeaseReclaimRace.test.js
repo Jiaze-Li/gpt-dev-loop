@@ -95,3 +95,48 @@ test('renew() is a CAS on the inode: it never overwrites a successor lease', asy
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('cross-host: after the lease is reclaimed mid-review, the displaced owner does NOT dispatch or persist', async () => {
+  const { createReviewLoopController } = await import('../src/reviewloop/controller.js');
+  const { Persistence } = await import('../src/orchestrator/persistence.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-lease-loss-'));
+  try {
+    const persistence = new Persistence(root);
+    let reviewerCalls = 0;
+    let loopIdRef = null;
+    const controller = createReviewLoopController({
+      persistence,
+      runtimeRoot: root,
+      captureBaselineFn: async () => ({ head: 'H', baselineRef: 'H', dirtyFiles: [], untrackedHashes: {}, evidenceComplete: true }),
+      collectWorkerDeltaFn: async () => {
+        // Simulate: our lease looked expired and a remote contender (host "B")
+        // reclaimed it and published its own lock at the same path.
+        const lockPath = path.join(root, loopIdRef, 'reviewloop.lock');
+        fs.writeFileSync(lockPath, JSON.stringify({
+          token: 'contender-B', pid: 5150, host: 'host-B',
+          acquiredAt: new Date().toISOString(), renewedAt: new Date().toISOString(),
+          expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        }));
+        return { baselineHead: 'H', currentHead: 'H', evidenceComplete: true, noWorkerChangeYet: false, changedFiles: ['a.js'], fingerprint: 'PRE', diff: 'diff --git a/a.js b/a.js\n+worker change\n' };
+      },
+      discoverVerificationCommandsFn: () => ({ source: 'none', commands: [], manifestFingerprint: 'mf' }),
+      runGateFn: async () => ({ verdict: 'PASS', pass: true, fingerprint: 'g', failureIdentities: [], results: [], evidence: { results: [], pass: true } }),
+      reviewerFn: async () => { reviewerCalls += 1; return { value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } }; },
+    });
+    const { loopId } = await controller.begin({ goal: 'g', cwd: root });
+    loopIdRef = loopId;
+    const before = JSON.stringify(await controller._store.load(loopId));
+
+    const r = await controller.review({ loopId });
+
+    assert.equal(reviewerCalls, 0, 'no paid Reviewer dispatch after the lease was lost');
+    assert.equal(r.status, 'WAITING_FOR_REVIEW');
+    assert.match(r.reason, /lease .*(reclaimed|lost)/i);
+    const after = JSON.stringify(await controller._store.load(loopId));
+    assert.equal(after, before, 'no durable ReviewLoop state was written after the lease was lost');
+    // The successor's lock is intact — the displaced owner never touched it.
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, loopId, 'reviewloop.lock'), 'utf8')).token, 'contender-B');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

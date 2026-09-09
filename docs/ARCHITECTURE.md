@@ -277,6 +277,23 @@ pre-send zero. Absent reliable provider usage, ModelSpendAuthority settles it
 UNRESOLVED and further spend/failover on the same evidence is blocked.
 `UNKNOWN != ZERO` wins over convenience.
 
+**Per-loop lease, fail-closed on loss**. Each `reviewloop_review` holds an
+in-process chain lock plus a durable cross-process lock file
+(`<runtimeRoot>/<loopId>/reviewloop.lock`). Reclaim of a foreign lock is
+ownership-preserving: same host → only when the owner pid is gone (a slow-but-
+alive owner keeps its lock past the nominal TTL); other host → only when the
+TTL, kept fresh by the owner's heartbeat, has expired; a malformed record → an
+atomically-guarded reclaim. **Renew is a compare-and-swap on the inode**: the
+owner writes renewals only through the descriptor it opened on the lock file it
+published, so a renewal issued after a remote contender reclaimed the path lands
+on the owner's now-unlinked inode and is invisible — it can never overwrite a
+successor lease. If a remote contender does reclaim an apparently-expired lease
+mid-review, the displaced owner **fails closed**: `assertLeaseHeld` (a fresh
+ownership probe) runs immediately before every paid model dispatch and every
+durable ReviewLoop state write, and a lost lease aborts the call read-only
+(`WAITING_FOR_REVIEW`) — no further dispatch, no state write; the new owner
+reconciles.
+
 ## State machine
 
 ```

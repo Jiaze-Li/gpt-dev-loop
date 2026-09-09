@@ -95,12 +95,18 @@ export async function acquireLoopFileLease({
   renewMs = DEFAULT_LEASE_RENEW_MS, clock = () => Date.now(),
 } = {}) {
   if (!runtimeRoot || !loopId) {
-    return { ok: true, release: async () => {}, renew: async () => true };
+    return {
+      ok: true, release: async () => {}, renew: async () => true, verifyHeld: async () => true,
+    };
   }
   const dir = path.join(runtimeRoot, loopId);
   const lockPath = path.join(dir, 'reviewloop.lock');
   const token = randomUUID();
   const acquiredAt = new Date(clock()).toISOString();
+  // Latches false the first time we CANNOT confirm we still own the published
+  // lock (a successor token, a vanished lock, or an unreadable one). Once lost,
+  // always lost — the holder must fail closed, never resume paid work.
+  let held = true;
   // A handle bound to the exact inode THIS process published at acquire time.
   // `renew()` writes only through it, so a renewal can never land on a
   // successor lease (a different inode a remote contender linked at lockPath
@@ -149,7 +155,7 @@ export async function acquireLoopFileLease({
       } catch {
         return false; // gone or malformed -> we no longer hold it
       }
-      if (current?.token !== token) return false; // a successor owns lockPath
+      if (current?.token !== token) { held = false; return false; } // a successor owns lockPath
       const body = Buffer.from(serialize(new Date(clock()).toISOString()));
       await lockFh.write(body, 0, body.length, 0);
       return true;
@@ -158,12 +164,31 @@ export async function acquireLoopFileLease({
     }
   };
 
+  // Confirm — with a fresh read, not just the last heartbeat — that this process
+  // still owns the published lock. Latches `held` to false on any outcome that
+  // is not a positive confirmation (successor token, missing lock, unreadable
+  // lock). Callers MUST treat a false here as "fail closed": no further paid
+  // dispatch, no further durable state write.
+  const verifyHeld = async () => {
+    if (!held) return false;
+    try {
+      const current = JSON.parse(await readFile(lockPath, 'utf8'));
+      if (current?.token !== token) held = false;
+    } catch {
+      held = false; // gone or unreadable -> cannot confirm ownership
+    }
+    return held;
+  };
+
   const acquired = () => {
-    const timer = setInterval(() => { renew().catch(() => {}); }, Math.max(1_000, renewMs));
+    const timer = setInterval(() => {
+      renew().then((ok) => { if (!ok) held = false; }).catch(() => { held = false; });
+    }, Math.max(1_000, renewMs));
     if (typeof timer.unref === 'function') timer.unref();
     return {
       ok: true,
       renew,
+      verifyHeld,
       release: async () => {
         clearInterval(timer);
         const fh = lockFh;
