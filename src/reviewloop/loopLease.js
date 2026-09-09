@@ -22,6 +22,15 @@
 //     which a live owner keeps fresh by RENEWING it on a timer (heartbeat).
 //     An expired remote lock is presumed abandoned.
 //   * unreadable / malformed lock record -> treated as abandoned.
+//
+// Renew is a compare-and-swap on the INODE, not the path: the owner keeps an
+// open descriptor to the exact lock file it published at acquire time and
+// writes renewals only through it (a single positional write of an equal-length
+// record). If a remote contender has meanwhile reclaimed the path and linked
+// its own lock, that is a different inode — the renewal lands on our unlinked
+// inode and is invisible, so a renewal can never overwrite a successor lease.
+// A crash mid-write can only truncate our own record, which the malformed-lock
+// reclaim path already handles.
 
 import {
   open, readFile, writeFile, unlink, mkdir, rename, link,
@@ -91,42 +100,58 @@ export async function acquireLoopFileLease({
   const dir = path.join(runtimeRoot, loopId);
   const lockPath = path.join(dir, 'reviewloop.lock');
   const token = randomUUID();
+  const acquiredAt = new Date(clock()).toISOString();
+  // A handle bound to the exact inode THIS process published at acquire time.
+  // `renew()` writes only through it, so a renewal can never land on a
+  // successor lease (a different inode a remote contender linked at lockPath
+  // after reclaiming ours) — the CAS-style ownership guarantee.
+  let lockFh = null;
+
+  const serialize = (renewedAt) => JSON.stringify({
+    token, pid: process.pid, host: os.hostname(),
+    acquiredAt,
+    renewedAt,
+    expiresAt: new Date(Date.parse(renewedAt) + ttlMs).toISOString(),
+  });
 
   // Publish the lock ATOMICALLY, already fully populated: write the complete
   // record to a private temp file, then `link()` it into place. `link` fails
   // with EEXIST if the lock already exists (same exclusive-create guarantee as
   // `open(…, 'wx')`), and the lock is NEVER observable empty or half-written —
   // so a concurrent contender can never mistake an in-progress initial write
-  // for an abandoned malformed lock.
+  // for an abandoned malformed lock. Then bind `lockFh` to that inode.
   const write = async () => {
     const tmp = `${lockPath}.new.${token}`;
-    await writeFile(tmp, JSON.stringify({
-      token, pid: process.pid, host: os.hostname(),
-      acquiredAt: new Date(clock()).toISOString(),
-      renewedAt: new Date(clock()).toISOString(),
-      expiresAt: new Date(clock() + ttlMs).toISOString(),
-    }));
+    await writeFile(tmp, serialize(new Date(clock()).toISOString()));
     try {
       await link(tmp, lockPath);
     } finally {
       await unlink(tmp).catch(() => {});
     }
+    lockFh = await open(lockPath, 'r+').catch(() => null);
   };
 
-  // Extend this lock's TTL in place. Only rewrites a lock still owned by this
-  // token; a no-op (returns false) once the lock is gone or was reclaimed.
+  // Extend this lock's TTL. Re-reads the published record first: a different
+  // token (a successor reclaimed us) or an unreadable/gone lock -> no-op. When
+  // we still own it, the fresh record — byte-for-byte the same length as the
+  // one we wrote (only the two fixed-width ISO timestamps change) — is written
+  // through `lockFh` in a single positional write. Because `lockFh` is bound to
+  // the inode we created, a renewal AFTER a remote contender reclaimed the path
+  // lands on our now-unlinked inode and is simply invisible; it can never
+  // overwrite the contender's live lock. A crash mid-write can only truncate
+  // OUR record, which the malformed-lock reclaim path already handles.
   const renew = async () => {
     try {
-      const current = JSON.parse(await readFile(lockPath, 'utf8'));
-      if (current?.token !== token) return false;
-      current.renewedAt = new Date(clock()).toISOString();
-      current.expiresAt = new Date(clock() + ttlMs).toISOString();
-      // Atomic in-place replace: a crash mid-renew can never truncate the lock,
-      // and a concurrent reader sees either the whole old record or the whole
-      // new one.
-      const tmp = `${lockPath}.renew.${token}`;
-      await writeFile(tmp, JSON.stringify(current));
-      await rename(tmp, lockPath);
+      if (!lockFh) return false;
+      let current;
+      try {
+        current = JSON.parse(await readFile(lockPath, 'utf8'));
+      } catch {
+        return false; // gone or malformed -> we no longer hold it
+      }
+      if (current?.token !== token) return false; // a successor owns lockPath
+      const body = Buffer.from(serialize(new Date(clock()).toISOString()));
+      await lockFh.write(body, 0, body.length, 0);
       return true;
     } catch {
       return false;
@@ -141,6 +166,9 @@ export async function acquireLoopFileLease({
       renew,
       release: async () => {
         clearInterval(timer);
+        const fh = lockFh;
+        lockFh = null;
+        if (fh) await fh.close().catch(() => {});
         await releaseIfOwned(lockPath, token);
       },
     };

@@ -63,3 +63,35 @@ test('N processes racing to reclaim ONE stale lock -> at most one wins', async (
     fs.rmSync(barrier, { recursive: true, force: true });
   }
 });
+
+test('renew() is a CAS on the inode: it never overwrites a successor lease', async () => {
+  const { acquireLoopFileLease } = await import('../src/reviewloop/loopLease.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-renew-cas-'));
+  const loopId = 'CASLOOP';
+  const lockPath = path.join(root, loopId, 'reviewloop.lock');
+  try {
+    const a = await acquireLoopFileLease({ runtimeRoot: root, loopId, ttlMs: 60_000 });
+    assert.equal(a.ok, true);
+    assert.equal(await a.renew(), true, 'owner can renew its own live lock');
+
+    // Simulate a remote contender that reclaimed the path and published its own
+    // lock (a different inode, a different token).
+    fs.unlinkSync(lockPath);
+    fs.writeFileSync(lockPath, JSON.stringify({
+      token: 'successor', pid: 4242, host: 'other-host',
+      acquiredAt: new Date().toISOString(), renewedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+
+    assert.equal(await a.renew(), false, 'the displaced owner no longer renews');
+    const after = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    assert.equal(after.token, 'successor', 'the successor lease is left intact');
+    assert.equal(after.pid, 4242);
+
+    await a.release();
+    assert.equal(JSON.parse(fs.readFileSync(lockPath, 'utf8')).token, 'successor',
+      'release() also refuses to delete a lock it no longer owns');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
