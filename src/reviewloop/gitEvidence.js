@@ -264,13 +264,15 @@ export async function captureBaseline({
 
   const untracked = await listUntracked(cwd, spawn, 'baseline');
   const untrackedHashes = {};
-  // Full text of each retained baseline-untracked file (<= cap, non-binary),
-  // keyed by path. Used at review time to build an honest delta for a Worker
-  // file that copies pre-existing untracked content, and to detect the leak
-  // when it cannot. Binary paths are listed so review can tell "genuinely
-  // uncomparable" from "content stripped after baseline".
+  // Raw bytes of each retained baseline-untracked file, latin1-encoded so the
+  // round-trip is lossless for any byte sequence. Retained only for a
+  // non-binary file within the cap: a binary file can be re-encoded (NUL bytes
+  // stripped, base64, hex) into a Worker text file with no contiguous run
+  // surviving, so a clean window comparison cannot clear it — it is left
+  // unretained and makes the baseline uncomparable (any brand-new Worker file
+  // then fails the evidence closed). Oversized or stripped content is treated
+  // the same way.
   const untrackedContent = {};
-  const untrackedContentBinary = [];
   let evidenceComplete = true;
   const incompleteReasons = [];
   for (const filePath of untracked) {
@@ -278,10 +280,8 @@ export async function captureBaseline({
     const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
     if (fp.safe) {
       untrackedHashes[filePath] = fp.digest;
-      if (fp.bytes && fp.bytes.includes(0)) {
-        untrackedContentBinary.push(filePath);
-      } else if (fp.bytes && fp.bytes.length <= UNTRACKED_CONTENT_CAP_BYTES) {
-        untrackedContent[filePath] = fp.bytes.toString('utf8');
+      if (fp.bytes && fp.bytes.length <= UNTRACKED_CONTENT_CAP_BYTES && !fp.bytes.includes(0)) {
+        untrackedContent[filePath] = fp.bytes.toString('latin1');
       }
     } else {
       evidenceComplete = false;
@@ -296,7 +296,6 @@ export async function captureBaseline({
     dirtyFiles,
     untrackedHashes,
     untrackedContent,
-    untrackedContentBinary,
     evidenceComplete,
     incompleteReasons,
   };
@@ -545,29 +544,22 @@ export async function collectWorkerDelta({
   //     untracked) that reproduces a substantial contiguous section of a
   //     baseline-untracked file leaks that file's pre-existing bytes even
   //     though its digest differs and its source may still be on disk. The
-  //     baseline retained capped text content for exactly this comparison; when
-  //     a baseline-untracked file's content is NOT available (binary that has
-  //     since vanished, oversized text, or stripped from state) the file cannot
-  //     be cleared and every brand-new Worker file fails closed.
+  //     comparison is byte-level (latin1). A baseline-untracked file whose
+  //     content was NOT retained — binary (re-encodable so no run survives),
+  //     oversized, or stripped from state so it no longer matches its
+  //     fingerprinted digest — cannot be cleared: every brand-new Worker file
+  //     then fails the evidence closed.
   if (Object.keys(baseline.untrackedHashes ?? {}).length) {
     const retained = baseline.untrackedContent ?? {};
-    const declaredBinary = new Set(baseline.untrackedContentBinary ?? []);
-    const comparableTexts = [];
+    const comparable = [];
     let uncomparableBaseline = null;
     for (const [bp, digest] of Object.entries(baseline.untrackedHashes ?? {})) {
-      const text = retained[bp];
-      if (typeof text === 'string' && sha256(Buffer.from(text, 'utf8')) === digest) {
-        comparableTexts.push({ text, windows: indexCopyWindows(text) });
-        continue;
+      const content = retained[bp];
+      if (typeof content === 'string' && sha256(Buffer.from(content, 'latin1')) === digest) {
+        comparable.push({ text: content, windows: indexCopyWindows(content) });
+      } else {
+        uncomparableBaseline = uncomparableBaseline ?? bp;
       }
-      if (declaredBinary.has(bp)) {
-        // Trust the "binary" label only if the file is still on disk AND still
-        // binary; a vanished or now-text path may have been relabelled.
-        // eslint-disable-next-line no-await-in-loop
-        const fp = await fingerprintUntracked({ cwd, filePath: bp, lstat, readFile, open });
-        if (fp.safe && fp.bytes && fp.bytes.includes(0)) continue;
-      }
-      uncomparableBaseline = uncomparableBaseline ?? bp;
     }
 
     const candidates = [
@@ -576,17 +568,17 @@ export async function collectWorkerDelta({
         .map((p) => ({ p, tracked: true })),
     ];
     for (const { p, tracked } of candidates) {
-      let text = null;
+      let bytes = null;
       if (tracked) {
         // eslint-disable-next-line no-await-in-loop
         const fp = await fingerprintUntracked({ cwd, filePath: p, lstat, readFile, open });
-        text = fp.safe && fp.bytes && !fp.bytes.includes(0) ? fp.bytes.toString('utf8') : null;
+        bytes = fp.safe && fp.bytes ? fp.bytes : null;
       } else {
-        const buf = safeBytes.get(p);
-        text = buf && !buf.includes(0) ? buf.toString('utf8') : null;
+        bytes = safeBytes.get(p) ?? null;
       }
-      if (text == null) continue; // binary Worker files fail closed at emission
-      const reproduced = comparableTexts.some((b) => reproducesBaselineContent(text, b.text, b.windows));
+      if (bytes == null) continue; // unreadable Worker files fail closed at emission
+      const text = bytes.toString('latin1');
+      const reproduced = comparable.some((b) => reproducesBaselineContent(text, b.text, b.windows));
       if (reproduced || uncomparableBaseline) {
         renamedUntrackedBaseline.push(p);
         if (tracked) {
@@ -598,10 +590,9 @@ export async function collectWorkerDelta({
         }
         fail(reproduced
           ? `brand-new file ${p} reproduces a substantial contiguous section of a baseline-untracked file `
-            + '— the baseline retained only a digest/capped content, so the pre-existing bytes cannot be '
-            + 'separated from Worker authorship'
+            + '— the pre-existing bytes cannot be separated from Worker authorship'
           : `brand-new file ${p} cannot be cleared: baseline-untracked file ${uncomparableBaseline} `
-            + 'had no comparable content retained (binary-and-vanished, oversized, or stripped)');
+            + 'had no comparable content retained (binary, oversized, or stripped from state)');
       }
     }
   }

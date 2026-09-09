@@ -409,6 +409,32 @@ test('fail closed: a new file copying a NON-ALIGNED window-length slice of a bas
   }
 });
 
+test('fail closed: a baseline-untracked BINARY file copied to a new text file (NUL bytes stripped) does not leak', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    // A "binary" blob: a long readable secret string with NUL bytes interleaved.
+    const secretRun = Array.from({ length: 30 }, (_, i) => `EMBEDDED_SECRET_TOKEN_${i}_abcdef`).join('|');
+    const withNuls = Buffer.from(secretRun.split('').join('\0'), 'latin1');
+    fs.writeFileSync(path.join(dir, 'blob.bin'), withNuls);
+    const baseline = await captureBaseline({ cwd: dir });
+    assert.equal(baseline.evidenceComplete, true, 'a binary untracked file is still retained for comparison');
+
+    // Worker copies the blob into a new text file with the NUL bytes removed —
+    // digest differs, source stays on disk and stays "binary".
+    fs.writeFileSync(path.join(dir, 'extracted.txt'), secretRun);
+    git('add', 'extracted.txt');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, false, 'the de-NUL-ed copy is caught');
+    assert.ok(delta.incompleteReasons.some((r) => /reproduces a substantial contiguous section|cannot be cleared/i.test(r)));
+    assert.equal(delta.trackedChanged.includes('extracted.txt'), false);
+    assert.doesNotMatch(delta.diff, /EMBEDDED_SECRET_TOKEN_15/, 'pre-existing bytes never reach the Reviewer');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a small coincidental overlap with a baseline-untracked file is NOT flagged', async () => {
   const dir = initRepo();
   try {

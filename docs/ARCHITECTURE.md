@@ -537,13 +537,16 @@ an exact-digest match fails closed, and — since the baseline kept only digests
 — a brand-new file (tracked or untracked) appearing in the same review where a
 baseline-untracked path disappeared (an undetectable rename+edit) fails closed.
 For the *edited copy with the source left in place*, the baseline additionally
-retains the full text of every untracked file ≤ 400 KB: a brand-new Worker file
-that reproduces a substantial contiguous character run of that text — a rolling
-hash over *every* window offset (confirmed with a direct substring check), so a
-large single-line file (minified JSON, a lockfile fragment) is covered exactly
-like a multi-line one and a non-aligned copy cannot slip between strides — or
-that cannot be cleared because a baseline-untracked file's content was not
-retained (binary-and-gone, oversized) fails the evidence closed. A baseline-untracked path missing from the
+retains the full bytes (latin1) of every **non-binary** untracked file ≤ 400 KB:
+a brand-new Worker file that reproduces a substantial contiguous character run
+of that content — a rolling hash over *every* window offset, confirmed with a
+direct substring check, so a large single-line file (minified JSON, a lockfile
+fragment) is covered exactly like a multi-line one and a non-aligned copy cannot
+slip between strides — fails the evidence closed. A baseline-untracked file
+whose content was **not** retained — binary (re-encodable, e.g. NUL bytes
+stripped, so no contiguous run survives a clean comparison), oversized, or
+stripped from state so it no longer matches its fingerprinted digest — makes the
+baseline *uncomparable*: every brand-new Worker file then fails closed. A baseline-untracked path missing from the
 current listing is called *deleted* only when its absence is definitively
 confirmed (`ENOENT`); any other `lstat`/read failure (`EACCES`, a mid-read
 race) fails the evidence closed instead. Every untracked path
