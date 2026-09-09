@@ -80,6 +80,16 @@ export function isDispatchOrLaterStatus(status) {
   return DISPATCH_OR_LATER.has(status);
 }
 
+// A trigger record in one of these statuses is fully settled: its round has
+// closed and nothing further is expected for it. When EVERY existing trigger
+// record for a subject is settled and a brand-new reviewable HEAD arrives, the
+// external-review wall clock is re-armed for that new round (see authorize()).
+const SETTLED_TRIGGER_STATUSES = new Set([
+  EXTERNAL_TRIGGER_STATUS.RESULT_RECEIVED,
+  EXTERNAL_TRIGGER_STATUS.UNRESOLVED,
+  EXTERNAL_TRIGGER_STATUS.CANCELLED_PRE_DISPATCH,
+]);
+
 // ---------------------------------------------------------------------------
 // Production default derivation (§ trigger count / round ceilings).
 //
@@ -111,11 +121,16 @@ export const DEFAULT_MAX_EXTERNAL_MODEL_TRIGGERS = DEFAULT_MAX_EXTERNAL_REVIEW_R
 
 // WALL CLOCK: the adapter's own per-request wait (githubPrReviewAdapter.js —
 // DEFAULT_MAX_WAIT_MS = 15 minutes; production's requestTrustedReview uses a
-// tighter 30s-per-reviewer budget) already bounds a SINGLE review wait. This
-// is a separate, OUTER, cumulative ceiling across the whole bounded review
-// sequence (every round above) and must survive a process restart. One hour
-// gives every round several multiples of the existing per-request wait
-// without keeping the workflow open indefinitely.
+// tighter 30s-per-reviewer budget) already bounds a SINGLE poll for a review
+// result. This is a separate, OUTER ceiling on ONE review round's total
+// external-review wait — armed when a round's trigger is authorized and
+// re-armed for each genuinely new reviewable HEAD once the previous round has
+// settled (see authorize()). It deliberately does NOT span the Worker's
+// between-round implementation time or the whole multi-round loop — the
+// review-ROUND budget (DEFAULT_MAX_EXTERNAL_REVIEW_ROUNDS) is that runaway
+// guard. One hour is several multiples of the per-request poll wait, enough
+// headroom for a slow reviewer within a single round without keeping the
+// workflow open indefinitely.
 export const DEFAULT_EXTERNAL_REVIEW_WALL_CLOCK_MS = 60 * 60 * 1000;
 
 const WORKFLOW_STATE_KEY = 'externalModelTriggers';
@@ -290,14 +305,33 @@ export class ExternalModelTriggerAuthority {
     }
     let bucket = map.get(subjectKey) ?? { triggers: {}, wallClock: { startedAt: null, deadlineAt: null }, dispatchCount: 0 };
 
-    // Wall-clock ceiling: initialized once, durably, on first authorize() for
-    // this subject; a process restart never resets it (elapsed time alone
-    // never authorizes a new trigger, and never re-arms a spent one).
-    if (!bucket.wallClock?.startedAt) {
+    // Wall-clock ceiling: bounds ONE review round's external-review wait — the
+    // time between posting `@codex review` for a HEAD and its result landing.
+    // It is NOT a budget on the Worker's between-round implementation time, nor
+    // on the whole multi-round loop (the review-ROUND budget is that runaway
+    // guard). So it is:
+    //   * armed on the first authorize() for this subject, and
+    //   * RE-ARMED whenever a genuinely new reviewable HEAD arrives AND every
+    //     existing trigger record is already settled (the previous round has
+    //     fully closed).
+    // Within an unsettled round every authorize() keeps sharing one deadline,
+    // so a hung / never-returning reviewer in the current round is still caught.
+    // A process restart never resets an in-round deadline (the settled-records
+    // check is a pure function of durable state, so a restart mid-round
+    // recomputes the same "not a fresh round" answer).
+    const triggerRecords = Object.values(bucket.triggers ?? {});
+    const isFreshRoundHead = !bucket.triggers?.[intent.headSha]
+      && triggerRecords.length > 0
+      && triggerRecords.every((r) => SETTLED_TRIGGER_STATUSES.has(r.status));
+    if (!bucket.wallClock?.startedAt || isFreshRoundHead) {
       try {
         bucket = await this._mutateWorkflow(intent.workflowId, (candidateMap) => {
           const b = getOrInitBucket(candidateMap, subjectKey);
-          if (!b.wallClock?.startedAt) {
+          const recs = Object.values(b.triggers ?? {});
+          const freshRound = !b.triggers?.[intent.headSha]
+            && recs.length > 0
+            && recs.every((r) => SETTLED_TRIGGER_STATUSES.has(r.status));
+          if (freshRound || !b.wallClock?.startedAt) {
             b.wallClock = { startedAt: iso(now), deadlineAt: iso(now + this._wallClockMs) };
           }
           return b;

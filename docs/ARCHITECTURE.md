@@ -276,6 +276,16 @@ READY_FOR_WORK → REVIEWING → PASS
 `WAITING_FOR_REVIEW` is a normal durable state, not an error. A restart
 reattaches to the pending external trigger without re-posting.
 
+`ExternalModelTriggerAuthority` posts **at most one** `@codex/@claude review`
+per semantic HEAD (workflow + PR + HEAD), caps the total distinct review rounds
+(`MAX_EXTERNAL_REVIEW_TRIGGERS`), and puts a **per-round** wall clock on the
+external-review wait: it is armed when a round's trigger is authorized and
+**re-armed for each genuinely new reviewable HEAD once the previous round has
+settled**. It deliberately does not span the Worker's between-round
+implementation time or the whole multi-round loop (the review-round budget is
+that runaway guard); within one unsettled round every authorize keeps sharing
+the same deadline, so a hung / never-returning reviewer is still caught.
+
 ## Convergence
 
 Default: `blockingSeverities = [P1, P2]`, `maxReviewRounds = 3`.
