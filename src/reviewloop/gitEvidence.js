@@ -105,7 +105,14 @@ async function fingerprintUntracked({
   try {
     info = await lstat(abs);
   } catch (err) {
-    return { unreadable: true, reason: `cannot lstat untracked path ${filePath}: ${err?.message ?? err}` };
+    // ENOENT is the only "definitively absent" signal — every other lstat
+    // failure (EACCES, EIO, ...) means the path may still exist and must not be
+    // treated as a deletion by the caller.
+    return {
+      unreadable: true,
+      missing: err?.code === 'ENOENT',
+      reason: `cannot lstat untracked path ${filePath}: ${err?.message ?? err}`,
+    };
   }
   if (info.isSymbolicLink()) {
     return { safe: false, reason: `untracked path ${filePath} is a symlink — refusing to follow or read its target` };
@@ -125,7 +132,11 @@ async function fingerprintUntracked({
     if (err?.code === 'ELOOP') {
       return { safe: false, reason: `untracked path ${filePath} became a symlink before it could be read — refusing to follow it` };
     }
-    return { unreadable: true, reason: `cannot open untracked file ${filePath}: ${err?.message ?? err}` };
+    return {
+      unreadable: true,
+      missing: err?.code === 'ENOENT',
+      reason: `cannot open untracked file ${filePath}: ${err?.message ?? err}`,
+    };
   }
   try {
     const st = await fh.stat();
@@ -351,8 +362,12 @@ export async function collectWorkerDelta({
       // would be reported deleted while PASS proceeds without reviewing it.
       // eslint-disable-next-line no-await-in-loop
       const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
-      if (fp.unreadable) {
-        untrackedDeleted.push(filePath); // gone / unreadable -> a real deletion
+      if (fp.unreadable && fp.missing) {
+        untrackedDeleted.push(filePath); // definitively absent
+      } else if (fp.unreadable) {
+        // Present but unreadable (EACCES, EIO, a mid-read race): NOT a deletion,
+        // and its current content was never reviewed — fail closed.
+        fail(`baseline-untracked file ${filePath} vanished from the untracked listing but could not be confirmed absent (${fp.reason})`);
       } else if (!fp.safe) {
         fail(fp.reason); // a symlink/special now sits where a regular file was
       } else if (fp.digest === baselineUntracked[filePath]) {
@@ -366,6 +381,27 @@ export async function collectWorkerDelta({
           + 'only a baseline digest was retained, so its current content cannot be separated from the pre-existing bytes');
       }
     }
+  }
+
+  // A brand-new untracked file appearing while a pre-existing untracked file
+  // disappeared cannot be told apart from a rename (+ edit) of it — and the
+  // baseline kept only digests, so an honest baseline->current delta cannot be
+  // built. The exact-digest check above already caught unchanged renames; this
+  // catches rename+edit. Drop every brand-new untracked file from emitted
+  // evidence (any one of them might carry pre-existing bytes) and fail closed.
+  if (untrackedChanged.length && untrackedDeleted.length) {
+    fail(`brand-new untracked file(s) [${untrackedChanged.join(', ')}] appeared while pre-existing untracked `
+      + `file(s) [${untrackedDeleted.join(', ')}] disappeared — a rename+edit cannot be distinguished from a `
+      + 'delete+create and the baseline retained only digests');
+    for (const p of untrackedChanged) {
+      renamedUntrackedBaseline.push(p);
+      safeBytes.delete(p);
+    }
+    // The disappeared paths are no longer "clean deletions" either — fold them
+    // into the same ambiguous bucket.
+    renamedUntrackedBaseline.push(...untrackedDeleted);
+    untrackedChanged.length = 0;
+    untrackedDeleted.length = 0;
   }
 
   const changedFiles = [

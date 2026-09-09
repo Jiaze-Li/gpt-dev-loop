@@ -197,6 +197,11 @@ export const EXTERNAL_TRIGGER_ERROR_CODES = Object.freeze({
   // zero external trigger dispatches. Never interpret unreadable state as an
   // empty trigger history.
   EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE: 'EXTERNAL_MODEL_TRIGGER_STATE_UNAVAILABLE',
+  // dispatchFn signalled — via a trusted in-process marker — that the caller
+  // cancelled BEFORE it invoked the physical post. postReviewTrigger provably
+  // never ran, so the reservation is rolled back (status CANCELLED_PRE_DISPATCH,
+  // dispatch budget restored) instead of latching the HEAD as UNRESOLVED.
+  EXTERNAL_MODEL_TRIGGER_CANCELLED_PRE_POST: 'EXTERNAL_MODEL_TRIGGER_CANCELLED_PRE_POST',
   // dispatch() refused to run without / with an invalid ExternalTriggerPermit.
   EXTERNAL_TRIGGER_PERMIT_MISSING: 'EXTERNAL_TRIGGER_PERMIT_MISSING',
   EXTERNAL_TRIGGER_PERMIT_UNKNOWN: 'EXTERNAL_TRIGGER_PERMIT_UNKNOWN',

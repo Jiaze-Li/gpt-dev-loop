@@ -499,8 +499,12 @@ whether still untracked, staged, or newly `.gitignore`d — cannot yield an
 honest baseline→current delta and fails the evidence closed rather than
 emitting its whole content; likewise a brand-new untracked path whose bytes are
 identical to a baseline-untracked file (a rename or copy of pre-existing
-content). A baseline-untracked path missing from the current listing is only
-called *deleted* after its absence from disk is confirmed. Every untracked path
+content), and — since the baseline kept only digests — a brand-new untracked
+path appearing in the same review where a baseline-untracked path disappeared
+(an undetectable rename+edit). A baseline-untracked path missing from the
+current listing is called *deleted* only when its absence is definitively
+confirmed (`ENOENT`); any other `lstat`/read failure (`EACCES`, a mid-read
+race) fails the evidence closed instead. Every untracked path
 is `lstat`'d before it is read — a symlink, FIFO, socket, or device is never
 followed (it would fold an out-of-tree target's bytes into Reviewer evidence)
 and fails the evidence closed. Any git command that feeds

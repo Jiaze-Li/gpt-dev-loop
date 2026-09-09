@@ -200,6 +200,10 @@ export function createPrReviewController({
             if (signal?.aborted) {
               const e = new Error('the PR review was cancelled by the caller before the trigger comment was posted');
               e.code = 'REVIEWLOOP_TRIGGER_CANCELLED';
+              // Trusted in-process marker: the authority rolls this reservation
+              // back (CANCELLED_PRE_DISPATCH) instead of latching UNRESOLVED,
+              // because the physical post provably never ran.
+              e.reviewloopTriggerCancelledPrePost = true;
               throw e;
             }
             const posted = await prBackend.postReviewTrigger({ prNumber, reviewer, headSha: currentHead });

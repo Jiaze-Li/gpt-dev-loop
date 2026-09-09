@@ -223,6 +223,56 @@ test('active path: an untracked special file (FIFO) fails the evidence closed', 
   assert.equal(readCalls, 0);
 });
 
+test('fail closed: a baseline-untracked file gone from the listing but not confirmed absent (EACCES) is not a deletion', async () => {
+  const responses = {
+    'rev-parse HEAD': { code: 0, stdout: 'cur0000\n' },
+    'diff base000': { code: 0, stdout: '' },
+    'diff --name-only base000': { code: 0, stdout: '' },
+    'ls-files --others --exclude-standard -z': { code: 0, stdout: '' }, // now hidden (ignored)
+  };
+  const spawn = (_cmd, args) => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    queueMicrotask(() => {
+      const r = responses[args.join(' ')] ?? { code: 128 };
+      if (r.stdout) child.stdout.emit('data', Buffer.from(r.stdout));
+      child.emit('close', r.code ?? 0);
+    });
+    return child;
+  };
+  const eacces = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+  const delta = await collectWorkerDelta({
+    cwd: '/repo',
+    baseline: { head: 'base000', baselineRef: 'base000', untrackedHashes: { 'scratch.log': 'digest-abc' }, evidenceComplete: true },
+    spawn,
+    lstat: async () => { throw eacces; },
+    readFile: async () => Buffer.from(''),
+  });
+  assert.equal(delta.evidenceComplete, false, 'unreadable != deleted');
+  assert.equal(delta.untrackedDeleted.includes('scratch.log'), false);
+  assert.ok(delta.incompleteReasons.some((r) => /could not be confirmed absent/i.test(r)));
+});
+
+test('fail closed: a rename+edit of a pre-existing untracked file is not split into a clean delete+create', async () => {
+  const dir = initRepo();
+  try {
+    fs.writeFileSync(path.join(dir, 'notes-old.txt'), 'PRE_EXISTING_SECRET\nline\n');
+    const baseline = await captureBaseline({ cwd: dir });
+    // rename + append one line -> digest differs, old path gone, new path new.
+    fs.renameSync(path.join(dir, 'notes-old.txt'), path.join(dir, 'notes-new.txt'));
+    fs.appendFileSync(path.join(dir, 'notes-new.txt'), 'worker line\n');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, false);
+    assert.ok(delta.incompleteReasons.some((r) => /rename\+edit cannot be distinguished/i.test(r)));
+    assert.equal(delta.untrackedDeleted.includes('notes-old.txt'), false, 'not reported as a clean deletion');
+    assert.doesNotMatch(delta.diff, /PRE_EXISTING_SECRET/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function scriptedSpawn(responses) {
   return (_cmd, args) => {
     const child = new EventEmitter();

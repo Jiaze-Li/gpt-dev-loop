@@ -517,6 +517,34 @@ export class ExternalModelTriggerAuthority {
       outcome = { ok: false, error };
     }
 
+    // dispatchFn signalled — via a trusted in-process marker set by ReviewLoop's
+    // own callback — that the caller cancelled BEFORE the physical post. This is
+    // NOT an ambiguous dispatch: postReviewTrigger provably never ran. Roll the
+    // reservation back (CANCELLED_PRE_DISPATCH, dispatch budget restored) so the
+    // same HEAD is not permanently blocked as a duplicate.
+    if (!outcome.ok && outcome.error?.reviewloopTriggerCancelledPrePost === true) {
+      try {
+        await this._mutateWorkflow(intent.workflowId, (candidateMap) => {
+          const b = getOrInitBucket(candidateMap, subjectKey);
+          const rec = b.triggers[headSha];
+          if (!rec) throw new Error(`external trigger record missing for ${subjectKey} @ ${headSha}`);
+          rec.status = EXTERNAL_TRIGGER_STATUS.CANCELLED_PRE_DISPATCH;
+          rec.settledAt = iso(this._now());
+          rec.reason = 'caller cancelled before the trigger comment was posted';
+          b.dispatchCount = Math.max(0, (b.dispatchCount ?? 1) - 1);
+          return b;
+        });
+      } catch (error) {
+        throw this._stateUnavailable(intent, error);
+      }
+      this._onEvent?.({ type: 'EXTERNAL_TRIGGER_CANCELLED_PRE_DISPATCH', subjectKey, headSha });
+      throw new ExternalTriggerError(
+        EXTERNAL_TRIGGER_ERROR_CODES.EXTERNAL_MODEL_TRIGGER_CANCELLED_PRE_POST,
+        `external trigger for ${subjectKey} @ ${headSha} was cancelled by the caller before it was posted`,
+        { intent },
+      );
+    }
+
     const commentId = outcome.ok ? (outcome.value?.id ?? null) : null;
     if (outcome.ok && commentId != null) {
       const triggeredAt = outcome.value?.createdAt ?? iso(this._now());

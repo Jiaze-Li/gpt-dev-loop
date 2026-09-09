@@ -2,6 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
+import {
+  ExternalModelTriggerAuthority,
+  ExternalTriggerStore,
+} from '../src/orchestrator/externalModelTriggerAuthority.js';
 
 const TRUSTED_LOGIN = { codex: 'chatgpt-codex-connector[bot]', claude: 'claude[bot]' };
 
@@ -190,6 +194,45 @@ test('the trigger dispatch callback rechecks cancellation before posting', async
   const r = await controller.review({ loopId, signal: sig });
   assert.equal(r.status, 'HUMAN_REQUIRED');
   assert.equal(backend.state.triggers.length, 0, 'the callback bailed before postReviewTrigger');
+});
+
+test('a pre-post cancellation rolls the reservation back — the HEAD is not permanently blocked, budget restored', async () => {
+  const persistence = new MemoryPersistence();
+  const backend = mockPrBackend({
+    heads: ['H1'],
+    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
+  });
+  const realAuth = new ExternalModelTriggerAuthority({
+    store: new ExternalTriggerStore(persistence),
+    maxExternalModelTriggers: 7,
+    maxExternalReviewRounds: 7,
+  });
+  const sig = { aborted: false };
+  // Wrap the real authority: model the caller aborting during dispatch()'s
+  // durable DISPATCHING write, i.e. just before the callback runs.
+  const triggerAuthority = {
+    authorize: (i) => realAuth.authorize(i),
+    reservationIdFor: (p) => realAuth.reservationIdFor(p),
+    recordResult: (r) => realAuth.recordResult(r),
+    dispatch: (permit, intent, cb) => realAuth.dispatch(permit, intent, async () => { sig.aborted = true; return cb(); }),
+  };
+  const controller = createReviewLoopController({
+    persistence,
+    prBackend: backend,
+    triggerAuthority,
+    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }),
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+
+  const r1 = await controller.review({ loopId, signal: sig });
+  assert.equal(r1.status, 'HUMAN_REQUIRED');
+  assert.equal(backend.state.triggers.length, 0, 'nothing was posted');
+
+  // The same HEAD is still triggerable — not latched as a duplicate/UNRESOLVED.
+  sig.aborted = false;
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'REWORK');
+  assert.equal(backend.state.triggers.length, 1, 'the retried review posted exactly one trigger for H1');
 });
 
 test('reviewloop_begin threads the caller AbortSignal into the baseline Gate', async () => {
