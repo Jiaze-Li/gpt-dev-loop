@@ -273,6 +273,59 @@ test('fail closed: a rename+edit of a pre-existing untracked file is not split i
   }
 });
 
+test('fail closed: a baseline-untracked file renamed+edited AND staged under the new name does not leak its pre-existing bytes', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'draft-old.txt'), 'PRE_EXISTING_SECRET\nkeep\n');
+    const baseline = await captureBaseline({ cwd: dir });
+    assert.equal('draft-old.txt' in baseline.untrackedHashes, true);
+
+    // rename + edit + stage the new name. `git diff <baseRef>` renders the
+    // destination as a wholly-new file (baseRef has no blob for it) and the
+    // untracked listing no longer shows either path.
+    fs.renameSync(path.join(dir, 'draft-old.txt'), path.join(dir, 'draft-new.txt'));
+    fs.appendFileSync(path.join(dir, 'draft-new.txt'), 'worker line\n');
+    git('add', 'draft-new.txt');
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+
+    assert.equal(delta.evidenceComplete, false, 'fails the evidence closed');
+    assert.ok(delta.incompleteReasons.some((r) => /rename\+edit cannot be distinguished/i.test(r)));
+    assert.equal(delta.trackedChanged.includes('draft-new.txt'), false, 'not emitted as a tracked change');
+    assert.ok((delta.renamedUntrackedBaseline ?? []).includes('draft-new.txt'));
+    assert.equal(delta.untrackedDeleted.includes('draft-old.txt'), false, 'not a clean deletion');
+    assert.doesNotMatch(delta.diff, /PRE_EXISTING_SECRET/, 'pre-existing bytes never reach the Reviewer');
+    assert.doesNotMatch(delta.diff, /worker line/, 'not rendered as a whole-new-file block');
+
+    const controller = createReviewLoopController({
+      persistence: new MemoryPersistence(),
+      captureBaselineFn: async () => baseline,
+      reviewerFn: async () => { throw new Error('reviewer must not be called'); },
+    });
+    const { loopId } = await controller.begin({ goal: 'g', cwd: dir });
+    assert.equal((await controller.review({ loopId })).status, 'HUMAN_REQUIRED');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a genuinely new tracked file is still normal Worker output when no baseline-untracked file vanished', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    const baseline = await captureBaseline({ cwd: dir });
+    fs.writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;\n');
+    git('add', 'feature.js');
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, true);
+    assert.ok(delta.trackedChanged.includes('feature.js'));
+    assert.match(delta.diff, /export const x = 1/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function scriptedSpawn(responses) {
   return (_cmd, args) => {
     const child = new EventEmitter();

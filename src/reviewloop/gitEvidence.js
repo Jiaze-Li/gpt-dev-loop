@@ -251,6 +251,20 @@ export async function collectWorkerDelta({
     fail(`"git diff --name-only ${baseRef}" exited ${nameRes.code}`);
   }
 
+  // Paths `git diff <baseRef>` renders as wholly-new additions (no blob in the
+  // baseline tree). A pre-existing untracked file that the Worker renamed,
+  // edited AND `git add`ed lands here — not in `currentUntracked` and not in
+  // `baselineUntracked` — so the untracked rename+edit guard below never sees
+  // it. Kept so that guard can also reconcile these against vanished
+  // baseline-untracked paths.
+  const addRes = await runGit(['diff', '--name-only', '--diff-filter=A', baseRef], cwd, spawn);
+  let addedTracked = [];
+  if (addRes.code === 0) {
+    addedTracked = addRes.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+  } else {
+    fail(`"git diff --name-only --diff-filter=A ${baseRef}" exited ${addRes.code}`);
+  }
+
   // Untracked attribution.
   const lsRes = await runGit(['ls-files', '--others', '--exclude-standard', '-z'], cwd, spawn);
   let currentUntracked = new Set();
@@ -383,19 +397,39 @@ export async function collectWorkerDelta({
     }
   }
 
-  // A brand-new untracked file appearing while a pre-existing untracked file
-  // disappeared cannot be told apart from a rename (+ edit) of it — and the
-  // baseline kept only digests, so an honest baseline->current delta cannot be
-  // built. The exact-digest check above already caught unchanged renames; this
-  // catches rename+edit. Drop every brand-new untracked file from emitted
-  // evidence (any one of them might carry pre-existing bytes) and fail closed.
-  if (untrackedChanged.length && untrackedDeleted.length) {
-    fail(`brand-new untracked file(s) [${untrackedChanged.join(', ')}] appeared while pre-existing untracked `
+  // A brand-new file appearing while a pre-existing untracked file disappeared
+  // cannot be told apart from a rename (+ edit) of it — and the baseline kept
+  // only digests, so an honest baseline->current delta cannot be built. The
+  // exact-digest check above already caught unchanged untracked renames; this
+  // catches rename+edit. The "new" side is every brand-new untracked file AND
+  // every brand-new *tracked* addition that was neither tracked nor untracked
+  // at baseline (a rename+edit+`git add` of a baseline-untracked file would
+  // otherwise be emitted whole, leaking its pre-existing bytes with
+  // evidenceComplete=true). Drop every such path from emitted evidence and fail
+  // closed.
+  const brandNewTracked = addedTracked.filter(
+    (p) => trackedChanged.includes(p) && !leaked.has(p) && !(p in baselineUntracked),
+  );
+  if (untrackedDeleted.length && (untrackedChanged.length || brandNewTracked.length)) {
+    const appeared = [...untrackedChanged, ...brandNewTracked];
+    fail(`brand-new file(s) [${appeared.join(', ')}] appeared while pre-existing untracked `
       + `file(s) [${untrackedDeleted.join(', ')}] disappeared — a rename+edit cannot be distinguished from a `
       + 'delete+create and the baseline retained only digests');
     for (const p of untrackedChanged) {
       renamedUntrackedBaseline.push(p);
       safeBytes.delete(p);
+    }
+    if (brandNewTracked.length) {
+      const drop = new Set(brandNewTracked);
+      renamedUntrackedBaseline.push(...brandNewTracked);
+      trackedChanged = trackedChanged.filter((p) => !drop.has(p));
+      if (trackedChanged.length) {
+        const scoped = await runGit(['diff', baseRef, '--', ...trackedChanged], cwd, spawn);
+        if (scoped.code === 0) trackedDiff = scoped.stdout;
+        else fail(`"git diff ${baseRef} -- <scoped>" exited ${scoped.code}`);
+      } else {
+        trackedDiff = '';
+      }
     }
     // The disappeared paths are no longer "clean deletions" either — fold them
     // into the same ambiguous bucket.
