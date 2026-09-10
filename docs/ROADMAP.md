@@ -84,7 +84,7 @@ benchmark:transports` green. No real-provider calls.
 
 ## V2 pre-freeze final pass (this change)
 
-Deterministic/mock `npm test` (464) + `npm run doctor` + `npm run
+Deterministic/mock `npm test` + `npm run doctor` + `npm run
 benchmark:transports` green. No real-provider calls.
 
 - **Token Sentinel restart re-inference** (`reinferAnomalyFromSpendLog`) no
@@ -212,14 +212,45 @@ Token-Safety P1 from the independent re-verification:
   and E2E-C (same blocker after a changed implementation → Supervisor exactly
   once → REWORK).
 
+## LOCAL controller-level real-provider certification (this closeout)
+
+Carried on the frozen PR #4 HEAD
+`ce02f1e83276d7349ac6dfec332f75c7b972fd32` (`v2-routing`). Deterministic bar:
+`npm test` **573/573**, `npm run doctor` PASS, `npm run benchmark:transports`
+PASS (0 real spawns), `git diff --check` clean.
+
+A full `reviewloop_begin` → deterministic Gate → independent Reviewer → verdict
+loop was run over the current architecture, in a throwaway isolated worktree,
+against the byte-exact frozen certification delta `bb0c36e → ce02f1e`:
+
+- Selected Reviewer family **`agy:opus`** (first choice), live-resolved model
+  **`claude-opus-4-6-thinking`** (`resolvedFrom: runtime_catalog`), quota pool
+  **`agy-claude-gpt`**.
+- Supervisor first choice **`agy:gemini-supervisor`** / Gemini medium — **not
+  invoked** (loop converged in round 1).
+- Physical Reviewer calls **1**; Supervisor calls **0**.
+- Usage: input **6358**, output **2602**, thinking 0 (AGY transport does not
+  itemise thinking), cache-read 0, cache-creation 0, `usageVolume` **8960** —
+  no token anomaly, sentinel thresholds untouched, spend not blocked.
+- AGY `reviewloop-minimal` isolation / effective-loading verification: **PASS**
+  (startup capability probe `supported: true` + per-call log check, no
+  `AGY_ISOLATION_UNVERIFIED`).
+- Findings: **no blocking P1/P2**. Three non-blocking `OTHER` / cosmetic
+  findings reported and deliberately **left unchanged** after the freeze.
+- Controller final verdict: **PASS** (round 1, "no P1/P2 findings").
+
+Scope of this certification: **LOCAL mode only**, first-choice Reviewer only.
+It does **not** cover PR external-review mode or the multi-provider failover
+chain (see below).
+
 ## Real-provider status (needs real providers / real GitHub)
 
 Corrected against this machine's durable reservation + spend ledgers under
 `~/.reviewloop/` (not from recollection):
 
-- Current deterministic/mock certification on `v2-routing` HEAD = **PASS** —
-  `npm test` 464/464, `npm run doctor` PASS, `npm run benchmark:transports`
-  PASS (0 real spawns), `git diff --check` clean.
+- Current deterministic/mock certification on `v2-routing` HEAD
+  `ce02f1e` = **PASS** — `npm test` 573/573, `npm run doctor` PASS,
+  `npm run benchmark:transports` PASS (0 real spawns), `git diff --check` clean.
 - `npm run install-global` = **executed** against this machine's agent
   config / dotfiles (managed block + `reviewloop` MCP registration).
 - Real ReviewLoop provider calls with a durable record on this machine =
@@ -239,6 +270,7 @@ Corrected against this machine's durable reservation + spend ledgers under
 
   | Role | Family | Result | resolvedModel | usageVolume | isolation |
   | --- | --- | --- | --- | --- | --- |
+  | Reviewer | `agy:opus` (first choice) | PASS | `claude-opus-4-6-thinking` | 8960 | effectiveLoadingVerified + isolationVerified |
   | Reviewer | `codex:default` | PASS | — | 16535 | — |
   | Reviewer | `agy:sonnet` | PASS | `claude-sonnet-4-6` | 3191 | isolationVerified |
   | Reviewer | `agy:gpt-oss` | PASS | `gpt-oss-120b-medium` | 2427 | isolationVerified |
@@ -263,11 +295,14 @@ Corrected against this machine's durable reservation + spend ledgers under
   "minimal" smoke predated effective-loading verification. The definitive
   isolated-agent result is `agy:gemini` Supervisor `usageVolume 2933,
   effectiveLoadingVerified`.
-- ReviewLoop real-provider **controller-level** Reviewer/Supervisor E2E
-  (a full loop carried to a certified PASS/REWORK verdict over the current
-  architecture) = **NOT CERTIFIED**.
+- ReviewLoop real-provider **controller-level** Reviewer E2E in **LOCAL** mode
+  (a full loop carried to a certified controller `PASS` over the current
+  architecture) = **CERTIFIED** — `agy:opus` / `claude-opus-4-6-thinking`,
+  frozen delta `bb0c36e → ce02f1e`, HEAD `ce02f1e` (see the LOCAL
+  controller-level certification section above).
 - ReviewLoop real PR external-review loop (`@codex review` / `@claude review`)
-  = **NOT RUN**.
+  = **NOT CERTIFIED / NOT RUN**. The LOCAL certification above does not cover
+  PR mode.
 - Real multi-provider failover chain end-to-end = **NOT RUN** (structurally
   wired; per-candidate certs above are single-candidate).
 - A controlled `Worker + ReviewLoop` vs `Worker alone` wrapper benchmark
@@ -276,8 +311,10 @@ Corrected against this machine's durable reservation + spend ledgers under
 
 ## Later
 
-- A real-provider **controller-level** E2E carried to a certified PASS/REWORK
-  verdict, and a real multi-provider failover chain (the per-candidate
-  transports are each live-certified; the full chain is not).
+- A real-provider **controller-level** E2E for **PR mode** carried to a
+  certified verdict (LOCAL mode is certified; PR external-review mode is not),
+  a REWORK→PASS controller loop over real providers, and a real multi-provider
+  failover chain (the per-candidate transports are each live-certified; the
+  full chain is not).
 - Optional read-only ReviewLoop dashboard (removed in this migration; re-add
   only if it can stay zero-token and simple).

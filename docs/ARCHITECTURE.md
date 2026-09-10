@@ -89,7 +89,7 @@ All argv below is verified against the installed CLIs' own `--help`; the
 | `agy:gemini-reviewer` | same as `agy:gpt-oss` (fixed effort **low** → catalog resolves `gemini-*-low`) | same as `agy:gpt-oss` | Reviewer head; shares the `agy-gemini` quota pool with `agy:gemini-supervisor` |
 | `agy:gemini-supervisor` | same as `agy:gpt-oss` (fixed effort **medium** → catalog resolves `gemini-*-medium`, currently `gemini-3.8-flash-medium`) | same as `agy:gpt-oss` | **definitive isolated-agent live result**: Supervisor usageVolume 2933, resolvedModel `gemini-3.8-flash-medium`, effectiveLoadingVerified + isolationVerified |
 | `agy:sonnet` | same as `agy:gpt-oss` (AGY-hosted Claude Sonnet; `catalogPrefix: 'claude-sonnet-'` → newest catalog Sonnet, currently `claude-sonnet-4-6`) | same as `agy:gpt-oss` | live-certified: Reviewer usageVolume 3191, Supervisor 3303, resolvedModel `claude-sonnet-4-6`, isolationVerified |
-| `agy:opus` | same as `agy:gpt-oss` (AGY-hosted Claude Opus; `catalogPrefix: 'claude-opus-'` → newest catalog Opus, currently `claude-opus-4-6`, resolved dynamically at pool construction — never a long-term version pin) | same as `agy:gpt-oss` | **Reviewer role only** — Reviewer first choice; shares the `agy-claude-gpt` quota pool with `agy:sonnet` + `agy:gpt-oss` |
+| `agy:opus` | same as `agy:gpt-oss` (AGY-hosted Claude Opus; `catalogPrefix: 'claude-opus-'` → newest catalog Opus, currently `claude-opus-4-6-thinking`, resolved dynamically at pool construction — never a long-term version pin) | same as `agy:gpt-oss` | **Reviewer role only** — Reviewer first choice. LOCAL controller-level live cert: Reviewer usageVolume 8960, resolvedModel `claude-opus-4-6-thinking`, effectiveLoadingVerified + isolationVerified, controller verdict PASS. Shares the `agy-claude-gpt` quota pool with `agy:sonnet` + `agy:gpt-oss` |
 
 **AGY minimal-agent transport — effective loading**:
 ReviewLoop runs every AGY family through the `reviewloop-minimal` agent
@@ -132,8 +132,12 @@ Historical AGY token figures are **not** a baseline:
 - the still-earlier ~6.7k "minimal" smoke was taken before effective loading
   was verified, so it is not a trusted isolation baseline either.
 
-The definitive isolated-agent live result is the `agy:gemini-supervisor` medium
-Supervisor: **usageVolume 2933, effectiveLoadingVerified**. The live certification
+The definitive isolated-agent live results are the `agy:gemini-supervisor`
+medium Supervisor (**usageVolume 2933, effectiveLoadingVerified**) and the
+`agy:opus` Reviewer carried to a controller-level `PASS` in LOCAL mode
+(**usageVolume 8960, resolvedModel `claude-opus-4-6-thinking`,
+effectiveLoadingVerified + isolationVerified**, frozen delta
+`bb0c36e → ce02f1e`). The live certification
 (`scripts/live-reviewloop-certify.mjs`) asserts `customAgentSupport.supported`
 plus per-call effective-loading verification and reports the real numbers.
 

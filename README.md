@@ -67,19 +67,33 @@ npm run doctor
 
 ## Certification status
 
-- Last locally reported deterministic/mock certification before the latest
-  auth/alias/E2E rework: **PASS** (`npm test` 336/336, `npm run doctor`,
-  `npm run benchmark:transports`). The current head requires one local rerun
-  before merge; see `docs/ROADMAP.md` / PR #4.
-- ReviewLoop real-provider Reviewer/Supervisor E2E: **ATTEMPTED / NOT CERTIFIED**
-  (a live `agy` Reviewer has been reached; no run has been carried to a
-  certified end-to-end verdict).
-- `codex` / `claude` Reviewer/Supervisor transports: **IMPLEMENTED**;
-  production eligibility requires zero-model version + local-auth preflights.
-  No real Codex/Claude Reviewer/Supervisor call has been made.
+Current head **`ce02f1e83276d7349ac6dfec332f75c7b972fd32`** (branch `v2-routing`,
+PR #4):
+
+- Deterministic bar: **PASS** — `npm test` **573/573**, `npm run doctor` PASS,
+  `npm run benchmark:transports` PASS (0 real spawns), `git diff --check` clean.
+- **LOCAL controller-level real-provider certification: PASS.** A full
+  `reviewloop_begin` → Gate → Reviewer → verdict loop was carried to a
+  controller `PASS` over the current architecture against the byte-exact frozen
+  delta `bb0c36e → ce02f1e`:
+  - Reviewer first choice **`agy:opus`**, live-resolved model
+    **`claude-opus-4-6-thinking`**, quota pool **`agy-claude-gpt`**.
+  - Supervisor first choice **`agy:gemini-supervisor`** (Gemini, medium effort);
+    not invoked (loop converged in one round).
+  - Physical Reviewer calls **1**, Supervisor calls **0**;
+    input/output **6358 / 2602**, `usageVolume` **8960**.
+  - AGY `reviewloop-minimal` isolation / effective-loading verification: **PASS**
+    (startup capability probe + per-call check).
+  - Blocking P1/P2 findings: **none**. The Reviewer's `OTHER` / cosmetic
+    findings are non-blocking and are deliberately left unchanged after the
+    freeze.
+- ReviewLoop **PR external-review** mode (`@codex review` / `@claude review`):
+  **NOT CERTIFIED** — no real PR external-review loop has been run. The LOCAL
+  certification above does **not** cover PR mode.
+- Real multi-provider failover chain end-to-end: **NOT RUN** (structurally
+  wired; the certified loop above exercised the first-choice Reviewer only).
 - `claude:opus` uses the stable provider alias `opus`; `codex:default` follows
   the provider default. No concrete release is pinned by default.
-- ReviewLoop real PR external-review loop: **NOT RUN**.
 
 Historical SuperGPT V1/V2 measured numbers are labelled historical in
 `docs/history/` and are not ReviewLoop certification.
