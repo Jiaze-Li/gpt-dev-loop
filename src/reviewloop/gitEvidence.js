@@ -294,12 +294,16 @@ export async function collectWorkerDelta({
   if (diffRes.code === 0) trackedDiff = diffRes.stdout;
   else fail(`"git diff ${baseRef}" exited ${diffRes.code}: ${(diffRes.stderr || '').trim().slice(0, 200)}`);
 
-  const nameRes = await runGit(['diff', '--name-only', baseRef], cwd, spawn);
+  // NUL-delimited: a tracked path may legally contain a newline (or a leading/
+  // trailing space). Newline-splitting or trimming that list would mis-slice
+  // the path and mis-attribute the Worker's change; `-z` also disables git's
+  // octal path-quoting so the bytes are literal.
+  const nameRes = await runGit(['diff', '-z', '--name-only', baseRef], cwd, spawn);
   let trackedChanged = [];
   if (nameRes.code === 0) {
-    trackedChanged = nameRes.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    trackedChanged = nameRes.stdout.split('\0').filter(Boolean);
   } else {
-    fail(`"git diff --name-only ${baseRef}" exited ${nameRes.code}`);
+    fail(`"git diff -z --name-only ${baseRef}" exited ${nameRes.code}`);
   }
 
   // Submodule / gitlink delta. `git diff` renders any change inside a checked-out
@@ -322,12 +326,12 @@ export async function collectWorkerDelta({
   // `baselineUntracked` — so the untracked rename+edit guard below never sees
   // it. Kept so that guard can also reconcile these against vanished
   // baseline-untracked paths.
-  const addRes = await runGit(['diff', '--name-only', '--diff-filter=A', baseRef], cwd, spawn);
+  const addRes = await runGit(['diff', '-z', '--name-only', '--diff-filter=A', baseRef], cwd, spawn);
   let addedTracked = [];
   if (addRes.code === 0) {
-    addedTracked = addRes.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    addedTracked = addRes.stdout.split('\0').filter(Boolean);
   } else {
-    fail(`"git diff --name-only --diff-filter=A ${baseRef}" exited ${addRes.code}`);
+    fail(`"git diff -z --name-only --diff-filter=A ${baseRef}" exited ${addRes.code}`);
   }
 
   // Untracked attribution.
@@ -565,6 +569,22 @@ export async function collectWorkerDelta({
       else fail(`"git diff ${baseRef} -- <scoped>" exited ${scoped.code}`);
     } else {
       trackedDiff = '';
+    }
+  }
+
+  // Tracked binary delta. `git diff` renders a changed binary blob (a real
+  // binary, or a path forced binary by `.gitattributes`) as a lone
+  // "Binary files a/<p> and b/<p> differ" line — NONE of the changed bytes
+  // appear, so a Reviewer sees only that something changed, not what. A
+  // Worker-created *untracked* binary already fails the evidence closed
+  // (see the untracked-block builder below); mirror that for tracked blobs.
+  // Checked on the FINAL tracked diff so a binary path already scoped out
+  // above (e.g. a leaked baseline-untracked file) is not double-counted.
+  // Detected structurally from git's own output — no content sniffing.
+  for (const line of trackedDiff.split('\n')) {
+    if (/^Binary files .+ differ$/.test(line)) {
+      fail(`the Worker delta changes a binary file — "${line.trim()}" — whose changed bytes `
+        + 'are never rendered in the diff and cannot be reviewed as text');
     }
   }
 

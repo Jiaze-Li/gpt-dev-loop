@@ -533,7 +533,8 @@ test('fail closed: git diff non-zero exit -> evidenceComplete=false, no empty-di
   const spawn = scriptedSpawn({
     'rev-parse HEAD': { code: 0, stdout: 'cur0000\n' },
     'diff base000': { code: 128, stderr: 'fatal: bad revision' },
-    'diff --name-only base000': { code: 0, stdout: '' },
+    'diff -z --name-only base000': { code: 0, stdout: '' },
+    'diff -z --name-only --diff-filter=A base000': { code: 0, stdout: '' },
     'ls-files --others --exclude-standard -z': { code: 0, stdout: '' },
   });
   const delta = await collectWorkerDelta({
@@ -550,7 +551,8 @@ test('fail closed: git ls-files non-zero exit -> evidenceComplete=false and no p
   const spawn = scriptedSpawn({
     'rev-parse HEAD': { code: 0, stdout: 'base000\n' },
     'diff base000': { code: 0, stdout: '' },
-    'diff --name-only base000': { code: 0, stdout: '' },
+    'diff -z --name-only base000': { code: 0, stdout: '' },
+    'diff -z --name-only --diff-filter=A base000': { code: 0, stdout: '' },
     'ls-files --others --exclude-standard -z': { code: 129, stderr: 'error' },
   });
   const delta = await collectWorkerDelta({
@@ -577,4 +579,44 @@ test('fail closed: captureBaseline throws when git stash create fails', async ()
     'stash create reviewloop-baseline': { code: 1, stderr: 'fatal: could not write stash' },
   });
   await assert.rejects(captureBaseline({ cwd: '/repo', spawn }), /stash create/);
+});
+
+test('NUL-delimited: a Worker file whose name contains a newline is attributed as one path, not split', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    const baseline = await captureBaseline({ cwd: dir });
+    const weird = 'weird\nname.txt';
+    fs.writeFileSync(path.join(dir, weird), 'worker body\n');
+    git('add', '-A');
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.deepEqual(delta.trackedChanged, [weird], 'the newline in the path did not slice it into two entries');
+    assert.equal(delta.evidenceComplete, true, 'a legal newline in a filename is not a fail-closed condition');
+    assert.match(delta.diff, /worker body/, 'the change is still rendered for the Reviewer');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fail closed: a tracked binary file the Worker changed (rendered only as "Binary files ... differ") is not reviewable as text', async () => {
+  const dir = initRepo();
+  try {
+    const git = (...a) => execFileSync('git', a, { cwd: dir });
+    const asset = path.join(dir, 'asset.bin');
+    fs.writeFileSync(asset, Buffer.from([0, 1, 2, 3, 0, 255, 10, 0]));
+    git('add', '-A');
+    git('commit', '-qm', 'add binary asset');
+
+    const baseline = await captureBaseline({ cwd: dir });
+    fs.writeFileSync(asset, Buffer.from([9, 9, 9, 0, 1, 2, 3, 0, 255, 10, 0, 7]));
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline });
+    assert.equal(delta.evidenceComplete, false, 'a changed tracked binary blob fails the evidence closed');
+    assert.ok(
+      delta.incompleteReasons.some((r) => /binary file/i.test(r)),
+      JSON.stringify(delta.incompleteReasons),
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

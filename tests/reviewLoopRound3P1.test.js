@@ -44,7 +44,7 @@ test('a baseline-untracked file that was later staged does not leak into the Wor
     const key = cmdArgs.join(' ');
     queueMicrotask(() => {
       if (key.includes('rev-parse')) child.stdout.emit('data', Buffer.from('HEADSHA\n'));
-      else if (key.includes('--name-only')) child.stdout.emit('data', Buffer.from('leak.txt\n'));
+      else if (key.includes('--name-only')) child.stdout.emit('data', Buffer.from('leak.txt\0'));
       else if (key.includes('diff')) child.stdout.emit('data', Buffer.from('diff --git a/leak.txt b/leak.txt\n+staged'));
       else if (key.includes('ls-files')) child.stdout.emit('data', Buffer.from(''));
       else if (key.includes('status')) child.stdout.emit('data', Buffer.from(''));
@@ -80,7 +80,7 @@ test('a baseline-untracked file that was MODIFIED and then staged fails the evid
     const key = cmdArgs.join(' ');
     queueMicrotask(() => {
       if (key.includes('rev-parse')) child.stdout.emit('data', Buffer.from('HEADSHA\n'));
-      else if (key.includes('--name-only')) child.stdout.emit('data', Buffer.from('secrets.env\n'));
+      else if (key.includes('--name-only')) child.stdout.emit('data', Buffer.from('secrets.env\0'));
       else if (key.includes('diff')) child.stdout.emit('data', Buffer.from('diff --git a/secrets.env b/secrets.env\n+SECRET=1'));
       else if (key.includes('ls-files')) child.stdout.emit('data', Buffer.from(''));
       else if (key.includes('status')) child.stdout.emit('data', Buffer.from(''));
