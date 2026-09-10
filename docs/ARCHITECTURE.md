@@ -136,8 +136,9 @@ The definitive isolated-agent live results are the `agy:gemini-supervisor`
 medium Supervisor (**usageVolume 2933, effectiveLoadingVerified**) and the
 `agy:opus` Reviewer carried to a controller-level `PASS` in LOCAL mode
 (**usageVolume 8960, resolvedModel `claude-opus-4-6-thinking`,
-effectiveLoadingVerified + isolationVerified**, frozen delta
-`bb0c36e → ce02f1e`). The live certification
+effectiveLoadingVerified + isolationVerified**, against the certified
+implementation snapshot `ce02f1e` and the frozen delta `bb0c36e → ce02f1e`).
+The live certification
 (`scripts/live-reviewloop-certify.mjs`) asserts `customAgentSupport.supported`
 plus per-call effective-loading verification and reports the real numbers.
 

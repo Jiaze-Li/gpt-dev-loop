@@ -67,15 +67,18 @@ npm run doctor
 
 ## Certification status
 
-Current head **`ce02f1e83276d7349ac6dfec332f75c7b972fd32`** (branch `v2-routing`,
-PR #4):
+Certified implementation snapshot: **`ce02f1e83276d7349ac6dfec332f75c7b972fd32`**
+(branch `v2-routing`, PR #4) — the frozen implementation head the certification
+below was run against. Later closeout commits on `v2-routing` change
+documentation only and do not alter the certified implementation.
 
-- Deterministic bar: **PASS** — `npm test` **573/573**, `npm run doctor` PASS,
-  `npm run benchmark:transports` PASS (0 real spawns), `git diff --check` clean.
+- Deterministic bar at `ce02f1e`: **PASS** — `npm test` **573/573**,
+  `npm run doctor` PASS, `npm run benchmark:transports` PASS (0 real spawns),
+  `git diff --check` clean.
 - **LOCAL controller-level real-provider certification: PASS.** A full
   `reviewloop_begin` → Gate → Reviewer → verdict loop was carried to a
-  controller `PASS` over the current architecture against the byte-exact frozen
-  delta `bb0c36e → ce02f1e`:
+  controller `PASS` over the `ce02f1e` implementation snapshot against the
+  byte-exact frozen delta `bb0c36e → ce02f1e`:
   - Reviewer first choice **`agy:opus`**, live-resolved model
     **`claude-opus-4-6-thinking`**, quota pool **`agy-claude-gpt`**.
   - Supervisor first choice **`agy:gemini-supervisor`** (Gemini, medium effort);

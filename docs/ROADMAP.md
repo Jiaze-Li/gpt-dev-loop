@@ -214,14 +214,17 @@ Token-Safety P1 from the independent re-verification:
 
 ## LOCAL controller-level real-provider certification (this closeout)
 
-Carried on the frozen PR #4 HEAD
-`ce02f1e83276d7349ac6dfec332f75c7b972fd32` (`v2-routing`). Deterministic bar:
-`npm test` **573/573**, `npm run doctor` PASS, `npm run benchmark:transports`
-PASS (0 real spawns), `git diff --check` clean.
+Certified implementation snapshot:
+`ce02f1e83276d7349ac6dfec332f75c7b972fd32` (`v2-routing`, PR #4) — the frozen
+implementation head this certification was run against. Later closeout commits
+on `v2-routing` change documentation only and do not alter the certified
+implementation. Deterministic bar at `ce02f1e`: `npm test` **573/573**,
+`npm run doctor` PASS, `npm run benchmark:transports` PASS (0 real spawns),
+`git diff --check` clean.
 
 A full `reviewloop_begin` → deterministic Gate → independent Reviewer → verdict
-loop was run over the current architecture, in a throwaway isolated worktree,
-against the byte-exact frozen certification delta `bb0c36e → ce02f1e`:
+loop was run over the `ce02f1e` implementation snapshot, in a throwaway isolated
+worktree, against the byte-exact frozen certification delta `bb0c36e → ce02f1e`:
 
 - Selected Reviewer family **`agy:opus`** (first choice), live-resolved model
   **`claude-opus-4-6-thinking`** (`resolvedFrom: runtime_catalog`), quota pool
@@ -248,9 +251,10 @@ chain (see below).
 Corrected against this machine's durable reservation + spend ledgers under
 `~/.reviewloop/` (not from recollection):
 
-- Current deterministic/mock certification on `v2-routing` HEAD
+- Deterministic/mock certification at the certified implementation snapshot
   `ce02f1e` = **PASS** — `npm test` 573/573, `npm run doctor` PASS,
   `npm run benchmark:transports` PASS (0 real spawns), `git diff --check` clean.
+  Later `v2-routing` closeout commits are documentation-only.
 - `npm run install-global` = **executed** against this machine's agent
   config / dotfiles (managed block + `reviewloop` MCP registration).
 - Real ReviewLoop provider calls with a durable record on this machine =
@@ -296,9 +300,9 @@ Corrected against this machine's durable reservation + spend ledgers under
   isolated-agent result is `agy:gemini` Supervisor `usageVolume 2933,
   effectiveLoadingVerified`.
 - ReviewLoop real-provider **controller-level** Reviewer E2E in **LOCAL** mode
-  (a full loop carried to a certified controller `PASS` over the current
-  architecture) = **CERTIFIED** — `agy:opus` / `claude-opus-4-6-thinking`,
-  frozen delta `bb0c36e → ce02f1e`, HEAD `ce02f1e` (see the LOCAL
+  (a full loop carried to a certified controller `PASS`) = **CERTIFIED** —
+  `agy:opus` / `claude-opus-4-6-thinking`, against the certified implementation
+  snapshot `ce02f1e` and the frozen delta `bb0c36e → ce02f1e` (see the LOCAL
   controller-level certification section above).
 - ReviewLoop real PR external-review loop (`@codex review` / `@claude review`)
   = **NOT CERTIFIED / NOT RUN**. The LOCAL certification above does not cover
