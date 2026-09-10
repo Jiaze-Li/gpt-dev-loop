@@ -12,11 +12,10 @@ export const REVIEW_MODES = Object.freeze({ LOCAL: 'LOCAL', PR: 'PR' });
 
 export const DEFAULT_BLOCKING_SEVERITIES = Object.freeze(['P1', 'P2']);
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
-// LOCAL mode always uses the internal Reviewer pool. PR mode uses an explicit
-// external reviewer; when the caller omits it, the default is `codex` — never
-// `internal` (an internal identity must never become a PR trigger identity).
-export const DEFAULT_PR_REVIEWER = 'codex';
-export const PR_REVIEWERS = Object.freeze(['codex', 'claude']);
+// ReviewLoop has ONE review engine. Both LOCAL and PR targets are judged by the
+// same internal Reviewer pool (`reviewer: 'internal'`). PR is a review TARGET
+// (PR base -> exact PR HEAD), never a reviewer transport — no third-party
+// review-trigger engine exists any more.
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -50,8 +49,7 @@ function freezeDeep(value) {
 }
 
 // Build the immutable objective record. `mode` is LOCAL unless a PR number is
-// supplied. `reviewer` only applies to PR mode (codex | claude); LOCAL mode
-// always uses the internal Reviewer pool.
+// supplied. Every mode uses the internal Reviewer pool.
 export function createReviewObjective({
   loopId,
   goal,
@@ -61,6 +59,12 @@ export function createReviewObjective({
   reviewer = null,
   baseline = null,
   prHead = null,
+  // PR target identity, frozen at reviewloop_begin. `prBaseSha` is the PR's
+  // merge-base with its target branch; `reviewedHeadSha` is the exact PR HEAD
+  // bound at begin. Both are folded into the objective fingerprint so persisted
+  // state cannot be edited to swap the review onto a different PR snapshot.
+  prBaseSha = null,
+  reviewedHeadSha = null,
   constraints = [],
   blockingSeverities = DEFAULT_BLOCKING_SEVERITIES,
   maxReviewRounds = DEFAULT_MAX_REVIEW_ROUNDS,
@@ -101,16 +105,14 @@ export function createReviewObjective({
       : null,
     mode: resolvedMode,
     prNumber: resolvedMode === REVIEW_MODES.PR ? (prNumber ?? null) : null,
-    reviewer: (() => {
-      if (resolvedMode !== REVIEW_MODES.PR) return 'internal';
-      const r = String(reviewer || DEFAULT_PR_REVIEWER).toLowerCase();
-      if (!PR_REVIEWERS.includes(r)) {
-        throw new Error(`createReviewObjective: PR reviewer must be one of ${PR_REVIEWERS.join(' | ')}, got "${r}"`);
-      }
-      return r;
-    })(),
+    // ONE review engine: the internal Reviewer pool judges every target.
+    reviewer: 'internal',
     baseline: baseline ?? null,
-    initialPrHead: resolvedMode === REVIEW_MODES.PR ? (prHead ?? null) : null,
+    prBaseSha: resolvedMode === REVIEW_MODES.PR ? (prBaseSha ?? null) : null,
+    // The exact PR HEAD this objective is bound to review (PR base -> this SHA).
+    reviewedHeadSha: resolvedMode === REVIEW_MODES.PR
+      ? (reviewedHeadSha ?? prHead ?? null)
+      : null,
     constraints: normalizedConstraints,
     blockingSeverities: blocking,
     maxReviewRounds: rounds,
@@ -153,6 +155,11 @@ function fingerprintFields(o) {
     maxReviewRounds: o.maxReviewRounds,
   };
   if (o.verificationPlan) base.verificationPlan = o.verificationPlan;
+  // PR target identity — load-bearing for "which PR snapshot is under review".
+  // Only folded in when present, so a LOCAL / pre-existing objective keeps its
+  // original hash.
+  if (o.prBaseSha) base.prBaseSha = o.prBaseSha;
+  if (o.reviewedHeadSha) base.reviewedHeadSha = o.reviewedHeadSha;
   // The captured pre-Worker baseline is load-bearing: a state editor that swaps
   // it could hide or misattribute the Worker's delta. Fold its stable identity
   // (never the volatile capturedAt / dirtyFiles listing) into the fingerprint.
@@ -211,6 +218,8 @@ export function assertObjectiveNotWeakened(original, candidate) {
   if (candidate.goal !== original.goal) problems.push('goal changed');
   if (candidate.mode !== original.mode) problems.push('mode changed');
   if ((candidate.prNumber ?? null) !== (original.prNumber ?? null)) problems.push('prNumber changed');
+  if ((candidate.prBaseSha ?? null) !== (original.prBaseSha ?? null)) problems.push('PR base SHA changed');
+  if ((candidate.reviewedHeadSha ?? null) !== (original.reviewedHeadSha ?? null)) problems.push('reviewed PR HEAD changed');
   if (JSON.stringify(candidate.repository ?? null) !== JSON.stringify(original.repository ?? null)) {
     problems.push('repository changed');
   }

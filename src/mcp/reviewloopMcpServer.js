@@ -3,15 +3,18 @@
 // Deliberately TINY agent-facing surface — every exposed tool/schema is
 // always-loaded Worker context. Exactly two normal Worker-facing tools:
 //
-//   reviewloop_begin(goal, cwd, prNumber?, reviewer?)
+//   reviewloop_begin(goal, cwd, prNumber?)
 //       Register the immutable review objective and capture the baseline
-//       (LOCAL) or bind the PR HEAD (PR). Zero model calls.
+//       (LOCAL) or bind the exact PR snapshot: repository, prNumber, base SHA,
+//       HEAD SHA (PR). Zero model calls.
 //
 //   reviewloop_review(loopId)
 //       The one re-entrant operation: deterministic Gate -> Reviewer (if
 //       justified) -> convergence policy -> Supervisor (only on non-
-//       convergence). Returns PASS | REWORK | HUMAN_REQUIRED |
-//       WAITING_FOR_REVIEW | NO_PROGRESS | PUSH_REQUIRED.
+//       convergence). For a PR target the same engine runs over the PR
+//       base -> exact HEAD diff, with a pre-PASS live-HEAD recheck. Returns
+//       PASS | REWORK | HUMAN_REQUIRED | WAITING_FOR_REVIEW | NO_PROGRESS |
+//       PUSH_REQUIRED.
 //
 // Status / dashboard / stop live on the human `reviewloop` CLI, not here.
 
@@ -50,12 +53,11 @@ export function createReviewLoopMcpServer({
     'reviewloop_begin',
     {
       description:
-        'Register a ReviewLoop session for a non-trivial coding task BEFORE your first edit so the baseline is captured. ReviewLoop does not implement the task — you do, in this session. Returns a loopId. Zero model calls.',
+        'Register a ReviewLoop session for a non-trivial coding task BEFORE your first edit so the baseline is captured. Pass prNumber to review an open PR instead (PR base -> exact PR HEAD). ReviewLoop does not implement the task — you do, in this session. Returns a loopId. Zero model calls.',
       inputSchema: {
         goal: z.string().min(1).describe('the original user coding goal (immutable success definition)'),
         cwd: z.string().optional().describe('workspace directory (default: server cwd)'),
-        prNumber: z.number().int().optional().describe('PR number — switches to PR review mode'),
-        reviewer: z.enum(['codex', 'claude']).optional().describe('PR-mode external reviewer (default: codex)'),
+        prNumber: z.number().int().optional().describe('PR number — review the PR (base -> exact HEAD) instead of the local worktree'),
       },
       outputSchema: {
         loopId: z.string(),
@@ -63,15 +65,16 @@ export function createReviewLoopMcpServer({
         status: z.literal('READY'),
         baseline: z.record(z.string(), z.any()).nullable(),
         prHead: z.string().nullable(),
+        prBaseSha: z.string().nullable().optional(),
+        repository: z.string().nullable().optional(),
         reviewer: z.string(),
       },
     },
-    async ({ goal, cwd: reqCwd, prNumber, reviewer }, extra) => {
+    async ({ goal, cwd: reqCwd, prNumber }, extra) => {
       const res = await ctl.begin({
         goal,
         cwd: reqCwd ? path.resolve(reqCwd) : cwd,
         prNumber: prNumber ?? null,
-        reviewer: reviewer ?? null,
         signal: extra?.signal,
       });
       const structured = {
@@ -80,6 +83,8 @@ export function createReviewLoopMcpServer({
         status: 'READY',
         baseline: res.baseline ?? null,
         prHead: res.prHead ?? null,
+        prBaseSha: res.prBaseSha ?? null,
+        repository: res.repository ?? null,
         reviewer: res.reviewer,
       };
       return { content: [{ type: 'text', text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
@@ -90,7 +95,7 @@ export function createReviewLoopMcpServer({
     'reviewloop_review',
     {
       description:
-        'Run one ReviewLoop round for a loopId: deterministic Gate, then independent Reviewer if justified, then convergence policy. PASS -> done. REWORK -> fix the returned findings yourself in THIS session and call again. HUMAN_REQUIRED -> surface the blocker. WAITING_FOR_REVIEW -> a PR review was triggered; call again later. Blocks locally with zero model tokens while waiting.',
+        'Run one ReviewLoop round for a loopId: deterministic Gate, then independent Reviewer if justified, then convergence policy. PASS -> done. REWORK -> fix the returned findings yourself in THIS session and call again. HUMAN_REQUIRED -> surface the blocker. WAITING_FOR_REVIEW -> transient (loop lease held, or the PR HEAD kept moving); call again once state settles. Blocks locally with zero model tokens while waiting.',
       inputSchema: {
         loopId: z.string().min(1).describe('the loopId from reviewloop_begin'),
       },

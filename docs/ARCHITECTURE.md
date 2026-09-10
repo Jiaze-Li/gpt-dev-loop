@@ -35,9 +35,8 @@ src/reviewloop/
   diffChunker.js        deterministic diff chunking (no silent truncation)
   reviewPolicy.js       review normalization + convergence policy
   reviewSpend.js        DURABLE ReviewLoop-scoped Token Safety (Reviewer + Supervisor)
-  prTrust.js            PR trust boundary (reviewer id + explicit reviewed HEAD == current HEAD)
-  prReviewController.js  PR external-review loop (ExternalModelTriggerAuthority)
-  githubBackend.js      production PR transport via the `gh` CLI (read + one trigger comment)
+  prEvidence.js         PR base->HEAD delta collection (LOCAL-delta-shaped; fails closed)
+  githubBackend.js      slim PR-target transport via the `gh` CLI (repo id, base/HEAD SHA, PR diff, optional result publication — never a reviewer)
   providerWiring.js     production Reviewer/Supervisor pool (RoleRouter) + PR backend
   adapters/
     scratchCwd.js          shared isolated empty scratch cwd for every narrow transport
@@ -52,9 +51,29 @@ src/mcp/reviewloopMcpServer.js   exactly 2 Worker-facing tools
 ```
 
 Preserved generic primitives: `ModelSpendAuthority`, `ReservationLedger`,
-`NewInformationLedger`, `ExternalModelTriggerAuthority`, provider
-health/quota routing (`roleRouting.js`), Git evidence collector, normalized
-PR review, `baselineDiffGate`, `gateFailureIdentity`, process-tree cleanup.
+`NewInformationLedger`, provider health/quota routing (`roleRouting.js`), Git
+evidence collector, normalized review, `baselineDiffGate`,
+`gateFailureIdentity`, process-tree cleanup.
+
+## One review engine, two targets
+
+There is a single review path. `reviewloop_review` attributes evidence, runs
+the deterministic Gate, routes an independent Reviewer over the full evidence
+(bounded or chunked), applies the convergence policy, and — only on
+non-convergence — the Supervisor.
+
+| target | evidence | HEAD binding |
+|--------|----------|--------------|
+| LOCAL  | `reviewloop_begin` baseline → current Worker delta | n/a |
+| PR     | PR base SHA → exact PR HEAD diff (`gh pr diff`)     | live PR HEAD re-read every round; a pre-`PASS` recheck refuses to certify a stale review if the HEAD moved |
+
+A PR round writes a durable, tamper-evident audit record to loop state
+(`loopState.audit[]`): the frozen target identity (repository, prNumber,
+baseSha, reviewedHeadSha) + a `targetFingerprint` over it, the objective
+fingerprint, the Gate verdict/fingerprint, the Reviewer verdict/findings, the
+Supervisor state, the spend telemetry, and the round result. The objective
+fingerprint itself folds in `prBaseSha` and `reviewedHeadSha`, so editing
+persisted PR identity fails the integrity check.
 
 ## Active model roles
 
@@ -325,25 +344,21 @@ READY_FOR_WORK → REVIEWING → PASS
                           └→ HUMAN_REQUIRED
 ```
 
-`WAITING_FOR_REVIEW` is a normal durable state, not an error. A restart
-reattaches to the pending external trigger without re-posting.
+`WAITING_FOR_REVIEW` is a normal durable state, not an error. It is reached
+only transiently — another process holds the loop lease, or (PR target) the PR
+HEAD kept moving faster than one review round could complete. Re-call
+`reviewloop_review` once state settles.
 
-`ExternalModelTriggerAuthority` posts **at most one** `@codex/@claude review`
-per semantic HEAD (workflow + PR + HEAD), caps the total distinct review rounds
-(`MAX_EXTERNAL_REVIEW_TRIGGERS`), and puts a **per-round** wall clock on the
-external-review wait: it is armed when a round's trigger is authorized and
-**re-armed every time `authorize()` runs for a genuinely new reviewable HEAD**
-(a new HEAD means the Worker moved on, so the old round's deadline no longer
-applies — this does not depend on historical trigger records being "settled", so
-a lost best-effort `recordResult()` write can't wedge later HEADs). It
-deliberately does not span the Worker's between-round implementation time or the
-whole multi-round loop (the review-round budget is that runaway guard). A
-reviewer that accepted the trigger for a HEAD and then hung is still caught per
-round: a same-HEAD re-authorize hits the deadline check before REUSE, and the
-reattach poll path (which never calls authorize) checks the in-flight round's
-deadline via `checkInFlightDeadline`. A late review that eventually lands is
-still ingested on the next call (the
-existing-review check runs first).
+### PR HEAD binding
+
+Each PR round re-reads the live PR HEAD (`gh pr view … headRefOid`), fails
+closed if it cannot be resolved, and reviews `objective.prBaseSha → observed
+HEAD`. Before a `PASS` the live HEAD is read once more: only
+`finalObservedHeadSha === reviewedHeadSha` lets the round PASS. A HEAD that
+moved during the review is never certified by the stale review — the round
+rebinds and re-reviews the new HEAD (bounded; a HEAD that never settles →
+`WAITING_FOR_REVIEW`). `PUSH_REQUIRED` is returned when the HEAD is unchanged
+since a prior actionable review (fix not pushed yet).
 
 ## Convergence
 
@@ -379,15 +394,13 @@ Supervisor exactly once → REWORK), in addition to CLI transport narrowness.
 
 `UNKNOWN != ZERO`. `CallIntent → authorize → PhysicalCallPermit → dispatch →
 SETTLED_KNOWN | UNRESOLVED`. Scoped to ReviewLoop-owned spend (Reviewer,
-Supervisor). External `@codex/@claude review` crosses
-`ExternalModelTriggerAuthority`. Worker usage is reported as
+Supervisor) for every target — LOCAL and PR alike. Worker usage is reported as
 `external / not observable by ReviewLoop` — never as zero.
 
 Limits (`REVIEWLOOP_*`): `MAX_COST_USD`, `MAX_USAGE_VOLUME`,
 `MAX_REVIEW_ROUNDS`, `MAX_REVIEWER_CALLS`, `MAX_SUPERVISOR_CALLS`,
-`MAX_EXTERNAL_REVIEW_TRIGGERS`, `MAX_REVIEW_DIFF_CHARS`, `MAX_REVIEW_CHUNKS`,
-`MAX_SINGLE_CALL_USAGE`, `MAX_CONTEXT_OVERHEAD_TOKENS` (single-call Token
-Sentinel — see below).
+`MAX_REVIEW_DIFF_CHARS`, `MAX_REVIEW_CHUNKS`, `MAX_SINGLE_CALL_USAGE`,
+`MAX_CONTEXT_OVERHEAD_TOKENS` (single-call Token Sentinel — see below).
 
 The aggregate budget (call counts, `usageVolume`, `costUsd`) is **durable** and
 keyed by `loopId`: it accumulates across every `reviewloop_review` round, the
@@ -532,26 +545,15 @@ tracked state without touching the tree; the review diff is `baseline..current`
 never attributed to the Worker. Unattributable state → `HUMAN_REQUIRED`. No
 Worker change since `begin` → deterministic `NO_PROGRESS`, zero Reviewer calls.
 
-**PR trust boundary** (`prTrust.js`, reusing `trustedPrReview.js`): a trusted
-external review must prove its **real GitHub login is in the EXACT allowlist**
-for the configured reviewer. The defaults are the literal REST `user.login`
-strings a GitHub App produces on a PR — `chatgpt-codex-connector[bot]` /
-`claude[bot]` (the bare, suffix-less slug is never what REST returns and is not
-trusted). Exact string match — never substring/includes, so `evil-codex-bot` /
-`chatgpt-codex-connector` / `claude[bot]x` are rejected; override via
-`REVIEWLOOP_{CODEX,CLAUDE}_REVIEWER_LOGINS`. Also required: an explicit reviewed
-HEAD in the payload, and reviewed HEAD == current PR HEAD. The payload is never
-first rewritten to the configured reviewer name and then "verified" against
-itself; the normalizer never substitutes the current HEAD.
-
-**PR review ingestion** aggregates EVERY trusted review submission and EVERY
-trusted inline review comment for the exact HEAD (exact bot login). Per-state
-semantics: `APPROVED` clears only with a structured empty findings list or a
-benign body; `CHANGES_REQUESTED` blocks; `COMMENTED` / any unstructured state
-blocks (never an empty findings list); `DISMISSED` is void and fails closed
-when nothing else clears the HEAD; `PENDING` is ignored. A later `APPROVED`
-cannot erase an earlier `CHANGES_REQUESTED` / `COMMENTED` finding on the same
-HEAD.
+**PR evidence** (`prEvidence.js`): the primary Reviewer evidence for a PR
+target is the PR's own `base → HEAD` unified diff (`gh pr diff`) plus its
+changed-file list — not "what the Worker changed since `begin`". A base/HEAD
+that cannot be resolved, a diff that cannot be fetched, or a binary/submodule
+hunk in the PR diff marks the evidence incomplete → `HUMAN_REQUIRED`. GitHub is
+a target adapter only: it resolves the repository, the base SHA, the current
+HEAD SHA, the PR diff, and (opt-in, `REVIEWLOOP_PUBLISH_PR_RESULT=1`) publishes
+a one-comment result summary. It is never a reviewer, never posts a
+review-trigger comment, and a publication failure never changes the verdict.
 
 **Complete physical-attempt accounting**: every settled metered attempt —
 success, known-usage failure, OR mechanically-zero pre-send failure

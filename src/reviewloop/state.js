@@ -64,7 +64,6 @@ export function initialLoopState(objective) {
     gateRepairCount: 0, // deterministic Gate FAIL -> REWORK cycles (separate from `round`)
     reviewerCalls: 0,
     supervisorCalls: 0,
-    externalTriggerCount: 0,
     // deterministic no-new-information tracking
     lastReviewedFingerprint: null,
     lastReviewedPrHead: null,
@@ -77,13 +76,9 @@ export function initialLoopState(objective) {
     // further reviewloop_review returns the terminal result instead of
     // re-entering. A transient-failure HUMAN_REQUIRED leaves this false.
     budgetExhausted: false,
-    pendingExternalTrigger: null, // { head, reviewer, triggerId, status }
-    // PR mode: durable GitHub review-thread identities for every trusted inline
-    // blocking finding ReviewLoop has ingested. Survives normalization,
-    // persistence, restart, REWORK, and the next review round. Entries are
-    // resolved (not deleted) once their finding is independently cleared on a
-    // newer HEAD. See threadResolution.js.
-    managedThreads: [], // [{ threadNodeId, reviewId, commentId, head, reviewerLogin, signature, reviewer, round, status, ... }]
+    // Durable per-round audit trail. One entry per PR review round,
+    // recoverable and tamper-evident. See controller.js `appendAuditRecord`.
+    audit: [],
     lastReview: null, // compact normalized review
     lastSupervisorGuidance: null,
     history: [],

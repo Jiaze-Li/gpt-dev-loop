@@ -34,6 +34,15 @@ test('removed modules are gone from the tree', () => {
     'src/orchestrator/workflowWorktree.js',
     'src/orchestrator/adapters/claudeSessionManager.js',
     'src/mcp/supergptMcpServer.js',
+    // The external-review engine: PR is now a review TARGET for the ONE
+    // internal Reviewer engine, never an `@codex review` / `@claude review`
+    // transport.
+    'src/reviewloop/prReviewController.js',
+    'src/reviewloop/prTrust.js',
+    'src/reviewloop/threadResolution.js',
+    'src/orchestrator/externalModelTriggerAuthority.js',
+    'src/orchestrator/prCloseoutPolicy.js',
+    'src/orchestrator/trustedPrReview.js',
   ]) {
     assert.equal(existsSync(new URL(f, new URL('..', import.meta.url))), false, f);
   }
@@ -43,6 +52,12 @@ test('COMMON is the ReviewLoop Worker Contract and mentions no retired concepts'
   const common = readFileSync(new URL('../agent-policy/COMMON.md', import.meta.url), 'utf8');
   assert.match(common, /ReviewLoop Worker Contract/);
   assert.doesNotMatch(common, /Front[- ]Agent|route-first|DIRECT \| SUPERGPT|Fast Path|Full Path|\bPlanner\b|\bExecutor\b|Task Card|start_and_wait/);
+  assert.doesNotMatch(common, /@codex review|@claude review/);
+});
+
+test('no active source posts an external @codex/@claude review trigger', () => {
+  const hits = grep('@codex review|@claude review', 'src bin');
+  assert.deepEqual(hits, [], hits.join('\n'));
 });
 
 test('any remaining "supergpt" occurrences in src/bin are migration/compat-only', () => {
@@ -60,11 +75,11 @@ test('no silent diff truncation and no unwired PR backend remain', () => {
   assert.deepEqual(grep('slice\\(0, ?12000|no GitHub backend wired', 'src'), []);
 });
 
-test('the PR trust boundary reuses the V2 trusted-review primitives (no second impl)', async () => {
-  const src = readFileSync(new URL('../src/reviewloop/prTrust.js', import.meta.url), 'utf8');
-  assert.match(src, /from '\.\.\/orchestrator\/trustedPrReview\.js'/);
-  assert.match(src, /isTrustedReviewer/);
-  assert.match(src, /isReviewFresh/);
+test('the PR target reuses the ONE review engine (no second Reviewer state machine)', async () => {
+  const controller = readFileSync(new URL('../src/reviewloop/controller.js', import.meta.url), 'utf8');
+  // Both targets flow through the same evidence -> Reviewer routing path.
+  assert.match(controller, /runReviewerOverEvidence\(\{ spend, loopState, objective, delta, gate, signal \}\)/);
+  assert.doesNotMatch(controller, /createPrReviewController|PR_REVIEW_OUTCOMES|ExternalModelTriggerAuthority/);
 });
 
 test('package.json is renamed to reviewloop with reviewloop bins', () => {

@@ -1,7 +1,8 @@
 // ReviewLoop controller — the two re-entrant operations behind the MCP tools.
 //
 //   reviewloop_begin  -> register the immutable objective + capture the exact
-//     pre-Worker baseline (LOCAL) or bind the PR HEAD (PR). Also captures
+//     pre-Worker baseline (LOCAL) or freeze the exact PR snapshot —
+//     repository, prNumber, base SHA, HEAD SHA (PR). Also captures
 //     baseline Gate evidence when trusted verification is deterministically
 //     discoverable. ZERO model calls.
 //
@@ -35,14 +36,7 @@ import {
   isTerminal,
 } from './state.js';
 import { captureBaseline, collectWorkerDelta } from './gitEvidence.js';
-import { reviewerLoginAllowlist } from './prTrust.js';
-import {
-  registerManagedThreads,
-  clearedPriorThreads,
-  unresolvedClearedThreads,
-  applyResolutionResult,
-  scopeCheckThread,
-} from './threadResolution.js';
+import { collectPrDelta } from './prEvidence.js';
 import { withInProcessLoopLock, acquireLoopFileLease } from './loopLease.js';
 import { discoverVerificationCommands, runGate, GATE_VERDICTS } from './gatePolicy.js';
 import {
@@ -53,7 +47,6 @@ import {
   REVIEW_VERDICTS,
 } from './reviewPolicy.js';
 import { createReviewLoopSpend } from './reviewSpend.js';
-import { createPrReviewController, PR_REVIEW_OUTCOMES } from './prReviewController.js';
 import { chunkDiffForReview } from './diffChunker.js';
 
 const RUNTIME_ROOT = REVIEWLOOP_RUNTIME_ROOT;
@@ -136,7 +129,6 @@ export function createReviewLoopController({
   routeSupervisorFn = null,
   recordProviderFailure = null,
   prBackend = null,
-  triggerAuthority = null,
   captureBaselineFn = captureBaseline,
   collectWorkerDeltaFn = collectWorkerDelta,
   // Re-collect the Worker delta AFTER the review-time Gate (a snapshot / codegen
@@ -210,9 +202,22 @@ export function createReviewLoopController({
 
     let baseline = null;
     let prHead = null;
+    let prBaseSha = null;
     const repository = { root: cwd, name: null, url: null };
     let baselineGate = null;
     let verificationPlan = null;
+
+    // The frozen verification plan is discovered the same way for every target.
+    const freezeVerificationPlan = () => {
+      const discovered = discoverVerificationCommandsFn({ cwd, configured: verificationCommands });
+      return {
+        source: String(discovered.source ?? 'unknown'),
+        commands: (discovered.commands ?? []).map(String),
+        manifestFingerprint: discovered.manifestFingerprint
+          ?? sha256Hex(`fallback::${JSON.stringify(discovered.commands ?? [])}`),
+        frozenAt: new Date(clock()).toISOString(),
+      };
+    };
 
     if (mode === REVIEW_MODES.LOCAL) {
       baseline = await captureBaselineFn({ cwd });
@@ -220,14 +225,7 @@ export function createReviewLoopController({
       // Freeze the verification plan NOW. reviewloop_review always runs these
       // exact commands; a later edit to .reviewloop.json / package.json's test
       // script cannot weaken the Gate.
-      const discovered = discoverVerificationCommandsFn({ cwd, configured: verificationCommands });
-      verificationPlan = {
-        source: String(discovered.source ?? 'unknown'),
-        commands: (discovered.commands ?? []).map(String),
-        manifestFingerprint: discovered.manifestFingerprint
-          ?? sha256Hex(`fallback::${JSON.stringify(discovered.commands ?? [])}`),
-        frozenAt: new Date(clock()).toISOString(),
-      };
+      verificationPlan = freezeVerificationPlan();
 
       // B8 — baseline Gate evidence, 0 model tokens, over the FROZEN plan. Only
       // when trusted/discoverable verification exists; a failure to run it is
@@ -273,10 +271,25 @@ export function createReviewLoopController({
         }
       }
     } else {
+      // PR target. Resolve + FREEZE the PR snapshot identity: repository,
+      // prNumber, base SHA, exact HEAD. Fail closed on anything unresolvable —
+      // a review that cannot prove which snapshot it covers is worthless.
       if (!prBackend) throw new Error('reviewloop_begin: PR mode requires a PR backend');
       if (signal?.aborted) throw new Error('reviewloop_begin: cancelled by the caller');
+      if (typeof prBackend.resolveRepo === 'function') {
+        try {
+          const ident = await prBackend.resolveRepo();
+          repository.name = ident?.nameWithOwner ?? null;
+        } catch { /* repository name is best-effort metadata */ }
+      }
       prHead = await prBackend.getPrHead({ prNumber });
       if (!prHead) throw new Error(`reviewloop_begin: cannot resolve HEAD for PR #${prNumber}`);
+      prBaseSha = typeof prBackend.getPrBaseSha === 'function'
+        ? await prBackend.getPrBaseSha({ prNumber })
+        : null;
+      if (!prBaseSha) throw new Error(`reviewloop_begin: cannot resolve the base SHA for PR #${prNumber}`);
+      // The PR Gate runs the same frozen verification plan as a LOCAL target.
+      verificationPlan = freezeVerificationPlan();
     }
 
     // REVIEWLOOP_MAX_REVIEW_ROUNDS is a public tuning knob: an explicit begin
@@ -290,6 +303,7 @@ export function createReviewLoopController({
 
     const objective = createReviewObjective({
       loopId, goal, repository, mode, prNumber, reviewer, baseline, prHead,
+      prBaseSha, reviewedHeadSha: prHead,
       constraints, blockingSeverities, maxReviewRounds: resolvedMaxRounds,
       verificationPlan,
       baselineGateEvidence: baselineGate,
@@ -308,6 +322,8 @@ export function createReviewLoopController({
       status: 'READY',
       baseline: baseline ? compactBaselineSummary(baseline) : null,
       prHead: prHead ?? null,
+      prBaseSha: prBaseSha ?? null,
+      repository: repository.name ?? null,
       reviewer: objective.reviewer,
       objectiveFingerprint: objective.fingerprint,
     };
@@ -427,7 +443,7 @@ export function createReviewLoopController({
       }
       activeLeaseGuards.set(loopId, lease.verifyHeld ?? (async () => true));
       try {
-        return await reviewInner({ loopId, signal, onHeartbeat });
+        return await reviewInner({ loopId, signal });
       } catch (err) {
         if (err instanceof LeaseLostError) {
           // The lease was reclaimed by another owner while this call ran. We
@@ -451,7 +467,7 @@ export function createReviewLoopController({
     });
   }
 
-  async function reviewInner({ loopId, signal, onHeartbeat }) {
+  async function reviewInner({ loopId, signal }) {
     // Per-invocation safety-event isolation: start this call with a clean list.
     safetyEvents = [];
     const loopState = await loadLoop(loopId);
@@ -469,7 +485,7 @@ export function createReviewLoopController({
       return terminalResult(loopState);
     }
 
-    if (objective.mode === REVIEW_MODES.PR) return reviewPr({ loopState, signal, onHeartbeat });
+    if (objective.mode === REVIEW_MODES.PR) return reviewPr({ loopState, signal });
     return reviewLocal({ loopState, signal });
   }
 
@@ -1072,196 +1088,365 @@ export function createReviewLoopController({
     return { guidance: sup.guidance };
   }
 
-  // Resolve the GitHub review threads for prior-round findings that a trusted
-  // review bound to the exact newer HEAD has independently cleared. Mutates the
-  // managed-thread records in place. `targets` overrides the default
-  // (OPEN prior-head threads cleared by `review`) — used for the PASS retry.
-  async function reconcileReviewThreads({
-    loopState, objective, review, head, targets = null,
+  // ---- durable audit record ------------------------------------------
+  // One recoverable, tamper-evident entry per PR review round. Its fingerprint
+  // covers every load-bearing identity for "which PR snapshot did this round
+  // review": repository, prNumber, baseSha, reviewedHeadSha.
+  function appendAuditRecord({
+    loopState, objective, delta, gate, review, decision, telemetry,
+    observedHeadSha, finalObservedHeadSha, headStillCurrent, result,
   }) {
-    if (!prBackend || typeof prBackend.resolveReviewThread !== 'function') return;
-    const cleared = targets
-      ?? clearedPriorThreads({ managedThreads: loopState.managedThreads, review, head });
-    if (cleared.length === 0) return;
+    const target = {
+      type: 'PR',
+      repository: objective.repository?.name ?? null,
+      prNumber: objective.prNumber,
+      baseSha: objective.prBaseSha ?? null,
+      reviewedHeadSha: observedHeadSha ?? null,
+      finalObservedHeadSha: finalObservedHeadSha ?? null,
+      headStillCurrent: headStillCurrent === true,
+    };
+    const record = {
+      loopId: loopState.loopId,
+      round: loopState.round,
+      startedAt: loopState.updatedAt ?? loopState.createdAt ?? null,
+      completedAt: new Date().toISOString(),
+      target,
+      targetFingerprint: sha256Hex(JSON.stringify({
+        repository: target.repository,
+        prNumber: target.prNumber,
+        baseSha: target.baseSha,
+        reviewedHeadSha: target.reviewedHeadSha,
+      })),
+      objective: {
+        goal: objective.goal,
+        constraints: objective.constraints ?? [],
+        blockingSeverities: objective.blockingSeverities ?? [],
+        maxReviewRounds: objective.maxReviewRounds,
+        fingerprint: objective.fingerprint,
+      },
+      gate: gate ? {
+        commands: objective.verificationPlan?.commands ?? [],
+        commandSource: gate.commandSource ?? null,
+        fingerprint: gate.fingerprint ?? null,
+        verdict: gate.verdict ?? null,
+      } : null,
+      review: review ? {
+        reviewer: 'internal',
+        provider: review.provider ?? 'internal',
+        resolvedModel: review.resolvedModel ?? null,
+        status: review.status,
+        blockingFindings: review.blockingFindings?.length ?? 0,
+        findingSignatures: review.findingSignatures ?? [],
+      } : null,
+      supervisor: {
+        invoked: loopState.supervisorInvoked === true,
+        guidance: loopState.lastSupervisorGuidance ?? null,
+      },
+      spend: telemetry ?? null,
+      convergence: decision ? { verdict: decision.verdict, reason: decision.reason } : null,
+      result,
+    };
+    loopState.audit = [...(loopState.audit ?? []), record];
+    return record;
+  }
 
-    let liveThreads = null;
-    if (typeof prBackend.listReviewThreads === 'function') {
-      try {
-        liveThreads = await prBackend.listReviewThreads({ prNumber: objective.prNumber });
-      } catch { liveThreads = null; }
-    }
-    const allowlist = reviewerLoginAllowlist(objective.reviewer, env) ?? [];
-    const verificationReviewId = review.reviewId ?? review.review_id ?? null;
-
-    for (const mt of cleared) {
-      const scope = scopeCheckThread(mt, liveThreads, { allowlist });
-      if (!scope.ok) {
-        applyResolutionResult(mt, { success: false, error: `scope check failed: ${scope.reason}` });
-        collectSafetyEvent({
-          code: 'REVIEWLOOP_THREAD_RESOLVE_SKIPPED', severity: 'NON_BLOCKING', role: 'pr-review',
-          taskId: loopState.loopId, reason: `${mt.threadNodeId}: ${scope.reason}`,
-          actionTaken: 'thread left unresolved',
-        });
-        continue;
-      }
-      if (scope.alreadyResolved) {
-        applyResolutionResult(mt, { success: true, head, verificationReviewId });
-        continue;
-      }
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        await prBackend.resolveReviewThread({
-          prNumber: objective.prNumber, threadNodeId: mt.threadNodeId,
-          reviewer: objective.reviewer, headSha: head,
-        });
-        applyResolutionResult(mt, { success: true, head, verificationReviewId });
-        collectSafetyEvent({
-          code: 'REVIEWLOOP_THREAD_RESOLVED', severity: 'NON_BLOCKING', role: 'pr-review',
-          taskId: loopState.loopId,
-          reason: `resolved cleared finding ${mt.signature} (thread ${mt.threadNodeId}) on ${head}`,
-          actionTaken: 'GitHub review thread resolved',
-        });
-      } catch (err) {
-        applyResolutionResult(mt, { success: false, error: err?.message ?? err });
-        collectSafetyEvent({
-          code: 'REVIEWLOOP_THREAD_RESOLVE_FAILED', severity: 'BLOCKING', role: 'pr-review',
-          taskId: loopState.loopId, reason: `${mt.threadNodeId}: ${err?.message ?? err}`,
-          actionTaken: 'thread left unresolved; PASS withheld',
-        });
-      }
+  // Optional audit publication back to the PR. Opt-in via
+  // REVIEWLOOP_PUBLISH_PR_RESULT=1. NEVER changes the verdict — a publication
+  // failure is recorded as a safety event and nothing else.
+  async function maybePublishPrResult({
+    loopState, objective, result, review, headSha, telemetry,
+  }) {
+    if (String(env?.REVIEWLOOP_PUBLISH_PR_RESULT ?? '') !== '1') return;
+    if (!prBackend || typeof prBackend.publishResult !== 'function') return;
+    const body = [
+      `ReviewLoop ${result}`,
+      '',
+      `PR: #${objective.prNumber}`,
+      `Reviewed base: ${objective.prBaseSha ?? '(unknown)'}`,
+      `Reviewed head: ${headSha}`,
+      `Final HEAD check: ${result === 'PASS' ? 'MATCH' : 'see loop state'}`,
+      '',
+      'Reviewer: internal Reviewer pool',
+      `Rounds: ${loopState.round}`,
+      `Blocking findings: ${review?.blockingFindings?.length ?? 0}`,
+      `usageVolume: ${telemetry?.usageVolume ?? 'n/a'}`,
+      '',
+      `ReviewLoop ID: ${loopState.loopId}`,
+    ].join('\n');
+    try {
+      await prBackend.publishResult({ prNumber: objective.prNumber, body });
+    } catch (err) {
+      collectSafetyEvent({
+        code: 'REVIEWLOOP_PR_RESULT_PUBLICATION_FAILED', severity: 'NON_BLOCKING', role: 'pr-target',
+        taskId: loopState.loopId, reason: String(err?.message ?? err),
+        actionTaken: 'result verdict unchanged; publication failure recorded only',
+      });
     }
   }
 
-  // ---- PR mode ---------------------------------------------------------
-  async function reviewPr({ loopState, signal, onHeartbeat }) {
+  async function prHumanRequired(loopState, reason) {
+    recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, reason);
+    await saveLoop(loopState);
+    return {
+      status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
+      reason,
+      blockingFindings: loopState.lastReview?.blockingFindings ?? [],
+      telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+    };
+  }
+
+  // ---- PR mode: ONE unified review engine over the PR base->HEAD delta ----
+  async function reviewPr({ loopState, signal }) {
     const objective = loopState.objective;
-    recordTransition(loopState, REVIEW_LOOP_STATES.REVIEWING, 'PR review requested');
+    const cwd = objective.repository?.root;
+    const prNumber = objective.prNumber;
+    const MAX_HEAD_REBIND = 4;
 
-    const prCtl = createPrReviewController({
-      loopId: loopState.loopId, persistence, prBackend, env, onEvent,
-      recordSafetyEvent: collectSafetyEvent, triggerAuthority,
-    });
+    for (let rebind = 0; rebind < MAX_HEAD_REBIND; rebind += 1) {
+      await assertLeaseHeld(loopState.loopId);
 
-    // Fail closed before any external-review trigger dispatch or PR state write
-    // if this process no longer holds the lease.
-    await assertLeaseHeld(loopState.loopId);
-    const result = await prCtl.obtainReview({ objective, loopState, signal, onHeartbeat });
-
-    if (result.outcome === PR_REVIEW_OUTCOMES.PUSH_REQUIRED) {
-      await saveLoop(loopState);
-      return { status: 'PUSH_REQUIRED', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: await durableTelemetry(loopState.loopId), safetyEvents };
-    }
-    if (result.outcome === PR_REVIEW_OUTCOMES.WAITING_FOR_REVIEW) {
-      recordTransition(loopState, REVIEW_LOOP_STATES.WAITING_FOR_REVIEW, 'external review pending');
-      loopState.pendingExternalTrigger = loopState.pendingExternalTrigger
-        ?? { head: result.head, reviewer: objective.reviewer, status: 'TRIGGERED' };
-      await saveLoop(loopState);
-      return { status: 'WAITING_FOR_REVIEW', loopId: loopState.loopId, head: result.head, reason: result.reason, telemetry: await durableTelemetry(loopState.loopId), safetyEvents };
-    }
-    if (result.outcome === PR_REVIEW_OUTCOMES.HUMAN_REQUIRED) {
-      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, result.reason);
-      await saveLoop(loopState);
-      return {
-        status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head ?? null, reason: result.reason,
-        blockingFindings: loopState.lastReview?.blockingFindings ?? [], telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
-      };
-    }
-
-    // REVIEW_READY
-    const review = result.review;
-    if (review.status === 'FAILED') {
-      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, review.error?.reason ?? 'pr review failed');
-      await saveLoop(loopState);
-      return {
-        status: 'HUMAN_REQUIRED', loopId: loopState.loopId, head: result.head,
-        reason: `trusted PR review was not usable (${review.error?.reason}): ${review.error?.message ?? ''}`,
-        telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
-      };
-    }
-
-    const priorReviewedHead = loopState.lastReviewedPrHead;
-    const newHead = result.head !== priorReviewedHead;
-    if (newHead) loopState.round += 1;
-    loopState.lastReviewedPrHead = result.head;
-    loopState.lastReview = review;
-    loopState.pendingExternalTrigger = null;
-
-    // Review-thread reconciliation. Only a trusted review bound to the EXACT
-    // newer HEAD (this `review`) can clear a prior-round thread; a recurring
-    // finding keeps its prior thread open. A REWORK round may therefore resolve
-    // old findings while introducing new open ones.
-    loopState.managedThreads = Array.isArray(loopState.managedThreads) ? loopState.managedThreads : [];
-    if (newHead && priorReviewedHead) {
-      await reconcileReviewThreads({ loopState, objective, review, head: result.head });
-    }
-    loopState.managedThreads = registerManagedThreads({
-      managedThreads: loopState.managedThreads, review, head: result.head,
-      reviewer: objective.reviewer, round: loopState.round,
-    });
-
-    const spend = spendFor(loopState.loopId);
-    await spend.registerEvidence({
-      kind: 'external', subject: `pr-${objective.prNumber}`,
-      fingerprint: `${result.head}:${review.findingSignatures.join('|')}`,
-    });
-
-    const decision = decideConvergence({ loopState, review });
-    loopState.findingSignatureHistory = [
-      ...(loopState.findingSignatureHistory ?? []),
-      { round: loopState.round, signatures: review.findingSignatures },
-    ];
-
-    if (decision.verdict === REVIEW_VERDICTS.PASS) {
-      // Every ReviewLoop-managed blocking thread that has been independently
-      // cleared MUST be resolved before PASS. A GitHub resolution failure is an
-      // infrastructure/retry condition — never a silent PASS.
-      let stuck = unresolvedClearedThreads({ managedThreads: loopState.managedThreads, review, head: result.head });
-      if (stuck.length) {
-        await reconcileReviewThreads({ loopState, objective, review, head: result.head, targets: stuck });
-        stuck = unresolvedClearedThreads({ managedThreads: loopState.managedThreads, review, head: result.head });
+      // 1. Live PR HEAD. FAIL CLOSED — an inability to prove which commit is
+      //    currently HEAD must never fall back to a cached SHA.
+      let observedHead;
+      try {
+        observedHead = await prBackend.getPrHead({ prNumber });
+      } catch (err) {
+        return prHumanRequired(loopState, `cannot resolve the live PR HEAD: ${err?.message ?? err}`);
       }
-      if (stuck.length) {
-        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, 'ReviewLoop-managed review threads could not be resolved');
+      if (!observedHead) return prHumanRequired(loopState, `cannot resolve the live HEAD for PR #${prNumber}`);
+
+      // 2. Local fix not pushed: HEAD unchanged since a prior actionable review.
+      if (loopState.lastReviewedPrHead === observedHead
+        && loopState.lastReview?.status === 'ACTIONABLE') {
         await saveLoop(loopState);
         return {
-          status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round,
-          head: result.head, blockingFindings: [],
-          reason: `PASS withheld: ${stuck.length} ReviewLoop-managed review thread(s) were independently cleared but could not be resolved on GitHub (${stuck.map((s) => s.threadNodeId).join(', ')}). This is an infrastructure/retry condition — retry reviewloop_review once GitHub is reachable, or resolve the threads manually.`,
+          status: 'PUSH_REQUIRED', loopId: loopState.loopId, head: observedHead,
+          reason: 'PR HEAD unchanged since the last review; push your fix, then call reviewloop_review',
+          telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+        };
+      }
+
+      recordTransition(loopState, REVIEW_LOOP_STATES.REVIEWING, 'PR review requested');
+
+      // 3. PR base -> exact HEAD delta (the primary Reviewer evidence).
+      const delta = await collectPrDelta({
+        prBackend, prNumber, baseSha: objective.prBaseSha, headSha: observedHead,
+      });
+      if (delta.noWorkerChangeYet) {
+        await saveLoop(loopState);
+        return {
+          status: 'NO_PROGRESS', loopId: loopState.loopId, round: loopState.round,
+          head: observedHead,
+          reason: 'the PR has no reviewable base->HEAD change',
+          telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+        };
+      }
+      if (delta.evidenceComplete === false) {
+        return prHumanRequired(
+          loopState,
+          `cannot construct a trustworthy PR delta: ${(delta.incompleteReasons ?? []).join('; ')}`,
+        );
+      }
+
+      // 4. The FROZEN deterministic Gate (same plan as a LOCAL target).
+      const frozenPlan = objective.verificationPlan;
+      let gateCommands;
+      let commandSource;
+      if (frozenPlan?.commands?.length) {
+        gateCommands = frozenPlan.commands;
+        commandSource = `${frozenPlan.source} (frozen at begin)`;
+        try {
+          const current = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
+          if (current?.manifestFingerprint && frozenPlan.manifestFingerprint
+            && current.manifestFingerprint !== frozenPlan.manifestFingerprint) {
+            collectSafetyEvent({
+              code: 'VERIFICATION_PLAN_DRIFT', severity: 'BLOCKING', role: 'gate',
+              taskId: loopState.loopId,
+              reason: `the verification config (${frozenPlan.source}) was modified after reviewloop_begin`,
+              actionTaken: 'review blocked; frozen Gate cannot be trusted',
+            });
+            loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
+            recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'verification plan drift');
+            await saveLoop(loopState);
+            return {
+              ...compactReworkPayload({
+                loopState,
+                review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 },
+                gate: { verdict: 'FAIL', failureIdentities: ['verification-plan-drift'] },
+              }),
+              reason: 'the verification configuration was changed after reviewloop_begin; revert it or start a new reviewloop_begin',
+              telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+            };
+          }
+        } catch { /* discovery is best-effort here */ }
+      } else {
+        const discovered = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
+        gateCommands = discovered.commands;
+        commandSource = discovered.source;
+      }
+
+      let gate = await runGateFn({
+        cwd, commands: gateCommands, runner: gateRunner, env, signal,
+      });
+      gate.commandSource = commandSource;
+
+      if (signal?.aborted) {
+        return prHumanRequired(loopState, 'the review was cancelled by the caller before the Reviewer ran');
+      }
+
+      const fp = reviewFingerprint({ deltaFingerprint: delta.fingerprint, gateFingerprint: gate.fingerprint });
+      if (loopState.lastReviewedFingerprint && loopState.lastReviewedFingerprint === fp) {
+        await saveLoop(loopState);
+        return {
+          status: 'NO_PROGRESS', loopId: loopState.loopId, round: loopState.round,
+          head: observedHead,
+          reason: 'submitted PR state is identical to the last review; no Reviewer/Supervisor call made',
+          lastReview: compactLastReview(loopState),
+          telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+        };
+      }
+
+      if (gate.verdict === GATE_VERDICTS.FAIL) {
+        loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
+        loopState.lastReviewedFingerprint = fp;
+        loopState.lastGateFingerprint = gate.fingerprint;
+        loopState.lastReviewedPrHead = observedHead;
+        recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'gate regression');
+        await saveLoop(loopState);
+        return {
+          ...compactReworkPayload({ loopState, review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 }, gate }),
+          head: observedHead,
+          reason: 'deterministic Gate failed with a regression; fix it before the Reviewer runs',
+          telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+        };
+      }
+
+      const spend = spendFor(loopState.loopId);
+      let reviewOut;
+      try {
+        reviewOut = await runReviewerOverEvidence({ spend, loopState, objective, delta, gate, signal });
+      } catch (err) {
+        if (err instanceof LeaseLostError) throw err;
+        return spendDenialResult(loopState, err, await spend.telemetry());
+      }
+      const review = reviewOut.review;
+      review.reviewedFingerprint = fp;
+      review.reviewedHead = observedHead;
+      loopState.lastReviewedFingerprint = fp;
+      loopState.lastGateFingerprint = gate.fingerprint;
+      loopState.lastReviewedPrHead = observedHead;
+      loopState.lastReview = review;
+      loopState.chunkReviewCheckpoint = null;
+
+      if (review.status === 'FAILED') {
+        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, review.error?.reason ?? 'pr review failed');
+        await saveLoop(loopState);
+        return {
+          status: 'HUMAN_REQUIRED', loopId: loopState.loopId, round: loopState.round, head: observedHead,
+          reason: `Reviewer did not produce a usable result (${review.error?.reason}): ${review.error?.message ?? ''}`,
           telemetry: await spend.telemetry(), safetyEvents,
         };
       }
-      recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
+
+      const decision = decideConvergence({ loopState, review });
+      loopState.findingSignatureHistory = [
+        ...(loopState.findingSignatureHistory ?? []),
+        { round: loopState.round, signatures: review.findingSignatures },
+      ];
+
+      let supervisorGuidance = null;
+      if (decision.verdict === REVIEW_VERDICTS.REWORK && decision.invokeSupervisor && !loopState.supervisorInvoked) {
+        const sup = await runSupervisor({ spend, loopState, objective, review, gate, signal });
+        if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
+        const outcome = await applySupervisorOutcome({
+          sup, loopState, review, spend, escalationReason: 'PR non-convergence escalation',
+        });
+        if (outcome.result) return outcome.result;
+        supervisorGuidance = outcome.guidance;
+      }
+
+      const telemetry = await spend.telemetry();
+
+      if (decision.verdict === REVIEW_VERDICTS.PASS) {
+        // 5. Exact-HEAD recheck. Re-read the live PR HEAD; only PASS when it is
+        //    still the exact SHA this round reviewed. A moved HEAD is never
+        //    certified by a stale review — rebind and re-review it (bounded).
+        let finalHead;
+        try {
+          finalHead = await prBackend.getPrHead({ prNumber });
+        } catch (err) {
+          return prHumanRequired(loopState, `could not re-confirm the live PR HEAD before PASS: ${err?.message ?? err}`);
+        }
+        if (!finalHead) return prHumanRequired(loopState, 'could not re-confirm the live PR HEAD before PASS');
+        if (finalHead !== observedHead) {
+          collectSafetyEvent({
+            code: 'REVIEWLOOP_PR_HEAD_MOVED_DURING_REVIEW', severity: 'NON_BLOCKING', role: 'pr-target',
+            taskId: loopState.loopId,
+            reason: `PR HEAD moved from ${observedHead} to ${finalHead} during the review`,
+            actionTaken: 'stale review not certified; re-reviewing the new HEAD',
+          });
+          appendAuditRecord({
+            loopState, objective, delta, gate, review, decision, telemetry,
+            observedHeadSha: observedHead, finalObservedHeadSha: finalHead,
+            headStillCurrent: false, result: 'REWORK',
+          });
+          loopState.lastReviewedFingerprint = null; // allow a fresh review of the new HEAD
+          await saveLoop(loopState);
+          continue;
+        }
+        appendAuditRecord({
+          loopState, objective, delta, gate, review, decision, telemetry,
+          observedHeadSha: observedHead, finalObservedHeadSha: finalHead,
+          headStillCurrent: true, result: 'PASS',
+        });
+        recordTransition(loopState, REVIEW_LOOP_STATES.PASS, decision.reason);
+        await saveLoop(loopState);
+        await maybePublishPrResult({
+          loopState, objective, result: 'PASS', review, headSha: observedHead, telemetry,
+        });
+        return passResult(loopState, review, telemetry);
+      }
+
+      if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
+        loopState.budgetExhausted = true;
+        appendAuditRecord({
+          loopState, objective, delta, gate, review, decision, telemetry,
+          observedHeadSha: observedHead, finalObservedHeadSha: observedHead,
+          headStillCurrent: true, result: 'HUMAN_REQUIRED',
+        });
+        recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
+        await saveLoop(loopState);
+        await maybePublishPrResult({
+          loopState, objective, result: 'HUMAN_REQUIRED', review, headSha: observedHead, telemetry,
+        });
+        return humanRequiredResult(loopState, review, telemetry, supervisorGuidance);
+      }
+
+      appendAuditRecord({
+        loopState, objective, delta, gate, review, decision, telemetry,
+        observedHeadSha: observedHead, finalObservedHeadSha: observedHead,
+        headStillCurrent: true, result: 'REWORK',
+      });
+      recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, decision.reason);
       await saveLoop(loopState);
-      return passResult(loopState, review, await spend.telemetry());
-    }
-    if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
-      loopState.budgetExhausted = true; // 3 rounds spent, still blocking — terminal
-      recordTransition(loopState, REVIEW_LOOP_STATES.HUMAN_REQUIRED, decision.reason);
-      await saveLoop(loopState);
-      return humanRequiredResult(loopState, review, await spend.telemetry(), null);
+      await maybePublishPrResult({
+        loopState, objective, result: 'REWORK', review, headSha: observedHead, telemetry,
+      });
+      return {
+        ...compactReworkPayload({ loopState, review, gate, supervisorGuidance }),
+        head: observedHead,
+        reason: `${decision.reason}; push your fix so ReviewLoop reviews the new HEAD`,
+        telemetry, safetyEvents,
+      };
     }
 
-    let supervisorGuidance = null;
-    if (decision.invokeSupervisor && !loopState.supervisorInvoked) {
-      const sup = await runSupervisor({
-        spend, loopState, objective, review, gate: null, signal,
-      });
-      if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
-      const outcome = await applySupervisorOutcome({
-        sup, loopState, review, spend, escalationReason: 'PR non-convergence escalation',
-      });
-      if (outcome.result) return outcome.result;
-      supervisorGuidance = outcome.guidance;
-    }
-
-    recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, decision.reason);
+    // The PR HEAD kept moving faster than one review round.
+    recordTransition(loopState, REVIEW_LOOP_STATES.WAITING_FOR_REVIEW, 'PR HEAD kept moving');
     await saveLoop(loopState);
     return {
-      ...compactReworkPayload({ loopState, review, gate: null, supervisorGuidance }),
-      head: result.head,
-      reason: `${decision.reason}; push your fix so ReviewLoop can request a review of the new HEAD`,
-      telemetry: await spend.telemetry(),
-      safetyEvents,
+      status: 'WAITING_FOR_REVIEW', loopId: loopState.loopId, round: loopState.round,
+      reason: 'the PR HEAD kept changing during the review; let it settle, then call reviewloop_review again',
+      telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
     };
   }
 
@@ -1324,7 +1509,7 @@ export function createReviewLoopController({
     return { status: r.status, blockingFindings: r.blockingFindings, findingSignatures: r.findingSignatures };
   }
   function emptyTelemetry() {
-    return { reviewerCalls: 0, supervisorCalls: 0, externalTriggers: 0, workerUsage: 'external / not observable by ReviewLoop' };
+    return { reviewerCalls: 0, supervisorCalls: 0, workerUsage: 'external / not observable by ReviewLoop' };
   }
 
   return { begin, review, _store: store, _persistence: persistence };

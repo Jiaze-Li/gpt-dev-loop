@@ -58,3 +58,44 @@ export function makeHarness({
 }
 
 export const finding = (severity, file = 'a.js', title = 't') => ({ severity, file, line: 1, title });
+
+// Deterministic slim PR backend for the ONE unified review engine. No external
+// reviewer, no trigger, no polling — just PR-snapshot metadata + the base->HEAD
+// diff, exactly what src/reviewloop/githubBackend.js exposes.
+export function mockPrBackend({
+  base = 'BASE',
+  heads = ['H1'],
+  diffByHead = {},
+  filesByHead = {},
+  repo = 'acme/repo',
+  // Per-getPrHead-call script (1-indexed by call count, clamped). Lets a test
+  // move the PR HEAD mid-review to exercise the exact-HEAD recheck.
+  headScript = null,
+  // Every getPrHead call returns a brand-new SHA — the HEAD never settles.
+  movingHead = false,
+} = {}) {
+  const state = {
+    headIdx: 0, headReads: 0, published: [], diffReads: 0,
+  };
+  const head = () => {
+    if (movingHead) return `MH${state.headReads}`;
+    if (headScript) return headScript[Math.min(state.headReads, headScript.length - 1)];
+    return heads[Math.min(state.headIdx, heads.length - 1)];
+  };
+  return {
+    state,
+    head,
+    advanceHead() { state.headIdx += 1; },
+    async resolveRepo() { return { nameWithOwner: repo }; },
+    async getPrHead() { const h = head(); state.headReads += 1; return h; },
+    async getPrBaseSha() { return base; },
+    async getPrDiff({ headSha } = {}) {
+      state.diffReads += 1;
+      const h = headSha ?? head();
+      return diffByHead[h]
+        ?? `diff --git a/f.js b/f.js\n--- a/f.js\n+++ b/f.js\n@@ -1 +1 @@\n-old\n+new-at-${h}\n`;
+    },
+    async getPrChangedFiles({ headSha } = {}) { return filesByHead[headSha ?? head()] ?? ['f.js']; },
+    async publishResult({ body }) { state.published.push(body); return { published: true, commentId: 'pub-1' }; },
+  };
+}

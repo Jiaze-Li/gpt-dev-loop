@@ -1,6 +1,6 @@
 # ReviewLoop Worker Contract
 
-Contract version: 2
+Contract version: 3
 
 The one source of truth for how a coding agent uses ReviewLoop. The installer
 writes it byte-identically into each agent's auto-loaded rules inside one
@@ -17,8 +17,8 @@ managed block; `npm run doctor` verifies the match with zero model calls.
 ## Using ReviewLoop
 
 - For non-trivial code work, call `reviewloop_begin({ goal, cwd })` BEFORE your
-  first edit to capture the pre-edit baseline. Pass `prNumber` (and optionally
-  `reviewer`) to review an open PR instead of the local worktree.
+  first edit to capture the pre-edit baseline. Pass `prNumber` to review an open
+  PR (PR base -> exact PR HEAD) with the same engine instead of the worktree.
 - Do the work.
 - When your implementation is ready, call `reviewloop_review({ loopId })`.
   - `PASS` → report completion.
@@ -26,9 +26,9 @@ managed block; `npm run doctor` verifies the match with zero model calls.
     call `reviewloop_review` again.
   - `HUMAN_REQUIRED` → **STOP.** This ends the task: report the blocker and
     findings to the user and wait. Do not `reviewloop_begin` again, switch
-    reviewer/session, or push a new HEAD for a fresh counter — budget spent.
-  - `WAITING_FOR_REVIEW` → a PR review was triggered; normal. Call
-    `reviewloop_review` again later; it reattaches without re-triggering.
+    session, or push a new HEAD for a fresh counter — budget spent.
+  - `WAITING_FOR_REVIEW` → transient (a lease is held, or the PR HEAD kept
+    moving); call `reviewloop_review` again once state settles.
   - `PUSH_REQUIRED` / `NO_PROGRESS` → change or push real state first.
 
 ## Execution budget
@@ -41,9 +41,7 @@ managed block; `npm run doctor` verifies the match with zero model calls.
 ## Rules
 
 - In PR mode, push your fix when the user's task authorizes it; ReviewLoop
-  waits for the configured external review and never pushes for you. Do not
-  post your own `@codex review` / `@claude review` while ReviewLoop owns the
-  loop.
+  reviews the pushed PR HEAD and never pushes, merges, or force-pushes for you.
 - Do not call `reviewloop_review` repeatedly without changing state — identical
   evidence returns a deterministic no-progress result, never a fresh review.
 - Do not self-repair ReviewLoop while using it on another repository; report an

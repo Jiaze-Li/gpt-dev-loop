@@ -7,7 +7,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
-import { MemoryPersistence, makeHarness, finding } from './helpers/reviewLoopHarness.js';
+import {
+  MemoryPersistence, makeHarness, finding, mockPrBackend,
+} from './helpers/reviewLoopHarness.js';
 
 test('a safety event from loop A does not leak into loop B on the same controller', async () => {
   const persistence = new MemoryPersistence();
@@ -61,32 +63,23 @@ test('NO_PROGRESS after a spending round still reports cumulative durable spend'
   assert.equal(r2.telemetry.workerUsage, 'external / not observable by ReviewLoop');
 });
 
-test('PR WAITING_FOR_REVIEW reports cumulative spend, not zeros', async () => {
-  // A supervisor call happens on round 2; then a detached wait must still show
-  // that spend.
-  const heads = ['H1', 'H1', 'H2', 'H2'];
-  let i = 0;
-  const prBackend = {
-    async getPrHead() { return heads[Math.min(i, heads.length - 1)]; },
-    async findExistingReview() { return null; },
-    async postReviewTrigger() { return { id: 'c' }; },
-    async waitForReview({ headSha }) {
-      i += 1;
-      if (headSha === 'H1') return { login: 'chatgpt-codex-connector[bot]', headSha, head_sha: headSha, findings: [{ severity: 'P1', file: 'a', title: 'b' }] };
-      return null; // H2 -> detach -> WAITING_FOR_REVIEW
-    },
-  };
+test('PR PUSH_REQUIRED after a spending round still reports cumulative durable spend', async () => {
+  const backend = mockPrBackend({ heads: ['H1'] });
   const controller = createReviewLoopController({
     persistence: new MemoryPersistence(),
-    prBackend,
-    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 5, output_tokens: 5 } }),
+    prBackend: backend,
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo t'], manifestFingerprint: 'mf' }),
+    runGateFn: async () => ({ verdict: 'PASS', pass: true, results: [], fingerprint: `g${Math.random()}`, failureIdentities: [] }),
+    reviewerFn: async () => ({ value: { findings: [{ severity: 'P1', file: 'a', title: 'b' }] }, usage: { input_tokens: 5, output_tokens: 5 }, model: 'm' }),
   });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  await controller.review({ loopId });          // H1 REWORK
-  await controller.review({ loopId });          // H1 again — REWORK/supervisor path
-  i = 2;                                         // pushed H2
-  const rW = await controller.review({ loopId });
-  assert.equal(rW.status, 'WAITING_FOR_REVIEW');
-  assert.ok(rW.telemetry.usageVolume >= 0);
-  assert.equal(rW.telemetry.workerUsage, 'external / not observable by ReviewLoop');
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+  const r1 = await controller.review({ loopId });
+  assert.equal(r1.status, 'REWORK');
+  assert.equal(r1.telemetry.reviewerCalls, 1);
+
+  // No push -> PUSH_REQUIRED, no fresh Reviewer call, but the earlier spend stays.
+  const r2 = await controller.review({ loopId });
+  assert.equal(r2.status, 'PUSH_REQUIRED');
+  assert.equal(r2.telemetry.reviewerCalls, 1, 'cumulative spend is not reset to zero on an early-return re-call');
+  assert.equal(r2.telemetry.workerUsage, 'external / not observable by ReviewLoop');
 });

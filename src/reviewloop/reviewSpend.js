@@ -17,8 +17,8 @@
 // on load and any settled/blocking reservation without a matching spend record
 // is counted conservatively (call counted, usage UNKNOWN).
 //
-// External model spend (@codex review / @claude review) is NOT routed here —
-// it crosses ExternalModelTriggerAuthority (prReviewController.js).
+// ReviewLoop has ONE review engine — every Reviewer / Supervisor call for both
+// LOCAL and PR targets is metered here.
 
 import { ModelSpendAuthority } from '../orchestrator/modelSpendAuthority.js';
 import { ReservationLedger, ReservationStore } from '../orchestrator/modelSpendReservation.js';
@@ -38,7 +38,6 @@ export const REVIEWLOOP_ENV = Object.freeze({
   MAX_REVIEW_ROUNDS: 'REVIEWLOOP_MAX_REVIEW_ROUNDS',
   MAX_REVIEWER_CALLS: 'REVIEWLOOP_MAX_REVIEWER_CALLS',
   MAX_SUPERVISOR_CALLS: 'REVIEWLOOP_MAX_SUPERVISOR_CALLS',
-  MAX_EXTERNAL_REVIEW_TRIGGERS: 'REVIEWLOOP_MAX_EXTERNAL_REVIEW_TRIGGERS',
   MAX_SINGLE_CALL_USAGE: 'REVIEWLOOP_MAX_SINGLE_CALL_USAGE',
   MAX_CONTEXT_OVERHEAD_TOKENS: 'REVIEWLOOP_MAX_CONTEXT_OVERHEAD_TOKENS',
 });
@@ -61,7 +60,6 @@ export const REVIEWLOOP_DEFAULTS = Object.freeze({
   // stays mechanically reachable when every earlier one fails safely.
   // MAX_COST_USD / MAX_USAGE_VOLUME remain the real runaway guards.
   MAX_SUPERVISOR_CALLS: 4,
-  MAX_EXTERNAL_REVIEW_TRIGGERS: 7,
   // ---- post-settlement single-call Token Sentinel -------------------------
   // A runaway guard for ONE physical call: the durable aggregate ceilings
   // (MAX_USAGE_VOLUME / MAX_COST_USD) only fire once the running total crosses
@@ -140,9 +138,6 @@ export function resolveReviewLoopLimits(env = process.env) {
     maxReviewRounds: num(env, REVIEWLOOP_ENV.MAX_REVIEW_ROUNDS, REVIEWLOOP_DEFAULTS.MAX_REVIEW_ROUNDS),
     maxReviewerCalls: num(env, REVIEWLOOP_ENV.MAX_REVIEWER_CALLS, REVIEWLOOP_DEFAULTS.MAX_REVIEWER_CALLS),
     maxSupervisorCalls: num(env, REVIEWLOOP_ENV.MAX_SUPERVISOR_CALLS, REVIEWLOOP_DEFAULTS.MAX_SUPERVISOR_CALLS),
-    maxExternalReviewTriggers: num(
-      env, REVIEWLOOP_ENV.MAX_EXTERNAL_REVIEW_TRIGGERS, REVIEWLOOP_DEFAULTS.MAX_EXTERNAL_REVIEW_TRIGGERS,
-    ),
     maxSingleCallUsage: boundedThreshold(
       env, REVIEWLOOP_ENV.MAX_SINGLE_CALL_USAGE,
       REVIEWLOOP_DEFAULTS.MAX_SINGLE_CALL_USAGE, TOKEN_SENTINEL_HARD_CAPS.MAX_SINGLE_CALL_USAGE,

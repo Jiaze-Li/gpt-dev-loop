@@ -5,8 +5,11 @@ already using. It does not replace or spawn that coding agent.
 
 > ReviewLoop is a post-execution review and repair controller for coding
 > agents. The user's current coding agent (the **Worker**) owns execution;
-> ReviewLoop owns independent verification, review, external-review waiting,
-> non-convergence detection, and exception guidance.
+> ReviewLoop owns independent verification, review, non-convergence detection,
+> and exception guidance. It has ONE review engine — the same deterministic
+> Gate, internal Reviewer routing, Supervisor and 3-round convergence policy
+> judge a LOCAL target (baseline → Worker delta) and a PR target (PR base →
+> exact PR HEAD).
 
 ## Model
 
@@ -35,18 +38,21 @@ The Worker calls two MCP tools:
 | `reviewloop_review({ loopId })` | when the implementation is ready | Gate (0) + Reviewer if justified |
 
 `reviewloop_review` returns one of: `PASS`, `REWORK` (fix the findings in the
-same session, call again), `HUMAN_REQUIRED`, `WAITING_FOR_REVIEW` (PR review
-triggered — call again later), `NO_PROGRESS`, `PUSH_REQUIRED`.
+same session, call again), `HUMAN_REQUIRED`, `WAITING_FOR_REVIEW` (transient —
+call again once state settles), `NO_PROGRESS`, `PUSH_REQUIRED`.
 
 Full Worker contract: [`agent-policy/COMMON.md`](agent-policy/COMMON.md).
 
-## PR mode
+## PR target
 
-Pass `prNumber` to review an open PR. ReviewLoop posts **one**
-`@codex review` / `@claude review` per PR HEAD, waits locally with **zero**
-model tokens, normalizes the findings, and hands `REWORK` back to the Worker,
-who fixes and pushes. ReviewLoop then reviews the new HEAD. It never pushes or
-merges.
+Pass `prNumber` to review an open PR. `reviewloop_begin` freezes the exact PR
+snapshot — repository, `prNumber`, base SHA, HEAD SHA — and every review round
+runs the **same** engine as a LOCAL target over the PR's `base → HEAD` diff:
+deterministic Gate → internal Reviewer routing (`agy:opus` first) → convergence
+policy → Supervisor only on non-convergence. Before a PR `PASS`, ReviewLoop
+re-reads the live PR HEAD and refuses to certify a stale review if it moved.
+Each round writes a durable, tamper-evident audit record. ReviewLoop never
+pushes, merges, force-pushes, or posts a third-party review trigger.
 
 ## CLI
 
@@ -90,9 +96,9 @@ documentation only and do not alter the certified implementation.
   - Blocking P1/P2 findings: **none**. The Reviewer's `OTHER` / cosmetic
     findings are non-blocking and are deliberately left unchanged after the
     freeze.
-- ReviewLoop **PR external-review** mode (`@codex review` / `@claude review`):
-  **NOT CERTIFIED** — no real PR external-review loop has been run. The LOCAL
-  certification above does **not** cover PR mode.
+- ReviewLoop **PR target** (unified engine, mock providers): implemented and
+  covered by deterministic tests. A real-provider PR-target certification has
+  **not** been run yet — the LOCAL certification above does not cover it.
 - Real multi-provider failover chain end-to-end: **NOT RUN** (structurally
   wired; the certified loop above exercised the first-choice Reviewer only).
 - `claude:opus` uses the stable provider alias `opus`; `codex:default` follows

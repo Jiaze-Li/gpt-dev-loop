@@ -19,218 +19,6 @@ const BOT = 'chatgpt-codex-connector[bot]';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
-const WRAPPER = [
-  '', '### 💡 Codex Review', '',
-  'Here are some automated review suggestions for this pull request.', '',
-  `**Reviewed commit:** \`${HEAD.slice(0, 10)}\``, '',
-  '<details> <summary>ℹ️ About Codex in GitHub</summary></details>',
-].join('\n');
-
-function badge(sev) {
-  return `**<sub><sub>![${sev} Badge](https://img.shields.io/badge/${sev}-orange?style=flat)</sub></sub>  ${sev} finding title**\n\nBody text here.\n\nUseful? React with 👍 / 👎.`;
-}
-
-function backend({
-  reviews = [], comments = [], reactions = [], head = HEAD, heads = null,
-} = {}) {
-  let call = 0;
-  return createGithubReviewBackend({
-    pollIntervalMs: 1,
-    maxWaitMs: 50,
-    sleep: () => Promise.resolve(),
-    transport: {
-      async getPrHead() {
-        if (Array.isArray(heads)) { const h = heads[Math.min(call, heads.length - 1)]; call += 1; return h; }
-        return head;
-      },
-      async listReviews() { return reviews; },
-      async listReviewComments() { return comments; },
-      async listIssueCommentReactions() { return reactions; },
-      async postComment() { return { id: 'https://github.com/o/r/pull/4#issuecomment-999' }; },
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// 1. Codex wrapper + 6 inline findings -> exactly 6 findings, 4 P1 + 2 P2.
-// ---------------------------------------------------------------------------
-test('Codex wrapper + 6 inline findings parse to exactly 6 findings (4×P1 + 2×P2), not all P2', async () => {
-  const REVIEW_ID = 5139035349;
-  const inline = ['P1', 'P1', 'P1', 'P1', 'P2', 'P2'].map((sev, i) => ({
-    login: BOT, body: badge(sev), path: `src/f${i}.js`, line: 10 + i,
-    commitId: HEAD, originalCommitId: HEAD, pullRequestReviewId: REVIEW_ID, id: 100 + i,
-  }));
-  const agg = await backend({
-    reviews: [{ login: BOT, state: 'COMMENTED', commitId: HEAD, body: WRAPPER, submittedAt: '2026-09-08', id: REVIEW_ID }],
-    comments: inline,
-  }).findExistingReview({ prNumber: 4, headSha: HEAD, reviewer: 'codex' });
-
-  assert.ok(agg, 'aggregated review produced');
-  assert.equal(agg.findings.length, 6, 'exactly the 6 real inline findings, no synthetic wrapper finding');
-  const p1 = agg.findings.filter((f) => f.severity === 'P1').length;
-  const p2 = agg.findings.filter((f) => f.severity === 'P2').length;
-  assert.equal(p1, 4, '4 P1 badges parsed as P1');
-  assert.equal(p2, 2, '2 P2 badges parsed as P2');
-});
-
-// ---------------------------------------------------------------------------
-// 2. Wrapper-only -> not PASS, not a synthetic P2, no duplicate trigger.
-// ---------------------------------------------------------------------------
-test('a Codex wrapper submission with no inline findings and no 👍 is not a reviewed state', async () => {
-  const agg = await backend({
-    reviews: [{ login: BOT, state: 'COMMENTED', commitId: HEAD, body: WRAPPER, submittedAt: '2026-09-08', id: 1 }],
-  }).findExistingReview({ prNumber: 4, headSha: HEAD, reviewer: 'codex' });
-  assert.equal(agg, null, 'wrapper-only is neither CLEAN nor a synthetic blocker — keep waiting');
-});
-
-test('wrapper-only during obtainReview -> WAITING_FOR_REVIEW, exactly one trigger posted', async () => {
-  const posts = [];
-  const be = createGithubReviewBackend({
-    pollIntervalMs: 1, maxWaitMs: 20, sleep: () => Promise.resolve(),
-    transport: {
-      async getPrHead() { return HEAD; },
-      async listReviews() { return [{ login: BOT, state: 'COMMENTED', commitId: HEAD, body: WRAPPER, submittedAt: '2026-09-08', id: 1 }]; },
-      async listReviewComments() { return []; },
-      async listIssueCommentReactions() { return []; },
-      async postComment() { posts.push(1); return { id: 'https://x#issuecomment-1' }; },
-    },
-  });
-  const persistence = new MemoryPersistence();
-  const controller = createReviewLoopController({ persistence, prBackend: be });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  const r1 = await controller.review({ loopId });
-  assert.equal(r1.status, 'WAITING_FOR_REVIEW');
-  const r2 = await controller.review({ loopId });
-  assert.equal(r2.status, 'WAITING_FOR_REVIEW');
-  assert.equal(posts.length, 1, 'no duplicate trigger for the same HEAD');
-});
-
-// ---------------------------------------------------------------------------
-// 3. Exact current trigger + trusted Codex bot 👍 -> CLEAN -> PASS.
-// ---------------------------------------------------------------------------
-test('a +1 by the trusted Codex bot on the exact current trigger comment -> PASS', async () => {
-  const be = createGithubReviewBackend({
-    pollIntervalMs: 1, maxWaitMs: 20, sleep: () => Promise.resolve(),
-    transport: {
-      async getPrHead() { return HEAD; },
-      async listReviews() { return [{ login: BOT, state: 'COMMENTED', commitId: HEAD, body: WRAPPER, submittedAt: '2026-09-08', id: 1 }]; },
-      async listReviewComments() { return []; },
-      async listIssueCommentReactions({ commentId }) {
-        assert.match(String(commentId), /issuecomment-777/);
-        return [{ content: '+1', login: BOT }];
-      },
-      async postComment() { return { id: 'https://github.com/o/r/pull/4#issuecomment-777' }; },
-    },
-  });
-  const controller = createReviewLoopController({ persistence: new MemoryPersistence(), prBackend: be });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  const r = await controller.review({ loopId });
-  assert.equal(r.status, 'PASS');
-});
-
-// ---------------------------------------------------------------------------
-// 4. user 👍 / untrusted bot 👍 / eyes / old-trigger 👍 -> never PASS.
-// ---------------------------------------------------------------------------
-for (const [label, reactions] of [
-  ['the PR author', [{ content: '+1', login: 'Jiaze-Li' }]],
-  ['an untrusted bot', [{ content: '+1', login: 'evil-codex[bot]' }]],
-  ['an eyes reaction from the bot', [{ content: 'eyes', login: BOT }]],
-]) {
-  test(`a 👍/reaction by ${label} on the trigger comment does NOT PASS`, async () => {
-    const agg = await backend({
-      reviews: [{ login: BOT, state: 'COMMENTED', commitId: HEAD, body: WRAPPER, submittedAt: '2026-09-08', id: 1 }],
-      reactions,
-    }).findExistingReview({ prNumber: 4, headSha: HEAD, reviewer: 'codex', triggerCommentId: 'https://x#issuecomment-1' });
-    assert.equal(agg, null);
-  });
-}
-
-test('a +1 on an OLD trigger comment (not this HEAD) does not PASS the new HEAD', async () => {
-  // The controller only forwards triggerCommentId when pendingExternalTrigger.head
-  // matches the current HEAD, so an old-round trigger id is simply never passed.
-  const be = createGithubReviewBackend({
-    pollIntervalMs: 1, maxWaitMs: 10, sleep: () => Promise.resolve(),
-    transport: {
-      async getPrHead() { return HEAD_B; },
-      async listReviews() { return []; },
-      async listReviewComments() { return []; },
-      // The 👍 exists ONLY on the OLD trigger comment, never on the new one.
-      async listIssueCommentReactions({ commentId }) {
-        return /issuecomment-OLD/.test(String(commentId)) ? [{ content: '+1', login: BOT }] : [];
-      },
-      async postComment() { return { id: 'https://x#issuecomment-new' }; },
-    },
-  });
-  const persistence = new MemoryPersistence();
-  const controller = createReviewLoopController({ persistence, prBackend: be });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  // Plant a stale pending trigger for a different HEAD.
-  const st = await persistence.readWorkflowState(loopId);
-  st.reviewLoop.pendingExternalTrigger = { head: HEAD, reviewer: 'codex', status: 'TRIGGERED', commentId: 'https://x#issuecomment-OLD' };
-  await persistence.updateWorkflowState(loopId, { reviewLoop: st.reviewLoop });
-  const r = await controller.review({ loopId });
-  assert.notEqual(r.status, 'PASS');
-});
-
-// ---------------------------------------------------------------------------
-// 5. Restart: pending trigger keeps its commentId; resume does not re-trigger.
-// ---------------------------------------------------------------------------
-test('after a restart the pending trigger keeps its exact comment id and resume does not re-trigger', async () => {
-  const posts = [];
-  let reacted = false;
-  const mk = () => createGithubReviewBackend({
-    pollIntervalMs: 1, maxWaitMs: 15, sleep: () => Promise.resolve(),
-    transport: {
-      async getPrHead() { return HEAD; },
-      async listReviews() { return [{ login: BOT, state: 'COMMENTED', commitId: HEAD, body: WRAPPER, submittedAt: '2026-09-08', id: 1 }]; },
-      async listReviewComments() { return []; },
-      async listIssueCommentReactions() { return reacted ? [{ content: '+1', login: BOT }] : []; },
-      async postComment() { posts.push(1); return { id: 'https://github.com/o/r/pull/4#issuecomment-abc' }; },
-    },
-  });
-  const persistence = new MemoryPersistence();
-  const c1 = createReviewLoopController({ persistence, prBackend: mk() });
-  const { loopId } = await c1.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  const w = await c1.review({ loopId });
-  assert.equal(w.status, 'WAITING_FOR_REVIEW');
-  const persisted = await persistence.readWorkflowState(loopId);
-  assert.match(String(persisted.reviewLoop.pendingExternalTrigger.commentId), /issuecomment-abc/);
-
-  // Fresh controller (process restart). The 👍 has now landed.
-  reacted = true;
-  const c2 = createReviewLoopController({ persistence, prBackend: mk() });
-  const r = await c2.review({ loopId });
-  assert.equal(r.status, 'PASS');
-  assert.equal(posts.length, 1, 'resume reused the persisted trigger — never posted a second one');
-});
-
-// ---------------------------------------------------------------------------
-// 6. HEAD moves A -> B mid-wait: an A review/reaction never certifies B.
-// ---------------------------------------------------------------------------
-test('PR HEAD moving during the wait invalidates the stale-commit review', async () => {
-  let polls = 0;
-  const be = createGithubReviewBackend({
-    pollIntervalMs: 1, maxWaitMs: 60, sleep: () => Promise.resolve(),
-    transport: {
-      async getPrHead() { polls += 1; return polls <= 1 ? HEAD : HEAD_B; },
-      async listReviews() {
-        // A clean-looking APPROVED for the OLD head A.
-        return [{ login: BOT, state: 'APPROVED', commitId: HEAD, body: '```json\n{"findings":[]}\n```', submittedAt: '2026-09-08', id: 1 }];
-      },
-      async listReviewComments() { return []; },
-      async listIssueCommentReactions() { return []; },
-      async postComment() { return { id: 'https://x#issuecomment-1' }; },
-    },
-  });
-  const persistence = new MemoryPersistence();
-  const controller = createReviewLoopController({ persistence, prBackend: be });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  const r = await controller.review({ loopId });
-  // The A review must NOT be accepted as a verdict for B. With A's review clean
-  // but B never reviewed, the loop keeps waiting for B.
-  assert.notEqual(r.status, 'PASS');
-  assert.ok(['WAITING_FOR_REVIEW', 'HUMAN_REQUIRED'].includes(r.status), r.status);
-});
 
 // ---------------------------------------------------------------------------
 // 8. A cancelled LOCAL review does not continue into paid Gate / Reviewer spend.
@@ -327,30 +115,31 @@ test('terminateProcessTree resolves done() even if the process group never repor
 // ---------------------------------------------------------------------------
 // Round-2 Codex findings on this change.
 // ---------------------------------------------------------------------------
-test('a transient failure to re-confirm the live PR HEAD does NOT accept the cached review (fail closed)', async () => {
+test('a transient failure to re-confirm the live PR HEAD before PASS fails closed (no stale PASS)', async () => {
   let headCalls = 0;
-  const be = createGithubReviewBackend({
-    pollIntervalMs: 1, maxWaitMs: 10, sleep: () => Promise.resolve(),
-    transport: {
-      async getPrHead() {
-        headCalls += 1;
-        // begin() + the initial currentHead read succeed; every RECHECK fails.
-        if (headCalls <= 2) return HEAD;
-        throw new Error('transient 502 from GitHub');
-      },
-      async listReviews() {
-        return [{ login: BOT, state: 'APPROVED', commitId: HEAD, body: '```json\n{"findings":[]}\n```', submittedAt: '2026-09-08', id: 1 }];
-      },
-      async listReviewComments() { return []; },
-      async listIssueCommentReactions() { return []; },
-      async postComment() { return { id: 'https://x#issuecomment-1' }; },
+  const be = {
+    async resolveRepo() { return { nameWithOwner: 'o/r' }; },
+    async getPrHead() {
+      headCalls += 1;
+      // begin() + the round's initial HEAD read succeed; the pre-PASS RECHECK fails.
+      if (headCalls <= 2) return HEAD;
+      throw new Error('transient 502 from GitHub');
     },
+    async getPrBaseSha() { return 'BASE'; },
+    async getPrDiff() { return 'diff --git a/f b/f\n@@ -1 +1 @@\n-a\n+b\n'; },
+    async getPrChangedFiles() { return ['f']; },
+  };
+  const controller = createReviewLoopController({
+    persistence: new MemoryPersistence(),
+    prBackend: be,
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo t'], manifestFingerprint: 'mf' }),
+    runGateFn: async () => ({ verdict: 'PASS', pass: true, results: [], fingerprint: 'g1', failureIdentities: [] }),
+    reviewerFn: async () => ({ value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } }),
   });
-  const controller = createReviewLoopController({ persistence: new MemoryPersistence(), prBackend: be });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
   const r = await controller.review({ loopId });
   assert.notEqual(r.status, 'PASS', 'a clean review is never accepted while the live HEAD cannot be confirmed');
-  assert.ok(['WAITING_FOR_REVIEW', 'HUMAN_REQUIRED'].includes(r.status), r.status);
+  assert.equal(r.status, 'HUMAN_REQUIRED');
 });
 
 test('an ancient orphan .reclaim guard never permanently blocks lease acquisition', async () => {

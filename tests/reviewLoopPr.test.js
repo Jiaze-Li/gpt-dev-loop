@@ -1,316 +1,245 @@
+// PR target: reviewed by the ONE unified ReviewLoop engine.
+//
+// A PR is a review TARGET (PR base -> exact PR HEAD), never a reviewer
+// transport. The same deterministic Gate, internal Reviewer routing,
+// Supervisor, spend accounting and 3-round convergence policy that judge a
+// LOCAL target judge a PR target. There is no `@codex review` / `@claude
+// review`, no external-review polling, no reaction-as-clean.
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
-import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
-import {
-  ExternalModelTriggerAuthority,
-  ExternalTriggerStore,
-} from '../src/orchestrator/externalModelTriggerAuthority.js';
+import { MemoryPersistence, mockPrBackend, finding } from './helpers/reviewLoopHarness.js';
 
-const TRUSTED_LOGIN = { codex: 'chatgpt-codex-connector[bot]', claude: 'claude[bot]' };
-
-// A raw review carries a real trusted GitHub login + the exact reviewed HEAD,
-// exactly as the real GitHub backend surfaces before checkPrReviewTrust().
-function stamp(raw, headSha, reviewer) {
-  if (!raw) return raw;
-  return { login: TRUSTED_LOGIN[reviewer], headSha, head_sha: headSha, ...raw };
-}
-
-function mockPrBackend({ heads = ['H1'], existing = {}, results = {}, reviewer = 'codex' } = {}) {
-  const state = { headIdx: 0, triggers: [], waits: 0 };
-  return {
-    state,
-    async getPrHead() { return heads[Math.min(state.headIdx, heads.length - 1)]; },
-    advanceHead() { state.headIdx += 1; },
-    async findExistingReview({ headSha }) { return stamp(existing[headSha], headSha, reviewer); },
-    async postReviewTrigger({ headSha, reviewer: r }) { state.triggers.push({ headSha, reviewer: r }); return { id: `comment-${headSha}` }; },
-    async waitForReview({ headSha }) {
-      state.waits += 1;
-      return stamp(results[headSha], headSha, reviewer); // null => detach -> WAITING_FOR_REVIEW
-    },
-  };
-}
-
-function build({ prBackend }) {
-  const persistence = new MemoryPersistence();
-  const calls = { supervisor: 0 };
+function build({
+  prBackend, reviews = [], gates = [], supervisorReplies = [], onReviewer, persistence = new MemoryPersistence(),
+} = {}) {
+  const calls = { reviewer: 0, supervisor: 0, gate: 0 };
+  let ri = 0;
+  let gi = 0;
+  let si = 0;
   const controller = createReviewLoopController({
     persistence,
     prBackend,
-    supervisorFn: async () => { calls.supervisor += 1; return { value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }; },
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo test'], manifestFingerprint: 'mf' }),
+    runGateFn: async () => {
+      const g = gates[gi] ?? gates[gates.length - 1] ?? { verdict: 'PASS' };
+      gi += 1;
+      calls.gate += 1;
+      return {
+        pass: g.verdict !== 'FAIL', results: [], fingerprint: `g${gi}`, failureIdentities: [], ...g,
+      };
+    },
+    reviewerFn: async (args) => {
+      const r = reviews[ri] ?? reviews[reviews.length - 1] ?? { findings: [] };
+      ri += 1;
+      calls.reviewer += 1;
+      onReviewer?.(args);
+      return { value: r, usage: { input_tokens: 3, output_tokens: 2 }, model: 'test-reviewer' };
+    },
+    supervisorFn: async () => {
+      const s = supervisorReplies[si] ?? { guidance: 'g', recommendation: 'REWORK' };
+      si += 1;
+      calls.supervisor += 1;
+      return { value: s, usage: { input_tokens: 1, output_tokens: 1 } };
+    },
   });
   return { controller, persistence, calls };
 }
 
-test('existing current-head review is reused — no new @codex trigger', async () => {
-  const backend = mockPrBackend({
-    heads: ['H1'],
-    existing: { H1: { findings: [{ severity: 'P3', file: 'a.js', title: 'nit' }], head_sha: 'H1' } },
-  });
-  const { controller } = build({ prBackend: backend });
-  const { loopId } = await controller.begin({ goal: 'fix pr', cwd: '/r', prNumber: 4, reviewer: 'codex' });
+// A -- PR target uses the internal Reviewer pool, not an external trigger.
+test('A: PR review runs the internal Reviewer, not an external trigger', async () => {
+  const backend = mockPrBackend({ heads: ['H1'] });
+  const { controller, calls } = build({ prBackend: backend, reviews: [{ findings: [] }] });
+  const { loopId, ...begun } = await controller.begin({ goal: 'fix pr', cwd: '/r', prNumber: 4 });
+  assert.equal(begun.mode, 'PR');
+  assert.equal(begun.reviewer, 'internal');
   const r = await controller.review({ loopId });
   assert.equal(r.status, 'PASS');
-  assert.equal(backend.state.triggers.length, 0);
+  assert.equal(calls.reviewer, 1);
+  assert.equal(calls.gate, 1);
+  assert.equal(typeof backend.postReviewTrigger, 'undefined');
+  assert.equal(typeof backend.waitForReview, 'undefined');
 });
 
-test('no current-head review -> exactly one trigger, then findings', async () => {
+// B -- the PR base->head delta is the Reviewer evidence.
+test('B: the Reviewer sees the PR base->HEAD diff', async () => {
   const backend = mockPrBackend({
-    heads: ['H1'],
-    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
+    base: 'BASE9', heads: ['H1'],
+    diffByHead: { H1: 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+PR_DIFF_BODY\n' },
   });
-  const { controller } = build({ prBackend: backend });
-  const { loopId } = await controller.begin({ goal: 'fix pr', cwd: '/r', prNumber: 4, reviewer: 'codex' });
-  const r = await controller.review({ loopId });
-  assert.equal(backend.state.triggers.length, 1);
-  assert.equal(r.status, 'REWORK');
-  assert.equal(r.blockingFindings.length, 1);
+  let seen = null;
+  const { controller } = build({
+    prBackend: backend, reviews: [{ findings: [] }], onReviewer: (a) => { seen = a; },
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 7 });
+  await controller.review({ loopId });
+  assert.match(seen.diff, /PR_DIFF_BODY/);
+  assert.deepEqual(seen.changedFiles, ['f.js']);
 });
 
-test('P3-only PR review -> PASS', async () => {
-  const backend = mockPrBackend({ heads: ['H1'], results: { H1: { findings: [{ severity: 'P3', file: 'a', title: 'n' }], head_sha: 'H1' } } });
-  const { controller } = build({ prBackend: backend });
+// C -- CLEAN + final HEAD unchanged -> PASS.
+test('C: Reviewer CLEAN and the PR HEAD still current -> PASS', async () => {
+  const backend = mockPrBackend({ heads: ['H1'] });
+  const { controller } = build({ prBackend: backend, reviews: [{ findings: [finding('P3')] }] });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
-  assert.equal((await controller.review({ loopId })).status, 'PASS');
+  const r = await controller.review({ loopId });
+  assert.equal(r.status, 'PASS');
 });
 
-test('detached wait -> WAITING_FOR_REVIEW is durable and does not re-trigger on resume', async () => {
-  const backend = mockPrBackend({ heads: ['H1'], results: { H1: null } });
-  const { controller, persistence } = build({ prBackend: backend });
+// D -- CLEAN but the PR HEAD moved during the review -> never PASS the stale review.
+test('D: Reviewer CLEAN but the PR HEAD moved -> not PASS', async () => {
+  // getPrHead: 1st (observed)=H1, every later call=H2 -> the pre-PASS recheck
+  // and every rebind see a moving HEAD.
+  const backend = mockPrBackend({ movingHead: true });
+  const { controller, persistence } = build({ prBackend: backend, reviews: [{ findings: [] }] });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+  const r = await controller.review({ loopId });
+  assert.notEqual(r.status, 'PASS');
+  assert.equal(r.status, 'WAITING_FOR_REVIEW');
+  const st = await persistence.readWorkflowState(loopId);
+  assert.notEqual(st.reviewLoop.state, 'PASS');
+  // The stale-HEAD event was recorded.
+  assert.ok((r.safetyEvents ?? []).some((e) => e.code === 'REVIEWLOOP_PR_HEAD_MOVED_DURING_REVIEW'));
+});
+
+// E -- blocking finding -> REWORK; a new HEAD lets the next round run.
+test('E: blocking PR finding -> REWORK, then the next HEAD -> a fresh round', async () => {
+  const backend = mockPrBackend({ heads: ['H1', 'H2'] });
+  const { controller } = build({
+    prBackend: backend,
+    reviews: [{ findings: [finding('P1')] }, { findings: [] }],
+  });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
   const r1 = await controller.review({ loopId });
-  assert.equal(r1.status, 'WAITING_FOR_REVIEW');
-  assert.equal(backend.state.triggers.length, 1);
-  const persisted = await persistence.readWorkflowState(loopId);
-  assert.equal(persisted.reviewLoop.state, 'WAITING_FOR_REVIEW');
-  assert.equal(persisted.reviewLoop.pendingExternalTrigger.head, 'H1');
-  // resume: still no result -> still WAITING, still no duplicate trigger
-  const r2 = await controller.review({ loopId });
-  assert.equal(r2.status, 'WAITING_FOR_REVIEW');
-  assert.equal(backend.state.triggers.length, 1);
-});
+  assert.equal(r1.status, 'REWORK');
+  assert.equal(r1.round, 1);
+  assert.equal(r1.blockingFindings.length, 1);
 
-test('a triggered same-HEAD reviewer that hangs past the wall clock is caught on the reattach path (not polled forever)', async () => {
-  const persistence = new MemoryPersistence();
-  const existing = {};
-  const backend = mockPrBackend({ heads: ['H1'], results: { H1: null }, existing });
-  const nowRef = { t: Date.parse('2026-09-09T02:00:00.000Z') };
-  const events = [];
-  const triggerAuthority = new ExternalModelTriggerAuthority({
-    store: new ExternalTriggerStore(persistence),
-    maxExternalModelTriggers: 7,
-    maxExternalReviewRounds: 7,
-    clock: { now: () => nowRef.t },
-    recordSafetyEvent: (e) => events.push(e),
-  });
-  const controller = createReviewLoopController({
-    persistence,
-    prBackend: backend,
-    triggerAuthority,
-    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }),
-  });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+  // No push yet -> PUSH_REQUIRED, Reviewer not re-run.
+  const rp = await controller.review({ loopId });
+  assert.equal(rp.status, 'PUSH_REQUIRED');
 
-  // Round 1: trigger posted for H1, no result yet -> WAITING (reattach primed).
-  assert.equal((await controller.review({ loopId })).status, 'WAITING_FOR_REVIEW');
-  assert.equal(backend.state.triggers.length, 1);
-
-  // Still within the round's deadline: reattach keeps waiting, no dead-end.
-  nowRef.t += 50 * 60 * 1000;
-  assert.equal((await controller.review({ loopId })).status, 'WAITING_FOR_REVIEW');
-
-  // The triggered reviewer never returns; past one round's wall-clock ceiling.
-  nowRef.t += 20 * 60 * 1000; // now 70 min in, deadline was 60 min
-  const timedOut = await controller.review({ loopId });
-  assert.equal(timedOut.status, 'HUMAN_REQUIRED', 'a hung same-HEAD reviewer is not polled forever');
-  assert.match(timedOut.reason, /wall-clock ceiling/);
-  assert.ok(events.some((e) => e.code === 'EXTERNAL_MODEL_TRIGGER_WALL_CLOCK_EXCEEDED'
-    && /in-flight review/.test(e.reason)));
-  assert.equal(backend.state.triggers.length, 1, 'no new trigger was posted');
-
-  // Not a permanent dead-end: a late review that finally lands is still ingested
-  // (findExistingReview runs before the reattach deadline check).
-  existing.H1 = { findings: [{ severity: 'P1', file: 'a.js', title: 'late bug' }], head_sha: 'H1' };
-  const late = await controller.review({ loopId });
-  assert.equal(late.status, 'REWORK');
-  assert.equal(backend.state.triggers.length, 1, 'the late review was ingested without a new trigger');
-});
-
-test('local fix not pushed (PR head unchanged, prior actionable) -> PUSH_REQUIRED, no re-review', async () => {
-  const backend = mockPrBackend({
-    heads: ['H1'],
-    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
-  });
-  const { controller } = build({ prBackend: backend });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
-  await controller.review({ loopId });                 // round 1: REWORK on H1
-  const r2 = await controller.review({ loopId });       // head still H1
-  assert.equal(r2.status, 'PUSH_REQUIRED');
-  assert.equal(backend.state.triggers.length, 1);       // no second trigger
-});
-
-test('new head after push -> old review invalidated, one fresh trigger for H2', async () => {
-  const backend = mockPrBackend({
-    heads: ['H1', 'H2'],
-    results: {
-      H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' },
-      H2: { findings: [{ severity: 'P3', file: 'a.js', title: 'nit' }], head_sha: 'H2' },
-    },
-  });
-  const { controller } = build({ prBackend: backend });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
-  await controller.review({ loopId });            // H1 REWORK
-  backend.advanceHead();                          // worker pushed H2
+  backend.advanceHead(); // Worker pushed H2
   const r2 = await controller.review({ loopId });
   assert.equal(r2.status, 'PASS');
-  assert.deepEqual(backend.state.triggers.map((t) => t.headSha), ['H1', 'H2']);
+  assert.equal(r2.round, 2);
 });
 
-test('round 3 still blocking -> HUMAN_REQUIRED', async () => {
-  const backend = mockPrBackend({
-    heads: ['H1', 'H2', 'H3'],
-    results: {
-      H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'b' }], head_sha: 'H1' },
-      H2: { findings: [{ severity: 'P1', file: 'a.js', title: 'b' }], head_sha: 'H2' },
-      H3: { findings: [{ severity: 'P1', file: 'a.js', title: 'b' }], head_sha: 'H3' },
+// F -- durable audit record.
+test('F: every PR round writes a recoverable, tamper-evident audit record', async () => {
+  const backend = mockPrBackend({ base: 'BASEabc', heads: ['H1'] });
+  const { controller, persistence } = build({ prBackend: backend, reviews: [{ findings: [] }] });
+  const { loopId } = await controller.begin({ goal: 'audit me', cwd: '/r', prNumber: 12 });
+  await controller.review({ loopId });
+  const audit = (await persistence.readWorkflowState(loopId)).reviewLoop.audit;
+  assert.equal(audit.length, 1);
+  const rec = audit[0];
+  assert.equal(rec.target.type, 'PR');
+  assert.equal(rec.target.repository, 'acme/repo');
+  assert.equal(rec.target.prNumber, 12);
+  assert.equal(rec.target.baseSha, 'BASEabc');
+  assert.equal(rec.target.reviewedHeadSha, 'H1');
+  assert.equal(rec.target.finalObservedHeadSha, 'H1');
+  assert.equal(rec.target.headStillCurrent, true);
+  assert.equal(rec.result, 'PASS');
+  assert.equal(rec.review.reviewer, 'internal');
+  assert.ok(rec.gate && rec.gate.verdict);
+  assert.ok(rec.spend && typeof rec.spend.reviewerCalls === 'number');
+  assert.ok(rec.objective.fingerprint);
+  assert.ok(rec.targetFingerprint);
+});
+
+// G -- resume keeps the exact PR snapshot identity.
+test('G: a resumed PR loop keeps its frozen snapshot identity', async () => {
+  const backend = mockPrBackend({ base: 'B1', heads: ['H1', 'H2'] });
+  const persistence = new MemoryPersistence();
+  const { controller } = build({
+    prBackend: backend, persistence, reviews: [{ findings: [finding('P1')] }, { findings: [] }],
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+  await controller.review({ loopId });
+  const obj = (await persistence.readWorkflowState(loopId)).reviewLoop.objective;
+  assert.equal(obj.prBaseSha, 'B1');
+  assert.equal(obj.reviewedHeadSha, 'H1');
+  assert.equal(obj.prNumber, 4);
+  // A fresh controller over the SAME persistence resumes without losing identity.
+  const { controller: c2 } = build({ prBackend: backend, persistence, reviews: [{ findings: [] }] });
+  backend.advanceHead();
+  const r = await c2.review({ loopId });
+  assert.equal(r.status, 'PASS');
+  const obj2 = (await persistence.readWorkflowState(loopId)).reviewLoop.objective;
+  assert.equal(obj2.reviewedHeadSha, 'H1', 'the frozen begin-time HEAD is unchanged');
+});
+
+// H -- tampered persisted PR identity -> objective integrity fails closed.
+test('H: editing the persisted PR base/HEAD SHA fails the objective integrity check', async () => {
+  const backend = mockPrBackend({ base: 'B1', heads: ['H1'] });
+  const { controller, persistence } = build({ prBackend: backend, reviews: [{ findings: [] }] });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
+
+  const raw = await persistence.readWorkflowState(loopId);
+  raw.reviewLoop.objective.prBaseSha = 'ATTACKER_BASE';
+  await persistence.writeWorkflowState(loopId, raw);
+
+  await assert.rejects(() => controller.review({ loopId }), /weakened|integrity|fingerprint/i);
+});
+
+// I -- no external-review path is ever taken.
+test('I: the PR review path never calls an external reviewer trigger or poll', async () => {
+  const backend = mockPrBackend({ heads: ['H1', 'H2', 'H3'] });
+  let externalTouch = 0;
+  const proxied = new Proxy(backend, {
+    get(t, p) {
+      if (['postReviewTrigger', 'waitForReview', 'findExistingReview', 'listIssueCommentReactions', 'listReviews'].includes(p)) {
+        externalTouch += 1;
+      }
+      return t[p];
     },
   });
-  const { controller } = build({ prBackend: backend });
+  const { controller } = build({ prBackend: proxied, reviews: [{ findings: [finding('P1')] }] });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
-  await controller.review({ loopId }); backend.advanceHead();
-  await controller.review({ loopId }); backend.advanceHead();
-  const r3 = await controller.review({ loopId });
-  assert.equal(r3.status, 'HUMAN_REQUIRED');
+  await controller.review({ loopId });
+  backend.advanceHead();
+  await controller.review({ loopId });
+  assert.equal(externalTouch, 0);
 });
 
-test('ReviewLoop never pushes / merges — controller exposes no such op', async () => {
-  const src = await import('node:fs').then((fs) => fs.promises.readFile(new URL('../src/reviewloop/prReviewController.js', import.meta.url), 'utf8'));
-  assert.doesNotMatch(src, /git push|gh pr merge|forcePush|--force/);
-});
-
-// B9 — PR reviewer default is codex, never internal.
-test('reviewloop_begin({ prNumber }) with no reviewer defaults to codex', async () => {
-  const backend = mockPrBackend({ heads: ['H1'], results: { H1: { findings: [] } } });
-  const { controller, persistence } = build({ prBackend: backend });
-  const begun = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 }); // no reviewer
-  assert.equal(begun.reviewer, 'codex');
-  const state = await persistence.readWorkflowState(begun.loopId);
-  assert.equal(state.reviewLoop.objective.reviewer, 'codex');
-  await controller.review({ loopId: begun.loopId });
-  assert.deepEqual(backend.state.triggers.map((t) => t.reviewer), ['codex']);
-});
-
-test('a cancelled PR review never posts an external trigger', async () => {
-  const backend = mockPrBackend({
-    heads: ['H1'],
-    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
+// PR reviewer identity is always internal — no external reviewer concept.
+test('PR objective reviewer is always internal', async () => {
+  const { createReviewObjective } = await import('../src/reviewloop/objective.js');
+  const o = createReviewObjective({
+    loopId: 'l', goal: 'g', mode: 'PR', prNumber: 4, prBaseSha: 'B', reviewedHeadSha: 'H',
   });
+  assert.equal(o.reviewer, 'internal');
+});
+
+// begin fails closed when the PR snapshot cannot be resolved.
+test('begin fails closed when the PR base SHA cannot be resolved', async () => {
+  const backend = mockPrBackend({ heads: ['H1'] });
+  backend.getPrBaseSha = async () => null;
   const { controller } = build({ prBackend: backend });
+  await assert.rejects(
+    () => controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 }),
+    /cannot resolve the base SHA/,
+  );
+});
+
+// a cancelled PR review never reaches the Reviewer.
+test('a cancelled PR review stops before the Reviewer', async () => {
+  const backend = mockPrBackend({ heads: ['H1'] });
+  const { controller, calls } = build({ prBackend: backend, reviews: [{ findings: [finding('P1')] }] });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
   const ac = new AbortController();
   ac.abort();
   const r = await controller.review({ loopId, signal: ac.signal });
   assert.equal(r.status, 'HUMAN_REQUIRED');
-  assert.notEqual(r.terminal, true, 'a cancellation is not budget-exhausted');
-  assert.equal(backend.state.triggers.length, 0, 'no @codex trigger posted for an abandoned request');
-  assert.equal(backend.state.waits, 0, 'never waited on a review');
+  assert.notEqual(r.terminal, true);
+  assert.equal(calls.reviewer, 0);
 });
 
-test('the trigger dispatch callback rechecks cancellation before posting', async () => {
-  const backend = mockPrBackend({
-    heads: ['H1'],
-    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
-  });
-  const sig = { aborted: false };
-  // A trigger authority that lets the pre-dispatch checks pass, then models the
-  // caller aborting during dispatch()'s durable write — just before the callback.
-  const triggerAuthority = {
-    async authorize() { return { outcome: 'DISPATCH', permit: { id: 'p1' } }; },
-    reservationIdFor() { return 'r1'; },
-    async dispatch(_permit, _intent, cb) { sig.aborted = true; return cb(); },
-    async recordResult() {},
-  };
-  const controller = createReviewLoopController({
-    persistence: new MemoryPersistence(),
-    prBackend: backend,
-    triggerAuthority,
-    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }),
-  });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
-  const r = await controller.review({ loopId, signal: sig });
-  assert.equal(r.status, 'HUMAN_REQUIRED');
-  assert.equal(backend.state.triggers.length, 0, 'the callback bailed before postReviewTrigger');
-});
-
-test('a pre-post cancellation rolls the reservation back — the HEAD is not permanently blocked, budget restored', async () => {
-  const persistence = new MemoryPersistence();
-  const backend = mockPrBackend({
-    heads: ['H1'],
-    results: { H1: { findings: [{ severity: 'P1', file: 'a.js', title: 'bug' }], head_sha: 'H1' } },
-  });
-  const realAuth = new ExternalModelTriggerAuthority({
-    store: new ExternalTriggerStore(persistence),
-    maxExternalModelTriggers: 7,
-    maxExternalReviewRounds: 7,
-  });
-  const sig = { aborted: false };
-  // Wrap the real authority: model the caller aborting during dispatch()'s
-  // durable DISPATCHING write, i.e. just before the callback runs.
-  const triggerAuthority = {
-    authorize: (i) => realAuth.authorize(i),
-    reservationIdFor: (p) => realAuth.reservationIdFor(p),
-    recordResult: (r) => realAuth.recordResult(r),
-    dispatch: (permit, intent, cb) => realAuth.dispatch(permit, intent, async () => { sig.aborted = true; return cb(); }),
-  };
-  const controller = createReviewLoopController({
-    persistence,
-    prBackend: backend,
-    triggerAuthority,
-    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }),
-  });
-  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
-
-  const r1 = await controller.review({ loopId, signal: sig });
-  assert.equal(r1.status, 'HUMAN_REQUIRED');
-  assert.equal(backend.state.triggers.length, 0, 'nothing was posted');
-
-  // The same HEAD is still triggerable — not latched as a duplicate/UNRESOLVED.
-  sig.aborted = false;
-  const r2 = await controller.review({ loopId });
-  assert.equal(r2.status, 'REWORK');
-  assert.equal(backend.state.triggers.length, 1, 'the retried review posted exactly one trigger for H1');
-});
-
-test('reviewloop_begin threads the caller AbortSignal into the baseline Gate', async () => {
-  const persistence = new MemoryPersistence();
-  let gateSawSignal = 'not-called';
-  const controller = createReviewLoopController({
-    persistence,
-    captureBaselineFn: async () => ({ head: 'H', baselineRef: 'H', dirtyFiles: [], untrackedHashes: {}, evidenceComplete: true }),
-    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo hi'], manifestFingerprint: 'mf' }),
-    runGateFn: async ({ signal }) => { gateSawSignal = signal ? 'yes' : 'no'; return { verdict: 'PASS', pass: true, results: [], evidence: {} }; },
-  });
-  const ok = new AbortController();
-  await controller.begin({ goal: 'g', cwd: '/r', signal: ok.signal });
-  assert.equal(gateSawSignal, 'yes', 'the Gate invocation received the request signal');
-
-  // An already-cancelled begin aborts before the Gate runs at all.
-  gateSawSignal = 'not-called';
-  const cancelled = new AbortController();
-  cancelled.abort();
-  await assert.rejects(
-    () => controller.begin({ goal: 'g', cwd: '/r', signal: cancelled.signal }),
-    /cancelled by the caller/,
-  );
-  assert.equal(gateSawSignal, 'not-called', 'the Gate never ran for a cancelled begin');
-});
-
-test('an internal identity can never be a PR reviewer', async () => {
-  const { createReviewObjective } = await import('../src/reviewloop/objective.js');
-  assert.throws(() => createReviewObjective({ loopId: 'l', goal: 'g', mode: 'PR', prNumber: 4, reviewer: 'internal' }), /PR reviewer must be one of/);
-});
-
-test('PR mode with an unknown reviewer is rejected', async () => {
-  const { createReviewObjective } = await import('../src/reviewloop/objective.js');
-  assert.throws(() => createReviewObjective({ loopId: 'l', goal: 'g', mode: 'PR', prNumber: 4, reviewer: 'gpt-9' }), /PR reviewer must be one of/);
+// ReviewLoop still never pushes / merges.
+test('the controller exposes no push / merge / force-push operation', async () => {
+  const src = await import('node:fs').then((fs) => fs.promises.readFile(new URL('../src/reviewloop/controller.js', import.meta.url), 'utf8'));
+  assert.doesNotMatch(src, /git push|gh pr merge|forcePush|--force\b/);
 });

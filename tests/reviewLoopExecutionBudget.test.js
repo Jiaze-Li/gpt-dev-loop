@@ -7,33 +7,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
-import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
+import { MemoryPersistence, mockPrBackend } from './helpers/reviewLoopHarness.js';
 
-const TRUSTED = { codex: 'chatgpt-codex-connector[bot]', claude: 'claude[bot]' };
 const P1 = { severity: 'P1', file: 'a.js', title: 'bug' };
 
-function stamp(raw, headSha, reviewer = 'codex') {
-  if (!raw) return raw;
-  return { login: TRUSTED[reviewer], headSha, head_sha: headSha, ...raw };
-}
-
-function mockPrBackend({ heads = ['H1', 'H2', 'H3', 'H4'], results = {} } = {}) {
-  const state = { headIdx: 0, triggers: [], waits: 0 };
-  return {
-    state,
-    async getPrHead() { return heads[Math.min(state.headIdx, heads.length - 1)]; },
-    advanceHead() { state.headIdx += 1; },
-    async findExistingReview() { return null; },
-    async postReviewTrigger({ headSha }) { state.triggers.push(headSha); return { id: `c-${headSha}` }; },
-    async waitForReview({ headSha }) { state.waits += 1; return stamp(results[headSha] ?? { findings: [P1] }, headSha); },
-  };
-}
-
-function prController(persistence, prBackend) {
+// A PR-review controller wired to the ONE unified engine: deterministic Gate +
+// internal Reviewer. `resultByHead` maps a PR HEAD SHA to the reviewer payload.
+function prController(persistence, prBackend, {
+  resultByHead = {}, defaultResult = { findings: [P1] }, supervisorFn,
+} = {}) {
   return createReviewLoopController({
     persistence,
     prBackend,
-    supervisorFn: async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } }),
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo test'], manifestFingerprint: 'mf' }),
+    runGateFn: async () => ({ verdict: 'PASS', pass: true, results: [], fingerprint: `g${Math.random()}`, failureIdentities: [] }),
+    reviewerFn: async () => ({
+      value: resultByHead[prBackend.head()] ?? defaultResult,
+      usage: { input_tokens: 1, output_tokens: 1 },
+      model: 'test-reviewer',
+    }),
+    supervisorFn: supervisorFn
+      ?? (async () => ({ value: { guidance: 'g', recommendation: 'REWORK' }, usage: { input_tokens: 1, output_tokens: 1 } })),
   });
 }
 
@@ -50,9 +44,11 @@ function localController(persistence, { reviews }) {
   });
 }
 
+const PR_HEADS = ['H1', 'H2', 'H3', 'H4'];
+
 test('PR: a loop runs at most 3 review rounds; round 3 still blocking -> HUMAN_REQUIRED', async () => {
   const persistence = new MemoryPersistence();
-  const backend = mockPrBackend();
+  const backend = mockPrBackend({ heads: PR_HEADS });
   const controller = prController(persistence, backend);
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
 
@@ -67,7 +63,7 @@ test('PR: a loop runs at most 3 review rounds; round 3 still blocking -> HUMAN_R
 
 test('PR: HUMAN_REQUIRED is terminal — a further reviewloop_review cannot continue the loop', async () => {
   const persistence = new MemoryPersistence();
-  const backend = mockPrBackend();
+  const backend = mockPrBackend({ heads: PR_HEADS });
   const controller = prController(persistence, backend);
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
   await controller.review({ loopId }); backend.advanceHead();
@@ -75,16 +71,14 @@ test('PR: HUMAN_REQUIRED is terminal — a further reviewloop_review cannot cont
   const r3 = await controller.review({ loopId });
   assert.equal(r3.status, 'HUMAN_REQUIRED');
 
-  const triggersBefore = backend.state.triggers.length;
-  const waitsBefore = backend.state.waits;
+  const diffReadsBefore = backend.state.diffReads;
   backend.advanceHead(); // "Worker pushed a new HEAD and tried again"
   const r4 = await controller.review({ loopId });
   assert.equal(r4.status, 'HUMAN_REQUIRED', 'still terminal, not REVIEWING/REWORK');
   assert.equal(r4.terminal, true);
   assert.match(r4.reason, /budget is spent|already reached HUMAN_REQUIRED/);
   assert.equal(r4.round, 3, 'the round counter did not advance');
-  assert.equal(backend.state.triggers.length, triggersBefore, 'no new external review trigger');
-  assert.equal(backend.state.waits, waitsBefore, 'the Reviewer was not re-run');
+  assert.equal(backend.state.diffReads, diffReadsBefore, 'the PR was not re-reviewed');
 
   const persisted = await persistence.readWorkflowState(loopId);
   assert.equal(persisted.reviewLoop.state, 'HUMAN_REQUIRED');
@@ -92,7 +86,7 @@ test('PR: HUMAN_REQUIRED is terminal — a further reviewloop_review cannot cont
 
 test('PR: a new independent reviewloop_begin starts a fresh budget from round 1', async () => {
   const persistence = new MemoryPersistence();
-  const b1 = mockPrBackend();
+  const b1 = mockPrBackend({ heads: PR_HEADS });
   const c1 = prController(persistence, b1);
   const first = await c1.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
   await c1.review({ loopId: first.loopId }); b1.advanceHead();
@@ -100,8 +94,8 @@ test('PR: a new independent reviewloop_begin starts a fresh budget from round 1'
   assert.equal((await c1.review({ loopId: first.loopId })).status, 'HUMAN_REQUIRED');
 
   // The user says "continue PR #4" -> a new task -> a new loop, fresh budget.
-  const b2 = mockPrBackend({ heads: ['H9'], results: { H9: { findings: [] } } });
-  const c2 = prController(persistence, b2);
+  const b2 = mockPrBackend({ heads: ['H9'] });
+  const c2 = prController(persistence, b2, { defaultResult: { findings: [] } });
   const second = await c2.begin({ goal: 'continue PR #4', cwd: '/r', prNumber: 4 });
   assert.notEqual(second.loopId, first.loopId);
   assert.equal(second.status, 'READY');
@@ -112,12 +106,10 @@ test('PR: a new independent reviewloop_begin starts a fresh budget from round 1'
 
 test('PR: a settled-but-unusable Supervisor result degrades to a plain REWORK — loop not stalled, budget not spent', async () => {
   const persistence = new MemoryPersistence();
-  // Same P1 on H1 and H2 -> round 2 triggers the Supervisor.
-  const backend = mockPrBackend({ heads: ['H1', 'H2', 'H3', 'H4'] });
+  // Same P1 on every HEAD -> round 2 triggers the Supervisor.
+  const backend = mockPrBackend({ heads: PR_HEADS });
   let supCalls = 0;
-  const controller = createReviewLoopController({
-    persistence,
-    prBackend: backend,
+  const controller = prController(persistence, backend, {
     // A call that SETTLES (known usage) but yields no usable guidance -> a
     // degradable transient failure, NOT terminal.
     supervisorFn: async () => {
@@ -153,10 +145,8 @@ test('PR: a settled-but-unusable Supervisor result degrades to a plain REWORK �
 
 test('PR: a Supervisor call dispatched with unresolvable usage is the deliberate fail-closed stop (not a degrade)', async () => {
   const persistence = new MemoryPersistence();
-  const backend = mockPrBackend({ heads: ['H1', 'H2', 'H3', 'H4'] });
-  const controller = createReviewLoopController({
-    persistence,
-    prBackend: backend,
+  const backend = mockPrBackend({ heads: PR_HEADS });
+  const controller = prController(persistence, backend, {
     // Provider threw mid-call: the reservation cannot be settled (UNKNOWN != ZERO).
     supervisorFn: async () => { throw new Error('socket hang up'); },
   });
@@ -175,8 +165,8 @@ test('PR: a Supervisor call dispatched with unresolvable usage is the deliberate
 
 test('PR: a clean review PASSes normally', async () => {
   const persistence = new MemoryPersistence();
-  const backend = mockPrBackend({ heads: ['H1'], results: { H1: { findings: [{ severity: 'P3', file: 'a', title: 'nit' }] } } });
-  const controller = prController(persistence, backend);
+  const backend = mockPrBackend({ heads: ['H1'] });
+  const controller = prController(persistence, backend, { defaultResult: { findings: [{ severity: 'P3', file: 'a', title: 'nit' }] } });
   const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 4 });
   assert.equal((await controller.review({ loopId })).status, 'PASS');
 });
