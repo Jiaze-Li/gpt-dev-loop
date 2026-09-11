@@ -431,7 +431,18 @@ export function createReviewLoopController({
     for (let attempt = startAttempt; attempt < startAttempt + maxAttempts; attempt += 1) {
       let selection = null;
       if (routeFn) {
-        selection = routeFn({ reworkCycles: attempt - startAttempt });
+        // Per-call audit attribution — passed fresh on every call, never
+        // stored on the (long-lived, shared-across-loops) router. Built from
+        // whatever this specific physical attempt already carries.
+        const requestContext = {
+          loopId: workflowId ?? null,
+          operationId: operationId ?? null,
+          attempt,
+          round: auditContext?.round ?? null,
+          chunkIndex: auditContext?.chunkIndex ?? null,
+          chunkTotal: auditContext?.chunkTotal ?? null,
+        };
+        selection = routeFn({ reworkCycles: attempt - startAttempt }, requestContext);
         if (!selection) break;
         if (tried.has(selection.family)) break;
         tried.add(selection.family);

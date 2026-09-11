@@ -156,8 +156,16 @@ export class ProviderHealthRegistry {
   get(target) {
     return this.candidates.get(target) ?? this.providers.get(target) ?? { provider: target, status: 'UNKNOWN', checkedAt: null, reason: null };
   }
-  record(target, status, reason = null) {
-    const entry = { provider: target, status, reason, checkedAt: nowIso(this.now()) };
+  // `reasonCode` is a structured, enumerated classification of WHY (distinct
+  // from `reason`, a free-text detail) — e.g. 'AGY_PROVISIONING_FAILED' vs
+  // 'AGY_EFFECTIVE_LOADING_FAILED' vs a post-dispatch PROVIDER_TIMEOUT. A
+  // stale-health revalidator MUST look at this before claiming recovery: it
+  // can only legitimately re-verify the failure class it actually re-probes,
+  // never every UNAVAILABLE regardless of origin.
+  record(target, status, reason = null, { reasonCode = null } = {}) {
+    const entry = {
+      provider: target, status, reason, reasonCode, checkedAt: nowIso(this.now()),
+    };
     if (typeof target === 'string' && target.includes(':')) {
       this.candidates.set(target, entry);
     } else {
@@ -201,6 +209,10 @@ export const ROUTE_SKIP_REASONS = Object.freeze({
   HIGH_CONTEXT: 'high_context',
   QUOTA_COOLDOWN: 'quota_cooldown',
   PROVIDER_HEALTH: 'provider_health',
+  // No transport function is actually wired for this family in THIS process
+  // — independent of what health/quota say. Checked before health so a
+  // family that was never wired is never even offered to revalidation.
+  NO_TRANSPORT: 'no_transport',
 });
 const ROUTE_SKIP_REASON_VALUES = new Set(Object.values(ROUTE_SKIP_REASONS));
 
@@ -303,22 +315,22 @@ export class RoleRouter {
     // disk; production wiring injects a disk-backed instance.
     routeAudit = new RouteAuditLog(),
     // Zero-token, synchronous re-probe for a candidate whose health record is
-    // stale: (family, provider) -> { available: boolean, reason?: string } |
-    // null | undefined. null/undefined means "no opinion" (the stale record
-    // is trusted as-is, i.e. current behaviour). Never call a model here —
-    // it must be a cheap local check (file/process probe), never a paid one.
+    // stale: (family, provider, entry) -> { available: boolean, reason?:
+    // string } | null | undefined, where `entry` is the FULL blocking health
+    // entry (status/reason/reasonCode/checkedAt) so the revalidator can
+    // refuse to opine on a failure class it cannot actually re-verify
+    // zero-token. null/undefined means "no opinion" (the stale record is
+    // trusted as-is, i.e. current behaviour). Never call a model here — it
+    // must be a cheap local check (file/process probe), never a paid one.
     healthRevalidator = null,
     // A provider_health skip older than this is eligible for revalidation.
     // AUTH_FAILED entries are never auto-revalidated (an auth break needs a
     // human, not a retry loop).
     staleHealthTtlMs = 10 * 60 * 1000,
-    // Attached to every persisted decision so a durable audit entry can be
-    // traced back to the loop/round that produced it.
-    context = {},
     now = () => Date.now(),
   } = {}) {
     this.rolePolicy = rolePolicy ?? DEFAULT_ROLE_POLICY; this.quotaRegistry = quotaRegistry; this.providerHealth = providerHealth; this.effortPolicy = effortPolicy; this.resolveFamily = resolveFamily; this.onEvent = onEvent; this.resolutions = new Map();
-    this.routeAudit = routeAudit; this.healthRevalidator = healthRevalidator; this.staleHealthTtlMs = staleHealthTtlMs; this.context = context; this.now = now;
+    this.routeAudit = routeAudit; this.healthRevalidator = healthRevalidator; this.staleHealthTtlMs = staleHealthTtlMs; this.now = now;
   }
   // Persist ONE routing decision (a skip or a selection). Fails closed:
   // - an unenumerated skip reason is refused before any attempt to persist it
@@ -328,14 +340,27 @@ export class RoleRouter {
   // The legacy in-memory onEvent hook still fires with the exact same event
   // shape as before this feature existed — nothing that already listens on
   // onEvent observes a difference.
-  _decide(rawEntry) {
+  // `requestContext` is passed in FRESH by the caller on every route() call
+  // (see route() below) — never read from shared instance state. RoleRouter
+  // is constructed once and reused across every loop/round for the life of
+  // the process, so attribution can only be correct if it travels with the
+  // call, not with the (singleton, concurrently-shared) router instance.
+  _decide(rawEntry, requestContext = {}) {
     if (rawEntry.type === 'ROLE_ROUTE_SKIPPED' && !ROUTE_SKIP_REASON_VALUES.has(rawEntry.reason)) {
       throw new RouteAuditError(
         `refusing to skip ${rawEntry.candidate} for role ${rawEntry.role}: reason "${rawEntry.reason}" is not an enumerated skip reason`,
         { code: 'ROUTE_REASON_NOT_ENUMERATED' },
       );
     }
-    const result = this.routeAudit.record({ ...rawEntry, loopId: this.context.loopId ?? null, round: this.context.round ?? null });
+    const result = this.routeAudit.record({
+      ...rawEntry,
+      loopId: requestContext.loopId ?? null,
+      round: requestContext.round ?? null,
+      operationId: requestContext.operationId ?? null,
+      attempt: requestContext.attempt ?? null,
+      chunkIndex: requestContext.chunkIndex ?? null,
+      chunkTotal: requestContext.chunkTotal ?? null,
+    });
     this.onEvent?.(rawEntry);
     if (!result.persisted) {
       const label = rawEntry.type === 'ROLE_ROUTE_SKIPPED' ? `skip ${rawEntry.candidate}` : `select ${rawEntry.requestedFamily}`;
@@ -349,7 +374,10 @@ export class RoleRouter {
   // Given a provider_health block on `candidate`, decide whether to trust it
   // as-is or spend a zero-token re-probe to see if it has since cleared.
   // Returns the (possibly updated) block, or null if revalidation recovered
-  // the candidate.
+  // the candidate. The revalidator sees the ORIGINAL entry (including
+  // reasonCode) so it can refuse to claim recovery for a failure class it
+  // cannot actually re-verify (e.g. a provisioning-only probe must not
+  // clear an effective-loading failure, or a post-dispatch provider error).
   _resolveHealthBlock(block, candidate, provider) {
     if (!block || block.entry.status !== 'UNAVAILABLE' || typeof this.healthRevalidator !== 'function') {
       return block ? { ...block, revalidated: false, staleMs: null } : null;
@@ -358,7 +386,7 @@ export class RoleRouter {
     if (!(staleMs > this.staleHealthTtlMs)) return { ...block, revalidated: false, staleMs };
     let verdict = null;
     try {
-      verdict = this.healthRevalidator(candidate.family, provider);
+      verdict = this.healthRevalidator(candidate.family, provider, block.entry);
     } catch (err) {
       verdict = { available: false, reason: `revalidator_threw: ${err?.message ?? String(err)}` };
     }
@@ -368,12 +396,18 @@ export class RoleRouter {
       return null; // recovered — no longer blocking
     }
     // Still down: refresh checkedAt so the same call isn't re-revalidated on
-    // every single route() invocation until the TTL elapses again.
-    this.providerHealth.record(block.key, block.entry.status, verdict.reason ?? block.entry.reason);
+    // every single route() invocation until the TTL elapses again. Preserve
+    // the original reasonCode — the underlying failure class hasn't changed.
+    this.providerHealth.record(block.key, block.entry.status, verdict.reason ?? block.entry.reason, { reasonCode: block.entry.reasonCode ?? null });
     const refreshed = this.providerHealth.blockingEntry(candidate.family, provider);
     return { ...(refreshed ?? block), revalidated: true, staleMs };
   }
-  route(role, signals = {}) {
+  // `requestContext` (loopId/round/operationId/attempt/chunkIndex/
+  // chunkTotal) is OPTIONAL, per-call attribution for the durable audit —
+  // never stored on `this`. Production wiring supplies it from
+  // meteredWithFailover, which already has every one of these fields in
+  // scope for the physical call it is about to make.
+  route(role, signals = {}, requestContext = {}) {
     const candidates = this.rolePolicy[role] ?? [];
     const skippedThisCall = [];
     for (const candidate of candidates) {
@@ -382,7 +416,7 @@ export class RoleRouter {
       if (resolved.resolvedModel) this.resolutions.set(candidate.family, resolved.resolvedModel);
       const recordSkip = (reason, extra = {}) => {
         const raw = { type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason, ...extra };
-        const result = this._decide(raw);
+        const result = this._decide(raw, requestContext);
         skippedThisCall.push({ candidate: candidate.family, reason, persisted: result.persisted });
       };
       // `roles` is an explicit adapter declaration. An empty declaration is
@@ -393,28 +427,52 @@ export class RoleRouter {
       // caller explicitly opts in. Purely deterministic — never a token probe.
       if (candidate.highContext && signals.allowHighContext !== true) { recordSkip(ROUTE_SKIP_REASONS.HIGH_CONTEXT); continue; }
       if (!this.quotaRegistry.usable(candidate.family)) { recordSkip(ROUTE_SKIP_REASONS.QUOTA_COOLDOWN, { pools: this.quotaRegistry.poolsFor(candidate.family) }); continue; }
+      // No transport wired for this family in THIS process at all (e.g. AGY
+      // isolation never came up at startup) — never selectable regardless of
+      // what health/quota say, and checked BEFORE health so a family that
+      // could never be dispatched is never even offered to revalidation.
+      // `undefined` (a resolver that predates this field) never blocks —
+      // strictly opt-in, so every pre-existing resolveFamily stays exactly
+      // as permissive as before.
+      if (resolved.transportAvailable === false) { recordSkip(ROUTE_SKIP_REASONS.NO_TRANSPORT); continue; }
       const healthBlock = this._resolveHealthBlock(this.providerHealth.blockingEntry(candidate.family, provider), candidate, provider);
       if (healthBlock) {
         recordSkip(ROUTE_SKIP_REASONS.PROVIDER_HEALTH, {
           healthScope: healthBlock.scope, healthStatus: healthBlock.entry.status, healthReason: healthBlock.entry.reason,
+          healthReasonCode: healthBlock.entry.reasonCode ?? null,
           revalidated: healthBlock.revalidated, staleMs: Number.isFinite(healthBlock.staleMs) ? healthBlock.staleMs : null,
         });
         continue;
       }
       const effort = this.effortPolicy.select({ candidate, capabilities: resolved.capabilities, signals });
       const selected = { role, requestedFamily: candidate.family, resolvedModel: resolved.resolvedModel ?? null, provider, quotaPools: this.quotaRegistry.poolsFor(candidate.family), effort, degraded: Boolean(candidate.degraded) };
-      this._decide({ type: 'ROLE_ROUTE_SELECTED', ...selected });
+      this._decide({ type: 'ROLE_ROUTE_SELECTED', ...selected }, requestContext);
       assertRoutePrimaryFirstInvariant(this.rolePolicy, role, selected.requestedFamily, skippedThisCall);
       return selected;
     }
-    this.routeAudit.record({ type: 'ROLE_ROUTE_POOL_EXHAUSTED', role, loopId: this.context.loopId ?? null, round: this.context.round ?? null });
+    this.routeAudit.record({
+      type: 'ROLE_ROUTE_POOL_EXHAUSTED',
+      role,
+      loopId: requestContext.loopId ?? null,
+      round: requestContext.round ?? null,
+      operationId: requestContext.operationId ?? null,
+      attempt: requestContext.attempt ?? null,
+    });
     return null;
   }
   recordFailure(selection, failure) {
     this.quotaRegistry.recordProviderFailure(selection.requestedFamily, failure);
     if (['PROVIDER_AUTH_FAILED', 'PROVIDER_UNAVAILABLE', 'PROVIDER_PROTOCOL_ERROR', 'PROVIDER_TIMEOUT', 'EXECUTOR_TIMEOUT'].includes(failure.code)) {
-      // Record failure on the specific candidate family so other models under the same provider remain eligible
-      this.providerHealth.record(selection.requestedFamily, failure.code === 'PROVIDER_AUTH_FAILED' ? 'AUTH_FAILED' : 'UNAVAILABLE', failure.code);
+      // Record failure on the specific candidate family so other models under the same provider remain eligible.
+      // reasonCode = the failure code itself: a post-dispatch provider error
+      // is its own, already-enumerated failure class — a provisioning-only
+      // zero-token revalidator must never claim it can clear this.
+      this.providerHealth.record(
+        selection.requestedFamily,
+        failure.code === 'PROVIDER_AUTH_FAILED' ? 'AUTH_FAILED' : 'UNAVAILABLE',
+        failure.code,
+        { reasonCode: failure.code },
+      );
     }
     this.onEvent?.({ type: 'ROLE_PROVIDER_FAILED', role: selection.role, family: selection.requestedFamily, reason: failure.code });
   }

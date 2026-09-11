@@ -290,7 +290,10 @@ export function createReviewLoopProviderPool({
   const enforcePerCall = capabilityProbed && capabilitySupported;
   const markAllAgyUnavailable = (reason) => {
     for (const family of REVIEWLOOP_AGY_FAMILIES) {
-      providerHealth.record(family, 'UNAVAILABLE', reason);
+      // Per-call effective-loading failure — needs a live CLI probe to
+      // re-verify, NOT re-checkable by the zero-token provisioning-only
+      // revalidator (see createAgyZeroTokenHealthRevalidator).
+      providerHealth.record(family, 'UNAVAILABLE', reason, { reasonCode: 'AGY_EFFECTIVE_LOADING_FAILED' });
     }
   };
   const narrow = (family) => async (prompt, { signal } = {}) => {
@@ -359,7 +362,15 @@ export function createReviewLoopProviderPool({
       concreteVersionPinnedByDefault: resolution[family].concreteVersionPinned,
     };
     if (!available) {
-      providerHealth.record(family, 'UNAVAILABLE', runtimeStatus[family].reason);
+      // These two sub-cases are exactly the two runtimeStatus[family].reason
+      // branches above: `!minimalAgent` means provisioning itself threw (the
+      // zero-token revalidator CAN legitimately re-check this); the other
+      // branch means agy was provisioned but the startup probe found it does
+      // not load the isolated agent (needs a live CLI probe to clear — the
+      // provisioning-only revalidator must not touch it).
+      providerHealth.record(family, 'UNAVAILABLE', runtimeStatus[family].reason, {
+        reasonCode: !minimalAgent ? 'AGY_PROVISIONING_FAILED' : 'AGY_CAPABILITY_UNVERIFIED',
+      });
     }
   }
 
@@ -379,7 +390,7 @@ export function createReviewLoopProviderPool({
     if (available) {
       transports[family] = CLI_TRANSPORT_FACTORY[family]({ model: modelForFamily[family] ?? null, env, spawn });
     } else {
-      providerHealth.record(family, 'UNAVAILABLE', runtimeStatus[family].reason);
+      providerHealth.record(family, 'UNAVAILABLE', runtimeStatus[family].reason, { reasonCode: 'CLI_RUNTIME_UNAVAILABLE' });
     }
   }
 
@@ -395,7 +406,7 @@ export function createReviewLoopProviderPool({
   for (const family of Object.keys(PRODUCTION_ROLE_CAPABILITIES)) {
     if (!transports[family] && !runtimeStatus[family]) {
       runtimeStatus[family] = { adapterImplemented: false, runtimeAvailable: false, reason: 'no adapter' };
-      providerHealth.record(family, 'UNAVAILABLE', 'no adapter for this family');
+      providerHealth.record(family, 'UNAVAILABLE', 'no adapter for this family', { reasonCode: 'NO_ADAPTER' });
     }
   }
 
@@ -414,6 +425,11 @@ export function createReviewLoopProviderPool({
         resolvedModel: r.resolvedModel,
         resolvedFrom: r.resolvedFrom,
         provider: r.provider ?? (family.startsWith('agy:') ? family.replace(':', '-') : family.split(':')[0]),
+        // Read from `transports` at ROUTE time (not captured earlier) so it
+        // reflects the final wired state after transportOverrides — the
+        // router must never select a family this process has no dispatch
+        // function for, no matter what health/quota say about it.
+        transportAvailable: Boolean(transports[family]),
         capabilities: {
           roles: PRODUCTION_ROLE_CAPABILITIES[family] ?? [],
           // Effort is NOT selected at route time for these families — each AGY
@@ -427,8 +443,11 @@ export function createReviewLoopProviderPool({
     },
   });
 
-  function route(role, signals = {}) {
-    const sel = router.route(role, signals);
+  // `requestContext` is per-call audit attribution (loopId/round/operationId/
+  // attempt/chunkIndex/chunkTotal) — passed straight through to the router,
+  // never captured on `router` itself (see roleRouting.js route()).
+  function route(role, signals = {}, requestContext = {}) {
+    const sel = router.route(role, signals, requestContext);
     if (!sel) return null;
     return {
       role,
@@ -516,18 +535,37 @@ function buildSupervisorInvoke() {
 
 // Zero-token stale-health revalidator for the AGY families: re-runs the
 // local, synchronous, no-CLI-spawn provisioning check that startup wiring
-// already performs once (see agyIsolationAvailable below). It re-verifies
-// only that half of the gate — "agy actually LOADS the isolated agent" needs
-// a real CLI probe and stays async, so it is NOT re-run here; the per-call
-// effective-loading verification already enforced elsewhere remains the
-// backstop for that half. Non-AGY families get no opinion (null) — the
-// stale-health TTL only ever matters for a family this returns non-null for.
+// already performs once (see agyIsolationAvailable above). It re-verifies
+// ONLY that one specific failure class — reasonCode AGY_PROVISIONING_FAILED,
+// meaning provisionMinimalAgent() itself threw at startup. Every other
+// reasonCode is refused, even for an AGY family:
+//   - AGY_CAPABILITY_UNVERIFIED / AGY_EFFECTIVE_LOADING_FAILED — "agy
+//     actually LOADS the isolated agent" needs a real CLI probe, which is
+//     async and NOT zero-token; a provisioning-only re-check proves nothing
+//     about it. Worse: when the startup gate failed for either of these
+//     reasons, `transports[family]` was never wired at all in this process —
+//     no amount of health revalidation changes that (the router's separate
+//     NO_TRANSPORT check is what actually blocks selection in that case;
+//     this refusal is about never claiming a false "recovered" verdict in
+//     the durable audit). Recovery requires an MCP server restart.
+//   - a post-dispatch PROVIDER_* reasonCode (see RoleRouter#recordFailure) —
+//     unrelated to local provisioning; this revalidator has no zero-token
+//     way to re-check a live provider condition.
+//   - no reasonCode at all (legacy/unclassified record) — conservatively
+//     refused rather than guessed at.
+// Non-AGY families get no opinion (null) unconditionally.
 export function createAgyZeroTokenHealthRevalidator({
   agyGeminiDir = narrowAgyGeminiDir(),
   provisionMinimalAgent = provisionMinimalAgyAgent,
 } = {}) {
-  return (family) => {
+  return (family, _provider, entry) => {
     if (!family.startsWith('agy:')) return null;
+    if (entry?.reasonCode !== 'AGY_PROVISIONING_FAILED') {
+      return {
+        available: false,
+        reason: `zero-token revalidation declined: reasonCode "${entry?.reasonCode ?? 'unknown'}" is not a provisioning failure — this needs an MCP server restart to clear, not a re-probe`,
+      };
+    }
     try {
       provisionMinimalAgent({ geminiDir: agyGeminiDir });
       return { available: true, reason: 'zero-token re-provisioning of the reviewloop-minimal agent succeeded' };
@@ -568,8 +606,8 @@ export function createProductionReviewLoopProviders({
     env,
     pool,
     runtimeStatus: pool.runtimeStatus,
-    routeReviewerFn: (signals) => pool.route('reviewer', signals),
-    routeSupervisorFn: (signals) => pool.route('supervisor', signals),
+    routeReviewerFn: (signals, requestContext) => pool.route('reviewer', signals, requestContext),
+    routeSupervisorFn: (signals, requestContext) => pool.route('supervisor', signals, requestContext),
     recordProviderFailure: pool.recordFailure,
     reviewerFn: async (args) => {
       const sel = args.selection ?? pool.route('reviewer');

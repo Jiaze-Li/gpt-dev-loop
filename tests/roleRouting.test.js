@@ -361,3 +361,99 @@ test('a revalidator that throws is treated as still unavailable — never silent
   const skip = audited.find((e) => e.type === 'ROLE_ROUTE_SKIPPED' && e.candidate === 'agy:opus');
   assert.match(skip.healthReason, /revalidator_threw/);
 });
+
+test('the revalidator sees the full blocking entry (including reasonCode), not just family/provider', () => {
+  let now = 0;
+  const health = new ProviderHealthRegistry({ now: () => now });
+  health.record('agy:opus', 'UNAVAILABLE', 'timed out', { reasonCode: 'PROVIDER_TIMEOUT' });
+  let seenEntry = null;
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    now: () => now,
+    staleHealthTtlMs: 1000,
+    healthRevalidator: (family, provider, entry) => { seenEntry = entry; return null; },
+  });
+  now = 2000;
+  router.route('reviewer');
+  assert.equal(seenEntry.reasonCode, 'PROVIDER_TIMEOUT');
+  assert.equal(seenEntry.status, 'UNAVAILABLE');
+});
+
+// ---- transport-availability gate ------------------------------------------
+
+test('a family the resolver reports has no wired transport is never selected, regardless of health', () => {
+  const health = new ProviderHealthRegistry(); // pristine — health alone would allow agy:opus
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: (family) => ({
+      ...resolver(family),
+      transportAvailable: family !== 'agy:opus', // only agy:opus lacks a transport
+    }),
+  });
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:gemini-reviewer');
+});
+
+test('a resolver that never declares transportAvailable stays exactly as permissive as before this feature (backward compatible)', () => {
+  const router = new RoleRouter({ resolveFamily: resolver }); // resolver never sets transportAvailable
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:opus');
+});
+
+test('the transport gate is checked before health — a family with no transport is never even offered to the revalidator', () => {
+  let now = 0;
+  const health = new ProviderHealthRegistry({ now: () => now });
+  health.record('agy:opus', 'UNAVAILABLE', 'x', { reasonCode: 'AGY_PROVISIONING_FAILED' });
+  let revalidatorCalls = 0;
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: (family) => ({ ...resolver(family), transportAvailable: family !== 'agy:opus' }),
+    now: () => now,
+    staleHealthTtlMs: 1000,
+    healthRevalidator: () => { revalidatorCalls += 1; return { available: true }; },
+  });
+  now = 2000;
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:gemini-reviewer');
+  assert.equal(revalidatorCalls, 0, 'a family with no transport must never be re-probed — there is nothing recovery could make dispatchable');
+});
+
+// ---- per-call audit attribution (no shared mutable router state) ---------
+
+test('interleaved route() calls with different requestContext never cross-contaminate audit attribution', () => {
+  const audited = [];
+  const health = new ProviderHealthRegistry();
+  health.record('agy:opus', 'UNAVAILABLE', 'x', { reasonCode: 'PROVIDER_TIMEOUT' });
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    routeAudit: new RouteAuditLog({ sink: (e) => audited.push(e) }),
+  });
+  // Simulates two concurrent loops interleaving their calls through the SAME
+  // (singleton, process-lifetime) router instance.
+  router.route('reviewer', {}, { loopId: 'loop-A', round: 1, operationId: 'op-A-1', attempt: 1 });
+  router.route('reviewer', {}, { loopId: 'loop-B', round: 7, operationId: 'op-B-1', attempt: 1 });
+  router.route('reviewer', {}, { loopId: 'loop-A', round: 2, operationId: 'op-A-2', attempt: 1 });
+  router.route('reviewer', {}, { loopId: 'loop-B', round: 8, operationId: 'op-B-2', attempt: 1 });
+
+  const a = audited.filter((e) => e.loopId === 'loop-A');
+  const b = audited.filter((e) => e.loopId === 'loop-B');
+  assert.ok(a.length > 0 && b.length > 0);
+  assert.ok(a.every((e) => e.operationId.startsWith('op-A')), 'loop A entries must never carry loop B operationIds');
+  assert.ok(b.every((e) => e.operationId.startsWith('op-B')), 'loop B entries must never carry loop A operationIds');
+  const aRounds = [...new Set(a.map((e) => e.round))].sort();
+  const bRounds = [...new Set(b.map((e) => e.round))].sort();
+  assert.deepEqual(aRounds, [1, 2]);
+  assert.deepEqual(bRounds, [7, 8]);
+});
+
+test('route() with no requestContext attributes null attribution rather than reusing a prior call\'s context', () => {
+  const audited = [];
+  const router = new RoleRouter({ resolveFamily: resolver, routeAudit: new RouteAuditLog({ sink: (e) => audited.push(e) }) });
+  router.route('reviewer', {}, { loopId: 'loop-A', round: 3 });
+  router.route('reviewer'); // no requestContext this time
+  const last = audited[audited.length - 1];
+  assert.equal(last.loopId, null);
+  assert.equal(last.round, null);
+});
