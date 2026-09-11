@@ -419,6 +419,10 @@ export function createReviewLoopProviderPool({
       model: sel.resolvedModel,
       resolvedFrom: resolution[sel.requestedFamily]?.resolvedFrom ?? null,
       transport: transports[sel.requestedFamily] ?? null,
+      // Which quota pool(s) this family draws from — carried through so the
+      // durable PR audit can answer "which physical model, on which quota
+      // pool, reviewed this SHA" (see controller.js appendAuditRecord).
+      quotaPools: sel.quotaPools ?? null,
     };
   }
 

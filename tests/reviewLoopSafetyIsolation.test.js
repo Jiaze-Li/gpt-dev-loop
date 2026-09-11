@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import {
-  MemoryPersistence, makeHarness, finding, mockPrBackend,
+  MemoryPersistence, makeHarness, finding, mockPrBackend, prTestFakes,
 } from './helpers/reviewLoopHarness.js';
 
 test('a safety event from loop A does not leak into loop B on the same controller', async () => {
@@ -68,6 +68,7 @@ test('PR PUSH_REQUIRED after a spending round still reports cumulative durable s
   const controller = createReviewLoopController({
     persistence: new MemoryPersistence(),
     prBackend: backend,
+    ...prTestFakes(backend),
     discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo t'], manifestFingerprint: 'mf' }),
     runGateFn: async () => ({ verdict: 'PASS', pass: true, results: [], fingerprint: `g${Math.random()}`, failureIdentities: [] }),
     reviewerFn: async () => ({ value: { findings: [{ severity: 'P1', file: 'a', title: 'b' }] }, usage: { input_tokens: 5, output_tokens: 5 }, model: 'm' }),

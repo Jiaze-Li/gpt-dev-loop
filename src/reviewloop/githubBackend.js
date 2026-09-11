@@ -1,98 +1,53 @@
 // ReviewLoop slim PR backend — GitHub via the `gh` CLI.
 //
 // GitHub is a TARGET adapter, NOT a reviewer. ReviewLoop has one review engine
-// (the internal Reviewer pool); this module only:
-//   - resolves the repository identity
+// (the internal Reviewer pool) that reviews the PR's merge-base->HEAD diff via
+// LOCAL git inside an isolated exact-snapshot worktree (see prEvidence.js /
+// prWorktree.js). This module only:
+//   - resolves the repository identity (for the begin-time cwd<->PR check)
 //   - resolves the PR base SHA and the current PR HEAD SHA
-//   - fetches the PR base->head diff + changed-file list (Reviewer evidence)
-//   - re-reads the live PR HEAD for the pre-PASS exact-HEAD recheck
 //   - optionally publishes a ReviewLoop result summary comment (audit only)
 //
 // It NEVER edits code, commits, pushes, merges, force-pushes, posts a review
-// trigger comment, or ingests a third-party review — ReviewLoop has one
-// Reviewer engine and it is internal.
+// trigger comment, ingests a third-party review, or serves the PR diff as
+// Reviewer evidence — ReviewLoop has one Reviewer engine and it is internal,
+// and its evidence is bound to explicit fetched SHAs, never a live API call.
+//
+// Every method takes an explicit `cwd` (the loop's own repository root) and
+// scopes its `gh`/git invocation to it — NEVER to the MCP process's own
+// (accidental) working directory.
 
 import { execFile as nodeExecFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileP = promisify(nodeExecFile);
 
-// `gh api --paginate` concatenates every page's JSON body back-to-back, which
-// `JSON.parse` cannot read as one value. Scan for each top-level JSON value and
-// flatten one level. Kept here because the PR-metadata reads below use it.
-function scanTopLevelJsonValues(text) {
-  const values = [];
-  let depth = 0;
-  let start = -1;
-  let inString = false;
-  let escaped = false;
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') { inString = true; continue; }
-    if (ch === '{' || ch === '[') {
-      if (depth === 0) start = i;
-      depth += 1;
-    } else if (ch === '}' || ch === ']') {
-      depth -= 1;
-      if (depth === 0 && start !== -1) {
-        values.push(JSON.parse(text.slice(start, i + 1)));
-        start = -1;
-      }
-    }
-  }
-  return values;
-}
-
-export function flattenPaginated(out) {
-  const text = typeof out === 'string' ? out.trim() : '';
-  if (!text) return [];
-  const flatten1 = (arr) => arr.flatMap((el) => (Array.isArray(el) ? el : [el]));
-  const elements = [];
-  for (const value of scanTopLevelJsonValues(text)) {
-    if (Array.isArray(value)) elements.push(...flatten1(value));
-    else elements.push(value);
-  }
-  return elements;
-}
-
 // Default `gh`-backed transport. Every method is overridable for tests.
+// `repo` is an explicit REVIEWLOOP_GH_REPO override (`-R owner/name`); when
+// absent, every call is scoped via `cwd` so `gh` infers the repository from
+// that directory's own git remote — never from the MCP process's cwd.
 export function createGhTransport({ execFile = execFileP, repo = null } = {}) {
-  const base = repo ? ['-R', repo] : [];
-  const gh = async (args) => {
-    const { stdout } = await execFile('gh', [...base, ...args], { maxBuffer: 16 * 1024 * 1024 });
+  const gh = async (args, cwd) => {
+    const base = repo ? ['-R', repo] : [];
+    const { stdout } = await execFile('gh', [...base, ...args], { cwd, maxBuffer: 16 * 1024 * 1024 });
     return stdout;
   };
   return {
-    async resolveRepo() {
-      const slug = repo ?? (await gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'])).trim();
+    async resolveRepo({ cwd } = {}) {
+      const slug = repo ?? (await gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], cwd)).trim();
       return { nameWithOwner: slug || null };
     },
-    async getPrHead({ prNumber }) {
-      const out = await gh(['pr', 'view', String(prNumber), '--json', 'headRefOid', '-q', '.headRefOid']);
+    async getPrHead({ prNumber, cwd } = {}) {
+      const out = await gh(['pr', 'view', String(prNumber), '--json', 'headRefOid', '-q', '.headRefOid'], cwd);
       return out.trim() || null;
     },
-    async getPrBaseSha({ prNumber }) {
-      const out = await gh(['pr', 'view', String(prNumber), '--json', 'baseRefOid', '-q', '.baseRefOid']);
+    async getPrBaseSha({ prNumber, cwd } = {}) {
+      const out = await gh(['pr', 'view', String(prNumber), '--json', 'baseRefOid', '-q', '.baseRefOid'], cwd);
       return out.trim() || null;
-    },
-    // The PR's merge-base->HEAD unified diff — exactly what a reviewer sees on
-    // the "Files changed" tab.
-    async getPrDiff({ prNumber }) {
-      return gh(['pr', 'diff', String(prNumber)]);
-    },
-    async getPrChangedFiles({ prNumber }) {
-      const out = await gh(['pr', 'view', String(prNumber), '--json', 'files', '-q', '.files[].path']);
-      return out.split('\n').map((s) => s.trim()).filter(Boolean);
     },
     // Audit-only write. One PR issue comment. Never a review, never a merge.
-    async postComment({ prNumber, body }) {
-      const out = await gh(['pr', 'comment', String(prNumber), '--body', body]);
+    async postComment({ prNumber, body, cwd } = {}) {
+      const out = await gh(['pr', 'comment', String(prNumber), '--body', body], cwd);
       return { id: out.trim() || `comment-${Date.now()}` };
     },
   };
@@ -106,34 +61,24 @@ export function createGithubReviewBackend({
   const gh = transport ?? github ?? createGhTransport({ repo: env?.REVIEWLOOP_GH_REPO ?? null });
 
   return {
-    async resolveRepo() {
+    async resolveRepo({ cwd, prNumber } = {}) {
       if (typeof gh.resolveRepo !== 'function') return { nameWithOwner: env?.REVIEWLOOP_GH_REPO ?? null };
-      return (await gh.resolveRepo()) ?? { nameWithOwner: null };
+      return (await gh.resolveRepo({ cwd, prNumber })) ?? { nameWithOwner: null };
     },
-    async getPrHead({ prNumber }) {
-      return gh.getPrHead({ prNumber });
+    async getPrHead({ prNumber, cwd } = {}) {
+      return gh.getPrHead({ prNumber, cwd });
     },
-    async getPrBaseSha({ prNumber }) {
+    async getPrBaseSha({ prNumber, cwd } = {}) {
       if (typeof gh.getPrBaseSha !== 'function') return null;
-      return gh.getPrBaseSha({ prNumber });
-    },
-    async getPrDiff({ prNumber, baseSha, headSha }) {
-      if (typeof gh.getPrDiff !== 'function') {
-        throw new Error('ReviewLoop PR backend: getPrDiff is not supported by this transport');
-      }
-      return gh.getPrDiff({ prNumber, baseSha, headSha });
-    },
-    async getPrChangedFiles({ prNumber, baseSha, headSha }) {
-      if (typeof gh.getPrChangedFiles !== 'function') return [];
-      return (await gh.getPrChangedFiles({ prNumber, baseSha, headSha })) ?? [];
+      return gh.getPrBaseSha({ prNumber, cwd });
     },
     // Optional audit publication. A failure here NEVER changes the review
     // verdict — the caller records the publication failure and moves on.
-    async publishResult({ prNumber, body }) {
+    async publishResult({ prNumber, body, cwd } = {}) {
       if (typeof gh.postComment !== 'function') {
         return { published: false, reason: 'transport has no postComment' };
       }
-      const res = await gh.postComment({ prNumber, body });
+      const res = await gh.postComment({ prNumber, body, cwd });
       return { published: true, commentId: res?.id ?? null };
     },
   };

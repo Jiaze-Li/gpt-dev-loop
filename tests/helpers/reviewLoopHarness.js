@@ -1,7 +1,10 @@
 // Deterministic in-memory harness for ReviewLoop controller tests.
 // Zero real provider calls, zero git, zero filesystem.
 
+import { createHash } from 'node:crypto';
 import { createReviewLoopController } from '../../src/reviewloop/controller.js';
+
+function sha256(v) { return createHash('sha256').update(String(v)).digest('hex'); }
 
 export class MemoryPersistence {
   constructor() { this._state = new Map(); }
@@ -97,5 +100,55 @@ export function mockPrBackend({
     },
     async getPrChangedFiles({ headSha } = {}) { return filesByHead[headSha ?? head()] ?? ['f.js']; },
     async publishResult({ body }) { state.published.push(body); return { published: true, commentId: 'pub-1' }; },
+  };
+}
+
+// ---- deterministic fakes for the snapshot-correctness injection points ----
+// Production PR reviews build an isolated `git worktree` at the exact HEAD
+// and diff explicit fetched SHAs (prWorktree.js / prEvidence.js) — real git,
+// deliberately NOT exercised by these fast in-memory controller tests. These
+// fakes give the controller the SAME shaped result without touching git, so
+// a test can still assert exact-HEAD binding, drift detection, and repository
+// identity fail-closed behaviour deterministically.
+
+// resolvePrRepositoryIdentityFn — cwd repo == PR repo, by construction here.
+export function fakePrRepositoryIdentity(nameWithOwner = 'acme/repo') {
+  return async () => ({ ok: true, nameWithOwner });
+}
+
+// buildPrSnapshotFn — no real worktree; the callback just runs against the
+// scripted `cwd`/`headSha` directly. `mergeBase` is the PR's declared base SHA
+// (tests never need a real merge-base computation).
+export function fakePrSnapshot() {
+  return async ({ cwd, baseSha, headSha }, fn) => fn({
+    worktreeDir: cwd, mergeBase: baseSha, headSha, baseSha,
+  });
+}
+
+// collectPrDeltaFn — pulls the scripted diff/changed-files straight from the
+// mockPrBackend's per-head maps, keyed EXACTLY by the snapshot's headSha (so a
+// test can prove an old HEAD's evidence never leaks onto a new HEAD).
+export function fakeCollectPrDelta(prBackend) {
+  return async ({ mergeBase, headSha }) => {
+    const diff = await prBackend.getPrDiff({ headSha });
+    const changedFiles = await prBackend.getPrChangedFiles({ headSha });
+    const fingerprint = sha256(`${headSha}\n${diff}`);
+    const noWorkerChangeYet = mergeBase === headSha || String(diff ?? '').trim() === '';
+    return {
+      baselineHead: mergeBase, baseSha: mergeBase, mergeBase,
+      currentHead: headSha, reviewedHeadSha: headSha,
+      fingerprint, diff, changedFiles,
+      evidenceComplete: true, incompleteReasons: [], noWorkerChangeYet,
+    };
+  };
+}
+
+// Bundle all three injection points for one mockPrBackend — spread this into
+// createReviewLoopController({ prBackend, ...prTestFakes(prBackend) }).
+export function prTestFakes(prBackend, { repo = 'acme/repo' } = {}) {
+  return {
+    resolvePrRepositoryIdentityFn: fakePrRepositoryIdentity(repo),
+    buildPrSnapshotFn: fakePrSnapshot(),
+    collectPrDeltaFn: fakeCollectPrDelta(prBackend),
   };
 }

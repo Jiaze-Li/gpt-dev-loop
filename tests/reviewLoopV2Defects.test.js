@@ -9,7 +9,7 @@ import os from 'node:os';
 
 import { createGithubReviewBackend } from '../src/reviewloop/githubBackend.js';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
-import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
+import { MemoryPersistence, prTestFakes } from './helpers/reviewLoopHarness.js';
 import { terminateProcessTree } from '../src/orchestrator/processTree.js';
 import { runGate, GATE_VERDICTS } from '../src/reviewloop/gatePolicy.js';
 import { checkMcpServerBinding } from '../scripts/doctor.js';
@@ -132,6 +132,7 @@ test('a transient failure to re-confirm the live PR HEAD before PASS fails close
   const controller = createReviewLoopController({
     persistence: new MemoryPersistence(),
     prBackend: be,
+    ...prTestFakes(be),
     discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo t'], manifestFingerprint: 'mf' }),
     runGateFn: async () => ({ verdict: 'PASS', pass: true, results: [], fingerprint: 'g1', failureIdentities: [] }),
     reviewerFn: async () => ({ value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } }),

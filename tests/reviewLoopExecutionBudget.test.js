@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
-import { MemoryPersistence, mockPrBackend } from './helpers/reviewLoopHarness.js';
+import { MemoryPersistence, mockPrBackend, prTestFakes } from './helpers/reviewLoopHarness.js';
 
 const P1 = { severity: 'P1', file: 'a.js', title: 'bug' };
 
@@ -19,6 +19,7 @@ function prController(persistence, prBackend, {
   return createReviewLoopController({
     persistence,
     prBackend,
+    ...prTestFakes(prBackend),
     discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo test'], manifestFingerprint: 'mf' }),
     runGateFn: async () => ({ verdict: 'PASS', pass: true, results: [], fingerprint: `g${Math.random()}`, failureIdentities: [] }),
     reviewerFn: async () => ({
@@ -192,4 +193,9 @@ test('LOCAL: 3 rounds still blocking -> HUMAN_REQUIRED, terminal; a fresh begin 
   const rf = await c2.review({ loopId: fresh.loopId });
   assert.equal(rf.round, 1);
   assert.equal(rf.status, 'PASS');
+
+  // K: LOCAL is not regressed by the PR snapshot-correctness machinery — no
+  // exact-HEAD worktree, no repository identity check, no PR audit trail.
+  const persistedFresh = await persistence.readWorkflowState(fresh.loopId);
+  assert.deepEqual(persistedFresh.reviewLoop.audit ?? [], [], 'a LOCAL loop never writes a PR audit record');
 });

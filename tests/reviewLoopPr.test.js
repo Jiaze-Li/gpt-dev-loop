@@ -9,7 +9,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
-import { MemoryPersistence, mockPrBackend, finding } from './helpers/reviewLoopHarness.js';
+import {
+  MemoryPersistence, mockPrBackend, finding, prTestFakes,
+} from './helpers/reviewLoopHarness.js';
 
 function build({
   prBackend, reviews = [], gates = [], supervisorReplies = [], onReviewer, persistence = new MemoryPersistence(),
@@ -21,6 +23,7 @@ function build({
   const controller = createReviewLoopController({
     persistence,
     prBackend,
+    ...prTestFakes(prBackend),
     discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo test'], manifestFingerprint: 'mf' }),
     runGateFn: async () => {
       const g = gates[gi] ?? gates[gates.length - 1] ?? { verdict: 'PASS' };
@@ -143,7 +146,9 @@ test('F: every PR round writes a recoverable, tamper-evident audit record', asyn
   assert.equal(rec.target.finalObservedHeadSha, 'H1');
   assert.equal(rec.target.headStillCurrent, true);
   assert.equal(rec.result, 'PASS');
-  assert.equal(rec.review.reviewer, 'internal');
+  assert.equal(rec.review.reviewer, 'internal pool');
+  assert.ok(Array.isArray(rec.review.physicalCalls) && rec.review.physicalCalls.length >= 1, 'every physical Reviewer attempt is recorded');
+  assert.ok(rec.review.physicalCalls.every((pc) => pc.role === 'reviewer' && pc.family), 'each physical call carries its family/provider');
   assert.ok(rec.gate && rec.gate.verdict);
   assert.ok(rec.spend && typeof rec.spend.reviewerCalls === 'number');
   assert.ok(rec.objective.fingerprint);
@@ -236,6 +241,53 @@ test('a cancelled PR review stops before the Reviewer', async () => {
   assert.equal(r.status, 'HUMAN_REQUIRED');
   assert.notEqual(r.terminal, true);
   assert.equal(calls.reviewer, 0);
+});
+
+// J -- a failover round keeps EVERY physical Reviewer attempt in the audit.
+test('J: a failover round keeps every physical Reviewer attempt in the audit, not just the winner', async () => {
+  const backend = mockPrBackend({ heads: ['H1'] });
+  let calls = 0;
+  const controller = createReviewLoopController({
+    persistence: new MemoryPersistence(),
+    prBackend: backend,
+    ...prTestFakes(backend),
+    discoverVerificationCommandsFn: () => ({ source: 'repo-config', commands: ['echo test'], manifestFingerprint: 'mf' }),
+    runGateFn: async () => ({
+      verdict: 'PASS', pass: true, results: [], fingerprint: 'g1', failureIdentities: [],
+    }),
+    routeReviewerFn: ({ reworkCycles }) => (reworkCycles === 0
+      ? { family: 'agy:opus', provider: 'agy', model: 'claude-opus-4-6' }
+      : { family: 'agy:sonnet', provider: 'agy', model: 'claude-sonnet-5' }),
+    reviewerFn: async ({ selection }) => {
+      calls += 1;
+      if (selection?.family === 'agy:opus') {
+        // Mechanically-zero pre-send failure (never reached the provider) —
+        // retryable via failover AND settles known-zero usage, so it never
+        // trips the separate "unaccounted spend" fail-closed latch this test
+        // is not exercising.
+        const err = new Error('provider unavailable');
+        err.code = 'PROVIDER_UNAVAILABLE';
+        throw err;
+      }
+      return { value: { findings: [] }, usage: { input_tokens: 4, output_tokens: 2 }, model: selection?.model };
+    },
+  });
+  const { loopId } = await controller.begin({ goal: 'g', cwd: '/r', prNumber: 9 });
+  const r = await controller.review({ loopId });
+  assert.equal(r.status, 'PASS');
+  assert.equal(calls, 2, 'the failing first attempt and the succeeding failover attempt both physically ran');
+
+  const audit = (await controller._persistence.readWorkflowState(loopId)).reviewLoop.audit;
+  const physicalCalls = audit[0].review.physicalCalls;
+  assert.equal(physicalCalls.length, 2, 'both physical attempts are traceable — not collapsed into one abstract "internal"');
+  assert.equal(physicalCalls[0].family, 'agy:opus');
+  assert.equal(physicalCalls[0].outcome, 'FAILURE');
+  assert.equal(physicalCalls[0].code, 'PROVIDER_UNAVAILABLE');
+  assert.equal(physicalCalls[0].usage, null);
+  assert.equal(physicalCalls[1].family, 'agy:sonnet');
+  assert.equal(physicalCalls[1].outcome, 'SUCCESS');
+  assert.equal(physicalCalls[1].resolvedModel, 'claude-sonnet-5');
+  assert.deepEqual(physicalCalls[1].usage, { input_tokens: 4, output_tokens: 2 });
 });
 
 // ReviewLoop still never pushes / merges.

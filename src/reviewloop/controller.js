@@ -37,6 +37,8 @@ import {
 } from './state.js';
 import { captureBaseline, collectWorkerDelta } from './gitEvidence.js';
 import { collectPrDelta } from './prEvidence.js';
+import { withPrSnapshotWorktree, PrSnapshotError } from './prWorktree.js';
+import { assertPrRepositoryIdentity } from './prIdentity.js';
 import { withInProcessLoopLock, acquireLoopFileLease } from './loopLease.js';
 import { discoverVerificationCommands, runGate, GATE_VERDICTS } from './gatePolicy.js';
 import {
@@ -129,6 +131,11 @@ export function createReviewLoopController({
   routeSupervisorFn = null,
   recordProviderFailure = null,
   prBackend = null,
+  // PR-target snapshot correctness. Real implementations by default; tests
+  // inject deterministic fakes so no real git/gh call is ever made.
+  resolvePrRepositoryIdentityFn = assertPrRepositoryIdentity,
+  buildPrSnapshotFn = withPrSnapshotWorktree,
+  collectPrDeltaFn = collectPrDelta,
   captureBaselineFn = captureBaseline,
   collectWorkerDeltaFn = collectWorkerDelta,
   // Re-collect the Worker delta AFTER the review-time Gate (a snapshot / codegen
@@ -276,16 +283,19 @@ export function createReviewLoopController({
       // a review that cannot prove which snapshot it covers is worthless.
       if (!prBackend) throw new Error('reviewloop_begin: PR mode requires a PR backend');
       if (signal?.aborted) throw new Error('reviewloop_begin: cancelled by the caller');
-      if (typeof prBackend.resolveRepo === 'function') {
-        try {
-          const ident = await prBackend.resolveRepo();
-          repository.name = ident?.nameWithOwner ?? null;
-        } catch { /* repository name is best-effort metadata */ }
+      // Repository identity is NOT best-effort metadata: cwd's own repository
+      // must be PROVEN identical to the PR's repository before any PR loop is
+      // registered. GitHub commands are always scoped by cwd, never by the
+      // MCP process's own (accidental) working directory.
+      const repoIdentity = await resolvePrRepositoryIdentityFn({ cwd, prBackend, prNumber });
+      if (!repoIdentity?.ok) {
+        throw new Error(`reviewloop_begin: repository identity check failed — ${repoIdentity?.reason ?? 'unknown reason'}`);
       }
-      prHead = await prBackend.getPrHead({ prNumber });
+      repository.name = repoIdentity.nameWithOwner;
+      prHead = await prBackend.getPrHead({ prNumber, cwd });
       if (!prHead) throw new Error(`reviewloop_begin: cannot resolve HEAD for PR #${prNumber}`);
       prBaseSha = typeof prBackend.getPrBaseSha === 'function'
-        ? await prBackend.getPrBaseSha({ prNumber })
+        ? await prBackend.getPrBaseSha({ prNumber, cwd })
         : null;
       if (!prBaseSha) throw new Error(`reviewloop_begin: cannot resolve the base SHA for PR #${prNumber}`);
       // The PR Gate runs the same frozen verification plan as a LOCAL target.
@@ -357,6 +367,14 @@ export function createReviewLoopController({
   // re-call included).
   async function meteredWithFailover({
     spend, role, routeFn, defaultFamily, defaultProvider, operationId, evidenceIds, invoke, workflowId = null,
+    // Fired once per PHYSICAL failover attempt that actually reached (or tried
+    // to reach) a provider — never for an authorization/spend denial, which
+    // never dispatches. Lets the caller build a durable audit trail of every
+    // physical attempt (family/provider/quotaPool/outcome), not just the last
+    // one that happened to succeed. Success itself is recorded by the caller
+    // (it alone sees the raw provider envelope's resolvedModel/usage before
+    // meteredCall reduces it to a bare business value).
+    onAttempt = null,
   }) {
     const tried = new Set();
     // Effective attempt bound = this role's candidate count, so every
@@ -397,12 +415,17 @@ export function createReviewLoopController({
         return await spend.meteredCall({
           role, family, provider, model: selection?.model ?? null,
           operationId, attempt, evidenceIds,
-          call: () => invoke({ selection }),
+          call: () => invoke({
+            selection, attempt, family, provider,
+          }),
         });
       } catch (err) {
         lastErr = err;
-        if (isAuthorizationFailure(err)) throw err; // spend/objective denial — never retry
+        if (isAuthorizationFailure(err)) throw err; // spend/objective denial — never dispatched, never retried
         const code = err?.code ?? err?.providerFailure ?? '';
+        onAttempt?.({
+          attempt, family, provider, quotaPools: selection?.quotaPools ?? null, outcome: 'FAILURE', code,
+        });
         if (!RETRYABLE.has(code)) throw err;
         if (selection && recordProviderFailure) recordProviderFailure(selection, { code });
         // loop -> next attempt re-routes
@@ -493,6 +516,12 @@ export function createReviewLoopController({
   async function runReviewerOverEvidence({
     spend, loopState, objective, delta, gate, signal,
   }) {
+    // Every PHYSICAL Reviewer attempt for this call — one entry per failover
+    // retry AND per chunk, success or failure. Never collapsed into a single
+    // abstract "internal" — the durable PR audit (appendAuditRecord) needs to
+    // answer "which physical model reviewed this SHA", including every
+    // attempt a failover/chunking round made along the way.
+    const physicalCalls = [];
     // Round is bound to the LOGICAL review state (delta + gate fingerprint),
     // NOT to how many times reviewloop_review was invoked. A crash/resume that
     // re-enters with the SAME logical review state — its durable per-chunk
@@ -504,7 +533,7 @@ export function createReviewLoopController({
         review: {
           status: 'FAILED', reviewer: 'internal', provider: 'internal',
           blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0,
-          findingSignatures: [], error: { reason: 'REVIEW_TOO_LARGE', message: reason },
+          findingSignatures: [], error: { reason: 'REVIEW_TOO_LARGE', message: reason }, physicalCalls,
         },
         chunkCount: chunks.length,
       };
@@ -554,6 +583,7 @@ export function createReviewLoopController({
             status: 'FAILED', reviewer: 'internal', provider: 'internal',
             blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0,
             findingSignatures: [], error: { reason: 'REVIEW_CANCELLED', message: 'the review was cancelled by the caller' },
+            physicalCalls,
           },
           chunkCount: chunks.length,
         };
@@ -562,7 +592,7 @@ export function createReviewLoopController({
       if (done) {
         // Resume: this chunk was already reviewed in a prior (crashed) attempt.
         if (done.status === 'FAILED') {
-          return { review: done, chunkCount: chunks.length, failedChunk: chunk.index };
+          return { review: { ...done, physicalCalls }, chunkCount: chunks.length, failedChunk: chunk.index };
         }
         perChunk.push(done);
         continue;
@@ -588,7 +618,14 @@ export function createReviewLoopController({
         operationId: chunkId,
         workflowId: loopState.loopId,
         evidenceIds: [reviewStateEvidence.evidenceId],
-        invoke: ({ selection }) => Promise.resolve(reviewerFn({
+        onAttempt: (a) => physicalCalls.push({
+          role: 'reviewer', round: loopState.round, chunkIndex: chunk.index, chunkTotal: chunk.total,
+          attempt: a.attempt, family: a.family, provider: a.provider, quotaPools: a.quotaPools,
+          resolvedModel: null, usage: null, outcome: a.outcome, code: a.code,
+        }),
+        invoke: ({
+          selection, attempt, family, provider,
+        }) => Promise.resolve(reviewerFn({
           objective,
           diff: chunk.text,
           changedFiles: delta.changedFiles,
@@ -598,9 +635,20 @@ export function createReviewLoopController({
           previousFindings: loopState.lastReview?.blockingFindings ?? [],
           selection,
           signal,
-        })).then((out) => ({
-          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
-        })),
+        })).then((out) => {
+          // Captured HERE, before meteredCall reduces the result to a bare
+          // business value: the ONE place the actually-resolved model and raw
+          // provider usage for THIS physical attempt are still visible.
+          physicalCalls.push({
+            role: 'reviewer', round: loopState.round, chunkIndex: chunk.index, chunkTotal: chunk.total,
+            attempt, family: selection?.family ?? family ?? null, provider: selection?.provider ?? provider ?? null,
+            quotaPools: selection?.quotaPools ?? null, resolvedModel: out?.model ?? selection?.model ?? null,
+            usage: out?.usage ?? null, outcome: 'SUCCESS', code: null,
+          });
+          return {
+            value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
+          };
+        }),
       });
       loopState.reviewerCalls += 1;
       const normalized = normalizeReview({ raw, reviewer: 'internal', provider: 'internal' });
@@ -611,7 +659,7 @@ export function createReviewLoopController({
       await saveLoop(loopState);
       // Any chunk we could not review successfully fails the whole review closed.
       if (normalized.status === 'FAILED') {
-        return { review: normalized, chunkCount: chunks.length, failedChunk: chunk.index };
+        return { review: { ...normalized, physicalCalls }, chunkCount: chunks.length, failedChunk: chunk.index };
       }
       perChunk.push(normalized);
     }
@@ -636,6 +684,7 @@ export function createReviewLoopController({
         nonBlockingOmitted: Math.max(0, findings.filter((f) => !objective.blockingSeverities.includes(f.severity)).length - 8),
         findingSignatures: [...new Set(blocking.map((f) => f.signature).filter(Boolean))].sort(),
         error: null,
+        physicalCalls,
       },
       chunkCount: chunks.length,
     };
@@ -1000,8 +1049,9 @@ export function createReviewLoopController({
   async function runSupervisor({
     spend, loopState, objective, review, gate, signal,
   }) {
+    const physicalCalls = [];
     if (signal?.aborted) {
-      return { humanRequired: true, reason: 'the review was cancelled by the caller before the Supervisor ran' };
+      return { humanRequired: true, reason: 'the review was cancelled by the caller before the Supervisor ran', physicalCalls };
     }
     const findingsEvidence = await spend.registerEvidence({
       kind: 'findings', taskId: loopState.loopId, signature: review.findingSignatures.join('|') || 'none',
@@ -1017,12 +1067,27 @@ export function createReviewLoopController({
         operationId: `${loopState.loopId}:supervise`,
         workflowId: loopState.loopId,
         evidenceIds: [findingsEvidence.evidenceId],
-        invoke: ({ selection }) => Promise.resolve(supervisorFn({
+        onAttempt: (a) => physicalCalls.push({
+          role: 'supervisor', round: loopState.round, chunkIndex: null, chunkTotal: null,
+          attempt: a.attempt, family: a.family, provider: a.provider, quotaPools: a.quotaPools,
+          resolvedModel: null, usage: null, outcome: a.outcome, code: a.code,
+        }),
+        invoke: ({
+          selection, attempt, family, provider,
+        }) => Promise.resolve(supervisorFn({
           objective, blockingFindings: review.blockingFindings, gate,
           round: loopState.round, priorSignatures: loopState.findingSignatureHistory, selection, signal,
-        })).then((out) => ({
-          value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
-        })),
+        })).then((out) => {
+          physicalCalls.push({
+            role: 'supervisor', round: loopState.round, chunkIndex: null, chunkTotal: null,
+            attempt, family: selection?.family ?? family ?? null, provider: selection?.provider ?? provider ?? null,
+            quotaPools: selection?.quotaPools ?? null, resolvedModel: out?.model ?? selection?.model ?? null,
+            usage: out?.usage ?? null, outcome: 'SUCCESS', code: null,
+          });
+          return {
+            value: out?.value ?? out, usage: out?.usage ?? null, model: out?.model ?? null, costUsd: out?.costUsd, meta: out?.meta ?? null,
+          };
+        }),
       });
     } catch (err) {
       // A spend/authorization denial (SPEND_DENIED, MODEL_SPEND_USAGE_UNRESOLVED
@@ -1032,23 +1097,29 @@ export function createReviewLoopController({
       // (provider pool exhausted with settled accounting, non-auth non-retryable
       // failure) is a degradable transient.
       if (err instanceof LeaseLostError) throw err; // read-only exit in review()
-      if (isAuthorizationFailure(err)) return { denied: true, error: err };
-      return { humanRequired: true, reason: `Supervisor call failed: ${err?.message ?? err}` };
+      if (isAuthorizationFailure(err)) return { denied: true, error: err, physicalCalls };
+      return { humanRequired: true, reason: `Supervisor call failed: ${err?.message ?? err}`, physicalCalls };
     }
     loopState.supervisorCalls += 1;
     loopState.supervisorInvoked = true;
     // B1 — malformed Supervisor output is never treated as valid REWORK guidance.
     if (!raw || raw.malformed === true || typeof raw.guidance !== 'string' || !raw.guidance.trim()) {
-      return { humanRequired: true, reason: `Supervisor produced no usable repair guidance${raw?.reason ? ` (${raw.reason})` : ''}` };
+      return {
+        humanRequired: true,
+        reason: `Supervisor produced no usable repair guidance${raw?.reason ? ` (${raw.reason})` : ''}`,
+        physicalCalls,
+      };
     }
     if (String(raw.recommendation).toUpperCase() === 'HUMAN_REQUIRED') {
       // The Supervisor actually adjudicated the loop non-convergent. Only this
       // path is terminal — a cancellation, transport throw, or malformed
       // response above returns `humanRequired` WITHOUT `terminal`, so the round
       // stays resumable.
-      return { humanRequired: true, terminal: true, reason: 'Supervisor recommends human involvement', guidance: raw.guidance };
+      return {
+        humanRequired: true, terminal: true, reason: 'Supervisor recommends human involvement', guidance: raw.guidance, physicalCalls,
+      };
     }
-    return { guidance: raw.guidance };
+    return { guidance: raw.guidance, physicalCalls };
   }
 
   // Apply a Supervisor result to the loop. Returns:
@@ -1088,6 +1159,26 @@ export function createReviewLoopController({
     return { guidance: sup.guidance };
   }
 
+  // One physical provider attempt, shaped for the durable audit. `usage` is
+  // the raw provider envelope (never re-derived/estimated) — null on a
+  // failed/pre-dispatch attempt, present on a settled success.
+  function physicalCallAuditEntry(pc) {
+    return {
+      role: pc.role ?? null,
+      family: pc.family ?? null,
+      provider: pc.provider ?? null,
+      quotaPools: pc.quotaPools ?? null,
+      resolvedModel: pc.resolvedModel ?? null,
+      attempt: pc.attempt ?? null,
+      round: pc.round ?? null,
+      chunkIndex: pc.chunkIndex ?? null,
+      chunkTotal: pc.chunkTotal ?? null,
+      outcome: pc.outcome ?? null,
+      code: pc.code ?? null,
+      usage: pc.usage ?? null,
+    };
+  }
+
   // ---- durable audit record ------------------------------------------
   // One recoverable, tamper-evident entry per PR review round. Its fingerprint
   // covers every load-bearing identity for "which PR snapshot did this round
@@ -1095,15 +1186,22 @@ export function createReviewLoopController({
   function appendAuditRecord({
     loopState, objective, delta, gate, review, decision, telemetry,
     observedHeadSha, finalObservedHeadSha, headStillCurrent, result,
+    supervisorPhysicalCalls = [],
   }) {
     const target = {
       type: 'PR',
       repository: objective.repository?.name ?? null,
       prNumber: objective.prNumber,
       baseSha: objective.prBaseSha ?? null,
+      mergeBase: delta?.mergeBase ?? null,
       reviewedHeadSha: observedHeadSha ?? null,
       finalObservedHeadSha: finalObservedHeadSha ?? null,
       headStillCurrent: headStillCurrent === true,
+      // Structural proof the Gate ran against the SAME exact snapshot the
+      // Reviewer's evidence was bound to (prWorktree.js tags this on the
+      // gate result right after it runs inside the isolated worktree).
+      gateRanOnReviewedHead: gate?.reviewedSnapshotHeadSha != null
+        && gate.reviewedSnapshotHeadSha === observedHeadSha,
     };
     const record = {
       loopId: loopState.loopId,
@@ -1131,16 +1229,21 @@ export function createReviewLoopController({
         verdict: gate.verdict ?? null,
       } : null,
       review: review ? {
-        reviewer: 'internal',
-        provider: review.provider ?? 'internal',
-        resolvedModel: review.resolvedModel ?? null,
+        // Logical pool identity — the Worker-facing abstraction never changes.
+        reviewer: 'internal pool',
         status: review.status,
         blockingFindings: review.blockingFindings?.length ?? 0,
         findingSignatures: review.findingSignatures ?? [],
+        // Every PHYSICAL Reviewer attempt bound to this exact reviewedHeadSha:
+        // role, family, provider, quotaPool, resolvedModel, attempt, round,
+        // chunk index/total, outcome, usage. Never collapsed to one abstract
+        // "internal" entry — a failover/chunked round keeps every attempt.
+        physicalCalls: (review.physicalCalls ?? []).map((pc) => physicalCallAuditEntry(pc)),
       } : null,
       supervisor: {
         invoked: loopState.supervisorInvoked === true,
         guidance: loopState.lastSupervisorGuidance ?? null,
+        physicalCalls: (supervisorPhysicalCalls ?? []).map((pc) => physicalCallAuditEntry(pc)),
       },
       spend: telemetry ?? null,
       convergence: decision ? { verdict: decision.verdict, reason: decision.reason } : null,
@@ -1196,6 +1299,79 @@ export function createReviewLoopController({
   }
 
   // ---- PR mode: ONE unified review engine over the PR base->HEAD delta ----
+  // Snapshot-correctness invariant, asserted right before a PR round is
+  // allowed to PASS. Every one of these must be POSITIVELY known-true; any
+  // UNKNOWN/mismatch refuses PASS (never certifies on a best-effort basis):
+  //   - repository identity was proven at reviewloop_begin
+  //   - the Reviewer's evidence is bound to this exact reviewedHeadSha
+  //   - the Gate ran inside the isolated worktree for this exact HEAD
+  //   - the live PR HEAD, re-read just now, is still this exact HEAD
+  function prPassInvariantFailure({
+    objective, delta, gate, observedHead, finalHead,
+  }) {
+    if (!objective.repository?.name) return 'repository identity is not known (reviewloop_begin should have refused to register this loop)';
+    if (!delta || delta.reviewedHeadSha !== observedHead) return 'Reviewer evidence is not bound to the exact reviewed HEAD';
+    if (!gate || gate.reviewedSnapshotHeadSha !== observedHead) return 'the deterministic Gate did not run inside the exact-HEAD snapshot worktree';
+    if (!finalHead || finalHead !== observedHead) return 'the live PR HEAD does not match the reviewed HEAD';
+    return null;
+  }
+
+  // Build the exact PR snapshot for ONE round and run the Gate + collect the
+  // Reviewer's evidence INSIDE it — Gate execution, the verification-manifest
+  // drift check, and the diff identity all run against the SAME isolated
+  // worktree checked out at `headSha`, never the user's own ambient cwd. The
+  // worktree is guaranteed torn down (success or failure) before this
+  // resolves — see prWorktree.js.
+  async function buildPrRoundEvidence({
+    loopState, objective, cwd, prNumber, headSha, signal,
+  }) {
+    return buildPrSnapshotFn({
+      cwd, baseSha: objective.prBaseSha, headSha, prNumber,
+    }, async ({ worktreeDir, mergeBase }) => {
+      const delta = await collectPrDeltaFn({ cwd: worktreeDir, mergeBase, headSha });
+      if (delta.evidenceComplete === false) {
+        return { kind: 'HUMAN_REQUIRED', reason: `cannot construct a trustworthy PR delta: ${(delta.incompleteReasons ?? []).join('; ')}` };
+      }
+      if (delta.noWorkerChangeYet) return { kind: 'NO_PROGRESS' };
+
+      // The FROZEN deterministic Gate (same plan as a LOCAL target) — but the
+      // drift check compares against THIS worktree, the exact snapshot being
+      // reviewed, never the user's ambient cwd (which may be on another
+      // branch, dirty, or simply irrelevant to this PR).
+      const frozenPlan = objective.verificationPlan;
+      let gateCommands;
+      let commandSource;
+      if (frozenPlan?.commands?.length) {
+        gateCommands = frozenPlan.commands;
+        commandSource = `${frozenPlan.source} (frozen at begin)`;
+        try {
+          const current = discoverVerificationCommandsFn({ cwd: worktreeDir, configured: loopState.verificationCommands });
+          if (current?.manifestFingerprint && frozenPlan.manifestFingerprint
+            && current.manifestFingerprint !== frozenPlan.manifestFingerprint) {
+            return { kind: 'DRIFT' };
+          }
+        } catch { /* discovery is best-effort here */ }
+      } else {
+        const discovered = discoverVerificationCommandsFn({ cwd: worktreeDir, configured: loopState.verificationCommands });
+        gateCommands = discovered.commands;
+        commandSource = discovered.source;
+      }
+
+      const gate = await runGateFn({
+        cwd: worktreeDir, commands: gateCommands, runner: gateRunner, env, signal,
+      });
+      gate.commandSource = commandSource;
+      // Structural proof this Gate ran inside the exact-HEAD snapshot — the
+      // pre-PASS invariant check and the durable audit both key off this.
+      gate.reviewedSnapshotHeadSha = headSha;
+
+      if (gate.verdict === GATE_VERDICTS.FAIL) return { kind: 'GATE_FAIL', delta, gate };
+      return {
+        kind: 'READY', delta, gate,
+      };
+    });
+  }
+
   async function reviewPr({ loopState, signal }) {
     const objective = loopState.objective;
     const cwd = objective.repository?.root;
@@ -1209,7 +1385,7 @@ export function createReviewLoopController({
       //    currently HEAD must never fall back to a cached SHA.
       let observedHead;
       try {
-        observedHead = await prBackend.getPrHead({ prNumber });
+        observedHead = await prBackend.getPrHead({ prNumber, cwd });
       } catch (err) {
         return prHumanRequired(loopState, `cannot resolve the live PR HEAD: ${err?.message ?? err}`);
       }
@@ -1228,11 +1404,23 @@ export function createReviewLoopController({
 
       recordTransition(loopState, REVIEW_LOOP_STATES.REVIEWING, 'PR review requested');
 
-      // 3. PR base -> exact HEAD delta (the primary Reviewer evidence).
-      const delta = await collectPrDelta({
-        prBackend, prNumber, baseSha: objective.prBaseSha, headSha: observedHead,
-      });
-      if (delta.noWorkerChangeYet) {
+      // 3+4. Exact PR snapshot: the Reviewer's diff identity AND the
+      // deterministic Gate both run inside ONE isolated worktree checked out
+      // at `observedHead`, torn down before this resolves.
+      let snap;
+      try {
+        snap = await buildPrRoundEvidence({
+          loopState, objective, cwd, prNumber, headSha: observedHead, signal,
+        });
+      } catch (err) {
+        if (err instanceof PrSnapshotError) {
+          return prHumanRequired(loopState, `cannot build an exact PR snapshot worktree: ${err.message}`);
+        }
+        throw err;
+      }
+
+      if (snap.kind === 'HUMAN_REQUIRED') return prHumanRequired(loopState, snap.reason);
+      if (snap.kind === 'NO_PROGRESS') {
         await saveLoop(loopState);
         return {
           status: 'NO_PROGRESS', loopId: loopState.loopId, round: loopState.round,
@@ -1241,54 +1429,30 @@ export function createReviewLoopController({
           telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
         };
       }
-      if (delta.evidenceComplete === false) {
-        return prHumanRequired(
-          loopState,
-          `cannot construct a trustworthy PR delta: ${(delta.incompleteReasons ?? []).join('; ')}`,
-        );
+      if (snap.kind === 'DRIFT') {
+        collectSafetyEvent({
+          code: 'VERIFICATION_PLAN_DRIFT', severity: 'BLOCKING', role: 'gate',
+          taskId: loopState.loopId,
+          reason: `the verification config (${objective.verificationPlan?.source}) drifted from the frozen plan in the reviewed PR snapshot`,
+          actionTaken: 'review blocked; frozen Gate cannot be trusted',
+        });
+        loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
+        recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'verification plan drift');
+        await saveLoop(loopState);
+        return {
+          ...compactReworkPayload({
+            loopState,
+            review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 },
+            gate: { verdict: 'FAIL', failureIdentities: ['verification-plan-drift'] },
+          }),
+          head: observedHead,
+          reason: 'the verification configuration in the reviewed PR snapshot no longer matches the plan frozen at reviewloop_begin; revert it or start a new reviewloop_begin',
+          telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+        };
       }
 
-      // 4. The FROZEN deterministic Gate (same plan as a LOCAL target).
-      const frozenPlan = objective.verificationPlan;
-      let gateCommands;
-      let commandSource;
-      if (frozenPlan?.commands?.length) {
-        gateCommands = frozenPlan.commands;
-        commandSource = `${frozenPlan.source} (frozen at begin)`;
-        try {
-          const current = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
-          if (current?.manifestFingerprint && frozenPlan.manifestFingerprint
-            && current.manifestFingerprint !== frozenPlan.manifestFingerprint) {
-            collectSafetyEvent({
-              code: 'VERIFICATION_PLAN_DRIFT', severity: 'BLOCKING', role: 'gate',
-              taskId: loopState.loopId,
-              reason: `the verification config (${frozenPlan.source}) was modified after reviewloop_begin`,
-              actionTaken: 'review blocked; frozen Gate cannot be trusted',
-            });
-            loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
-            recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'verification plan drift');
-            await saveLoop(loopState);
-            return {
-              ...compactReworkPayload({
-                loopState,
-                review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 },
-                gate: { verdict: 'FAIL', failureIdentities: ['verification-plan-drift'] },
-              }),
-              reason: 'the verification configuration was changed after reviewloop_begin; revert it or start a new reviewloop_begin',
-              telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
-            };
-          }
-        } catch { /* discovery is best-effort here */ }
-      } else {
-        const discovered = discoverVerificationCommandsFn({ cwd, configured: loopState.verificationCommands });
-        gateCommands = discovered.commands;
-        commandSource = discovered.source;
-      }
-
-      let gate = await runGateFn({
-        cwd, commands: gateCommands, runner: gateRunner, env, signal,
-      });
-      gate.commandSource = commandSource;
+      const { delta } = snap;
+      let { gate } = snap;
 
       if (signal?.aborted) {
         return prHumanRequired(loopState, 'the review was cancelled by the caller before the Reviewer ran');
@@ -1306,7 +1470,7 @@ export function createReviewLoopController({
         };
       }
 
-      if (gate.verdict === GATE_VERDICTS.FAIL) {
+      if (snap.kind === 'GATE_FAIL') {
         loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
         loopState.lastReviewedFingerprint = fp;
         loopState.lastGateFingerprint = gate.fingerprint;
@@ -1355,8 +1519,10 @@ export function createReviewLoopController({
       ];
 
       let supervisorGuidance = null;
+      let supervisorPhysicalCalls = [];
       if (decision.verdict === REVIEW_VERDICTS.REWORK && decision.invokeSupervisor && !loopState.supervisorInvoked) {
         const sup = await runSupervisor({ spend, loopState, objective, review, gate, signal });
+        supervisorPhysicalCalls = sup.physicalCalls ?? [];
         if (sup.denied) return spendDenialResult(loopState, sup.error, await spend.telemetry());
         const outcome = await applySupervisorOutcome({
           sup, loopState, review, spend, escalationReason: 'PR non-convergence escalation',
@@ -1373,7 +1539,7 @@ export function createReviewLoopController({
         //    certified by a stale review — rebind and re-review it (bounded).
         let finalHead;
         try {
-          finalHead = await prBackend.getPrHead({ prNumber });
+          finalHead = await prBackend.getPrHead({ prNumber, cwd });
         } catch (err) {
           return prHumanRequired(loopState, `could not re-confirm the live PR HEAD before PASS: ${err?.message ?? err}`);
         }
@@ -1386,7 +1552,7 @@ export function createReviewLoopController({
             actionTaken: 'stale review not certified; re-reviewing the new HEAD',
           });
           appendAuditRecord({
-            loopState, objective, delta, gate, review, decision, telemetry,
+            loopState, objective, delta, gate, review, decision, telemetry, supervisorPhysicalCalls,
             observedHeadSha: observedHead, finalObservedHeadSha: finalHead,
             headStillCurrent: false, result: 'REWORK',
           });
@@ -1394,8 +1560,16 @@ export function createReviewLoopController({
           await saveLoop(loopState);
           continue;
         }
+        // Explicit correctness invariant — every load-bearing fact must be
+        // POSITIVELY known-true, never assumed, right before certifying PASS.
+        const invariantFailure = prPassInvariantFailure({
+          objective, delta, gate, observedHead, finalHead,
+        });
+        if (invariantFailure) {
+          return prHumanRequired(loopState, `PR PASS invariant not satisfied: ${invariantFailure}`);
+        }
         appendAuditRecord({
-          loopState, objective, delta, gate, review, decision, telemetry,
+          loopState, objective, delta, gate, review, decision, telemetry, supervisorPhysicalCalls,
           observedHeadSha: observedHead, finalObservedHeadSha: finalHead,
           headStillCurrent: true, result: 'PASS',
         });
@@ -1410,7 +1584,7 @@ export function createReviewLoopController({
       if (decision.verdict === REVIEW_VERDICTS.HUMAN_REQUIRED) {
         loopState.budgetExhausted = true;
         appendAuditRecord({
-          loopState, objective, delta, gate, review, decision, telemetry,
+          loopState, objective, delta, gate, review, decision, telemetry, supervisorPhysicalCalls,
           observedHeadSha: observedHead, finalObservedHeadSha: observedHead,
           headStillCurrent: true, result: 'HUMAN_REQUIRED',
         });
@@ -1423,7 +1597,7 @@ export function createReviewLoopController({
       }
 
       appendAuditRecord({
-        loopState, objective, delta, gate, review, decision, telemetry,
+        loopState, objective, delta, gate, review, decision, telemetry, supervisorPhysicalCalls,
         observedHeadSha: observedHead, finalObservedHeadSha: observedHead,
         headStillCurrent: true, result: 'REWORK',
       });

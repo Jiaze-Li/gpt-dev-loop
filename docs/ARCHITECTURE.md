@@ -35,8 +35,10 @@ src/reviewloop/
   diffChunker.js        deterministic diff chunking (no silent truncation)
   reviewPolicy.js       review normalization + convergence policy
   reviewSpend.js        DURABLE ReviewLoop-scoped Token Safety (Reviewer + Supervisor)
-  prEvidence.js         PR base->HEAD delta collection (LOCAL-delta-shaped; fails closed)
-  githubBackend.js      slim PR-target transport via the `gh` CLI (repo id, base/HEAD SHA, PR diff, optional result publication — never a reviewer)
+  prEvidence.js         PR merge-base->HEAD delta via LOCAL git over explicit fetched SHAs (LOCAL-delta-shaped; fails closed; never a live API call)
+  prWorktree.js         isolated disposable `git worktree` at the exact PR HEAD — Gate + evidence identity both run inside it
+  prIdentity.js         cwd repository == PR repository, proven independently of `gh`/env, fail closed
+  githubBackend.js      slim PR-target transport via the `gh` CLI (repo id, base/HEAD SHA, optional result publication — never a reviewer, never PR diff evidence)
   providerWiring.js     production Reviewer/Supervisor pool (RoleRouter) + PR backend
   adapters/
     scratchCwd.js          shared isolated empty scratch cwd for every narrow transport
@@ -62,18 +64,39 @@ the deterministic Gate, routes an independent Reviewer over the full evidence
 (bounded or chunked), applies the convergence policy, and — only on
 non-convergence — the Supervisor.
 
-| target | evidence | HEAD binding |
-|--------|----------|--------------|
-| LOCAL  | `reviewloop_begin` baseline → current Worker delta | n/a |
-| PR     | PR base SHA → exact PR HEAD diff (`gh pr diff`)     | live PR HEAD re-read every round; a pre-`PASS` recheck refuses to certify a stale review if the HEAD moved |
+| target | evidence | Gate cwd | HEAD binding |
+|--------|----------|----------|--------------|
+| LOCAL  | `reviewloop_begin` baseline → current Worker delta | the user's own worktree | n/a |
+| PR     | `merge-base(prBaseSha, observedHead) .. observedHead` via LOCAL `git diff` | an isolated disposable `git worktree` checked out DETACHED at `observedHead` (prWorktree.js) | live PR HEAD re-read every round; a pre-`PASS` recheck refuses to certify a stale review if the HEAD moved |
+
+For a PR target, the Reviewer's diff identity, the deterministic Gate, and the
+verification-manifest drift check ALL run inside the SAME isolated worktree —
+never the user's ambient cwd (which may be on another branch, dirty, or
+unrelated to the PR). The worktree is built fresh each round at the round's
+`observedHead`, torn down (success or failure) before the round's Reviewer
+call, and never commits, pushes, or mutates the user's own branches. Before a
+PR loop is even registered, `reviewloop_begin` PROVES cwd's own repository
+(from its literal `origin` remote, independent of any `gh`/env override) is
+the exact repository the PR belongs to (prIdentity.js) — never best-effort
+metadata; an unresolvable or mismatched identity refuses the begin.
 
 A PR round writes a durable, tamper-evident audit record to loop state
 (`loopState.audit[]`): the frozen target identity (repository, prNumber,
-baseSha, reviewedHeadSha) + a `targetFingerprint` over it, the objective
-fingerprint, the Gate verdict/fingerprint, the Reviewer verdict/findings, the
+baseSha, reviewedHeadSha, mergeBase) + a `targetFingerprint` over it, the
+objective fingerprint, the Gate verdict/fingerprint (plus a structural
+`gateRanOnReviewedHead` flag proving the Gate ran in the exact-HEAD
+worktree), the Reviewer verdict/findings, and — for every PHYSICAL Reviewer
+and Supervisor call this round made (including every failover retry and every
+chunk) — its role, family, provider, quota pool, resolved model, attempt,
+round, chunk index/total, outcome, and raw usage. A failover or chunked round
+never collapses to one abstract "internal" entry. The record also carries the
 Supervisor state, the spend telemetry, and the round result. The objective
 fingerprint itself folds in `prBaseSha` and `reviewedHeadSha`, so editing
-persisted PR identity fails the integrity check.
+persisted PR identity fails the integrity check. `reviewloop_review` never
+PASSes a PR round unless it can positively prove: repository identity is
+known, the Reviewer's evidence is bound to the exact reviewed HEAD, the Gate
+ran inside that exact HEAD's worktree, AND the live PR HEAD re-read just
+before certifying still matches — any one of those being unknown refuses PASS.
 
 ## Active model roles
 
@@ -352,13 +375,19 @@ HEAD kept moving faster than one review round could complete. Re-call
 ### PR HEAD binding
 
 Each PR round re-reads the live PR HEAD (`gh pr view … headRefOid`), fails
-closed if it cannot be resolved, and reviews `objective.prBaseSha → observed
-HEAD`. Before a `PASS` the live HEAD is read once more: only
-`finalObservedHeadSha === reviewedHeadSha` lets the round PASS. A HEAD that
-moved during the review is never certified by the stale review — the round
-rebinds and re-reviews the new HEAD (bounded; a HEAD that never settles →
-`WAITING_FOR_REVIEW`). `PUSH_REQUIRED` is returned when the HEAD is unchanged
-since a prior actionable review (fix not pushed yet).
+closed if it cannot be resolved, and builds an isolated `git worktree`
+checked out DETACHED at that exact SHA (prWorktree.js) to compute
+`merge-base(objective.prBaseSha, observedHead) .. observedHead` via LOCAL git
+diff and to run the deterministic Gate — never a live `gh pr diff` call and
+never the user's own ambient cwd. Before a `PASS` the live HEAD is read once
+more: only `finalObservedHeadSha === reviewedHeadSha` lets the round PASS,
+and an explicit invariant check additionally requires repository identity to
+be known, the Reviewer evidence to be bound to `observedHead`, and the Gate
+to have run inside that exact HEAD's worktree — any one UNKNOWN refuses PASS.
+A HEAD that moved during the review is never certified by the stale review —
+the round rebinds and re-reviews the new HEAD (bounded; a HEAD that never
+settles → `WAITING_FOR_REVIEW`). `PUSH_REQUIRED` is returned when the HEAD is
+unchanged since a prior actionable review (fix not pushed yet).
 
 ## Convergence
 
@@ -545,15 +574,39 @@ tracked state without touching the tree; the review diff is `baseline..current`
 never attributed to the Worker. Unattributable state → `HUMAN_REQUIRED`. No
 Worker change since `begin` → deterministic `NO_PROGRESS`, zero Reviewer calls.
 
-**PR evidence** (`prEvidence.js`): the primary Reviewer evidence for a PR
-target is the PR's own `base → HEAD` unified diff (`gh pr diff`) plus its
-changed-file list — not "what the Worker changed since `begin`". A base/HEAD
-that cannot be resolved, a diff that cannot be fetched, or a binary/submodule
-hunk in the PR diff marks the evidence incomplete → `HUMAN_REQUIRED`. GitHub is
-a target adapter only: it resolves the repository, the base SHA, the current
-HEAD SHA, the PR diff, and (opt-in, `REVIEWLOOP_PUBLISH_PR_RESULT=1`) publishes
-a one-comment result summary. It is never a reviewer, never posts a
-review-trigger comment, and a publication failure never changes the verdict.
+**PR evidence** (`prEvidence.js` + `prWorktree.js`): the primary Reviewer
+evidence for a PR target is `merge-base(prBaseSha, reviewedHeadSha) ..
+reviewedHeadSha`, computed with LOCAL `git diff`/`git diff --name-only`
+inside an isolated disposable worktree — never a live `gh pr diff` API call,
+and never "what the Worker changed since `begin`". `prWorktree.js` first
+proves both SHAs are real, fetched commit objects (fetching them by exact SHA
+when the reviewer's own checkout does not already have them, falling back to
+`refs/pull/<n>/head` for the HEAD SHA only), computes their merge-base, then
+checks out a throwaway `git worktree --detach` at the exact HEAD SHA — torn
+down again (success or failure) before the round's Reviewer call, never
+committing, pushing, or touching the user's own branches. A base/HEAD that
+cannot be fetched, a merge-base that cannot be resolved, a diff that fails, or
+a binary/submodule hunk in the diff all mark the evidence incomplete →
+`HUMAN_REQUIRED`. GitHub is a target adapter only: it resolves the repository
+identity (cross-checked against cwd's own git remote — see **PR repository
+identity** below), the base SHA, the current HEAD SHA, and (opt-in,
+`REVIEWLOOP_PUBLISH_PR_RESULT=1`) publishes a one-comment result summary. It
+is never a reviewer, never serves the PR diff as Reviewer evidence, never
+posts a review-trigger comment, and a publication failure never changes the
+verdict.
+
+**PR repository identity** (`prIdentity.js`): `reviewloop_begin({ cwd,
+prNumber })` refuses to register a PR loop unless cwd's own repository is
+PROVEN identical to the PR's repository — never best-effort metadata. cwd's
+identity is derived from the LITERAL configured `git config
+remote.origin.url` (never `git remote get-url`, which silently applies any
+local `insteadOf` rewrite, and never the MCP process's own working
+directory), canonicalized to `owner/name`; the PR's identity comes from
+`prBackend.resolveRepo({ cwd, prNumber })`, itself scoped to `cwd` rather than
+an ambient process cwd. cwd not being a git repository, having no `origin`
+remote, an unparseable/non-GitHub remote, GitHub reporting no identity, or the
+two identities disagreeing are ALL refused — never treated as an implicit
+match.
 
 **Complete physical-attempt accounting**: every settled metered attempt —
 success, known-usage failure, OR mechanically-zero pre-send failure
