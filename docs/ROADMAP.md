@@ -10,7 +10,12 @@
   HUMAN_REQUIRED.
 - PR review controller: one `@codex/@claude review` per HEAD, zero-model local
   wait, durable `WAITING_FOR_REVIEW`, exact-HEAD binding, duplicate-trigger
-  prevention.
+  prevention. **Superseded by D28** — the external-review trigger engine
+  (`prReviewController`, `ExternalModelTriggerAuthority`, `prTrust`,
+  `threadResolution`, `trustedPrReview`, `prCloseoutPolicy`) was later removed
+  entirely. PR is now a review TARGET of the ONE unified engine (same
+  deterministic Gate → internal Reviewer routing → convergence → Supervisor as
+  LOCAL), never a trigger for `@codex review` / `@claude review`.
 - Token Safety migrated to `REVIEWLOOP_*` limits, scoped to Reviewer +
   Supervisor; `UNKNOWN != ZERO` and reservation-settlement invariants retained.
 - MCP surface reduced to `reviewloop_begin` + `reviewloop_review`.
@@ -243,8 +248,47 @@ worktree, against the byte-exact frozen certification delta `bb0c36e → ce02f1e
 - Controller final verdict: **PASS** (round 1, "no P1/P2 findings").
 
 Scope of this certification: **LOCAL mode only**, first-choice Reviewer only.
-It does **not** cover PR external-review mode or the multi-provider failover
-chain (see below).
+It does **not** cover the PR target or the multi-provider failover chain (see
+below).
+
+## PR-target real-provider certification (PR #5)
+
+Implementation freeze: `787a4070336d9839590d437ce95ec8a898519d11`.
+Certification PR: #5 (branches `cert/pr-target-base` → `cert/pr-target-e2e`),
+reviewed head `755c1e53cdcf113e2c85aa901e4e43ed21836d1d`.
+
+Exercises the real ReviewLoop PR-target production path end to end:
+repository identity proof, exact base/head SHA binding, Gate on the exact
+reviewed HEAD inside an isolated worktree, one real Reviewer call.
+
+- Physical Reviewer: `codex:default`. Reviewer calls **1**, Supervisor calls
+  **0**.
+- Controller verdict: **PASS**, round 1, "no P1/P2 findings".
+- `usageVolume` **16759**, `contextOverheadTokens` **16460** — below both
+  Token Sentinel thresholds (40000 single-call / 30000 context-overhead); not
+  tripped.
+- This closes the "PR external-review mode NOT CERTIFIED" gap recorded
+  earlier in this document for the PR-target path specifically. The real
+  multi-provider failover chain (see below) is still not run.
+
+## Final routing-hardening implementation (`928f79f`)
+
+`a1cfe2c` (durable route audit, primary-first invariant, stale-health
+revalidation) → `928f79f` (reason-scoped stale-health revalidation, transport
+gate, per-call audit attribution). See D30 in `docs/DECISIONS.md` for the
+invariant set.
+
+- Deterministic local suite / `npm run doctor` / `npm run benchmark:transports`:
+  **PASS**.
+- Independent manual GitHub code review: **PASS**.
+- No extra real-provider certification was performed against this head. One
+  real-provider certification attempt over the routing-hardening change
+  tripped the post-settlement Token Sentinel: `codex:default` Reviewer call,
+  `usageVolume` **79256**, `contextOverheadTokens` **69297** (both over
+  threshold, `SINGLE_CALL_USAGE` trigger) — the loop latched to
+  `HUMAN_REQUIRED`. This is a **safety trip, not a code finding**: the call
+  was fully accounted, no auto-failover occurred, and the Sentinel thresholds
+  were **not** raised or bypassed.
 
 ## Real-provider status (needs real providers / real GitHub)
 
@@ -304,9 +348,10 @@ Corrected against this machine's durable reservation + spend ledgers under
   `agy:opus` / `claude-opus-4-6-thinking`, against the certified implementation
   snapshot `ce02f1e` and the frozen delta `bb0c36e → ce02f1e` (see the LOCAL
   controller-level certification section above).
-- ReviewLoop real PR external-review loop (`@codex review` / `@claude review`)
-  = **NOT CERTIFIED / NOT RUN**. The LOCAL certification above does not cover
-  PR mode.
+- ReviewLoop real-provider **controller-level** PR-target E2E = **CERTIFIED**
+  (PR #5, see "PR-target real-provider certification" above) — `codex:default`,
+  round 1 `PASS`, against implementation freeze `787a407` / reviewed head
+  `755c1e5`.
 - Real multi-provider failover chain end-to-end = **NOT RUN** (structurally
   wired; per-candidate certs above are single-candidate).
 - A controlled `Worker + ReviewLoop` vs `Worker alone` wrapper benchmark
@@ -315,10 +360,9 @@ Corrected against this machine's durable reservation + spend ledgers under
 
 ## Later
 
-- A real-provider **controller-level** E2E for **PR mode** carried to a
-  certified verdict (LOCAL mode is certified; PR external-review mode is not),
-  a REWORK→PASS controller loop over real providers, and a real multi-provider
-  failover chain (the per-candidate transports are each live-certified; the
-  full chain is not).
+- A real-provider REWORK→PASS controller loop over real providers (both LOCAL
+  and PR-target one-round PASS are certified; a REWORK-then-PASS round is
+  not), and a real multi-provider failover chain (the per-candidate transports
+  are each live-certified; the full chain is not).
 - Optional read-only ReviewLoop dashboard (removed in this migration; re-add
   only if it can stay zero-token and simple).

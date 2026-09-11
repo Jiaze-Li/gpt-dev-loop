@@ -12,13 +12,12 @@ ReviewLoop owns independent verification and repair control.
 | implement / test / lint / build / debug / commit / push | **Worker** (external coding agent) |
 | immutable review objective + baseline / PR-HEAD identity | ReviewLoop |
 | deterministic Gate (0 model tokens) | ReviewLoop |
-| independent Reviewer | ReviewLoop |
-| external PR review trigger + zero-model wait | ReviewLoop |
+| independent Reviewer (same engine for LOCAL and PR targets) | ReviewLoop |
 | review normalization + finding signatures | ReviewLoop |
 | convergence / non-convergence policy | ReviewLoop |
 | Supervisor exception guidance | ReviewLoop |
 | durable loop state / resume | ReviewLoop |
-| ReviewLoop's own token + external-trigger safety | ReviewLoop |
+| ReviewLoop's own token safety (Reviewer + Supervisor spend) | ReviewLoop |
 
 ReviewLoop cannot autonomously: rewrite files, execute repair code, commit,
 push, force-push, merge, weaken the objective, or spend models without fresh
@@ -356,6 +355,44 @@ ownership probe) runs immediately before every paid model dispatch and every
 durable ReviewLoop state write, and a lost lease aborts the call read-only
 (`WAITING_FOR_REVIEW`) — no further dispatch, no state write; the new owner
 reconciles.
+
+### Final routing-hardening invariants (928f79f)
+
+Closing invariant set for `RoleRouter` route selection and its durable audit
+trail, landed across `a1cfe2c` (durable route audit, primary-first invariant,
+stale-health revalidation) and `928f79f` (reason-scoped stale-health
+revalidation, transport gate, per-call audit attribution):
+
+- **`agy:opus` eligible → must be the Reviewer primary selection.** If
+  `agy:opus` is not skipped, it is selected; `assertRoutePrimaryFirstInvariant`
+  throws (`ROUTE_PRIMARY_NOT_EVALUATED` / `ROUTE_PRIMARY_REASON_NOT_ENUMERATED`
+  / `ROUTE_PRIMARY_SKIP_UNPERSISTED`) if a route ever picks a non-primary
+  candidate without the primary having been evaluated and durably skipped for
+  an enumerated reason first.
+- **Every pre-dispatch skip records a durable, enumerated reason before route
+  moves to the next candidate** — one of `ROUTE_SKIP_REASONS` (capability,
+  high-context, quota cooldown, provider health, `no_transport`, …); an
+  unenumerated or unpersisted skip reason fails the invariant rather than
+  silently falling through.
+- **An unpersisted or unknown routing decision fails closed** — a skip whose
+  audit write did not durably persist is treated as if the primary was never
+  properly evaluated, never as an implicit pass-through.
+- **No wired transport → `no_transport`, never selectable.** A candidate whose
+  `resolved.transportAvailable === false` is skipped with `NO_TRANSPORT` and
+  can never be chosen regardless of health/quota state.
+- **Stale health is cleared only by a zero-token probe that proves that
+  specific failure class recovered.** Revalidation is reason-scoped: it only
+  attempts to clear a health record whose `reasonCode` is
+  `AGY_PROVISIONING_FAILED`; every other reasonCode (a post-dispatch
+  `PROVIDER_*` failure, or no reasonCode at all) refuses revalidation and
+  requires an MCP server restart to clear, never a re-probe on the same
+  process.
+- **Audit attribution is per loop / round / operation / attempt / chunk.**
+  `RouteAuditLog.record` persists `loopId`, `round`, `operationId`, `attempt`,
+  `chunkIndex`, `chunkTotal` alongside every route decision, so a failover or
+  chunked round never collapses into one abstract entry — each physical
+  routing decision is independently attributable in the durable log
+  (`~/.reviewloop/route-audit.log` by default).
 
 ## State machine
 
