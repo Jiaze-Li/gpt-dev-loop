@@ -43,7 +43,9 @@
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { readFile as nodeReadFile, lstat as nodeLstat, open as nodeOpen } from 'node:fs/promises';
+import {
+  readFile as nodeReadFile, lstat as nodeLstat, open as nodeOpen, realpath as nodeRealpath,
+} from 'node:fs/promises';
 import path from 'node:path';
 
 // O_NOFOLLOW is a POSIX flag; 0 (no-op) on platforms that lack it.
@@ -133,7 +135,7 @@ function describeSpecial(info) {
 //   { safe: false, reason }        symlink / FIFO / socket / device / dir
 //   { unreadable: true, reason }   lstat or read failure
 async function fingerprintUntracked({
-  cwd, filePath, lstat, readFile, open = nodeOpen,
+  cwd, filePath, lstat, readFile, open = nodeOpen, realpath = nodeRealpath,
 }) {
   const abs = path.join(cwd, filePath);
   // Fast pre-check by name: reject a symlink or a special file before opening.
@@ -155,6 +157,37 @@ async function fingerprintUntracked({
   }
   if (!info.isFile()) {
     return { safe: false, reason: `untracked path ${filePath} is a ${describeSpecial(info)} — refusing to read it` };
+  }
+  // `O_NOFOLLOW` below only rejects a symlink at the FINAL path component. If a
+  // background process replaces an INTERMEDIATE directory with a symlink after
+  // the lstat above (e.g. swaps `dir/` for a symlink between listing
+  // `dir/file` and opening it), the open still follows the new parent and
+  // returns a descriptor for whatever the attacker's symlink now points at —
+  // `fh.stat()` sees an ordinary regular file there and the final-component
+  // guard never fires. Close that gap by resolving the FULL real path (every
+  // component, not just the last) and requiring it to land exactly at the
+  // literal location under the repository root; any parent-directory symlink
+  // — or the final component itself resolving elsewhere — fails closed here,
+  // immediately before the open, rather than silently trusting the read.
+  let realCwd;
+  let realBefore;
+  try {
+    realCwd = await realpath(cwd);
+    realBefore = await realpath(abs);
+  } catch (err) {
+    return {
+      unreadable: true,
+      missing: err?.code === 'ENOENT',
+      reason: `cannot resolve the real path of untracked file ${filePath}: ${err?.message ?? err}`,
+    };
+  }
+  const expectedReal = path.join(realCwd, filePath);
+  if (realBefore !== expectedReal) {
+    return {
+      safe: false,
+      reason: `untracked path ${filePath} resolves to "${realBefore}" instead of the expected repository-relative `
+        + 'location — a parent directory (or the file itself) was replaced with a symlink; refusing to trust it',
+    };
   }
   // Authoritative read: open WITHOUT following a final-component symlink, then
   // operate ONLY on the returned descriptor. A concurrent process that renames
@@ -194,6 +227,22 @@ async function fingerprintUntracked({
       || (Number.isFinite(st2.size) && st2.size !== buf.length)) {
       return { safe: false, reason: `untracked path ${filePath} changed during read — refusing to trust its contents` };
     }
+    // Defense in depth: confirm the literal path still resolves to the SAME
+    // real location it did immediately before the open. This does not close
+    // every conceivable single-syscall race (Node exposes no openat/O_BENEATH
+    // equivalent to make the walk atomic), but it detects a parent-directory
+    // swap that happened during the read/digest itself, which the fd-based
+    // inode/size check above cannot see (the fd stays valid even after its
+    // path's parent directories are rearranged).
+    let realAfter;
+    try {
+      realAfter = await realpath(abs);
+    } catch (err) {
+      return { unreadable: true, reason: `cannot re-resolve real path of untracked file ${filePath} after reading it: ${err?.message ?? err}` };
+    }
+    if (realAfter !== realBefore) {
+      return { safe: false, reason: `untracked path ${filePath} resolved to a different real path during the read (${realBefore} -> ${realAfter}) — refusing to trust its contents` };
+    }
     return { safe: true, digest: sha256(buf), bytes: buf };
   } catch (err) {
     return { unreadable: true, reason: `cannot read untracked file ${filePath}: ${err?.message ?? err}` };
@@ -211,6 +260,7 @@ async function listUntracked(cwd, spawn, context) {
 // or the stash list.
 export async function captureBaseline({
   cwd, spawn = nodeSpawn, lstat = nodeLstat, readFile = nodeReadFile, open = nodeOpen,
+  realpath = nodeRealpath,
 } = {}) {
   const repoCheck = await runGit(['rev-parse', '--is-inside-work-tree'], cwd, spawn);
   if (repoCheck.code !== 0 || repoCheck.stdout.trim() !== 'true') {
@@ -245,7 +295,9 @@ export async function captureBaseline({
   const incompleteReasons = [];
   for (const filePath of untracked) {
     // eslint-disable-next-line no-await-in-loop
-    const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
+    const fp = await fingerprintUntracked({
+      cwd, filePath, lstat, readFile, open, realpath,
+    });
     if (fp.safe) {
       untrackedHashes[filePath] = fp.digest;
     } else {
@@ -272,6 +324,7 @@ export async function captureBaseline({
 // controller fails closed rather than reviewing partial / spoofed evidence.
 export async function collectWorkerDelta({
   cwd, baseline, spawn = nodeSpawn, lstat = nodeLstat, readFile = nodeReadFile, open = nodeOpen,
+  realpath = nodeRealpath,
 } = {}) {
   if (!baseline?.head) throw new Error('collectWorkerDelta: baseline.head is required');
   const baseRef = baseline.baselineRef ?? baseline.head;
@@ -361,7 +414,9 @@ export async function collectWorkerDelta({
 
   for (const filePath of currentUntracked) {
     // eslint-disable-next-line no-await-in-loop
-    const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
+    const fp = await fingerprintUntracked({
+      cwd, filePath, lstat, readFile, open, realpath,
+    });
     if (!fp.safe) {
       // symlink / special / unreadable — never attribute, never read.
       fail(fp.reason);
@@ -411,7 +466,9 @@ export async function collectWorkerDelta({
   for (const filePath of trackedChanged) {
     if (!(filePath in baselineUntracked)) continue;
     // eslint-disable-next-line no-await-in-loop
-    const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
+    const fp = await fingerprintUntracked({
+      cwd, filePath, lstat, readFile, open, realpath,
+    });
     if (fp.safe && fp.digest === baselineUntracked[filePath]) {
       leakedStaged.push(filePath); // unchanged pre-existing user work, just staged
     } else {
@@ -450,7 +507,9 @@ export async function collectWorkerDelta({
       // confirming it is actually gone — otherwise a modified-then-ignored file
       // would be reported deleted while PASS proceeds without reviewing it.
       // eslint-disable-next-line no-await-in-loop
-      const fp = await fingerprintUntracked({ cwd, filePath, lstat, readFile, open });
+      const fp = await fingerprintUntracked({
+        cwd, filePath, lstat, readFile, open, realpath,
+      });
       if (fp.unreadable && fp.missing) {
         untrackedDeleted.push(filePath); // definitively absent
       } else if (fp.unreadable) {
@@ -490,7 +549,9 @@ export async function collectWorkerDelta({
   //     `renamedUntrackedBaseline` check.
   for (const p of brandNewTracked) {
     // eslint-disable-next-line no-await-in-loop
-    const fp = await fingerprintUntracked({ cwd, filePath: p, lstat, readFile, open });
+    const fp = await fingerprintUntracked({
+      cwd, filePath: p, lstat, readFile, open, realpath,
+    });
     if (fp.safe && baselineUntrackedDigests.has(fp.digest)) {
       droppedTracked.add(p);
       renamedUntrackedBaseline.push(p);

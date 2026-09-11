@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 
 import {
@@ -618,5 +618,76 @@ test('fail closed: a tracked binary file the Worker changed (rendered only as "B
     );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// P1 (PR #4 review thread PRRT_kwDOUDdrZs6gSMmn): O_NOFOLLOW on the final path
+// component only protects that ONE component. If an INTERMEDIATE directory is
+// replaced by a symlink after git listed a path through it but before
+// fingerprintUntracked opens it, the by-name lstat() and the open() below both
+// transparently follow the new parent symlink — lstat/open only refuse to
+// follow a symlink at the exact path they are given, and neither is told
+// anything about the parent chain. Reproduced deterministically: `git
+// ls-files` is scripted to report `sub/leak.txt` (as it would have while
+// `sub` was still a real directory at listing time), while `sub` is ALREADY a
+// symlink to an external secret directory by the time collectWorkerDelta
+// resolves and reads it — exactly the window between listing and read.
+test('fail closed: an intermediate directory swapped for a symlink is rejected, even though the final component is a real file', async () => {
+  const dir = initRepo();
+  const secretDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rl-secret-parent-'));
+  try {
+    fs.writeFileSync(path.join(secretDir, 'leak.txt'), 'TOP_SECRET_VIA_PARENT_SWAP');
+
+    // `sub` is a symlink to the external secret directory for the ENTIRE test
+    // — standing in for "the swap already happened by the time we read it".
+    fs.symlinkSync(secretDir, path.join(dir, 'sub'));
+
+    // The baseline capture must not itself choke on `sub` — script its
+    // untracked listing to see no untracked files yet, isolating the
+    // vulnerability to collectWorkerDelta's own listing below.
+    const emptyLsFilesSpawn = (cmd, args) => {
+      const key = args.join(' ');
+      if (key.startsWith('ls-files')) {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => child.emit('close', 0));
+        return child;
+      }
+      return nodeSpawn(cmd, args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    };
+    const baseline = await captureBaseline({ cwd: dir, spawn: emptyLsFilesSpawn });
+
+    // Script ONLY the untracked listing `collectWorkerDelta` uses for the
+    // CURRENT tree, reporting the path git would have produced had `sub` still
+    // been a real directory at listing time. Every other git command runs for
+    // real against `dir`, which has no other untracked/tracked changes.
+    const scriptedSpawn = (cmd, args) => {
+      const key = args.join(' ');
+      if (key.startsWith('ls-files')) {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('sub/leak.txt\0'));
+          child.emit('close', 0);
+        });
+        return child;
+      }
+      return nodeSpawn(cmd, args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    };
+
+    const delta = await collectWorkerDelta({ cwd: dir, baseline, spawn: scriptedSpawn });
+
+    assert.equal(delta.evidenceComplete, false, 'an intermediate symlinked directory fails the evidence closed');
+    assert.ok(
+      delta.incompleteReasons.some((r) => /symlink|resolve/i.test(r)),
+      JSON.stringify(delta.incompleteReasons),
+    );
+    assert.doesNotMatch(delta.diff, /TOP_SECRET_VIA_PARENT_SWAP/, 'the secret directory\'s bytes never entered the diff');
+    assert.equal(delta.changedFiles.includes('sub/leak.txt'), false, 'the swapped path is never attributed as Worker output');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(secretDir, { recursive: true, force: true });
   }
 });

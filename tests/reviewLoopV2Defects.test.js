@@ -224,6 +224,7 @@ test('an untracked file swapped for a symlink between lstat and read fails close
     // was swapped in before the authoritative open: O_NOFOLLOW makes open fail
     // with ELOOP and the bytes are never read.
     open: async () => { const e = new Error('ELOOP: too many symbolic links'); e.code = 'ELOOP'; throw e; },
+    realpath: async (p) => p,
   });
   assert.equal(delta.evidenceComplete, false, 'a mid-read swap fails the evidence closed');
   assert.equal(readCalls, 0, 'the swapped-in symlink target was never read');

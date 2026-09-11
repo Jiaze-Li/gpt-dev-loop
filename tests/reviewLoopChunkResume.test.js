@@ -140,3 +140,47 @@ test('a resume under a larger chunk-size limit re-reviews the re-chunked layout 
   assert.ok(seen.some((s) => s.index === 0), `chunk 0 was not re-reviewed on resume: ${JSON.stringify(seen)}`);
   assert.notEqual(seen[0].total, smallLayoutTotal, 'the resume re-chunked the diff');
 });
+
+// P2 (PR #4 review thread PRRT_kwDOUDdrZs6gSMnC): a re-chunk of the SAME
+// logical (delta + gate) review state must reuse that state's already-
+// assigned round rather than consuming another of the objective's
+// maxReviewRounds. Only 2 rounds are budgeted here — if the layout-only
+// re-chunk wrongly incremented the round, this would exhaust the budget and
+// terminate HUMAN_REQUIRED instead of PASSing on the very same evidence.
+test('a re-chunk of the SAME (delta + gate) state preserves its assigned round', async () => {
+  const persistence = new MemoryPersistence();
+  let maxChars = '700';
+  let failChunk1 = true;
+  const build = () => createReviewLoopController({
+    persistence,
+    env: { REVIEWLOOP_MAX_REVIEW_DIFF_CHARS: maxChars, REVIEWLOOP_MAX_REVIEW_CHUNKS: '12' },
+    captureBaselineFn: async () => ({ head: 'BASE', dirtyFiles: [], evidenceComplete: true }),
+    collectWorkerDeltaFn: async () => ({
+      baselineHead: 'BASE', currentHead: 'BASE', evidenceComplete: true, noWorkerChangeYet: false,
+      changedFiles: ['file0.js', 'file1.js', 'file2.js'], fingerprint: 'DELTA_FP', diff: bigDiff(),
+    }),
+    runGateFn: async () => ({ verdict: 'PASS', pass: true, fingerprint: 'GATE_FP', failureIdentities: [], results: [] }),
+    discoverVerificationCommandsFn: () => ({ source: 'test', commands: ['echo'] }),
+    reviewerFn: async ({ chunk }) => {
+      if (chunk.index === 1 && failChunk1) throw Object.assign(new Error('blip'), { code: 'PROVIDER_UNAVAILABLE' });
+      return { value: { findings: [] }, usage: { input_tokens: 1, output_tokens: 1 } };
+    },
+  });
+
+  const { loopId } = await build().begin({ goal: 'g', cwd: '/r', maxReviewRounds: 2 });
+  const r1 = await build().review({ loopId });
+  assert.equal(r1.status, 'HUMAN_REQUIRED', 'chunk 1 could not be reviewed under the small layout');
+  const roundAfterFirstChunking = (await persistence.readWorkflowState(loopId)).reviewLoop.chunkReviewCheckpoint.round;
+  assert.equal(roundAfterFirstChunking, 1, 'the first chunking attempt was assigned round 1');
+
+  // Resume under a DIFFERENT chunk layout (same delta + gate fingerprints —
+  // the Worker made no change and the Gate result is identical). The stored
+  // per-chunk results are invalidated (different chunk boundaries), so every
+  // chunk must be re-sent — but this is still the SAME logical review state,
+  // so it must not consume a second round.
+  maxChars = '100000';
+  failChunk1 = false;
+  const r2 = await build().review({ loopId });
+  assert.equal(r2.status, 'PASS', 'the re-chunked, unchanged evidence passes without exhausting the round budget');
+  assert.equal(r2.round, 1, 'the re-chunk reused round 1 instead of consuming round 2');
+});

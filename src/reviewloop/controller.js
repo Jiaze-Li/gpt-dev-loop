@@ -605,34 +605,46 @@ export function createReviewLoopController({
       };
     }
 
-    // The checkpoint identity MUST cover the actual chunk layout, not just the
-    // (delta + gate) fingerprints. `chunkDiffForReview` depends on
+    // The per-chunk checkpoint identity MUST cover the actual chunk layout, not
+    // just the (delta + gate) fingerprints. `chunkDiffForReview` depends on
     // REVIEWLOOP_MAX_REVIEW_DIFF_CHARS; a crash/resume under a larger value
     // re-chunks the same diff into different boundaries. Without the layout in
-    // the key, the stored result for old chunk 0 would be reused for the new,
+    // that key, the stored result for old chunk 0 would be reused for the new,
     // larger chunk 0 and its added portion never reviewed — yet aggregation
-    // could still return CLEAN/PASS. Any layout change now yields a new key, a
-    // fresh checkpoint, and a full re-review.
+    // could still return CLEAN/PASS. Any layout change now yields a new
+    // checkpoint key and a full re-review of every chunk.
+    //
+    // The ROUND, however, is bound to the LOGICAL review state alone — the
+    // (delta + gate) fingerprint pair — never to the chunk layout on top of
+    // it. A crash/resume under a different REVIEWLOOP_MAX_REVIEW_DIFF_CHARS
+    // re-chunks the SAME (delta + gate) state; that must invalidate the
+    // per-chunk results (a layout change) but must NOT consume another of the
+    // objective's max review rounds — the Reviewer has not been asked to
+    // reconsider new evidence, only re-chunked old evidence. `deltaGateKey` is
+    // tracked separately from the layout-inclusive `checkpointKey` so round
+    // reuse survives a re-chunk.
+    const deltaGateKey = sha256Hex(`${delta.fingerprint}::${gate.fingerprint}`);
     const chunkLayoutHash = sha256Hex(`${chunks.length}::${chunks.map((c) => c.hash).join('::')}`);
-    const checkpointKey = sha256Hex(`${delta.fingerprint}::${gate.fingerprint}::${chunkLayoutHash}`);
+    const checkpointKey = sha256Hex(`${deltaGateKey}::${chunkLayoutHash}`);
     const resumeCheckpoint = loopState.chunkReviewCheckpoint;
-    if (resumeCheckpoint && resumeCheckpoint.key === checkpointKey
-      && resumeCheckpoint.chunkTotal === chunks.length
+    if (resumeCheckpoint && resumeCheckpoint.deltaGateKey === deltaGateKey
       && Number.isInteger(resumeCheckpoint.round)) {
       loopState.round = resumeCheckpoint.round;
     } else {
       loopState.round += 1;
     }
 
-    // Durable per-chunk checkpoint. Keyed to the exact review state (delta +
-    // gate); a changed diff invalidates it. On resume, a chunk already in the
-    // checkpoint is NOT re-sent to the model — its normalized result is reused.
-    // It also carries the round this logical review state was assigned so a
-    // resume never re-increments it.
+    // Durable per-chunk checkpoint. Keyed to the exact review state INCLUDING
+    // chunk layout (`checkpointKey`); a changed diff OR a changed chunk layout
+    // invalidates the stored per-chunk results, so a re-chunked round always
+    // re-sends every chunk to the model under the new boundaries — but
+    // `deltaGateKey` alone (above) governs round assignment, so that re-chunk
+    // reuses this logical state's already-assigned round instead of consuming
+    // a fresh one.
     let checkpoint = loopState.chunkReviewCheckpoint;
     if (!checkpoint || checkpoint.key !== checkpointKey || checkpoint.chunkTotal !== chunks.length) {
       checkpoint = {
-        key: checkpointKey, chunkTotal: chunks.length, chunks: {}, round: loopState.round,
+        key: checkpointKey, deltaGateKey, chunkTotal: chunks.length, chunks: {}, round: loopState.round,
       };
       loopState.chunkReviewCheckpoint = checkpoint;
     } else if (!Number.isInteger(checkpoint.round)) {

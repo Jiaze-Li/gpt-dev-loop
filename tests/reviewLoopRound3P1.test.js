@@ -64,6 +64,7 @@ test('a baseline-untracked file that was later staged does not leak into the Wor
     lstat: async () => regular,
     readFile: async () => Buffer.from('unchanged bytes'),
     open: fakeOpen(Buffer.from('unchanged bytes'), { ino: 5, size: 15 }),
+    realpath: async (p) => p,
   });
   assert.ok(!delta.changedFiles.includes('leak.txt'), JSON.stringify(delta.changedFiles));
   assert.doesNotMatch(delta.diff, /leak\.txt/);
