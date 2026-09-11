@@ -997,6 +997,13 @@ export function createReviewLoopSpend({
   async function meteredCall({
     role, family = 'agy:gpt-oss', provider = 'agy', model = null,
     operationId, attempt = 1, evidenceIds = [], call,
+    // Durable physical-call-audit identity. Never used for authorization or
+    // routing — purely so the crash/resume audit trail (physicalCalls in
+    // controller.js) can be reconstructed from THIS durable spend record
+    // alone, without depending on the in-memory array a resumed process never
+    // repopulates for an already-checkpointed chunk. `null` for a Supervisor
+    // call (it has no chunk).
+    auditContext = null,
   }) {
     // Fail closed: a single earlier physical call in this loop consumed an
     // anomalous amount of tokens. It was fully accounted, but the loop is
@@ -1181,6 +1188,14 @@ export function createReviewLoopSpend({
             costKnown,
             businessOutcome: 'FAILURE',
             failureCode: err?.code ?? err?.providerFailure ?? null,
+            // Durable physical-call-audit identity (see auditContext above).
+            operationId: operationId ?? null,
+            attempt,
+            rawUsage: usage ?? null,
+            round: auditContext?.round ?? null,
+            chunkIndex: auditContext?.chunkIndex ?? null,
+            chunkTotal: auditContext?.chunkTotal ?? null,
+            quotaPools: auditContext?.quotaPools ?? null,
           },
           role, family, provider, resolvedModel: model ?? null,
           accounting: failAccounting, contextOverhead: failOverhead,
@@ -1216,6 +1231,14 @@ export function createReviewLoopSpend({
         costUsd: Number.isFinite(result?.costUsd) ? result.costUsd : 0,
         costKnown: Number.isFinite(result?.costUsd),
         businessOutcome: 'SUCCESS',
+        // Durable physical-call-audit identity (see auditContext above).
+        operationId: operationId ?? null,
+        attempt,
+        rawUsage: result?.usage ?? null,
+        round: auditContext?.round ?? null,
+        chunkIndex: auditContext?.chunkIndex ?? null,
+        chunkTotal: auditContext?.chunkTotal ?? null,
+        quotaPools: auditContext?.quotaPools ?? null,
       },
       role, family, provider, resolvedModel: result?.model ?? model ?? null,
       accounting: okAccounting, contextOverhead: okOverhead,
@@ -1264,4 +1287,62 @@ export function createReviewLoopSpend({
     loadTokenAnomaly: loadAnomaly,
     telemetry,
   };
+}
+
+// ---- crash/resume durable physical-call audit reconstruction --------------
+//
+// The controller's in-memory `physicalCalls` array (runReviewerOverEvidence /
+// runSupervisor in controller.js) only sees attempts made in THIS process. A
+// chunk already served from the durable per-chunk checkpoint was reviewed by
+// an EARLIER — possibly crashed — process, so that array has nothing for it.
+// Every physical attempt (success, retryable failure, or mechanically-zero
+// pre-send failure) durably settles its full accounting record BEFORE
+// meteredCall() returns (see settleRecord above), now tagged with the same
+// role/round/chunkIndex/chunkTotal/attempt/quotaPools identity the in-memory
+// audit trail uses. A genuine authorization-before-dispatch denial NEVER
+// reaches settleRecord (meteredCall re-throws it first), so it correctly
+// never appears here either — no physical call is fabricated for a call that
+// never dispatched. Reusing this existing durable spend log means the audit
+// trail survives a crash with no new database.
+function physicalCallAuditEntryFromSpendRecord(r) {
+  return {
+    role: r.role ?? null,
+    family: r.family ?? null,
+    provider: r.provider ?? null,
+    quotaPools: r.quotaPools ?? null,
+    resolvedModel: r.model ?? null,
+    attempt: r.attempt ?? null,
+    round: r.round ?? null,
+    chunkIndex: r.chunkIndex ?? null,
+    chunkTotal: r.chunkTotal ?? null,
+    outcome: r.businessOutcome ?? null,
+    code: r.failureCode ?? null,
+    // Mirrors the in-memory audit convention (controller.js onAttempt / the
+    // invoke().then() success push): `usage` is the raw provider envelope for
+    // a SETTLED SUCCESS only. A FAILURE attempt's `rawUsage` may still carry a
+    // synthetic mechanically-zero usage object for accounting purposes (see
+    // isMechanicallyZeroPreSend) — that is a spend-accounting detail, not a
+    // provider-reported usage figure, so it is never surfaced here.
+    usage: r.businessOutcome === 'SUCCESS' ? (r.rawUsage ?? null) : null,
+  };
+}
+
+// Reconstruct every physical attempt durably recorded for one `role` within
+// one `round` (optionally narrowed to one `chunkIndex`), in attempt order.
+// Never throws on a normal empty result; the caller decides what "nothing
+// found" means (a fresh round that made no calls yet vs. a durable-read
+// failure it should fail closed on).
+export async function reconstructPhysicalCalls({
+  persistence, loopId, role, round, chunkIndex = undefined,
+} = {}) {
+  const store = new ReviewLoopSpendStore(persistence);
+  const records = await store.load(loopId);
+  return records
+    .filter((r) => r.role === role && r.round === round
+      && (chunkIndex === undefined || r.chunkIndex === chunkIndex))
+    .sort((a, b) => {
+      const ci = (a.chunkIndex ?? -1) - (b.chunkIndex ?? -1);
+      return ci !== 0 ? ci : (a.attempt ?? 0) - (b.attempt ?? 0);
+    })
+    .map(physicalCallAuditEntryFromSpendRecord);
 }

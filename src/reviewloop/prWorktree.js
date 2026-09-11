@@ -111,6 +111,45 @@ async function linkSharedDependencyDirs({ userCwd, worktreeDir }) {
   }
 }
 
+// Fingerprint of an isolated PR worktree's exact tracked + untracked state.
+// Used to PROVE the deterministic Gate did not mutate the exact reviewed
+// snapshot: called once immediately before the Gate runs and once immediately
+// after, and the two results compared. `node_modules` (the top-level
+// convenience symlink `linkSharedDependencyDirs` adds so an npm-based Gate can
+// find dependencies) is excluded — it is ReviewLoop's own read-only
+// convenience, never part of the reviewed source, and never git-diffable.
+//
+// Deliberately fails closed: a `git status` failure returns `{ ok: false }`
+// rather than a fabricated "clean" result — the caller must treat an
+// unverifiable snapshot state exactly like a proven mutation (never certify on
+// a best-effort basis).
+export async function worktreeSnapshotFingerprint({ worktreeDir, spawn = nodeSpawn } = {}) {
+  const res = await runGit(
+    ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no'],
+    worktreeDir,
+    spawn,
+  );
+  if (res.code !== 0) {
+    return { ok: false, reason: `"git status" failed inside the PR snapshot worktree (exit ${res.code}): ${(res.stderr || res.stdout || '').trim().slice(0, 300)}` };
+  }
+  // `--porcelain=v1 -z`: each changed path is its own NUL-terminated "XY PATH"
+  // token (a rename additionally emits its old path as its own following
+  // token — harmless here: we only need a stable multiset to detect ANY
+  // change between the pre- and post-Gate captures, never to interpret it).
+  const entries = res.stdout.split('\0').filter(Boolean).filter((entry) => {
+    const p = entry.slice(3);
+    return p !== 'node_modules' && !p.startsWith('node_modules/');
+  }).sort();
+  return { ok: true, entries };
+}
+
+// True when the two captures differ — i.e. something changed the worktree's
+// tracked or (non-node_modules) untracked state between them.
+export function worktreeSnapshotMutated(pre, post) {
+  if (pre.entries.length !== post.entries.length) return true;
+  return pre.entries.some((e, i) => e !== post.entries[i]);
+}
+
 async function teardownWorktree({ cwd, worktreeDir, spawn }) {
   const remove = await runGit(['worktree', 'remove', '--force', worktreeDir], cwd, spawn);
   if (remove.code !== 0) {

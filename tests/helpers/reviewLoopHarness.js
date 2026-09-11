@@ -125,6 +125,14 @@ export function fakePrSnapshot() {
   });
 }
 
+// captureWorktreeSnapshotFn — the fake worktree is just the scripted `cwd`
+// (see fakePrSnapshot), never a real git checkout, so there is nothing real
+// to `git status`. Deterministically clean by default; a test exercising the
+// Gate-mutation guard overrides this directly.
+export function fakeCleanWorktreeSnapshot() {
+  return async () => ({ ok: true, entries: [] });
+}
+
 // collectPrDeltaFn — pulls the scripted diff/changed-files straight from the
 // mockPrBackend's per-head maps, keyed EXACTLY by the snapshot's headSha (so a
 // test can prove an old HEAD's evidence never leaks onto a new HEAD).
@@ -150,5 +158,6 @@ export function prTestFakes(prBackend, { repo = 'acme/repo' } = {}) {
     resolvePrRepositoryIdentityFn: fakePrRepositoryIdentity(repo),
     buildPrSnapshotFn: fakePrSnapshot(),
     collectPrDeltaFn: fakeCollectPrDelta(prBackend),
+    captureWorktreeSnapshotFn: fakeCleanWorktreeSnapshot(),
   };
 }

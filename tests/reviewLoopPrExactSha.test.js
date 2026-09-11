@@ -18,7 +18,9 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { withPrSnapshotWorktree, PrSnapshotError } from '../src/reviewloop/prWorktree.js';
+import {
+  withPrSnapshotWorktree, PrSnapshotError, worktreeSnapshotFingerprint, worktreeSnapshotMutated,
+} from '../src/reviewloop/prWorktree.js';
 import { collectPrDelta } from '../src/reviewloop/prEvidence.js';
 import { assertPrRepositoryIdentity, resolveCwdRepositoryIdentity } from '../src/reviewloop/prIdentity.js';
 
@@ -220,6 +222,46 @@ test('F2: GitHub reporting no repository identity for the PR fails closed', asyn
     const check = await assertPrRepositoryIdentity({ cwd: fx.cwd, prBackend, prNumber: 1 });
     assert.equal(check.ok, false);
     assert.match(check.reason, /no repository identity/);
+  } finally {
+    await cleanup(fx.root);
+  }
+});
+
+test('worktreeSnapshotFingerprint: a real clean worktree fingerprints empty; a tracked edit and a new untracked file both register; node_modules is excluded', async () => {
+  const fx = await makeFixture();
+  try {
+    await withPrSnapshotWorktree({
+      cwd: fx.cwd, baseSha: fx.baseSha, headSha: fx.headSha,
+    }, async ({ worktreeDir }) => {
+      const clean = await worktreeSnapshotFingerprint({ worktreeDir });
+      assert.equal(clean.ok, true);
+      assert.deepEqual(clean.entries, []);
+
+      // Simulate a Gate that behaves like a formatter: edits a tracked file.
+      await writeFile(path.join(worktreeDir, 'f.txt'), 'formatter rewrote this\n');
+      const trackedEdit = await worktreeSnapshotFingerprint({ worktreeDir });
+      assert.equal(trackedEdit.ok, true);
+      assert.ok(trackedEdit.entries.length > 0);
+      assert.ok(worktreeSnapshotMutated(clean, trackedEdit));
+
+      // Revert, then simulate a Gate that writes a new untracked snapshot file.
+      await execFileP('git', ['checkout', '--', 'f.txt'], { cwd: worktreeDir });
+      await writeFile(path.join(worktreeDir, 'generated.snap'), 'snapshot output\n');
+      const untrackedAdd = await worktreeSnapshotFingerprint({ worktreeDir });
+      assert.ok(untrackedAdd.entries.length > 0);
+      assert.ok(worktreeSnapshotMutated(clean, untrackedAdd));
+      await rm(path.join(worktreeDir, 'generated.snap'));
+
+      // node_modules is ReviewLoop's own shared-dependency convenience
+      // symlink — never part of the reviewed snapshot.
+      const { symlink: fsSymlink } = await import('node:fs/promises');
+      const fakeNodeModules = path.join(fx.cwd, 'node_modules');
+      await import('node:fs/promises').then((m) => m.mkdir(fakeNodeModules, { recursive: true }));
+      await fsSymlink(fakeNodeModules, path.join(worktreeDir, 'node_modules'), 'dir');
+      const withNodeModules = await worktreeSnapshotFingerprint({ worktreeDir });
+      assert.deepEqual(withNodeModules.entries, [], 'node_modules must never register as a mutation');
+      assert.ok(!worktreeSnapshotMutated(clean, withNodeModules));
+    });
   } finally {
     await cleanup(fx.root);
   }

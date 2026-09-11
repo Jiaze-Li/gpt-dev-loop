@@ -37,7 +37,9 @@ import {
 } from './state.js';
 import { captureBaseline, collectWorkerDelta } from './gitEvidence.js';
 import { collectPrDelta } from './prEvidence.js';
-import { withPrSnapshotWorktree, PrSnapshotError } from './prWorktree.js';
+import {
+  withPrSnapshotWorktree, PrSnapshotError, worktreeSnapshotFingerprint, worktreeSnapshotMutated,
+} from './prWorktree.js';
 import { assertPrRepositoryIdentity } from './prIdentity.js';
 import { withInProcessLoopLock, acquireLoopFileLease } from './loopLease.js';
 import { discoverVerificationCommands, runGate, GATE_VERDICTS } from './gatePolicy.js';
@@ -48,7 +50,7 @@ import {
   reviewFingerprint,
   REVIEW_VERDICTS,
 } from './reviewPolicy.js';
-import { createReviewLoopSpend } from './reviewSpend.js';
+import { createReviewLoopSpend, reconstructPhysicalCalls } from './reviewSpend.js';
 import { chunkDiffForReview } from './diffChunker.js';
 
 const RUNTIME_ROOT = REVIEWLOOP_RUNTIME_ROOT;
@@ -136,6 +138,10 @@ export function createReviewLoopController({
   resolvePrRepositoryIdentityFn = assertPrRepositoryIdentity,
   buildPrSnapshotFn = withPrSnapshotWorktree,
   collectPrDeltaFn = collectPrDelta,
+  // Proves (or disproves) that the deterministic PR Gate left the exact
+  // reviewed snapshot byte-identical. Real implementation by default; tests
+  // inject a deterministic fake (the fake worktree is never a real checkout).
+  captureWorktreeSnapshotFn = worktreeSnapshotFingerprint,
   captureBaselineFn = captureBaseline,
   collectWorkerDeltaFn = collectWorkerDelta,
   // Re-collect the Worker delta AFTER the review-time Gate (a snapshot / codegen
@@ -214,9 +220,14 @@ export function createReviewLoopController({
     let baselineGate = null;
     let verificationPlan = null;
 
-    // The frozen verification plan is discovered the same way for every target.
-    const freezeVerificationPlan = () => {
-      const discovered = discoverVerificationCommandsFn({ cwd, configured: verificationCommands });
+    // The frozen verification plan is discovered the same way for every
+    // target, but from an explicit `discoverCwd` — LOCAL freezes from the
+    // ambient cwd (there is no other snapshot); PR freezes from inside the
+    // exact-HEAD disposable worktree so the ambient cwd's own branch/config
+    // (which may differ from the PR entirely) can never leak into the frozen
+    // PR Gate plan.
+    const freezeVerificationPlan = (discoverCwd) => {
+      const discovered = discoverVerificationCommandsFn({ cwd: discoverCwd, configured: verificationCommands });
       return {
         source: String(discovered.source ?? 'unknown'),
         commands: (discovered.commands ?? []).map(String),
@@ -232,7 +243,7 @@ export function createReviewLoopController({
       // Freeze the verification plan NOW. reviewloop_review always runs these
       // exact commands; a later edit to .reviewloop.json / package.json's test
       // script cannot weaken the Gate.
-      verificationPlan = freezeVerificationPlan();
+      verificationPlan = freezeVerificationPlan(cwd);
 
       // B8 — baseline Gate evidence, 0 model tokens, over the FROZEN plan. Only
       // when trusted/discoverable verification exists; a failure to run it is
@@ -298,8 +309,26 @@ export function createReviewLoopController({
         ? await prBackend.getPrBaseSha({ prNumber, cwd })
         : null;
       if (!prBaseSha) throw new Error(`reviewloop_begin: cannot resolve the base SHA for PR #${prNumber}`);
-      // The PR Gate runs the same frozen verification plan as a LOCAL target.
-      verificationPlan = freezeVerificationPlan();
+
+      // The PR Gate runs the same frozen verification plan as a LOCAL target
+      // — but discovered from INSIDE the exact PR HEAD snapshot, never the
+      // ambient user cwd (which may be on a different branch, dirty, or
+      // simply carry a different .reviewloop.json / package.json entirely).
+      // Build the same disposable worktree the review-time Gate itself uses,
+      // discover verification commands inside it, then tear it down — the
+      // frozen plan is bound to the PR's own snapshot from the start.
+      if (signal?.aborted) throw new Error('reviewloop_begin: cancelled by the caller before the PR verification plan was frozen');
+      try {
+        verificationPlan = await buildPrSnapshotFn(
+          { cwd, baseSha: prBaseSha, headSha: prHead, prNumber },
+          async ({ worktreeDir }) => freezeVerificationPlan(worktreeDir),
+        );
+      } catch (err) {
+        if (err instanceof PrSnapshotError) {
+          throw new Error(`reviewloop_begin: cannot build the exact PR HEAD snapshot to freeze the verification plan: ${err.message}`);
+        }
+        throw err;
+      }
     }
 
     // REVIEWLOOP_MAX_REVIEW_ROUNDS is a public tuning knob: an explicit begin
@@ -367,6 +396,10 @@ export function createReviewLoopController({
   // re-call included).
   async function meteredWithFailover({
     spend, role, routeFn, defaultFamily, defaultProvider, operationId, evidenceIds, invoke, workflowId = null,
+    // Durable physical-call-audit identity forwarded verbatim into the spend
+    // record (round / chunkIndex / chunkTotal; quotaPools is filled in below
+    // from the resolved routing selection) — see reviewSpend.js meteredCall.
+    auditContext = null,
     // Fired once per PHYSICAL failover attempt that actually reached (or tried
     // to reach) a provider — never for an authorization/spend denial, which
     // never dispatches. Lets the caller build a durable audit trail of every
@@ -415,6 +448,7 @@ export function createReviewLoopController({
         return await spend.meteredCall({
           role, family, provider, model: selection?.model ?? null,
           operationId, attempt, evidenceIds,
+          auditContext: auditContext ? { ...auditContext, quotaPools: selection?.quotaPools ?? null } : null,
           call: () => invoke({
             selection, attempt, family, provider,
           }),
@@ -522,6 +556,27 @@ export function createReviewLoopController({
     // answer "which physical model reviewed this SHA", including every
     // attempt a failover/chunking round made along the way.
     const physicalCalls = [];
+    // Crash/resume durability: reconcile the in-memory `physicalCalls` built
+    // by THIS process against the durable spend log for the round actually
+    // being reviewed. The durable log is a strict superset whenever it has
+    // anything at all — every physical attempt (this process's or an earlier,
+    // crashed one's) settles its accounting record durably BEFORE meteredCall
+    // returns (reviewSpend.js), tagged with the same round/chunkIndex/attempt
+    // identity. A chunk served from `loopState.chunkReviewCheckpoint` (a
+    // prior, possibly crashed, process reviewed it) has NOTHING in this
+    // process's `physicalCalls` array, so without this reconciliation its
+    // physical attempts would silently vanish from the durable audit record.
+    // Falls back to the in-memory list on a durable-read failure or an empty
+    // result (e.g. a persistence-less unit test) — never throws the review
+    // closed over an audit-trail nicety.
+    const withDurablePhysicalCalls = async (inMemory) => {
+      try {
+        const durable = await reconstructPhysicalCalls({
+          persistence, loopId: loopState.loopId, role: 'reviewer', round: loopState.round,
+        });
+        return durable.length ? durable : inMemory;
+      } catch { return inMemory; }
+    };
     // Round is bound to the LOGICAL review state (delta + gate fingerprint),
     // NOT to how many times reviewloop_review was invoked. A crash/resume that
     // re-enters with the SAME logical review state — its durable per-chunk
@@ -583,7 +638,7 @@ export function createReviewLoopController({
             status: 'FAILED', reviewer: 'internal', provider: 'internal',
             blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0,
             findingSignatures: [], error: { reason: 'REVIEW_CANCELLED', message: 'the review was cancelled by the caller' },
-            physicalCalls,
+            physicalCalls: await withDurablePhysicalCalls(physicalCalls),
           },
           chunkCount: chunks.length,
         };
@@ -592,7 +647,11 @@ export function createReviewLoopController({
       if (done) {
         // Resume: this chunk was already reviewed in a prior (crashed) attempt.
         if (done.status === 'FAILED') {
-          return { review: { ...done, physicalCalls }, chunkCount: chunks.length, failedChunk: chunk.index };
+          return {
+            review: { ...done, physicalCalls: await withDurablePhysicalCalls(physicalCalls) },
+            chunkCount: chunks.length,
+            failedChunk: chunk.index,
+          };
         }
         perChunk.push(done);
         continue;
@@ -618,6 +677,7 @@ export function createReviewLoopController({
         operationId: chunkId,
         workflowId: loopState.loopId,
         evidenceIds: [reviewStateEvidence.evidenceId],
+        auditContext: { round: loopState.round, chunkIndex: chunk.index, chunkTotal: chunk.total },
         onAttempt: (a) => physicalCalls.push({
           role: 'reviewer', round: loopState.round, chunkIndex: chunk.index, chunkTotal: chunk.total,
           attempt: a.attempt, family: a.family, provider: a.provider, quotaPools: a.quotaPools,
@@ -659,7 +719,11 @@ export function createReviewLoopController({
       await saveLoop(loopState);
       // Any chunk we could not review successfully fails the whole review closed.
       if (normalized.status === 'FAILED') {
-        return { review: { ...normalized, physicalCalls }, chunkCount: chunks.length, failedChunk: chunk.index };
+        return {
+          review: { ...normalized, physicalCalls: await withDurablePhysicalCalls(physicalCalls) },
+          chunkCount: chunks.length,
+          failedChunk: chunk.index,
+        };
       }
       perChunk.push(normalized);
     }
@@ -684,7 +748,7 @@ export function createReviewLoopController({
         nonBlockingOmitted: Math.max(0, findings.filter((f) => !objective.blockingSeverities.includes(f.severity)).length - 8),
         findingSignatures: [...new Set(blocking.map((f) => f.signature).filter(Boolean))].sort(),
         error: null,
-        physicalCalls,
+        physicalCalls: await withDurablePhysicalCalls(physicalCalls),
       },
       chunkCount: chunks.length,
     };
@@ -1044,6 +1108,16 @@ export function createReviewLoopController({
     };
   }
 
+  // See withDurablePhysicalCalls in runReviewerOverEvidence for the rationale.
+  async function withDurableSupervisorCalls(loopState, inMemory) {
+    try {
+      const durable = await reconstructPhysicalCalls({
+        persistence, loopId: loopState.loopId, role: 'supervisor', round: loopState.round,
+      });
+      return durable.length ? durable : inMemory;
+    } catch { return inMemory; }
+  }
+
   // Supervisor, exception-only. Returns { guidance } | { humanRequired, reason }
   // | { denied, error }.
   async function runSupervisor({
@@ -1067,6 +1141,7 @@ export function createReviewLoopController({
         operationId: `${loopState.loopId}:supervise`,
         workflowId: loopState.loopId,
         evidenceIds: [findingsEvidence.evidenceId],
+        auditContext: { round: loopState.round, chunkIndex: null, chunkTotal: null },
         onAttempt: (a) => physicalCalls.push({
           role: 'supervisor', round: loopState.round, chunkIndex: null, chunkTotal: null,
           attempt: a.attempt, family: a.family, provider: a.provider, quotaPools: a.quotaPools,
@@ -1097,11 +1172,17 @@ export function createReviewLoopController({
       // (provider pool exhausted with settled accounting, non-auth non-retryable
       // failure) is a degradable transient.
       if (err instanceof LeaseLostError) throw err; // read-only exit in review()
-      if (isAuthorizationFailure(err)) return { denied: true, error: err, physicalCalls };
-      return { humanRequired: true, reason: `Supervisor call failed: ${err?.message ?? err}`, physicalCalls };
+      const denialCalls = await withDurableSupervisorCalls(loopState, physicalCalls);
+      if (isAuthorizationFailure(err)) return { denied: true, error: err, physicalCalls: denialCalls };
+      return { humanRequired: true, reason: `Supervisor call failed: ${err?.message ?? err}`, physicalCalls: denialCalls };
     }
     loopState.supervisorCalls += 1;
     loopState.supervisorInvoked = true;
+    // Crash/resume durability, same reconciliation as the reviewer's chunk
+    // loop above: every physical Supervisor attempt (this process's or an
+    // earlier crashed one's, via the failover-reuse resume path) settled its
+    // accounting record durably before meteredCall returned.
+    physicalCalls.splice(0, physicalCalls.length, ...(await withDurableSupervisorCalls(loopState, physicalCalls)));
     // B1 — malformed Supervisor output is never treated as valid REWORK guidance.
     if (!raw || raw.malformed === true || typeof raw.guidance !== 'string' || !raw.guidance.trim()) {
       return {
@@ -1357,12 +1438,38 @@ export function createReviewLoopController({
         commandSource = discovered.source;
       }
 
+      // Capture the exact worktree state BEFORE the Gate runs. PR evidence
+      // must correspond to the exact commit already pushed — unlike LOCAL,
+      // there is no "adopt the Gate's own edits and re-run until it
+      // stabilises" option here (that would mean certifying bytes that were
+      // never pushed to the PR). If the Gate cannot be proven not to have
+      // mutated this snapshot, the snapshot is not certifiable, full stop.
+      const preGateState = await captureWorktreeSnapshotFn({ worktreeDir });
+      if (!preGateState.ok) {
+        return { kind: 'HUMAN_REQUIRED', reason: `cannot capture the PR snapshot's pre-Gate state: ${preGateState.reason}` };
+      }
+
       const gate = await runGateFn({
         cwd: worktreeDir, commands: gateCommands, runner: gateRunner, env, signal,
       });
       gate.commandSource = commandSource;
-      // Structural proof this Gate ran inside the exact-HEAD snapshot — the
-      // pre-PASS invariant check and the durable audit both key off this.
+
+      const postGateState = await captureWorktreeSnapshotFn({ worktreeDir });
+      if (!postGateState.ok) {
+        return { kind: 'HUMAN_REQUIRED', reason: `cannot verify the PR snapshot's post-Gate state: ${postGateState.reason}` };
+      }
+      if (worktreeSnapshotMutated(preGateState, postGateState)) {
+        // Gate mutated snapshot => snapshot not certifiable. Never set
+        // reviewedSnapshotHeadSha here — it is NOT proven — and never let the
+        // Reviewer see evidence collected against a tree the Gate then
+        // changed underneath it.
+        return { kind: 'GATE_MUTATED_SNAPSHOT', delta, gate };
+      }
+
+      // Structural proof this Gate ran inside the exact-HEAD snapshot AND
+      // left it byte-identical to that HEAD — asserted ONLY once cleanliness
+      // is proven. The pre-PASS invariant check and the durable audit both
+      // key off this.
       gate.reviewedSnapshotHeadSha = headSha;
 
       if (gate.verdict === GATE_VERDICTS.FAIL) return { kind: 'GATE_FAIL', delta, gate };
@@ -1447,6 +1554,30 @@ export function createReviewLoopController({
           }),
           head: observedHead,
           reason: 'the verification configuration in the reviewed PR snapshot no longer matches the plan frozen at reviewloop_begin; revert it or start a new reviewloop_begin',
+          telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
+        };
+      }
+      if (snap.kind === 'GATE_MUTATED_SNAPSHOT') {
+        collectSafetyEvent({
+          code: 'GATE_MUTATED_PR_SNAPSHOT', severity: 'BLOCKING', role: 'gate',
+          taskId: loopState.loopId,
+          reason: 'the deterministic Gate modified tracked or untracked files inside the exact reviewed PR '
+            + 'HEAD snapshot (a formatter, codegen step, or snapshot updater ran)',
+          actionTaken: 'review blocked; Reviewer not invoked; reviewedSnapshotHeadSha not asserted for this HEAD',
+        });
+        loopState.gateRepairCount = (loopState.gateRepairCount ?? 0) + 1;
+        recordTransition(loopState, REVIEW_LOOP_STATES.REWORK, 'gate mutated pr snapshot');
+        await saveLoop(loopState);
+        return {
+          ...compactReworkPayload({
+            loopState,
+            review: { blockingFindings: [], nonBlockingFindings: [], nonBlockingOmitted: 0 },
+            gate: { verdict: 'FAIL', failureIdentities: ['gate-mutated-pr-snapshot'] },
+          }),
+          head: observedHead,
+          reason: 'the deterministic Gate modified files inside the exact reviewed PR snapshot (formatter / '
+            + 'codegen / snapshot updater); run that step yourself, commit its output, and push before '
+            + 'calling reviewloop_review again — a snapshot the Gate itself changed can never be certified',
           telemetry: await durableTelemetry(loopState.loopId), safetyEvents,
         };
       }
