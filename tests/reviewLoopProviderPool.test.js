@@ -4,8 +4,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { QuotaPoolRegistry, ProviderHealthRegistry } from '../src/orchestrator/roleRouting.js';
-import { createReviewLoopProviderPool } from '../src/reviewloop/providerWiring.js';
+import { QuotaPoolRegistry, ProviderHealthRegistry, RouteAuditLog } from '../src/orchestrator/roleRouting.js';
+import { createReviewLoopProviderPool, createAgyZeroTokenHealthRevalidator } from '../src/reviewloop/providerWiring.js';
 import { createReviewLoopController } from '../src/reviewloop/controller.js';
 import { MemoryPersistence } from './helpers/reviewLoopHarness.js';
 
@@ -43,6 +43,57 @@ test('the pool never offers a planner or executor role', () => {
   const pool = createReviewLoopProviderPool({ callAgy: async () => ({}) });
   assert.equal(pool.route('planner'), null);
   assert.equal(pool.route('executor'), null);
+});
+
+test('a bare pool touches no disk for its routing-decision audit (in-memory default)', () => {
+  const pool = createReviewLoopProviderPool({ callAgy: async () => ({}) });
+  pool.route('reviewer');
+  assert.equal(pool.router.routeAudit.filePath, null);
+  assert.ok(pool.router.routeAudit.entries.length > 0);
+});
+
+test('createReviewLoopProviderPool forwards routeAudit / healthRevalidator / staleHealthTtlMs into the router', () => {
+  const audited = [];
+  let revalidatorCalls = 0;
+  const health = new ProviderHealthRegistry();
+  health.record('agy:opus', 'UNAVAILABLE', 'x');
+  const pool = createReviewLoopProviderPool({
+    callAgy: async () => ({}),
+    providerHealth: health,
+    routeAudit: new RouteAuditLog({ sink: (e) => audited.push(e) }),
+    healthRevalidator: () => { revalidatorCalls += 1; return null; },
+    staleHealthTtlMs: -1, // any non-negative age counts as stale — deterministic without controlling the clock
+  });
+  const sel = pool.route('reviewer');
+  assert.equal(sel.family, 'agy:gemini-reviewer');
+  assert.equal(revalidatorCalls, 1);
+  assert.ok(audited.some((e) => e.type === 'ROLE_ROUTE_SKIPPED' && e.candidate === 'agy:opus'));
+});
+
+test('createAgyZeroTokenHealthRevalidator: recovers an AGY family when re-provisioning now succeeds, zero token spend', () => {
+  const calls = [];
+  const revalidate = createAgyZeroTokenHealthRevalidator({
+    agyGeminiDir: '/fake/gemini-dir',
+    provisionMinimalAgent: (opts) => { calls.push(opts); return { name: 'reviewloop-minimal', path: '/fake', relativePath: 'x', wrote: false }; },
+  });
+  const verdict = revalidate('agy:opus');
+  assert.equal(verdict.available, true);
+  assert.deepEqual(calls, [{ geminiDir: '/fake/gemini-dir' }]);
+});
+
+test('createAgyZeroTokenHealthRevalidator: reports unavailable (not a throw) when re-provisioning still fails', () => {
+  const revalidate = createAgyZeroTokenHealthRevalidator({
+    agyGeminiDir: '/fake/gemini-dir',
+    provisionMinimalAgent: () => { throw new Error('still cannot write the agent file'); },
+  });
+  const verdict = revalidate('agy:gemini-reviewer');
+  assert.equal(verdict.available, false);
+  assert.match(verdict.reason, /still cannot write the agent file/);
+});
+
+test('createAgyZeroTokenHealthRevalidator: has no opinion (null) on a non-AGY family', () => {
+  const revalidate = createAgyZeroTokenHealthRevalidator({ agyGeminiDir: '/fake/gemini-dir', provisionMinimalAgent: () => ({}) });
+  assert.equal(revalidate('codex:default'), null);
 });
 
 test('the CallIntent family matches the actually-selected family', async () => {

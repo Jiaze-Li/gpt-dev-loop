@@ -19,6 +19,7 @@
 // Status / dashboard / stop live on the human `reviewloop` CLI, not here.
 
 import path from 'node:path';
+import os from 'node:os';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -26,9 +27,11 @@ import { z } from 'zod';
 import { createReviewLoopController } from '../reviewloop/controller.js';
 import {
   createProductionReviewLoopProviders,
+  createAgyZeroTokenHealthRevalidator,
   detectAgyCustomAgentSupport,
   narrowAgyGeminiDir,
 } from '../reviewloop/providerWiring.js';
+import { RouteAuditLog } from '../orchestrator/roleRouting.js';
 import { probeAgyModelCatalog } from '../agy/agyModelCatalog.js';
 import { probeReviewTransportRuntime } from '../reviewloop/adapters/cliReviewTransports.js';
 
@@ -45,8 +48,19 @@ export function createReviewLoopMcpServer({
 } = {}) {
   const server = new McpServer({ name: 'reviewloop', version: '1.0.0' });
 
+  // This IS the one real entrypoint: the only place that opts into a
+  // disk-backed routing-decision audit (survives this process restarting)
+  // and a zero-token stale-health revalidator for the AGY families. Every
+  // deterministic test builds its own providers/pool directly and never
+  // reaches this default.
   const ctl = controller ?? createReviewLoopController(
-    createProductionReviewLoopProviders({ agyCatalog, transportRuntime, customAgentSupport }),
+    createProductionReviewLoopProviders({
+      agyCatalog,
+      transportRuntime,
+      customAgentSupport,
+      routeAudit: new RouteAuditLog({ filePath: path.join(os.homedir(), '.reviewloop', 'route-audit.log') }),
+      healthRevalidator: createAgyZeroTokenHealthRevalidator(),
+    }),
   );
 
   server.registerTool(

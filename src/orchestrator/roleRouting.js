@@ -1,6 +1,8 @@
 // Deterministic, zero-token role routing.  Policy, quota, transport health,
 // effort and physical-session decisions deliberately live in separate modules.
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import {
+  mkdirSync, readFileSync, writeFileSync, existsSync, appendFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -162,17 +164,22 @@ export class ProviderHealthRegistry {
       this.providers.set(target, entry);
     }
   }
-  usable(target, provider = null) {
+  // The single source of truth for "is this candidate blocked?" — usable()
+  // and the router's stale-health revalidation both go through this so they
+  // can never disagree about which entry (candidate-specific vs shared
+  // provider) is the one actually blocking dispatch.
+  blockingEntry(target, provider = null) {
     const cand = this.candidates.get(target);
-    if (cand && (cand.status === 'UNAVAILABLE' || cand.status === 'AUTH_FAILED')) return false;
+    if (cand && (cand.status === 'UNAVAILABLE' || cand.status === 'AUTH_FAILED')) return { scope: 'candidate', key: target, entry: cand };
     if (provider) {
       const prov = this.providers.get(provider);
-      if (prov && (prov.status === 'UNAVAILABLE' || prov.status === 'AUTH_FAILED')) return false;
+      if (prov && (prov.status === 'UNAVAILABLE' || prov.status === 'AUTH_FAILED')) return { scope: 'provider', key: provider, entry: prov };
     }
     const direct = this.providers.get(target);
-    if (direct && (direct.status === 'UNAVAILABLE' || direct.status === 'AUTH_FAILED')) return false;
-    return true;
+    if (direct && (direct.status === 'UNAVAILABLE' || direct.status === 'AUTH_FAILED')) return { scope: 'provider', key: target, entry: direct };
+    return null;
   }
+  usable(target, provider = null) { return this.blockingEntry(target, provider) === null; }
 }
 
 export class EffortPolicy {
@@ -184,29 +191,223 @@ export class EffortPolicy {
   }
 }
 
+// Every reason the router is allowed to skip a candidate for, closed over a
+// fixed enum. A skip reason that is not one of these is refused outright
+// (see RoleRouter#_decide) rather than silently let through as a bare
+// string — an unenumerated reason is exactly the shape a future bug would
+// take (a typo, a new code path that forgot to register its reason here).
+export const ROUTE_SKIP_REASONS = Object.freeze({
+  CAPABILITY: 'capability',
+  HIGH_CONTEXT: 'high_context',
+  QUOTA_COOLDOWN: 'quota_cooldown',
+  PROVIDER_HEALTH: 'provider_health',
+});
+const ROUTE_SKIP_REASON_VALUES = new Set(Object.values(ROUTE_SKIP_REASONS));
+
+export class RouteAuditError extends Error {
+  constructor(message, { code = 'ROUTE_AUDIT_FAILED' } = {}) {
+    super(message);
+    this.name = 'RouteAuditError';
+    this.code = code;
+  }
+}
+
+export class RoleRouterInvariantError extends Error {
+  constructor(message, { code = 'ROUTE_INVARIANT_VIOLATED' } = {}) {
+    super(message);
+    this.name = 'RoleRouterInvariantError';
+    this.code = code;
+  }
+}
+
+// Durable record of every routing decision (selected AND skipped), keyed by
+// nothing more than append order — this is an audit trail, not a queryable
+// index. Two backends:
+//   - `sink(entry)` — caller-supplied, e.g. an in-memory collector for tests
+//     or assertions on a specific failure mode (throw to simulate a write
+//     failure and exercise the router's fail-closed path).
+//   - `filePath` — appended as newline-delimited JSON (survives process
+//     restart; this is what makes the audit "durable" rather than a
+//     same-process-only in-memory event).
+// With neither configured, entries still accumulate in `.entries` (in
+// process memory only) so a bare `new RoleRouter()` — as dozens of existing
+// unit tests construct it — never touches disk. Production wiring is the one
+// place that opts into the disk-backed form; see
+// createReviewLoopMcpServer()'s routeAudit construction.
+export class RouteAuditLog {
+  constructor({ filePath = null, sink = null, now = () => Date.now() } = {}) {
+    this.filePath = filePath;
+    this.sink = sink;
+    this.now = now;
+    this.entries = [];
+  }
+  record(entry) {
+    const full = { at: nowIso(this.now()), ...entry };
+    try {
+      if (typeof this.sink === 'function') {
+        this.sink(full);
+      } else if (this.filePath) {
+        mkdirSync(path.dirname(this.filePath), { recursive: true });
+        appendFileSync(this.filePath, `${JSON.stringify(full)}\n`);
+      }
+      this.entries.push(full);
+      return { persisted: true, entry: full };
+    } catch (err) {
+      return { persisted: false, error: err?.message ?? String(err), entry: full };
+    }
+  }
+}
+
+// Reviewer's primary-first invariant: whenever the role's first-listed
+// candidate was actually selected, the invariant holds trivially. Whenever
+// something else was selected instead, the primary MUST appear among the
+// skipped candidates with an enumerated reason that was itself durably
+// persisted — i.e. the router can always answer "why didn't you pick the
+// primary?" from the audit trail, not from best-effort reasoning after the
+// fact. Exported standalone (not just exercised indirectly through route())
+// so it has one direct, focused test.
+export function assertRoutePrimaryFirstInvariant(rolePolicy, role, selectedFamily, skippedThisCall) {
+  const primary = (rolePolicy[role] ?? [])[0]?.family;
+  if (!primary || selectedFamily === primary) return;
+  const primarySkip = skippedThisCall.find((s) => s.candidate === primary);
+  if (!primarySkip) {
+    throw new RoleRouterInvariantError(
+      `primary-first invariant violated for role "${role}": ${primary} was never evaluated before selecting ${selectedFamily}`,
+      { code: 'ROUTE_PRIMARY_NOT_EVALUATED' },
+    );
+  }
+  if (!ROUTE_SKIP_REASON_VALUES.has(primarySkip.reason)) {
+    throw new RoleRouterInvariantError(
+      `primary-first invariant violated for role "${role}": ${primary} was skipped for a non-enumerated reason "${primarySkip.reason}"`,
+      { code: 'ROUTE_PRIMARY_REASON_NOT_ENUMERATED' },
+    );
+  }
+  if (!primarySkip.persisted) {
+    throw new RoleRouterInvariantError(
+      `primary-first invariant violated for role "${role}": ${primary} was skipped without a durably persisted reason`,
+      { code: 'ROUTE_PRIMARY_SKIP_UNPERSISTED' },
+    );
+  }
+}
+
 export class RoleRouter {
-  constructor({ rolePolicy = DEFAULT_ROLE_POLICY, quotaRegistry = new QuotaPoolRegistry(), providerHealth = new ProviderHealthRegistry(), effortPolicy = new EffortPolicy(), resolveFamily = (family) => ({ requestedFamily: family, resolvedModel: null, provider: family.split(':')[0], capabilities: {} }), onEvent } = {}) {
+  constructor({
+    rolePolicy = DEFAULT_ROLE_POLICY,
+    quotaRegistry = new QuotaPoolRegistry(),
+    providerHealth = new ProviderHealthRegistry(),
+    effortPolicy = new EffortPolicy(),
+    resolveFamily = (family) => ({ requestedFamily: family, resolvedModel: null, provider: family.split(':')[0], capabilities: {} }),
+    onEvent,
+    // Durable routing-decision audit. In-memory-only by default (see
+    // RouteAuditLog) so bare construction — as most tests do — never touches
+    // disk; production wiring injects a disk-backed instance.
+    routeAudit = new RouteAuditLog(),
+    // Zero-token, synchronous re-probe for a candidate whose health record is
+    // stale: (family, provider) -> { available: boolean, reason?: string } |
+    // null | undefined. null/undefined means "no opinion" (the stale record
+    // is trusted as-is, i.e. current behaviour). Never call a model here —
+    // it must be a cheap local check (file/process probe), never a paid one.
+    healthRevalidator = null,
+    // A provider_health skip older than this is eligible for revalidation.
+    // AUTH_FAILED entries are never auto-revalidated (an auth break needs a
+    // human, not a retry loop).
+    staleHealthTtlMs = 10 * 60 * 1000,
+    // Attached to every persisted decision so a durable audit entry can be
+    // traced back to the loop/round that produced it.
+    context = {},
+    now = () => Date.now(),
+  } = {}) {
     this.rolePolicy = rolePolicy ?? DEFAULT_ROLE_POLICY; this.quotaRegistry = quotaRegistry; this.providerHealth = providerHealth; this.effortPolicy = effortPolicy; this.resolveFamily = resolveFamily; this.onEvent = onEvent; this.resolutions = new Map();
+    this.routeAudit = routeAudit; this.healthRevalidator = healthRevalidator; this.staleHealthTtlMs = staleHealthTtlMs; this.context = context; this.now = now;
+  }
+  // Persist ONE routing decision (a skip or a selection). Fails closed:
+  // - an unenumerated skip reason is refused before any attempt to persist it
+  // - a persistence failure (disk error, or a test sink that throws) aborts
+  //   the whole route() call rather than silently falling through to the
+  //   next candidate on an unrecorded basis.
+  // The legacy in-memory onEvent hook still fires with the exact same event
+  // shape as before this feature existed — nothing that already listens on
+  // onEvent observes a difference.
+  _decide(rawEntry) {
+    if (rawEntry.type === 'ROLE_ROUTE_SKIPPED' && !ROUTE_SKIP_REASON_VALUES.has(rawEntry.reason)) {
+      throw new RouteAuditError(
+        `refusing to skip ${rawEntry.candidate} for role ${rawEntry.role}: reason "${rawEntry.reason}" is not an enumerated skip reason`,
+        { code: 'ROUTE_REASON_NOT_ENUMERATED' },
+      );
+    }
+    const result = this.routeAudit.record({ ...rawEntry, loopId: this.context.loopId ?? null, round: this.context.round ?? null });
+    this.onEvent?.(rawEntry);
+    if (!result.persisted) {
+      const label = rawEntry.type === 'ROLE_ROUTE_SKIPPED' ? `skip ${rawEntry.candidate}` : `select ${rawEntry.requestedFamily}`;
+      throw new RouteAuditError(
+        `refusing to ${label} for role ${rawEntry.role}: routing-decision audit failed to persist (${result.error ?? 'unknown error'})`,
+        { code: 'ROUTE_AUDIT_UNPERSISTED' },
+      );
+    }
+    return result;
+  }
+  // Given a provider_health block on `candidate`, decide whether to trust it
+  // as-is or spend a zero-token re-probe to see if it has since cleared.
+  // Returns the (possibly updated) block, or null if revalidation recovered
+  // the candidate.
+  _resolveHealthBlock(block, candidate, provider) {
+    if (!block || block.entry.status !== 'UNAVAILABLE' || typeof this.healthRevalidator !== 'function') {
+      return block ? { ...block, revalidated: false, staleMs: null } : null;
+    }
+    const staleMs = block.entry.checkedAt ? (this.now() - Date.parse(block.entry.checkedAt)) : Infinity;
+    if (!(staleMs > this.staleHealthTtlMs)) return { ...block, revalidated: false, staleMs };
+    let verdict = null;
+    try {
+      verdict = this.healthRevalidator(candidate.family, provider);
+    } catch (err) {
+      verdict = { available: false, reason: `revalidator_threw: ${err?.message ?? String(err)}` };
+    }
+    if (!verdict) return { ...block, revalidated: false, staleMs };
+    if (verdict.available === true) {
+      this.providerHealth.record(block.key, 'READY', verdict.reason ?? 'zero-token stale-health revalidation confirmed availability');
+      return null; // recovered — no longer blocking
+    }
+    // Still down: refresh checkedAt so the same call isn't re-revalidated on
+    // every single route() invocation until the TTL elapses again.
+    this.providerHealth.record(block.key, block.entry.status, verdict.reason ?? block.entry.reason);
+    const refreshed = this.providerHealth.blockingEntry(candidate.family, provider);
+    return { ...(refreshed ?? block), revalidated: true, staleMs };
   }
   route(role, signals = {}) {
     const candidates = this.rolePolicy[role] ?? [];
+    const skippedThisCall = [];
     for (const candidate of candidates) {
       const resolved = this.resolveFamily(candidate.family) ?? {}; const provider = resolved.provider ?? candidate.family.split(':')[0];
       if (resolved.resolvedModel && this.resolutions.has(candidate.family) && this.resolutions.get(candidate.family) !== resolved.resolvedModel) this.onEvent?.({ type: 'MODEL_RESOLVED_CHANGED', requestedFamily: candidate.family, previousResolvedModel: this.resolutions.get(candidate.family), resolvedModel: resolved.resolvedModel });
       if (resolved.resolvedModel) this.resolutions.set(candidate.family, resolved.resolvedModel);
+      const recordSkip = (reason, extra = {}) => {
+        const raw = { type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason, ...extra };
+        const result = this._decide(raw);
+        skippedThisCall.push({ candidate: candidate.family, reason, persisted: result.persisted });
+      };
       // `roles` is an explicit adapter declaration. An empty declaration is
       // unsupported too; do not turn a missing adapter into a token-bearing
       // probe.  Resolvers that predate capability metadata remain compatible.
-      if (Array.isArray(resolved.capabilities?.roles) && !resolved.capabilities.roles.includes(role)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'capability' }); continue; }
+      if (Array.isArray(resolved.capabilities?.roles) && !resolved.capabilities.roles.includes(role)) { recordSkip(ROUTE_SKIP_REASONS.CAPABILITY); continue; }
       // A high-context family is excluded from automatic selection unless a
       // caller explicitly opts in. Purely deterministic — never a token probe.
-      if (candidate.highContext && signals.allowHighContext !== true) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'high_context' }); continue; }
-      if (!this.quotaRegistry.usable(candidate.family)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'quota_cooldown', pools: this.quotaRegistry.poolsFor(candidate.family) }); continue; }
-      if (!this.providerHealth.usable(candidate.family, provider)) { this.onEvent?.({ type: 'ROLE_ROUTE_SKIPPED', role, candidate: candidate.family, reason: 'provider_health' }); continue; }
+      if (candidate.highContext && signals.allowHighContext !== true) { recordSkip(ROUTE_SKIP_REASONS.HIGH_CONTEXT); continue; }
+      if (!this.quotaRegistry.usable(candidate.family)) { recordSkip(ROUTE_SKIP_REASONS.QUOTA_COOLDOWN, { pools: this.quotaRegistry.poolsFor(candidate.family) }); continue; }
+      const healthBlock = this._resolveHealthBlock(this.providerHealth.blockingEntry(candidate.family, provider), candidate, provider);
+      if (healthBlock) {
+        recordSkip(ROUTE_SKIP_REASONS.PROVIDER_HEALTH, {
+          healthScope: healthBlock.scope, healthStatus: healthBlock.entry.status, healthReason: healthBlock.entry.reason,
+          revalidated: healthBlock.revalidated, staleMs: Number.isFinite(healthBlock.staleMs) ? healthBlock.staleMs : null,
+        });
+        continue;
+      }
       const effort = this.effortPolicy.select({ candidate, capabilities: resolved.capabilities, signals });
       const selected = { role, requestedFamily: candidate.family, resolvedModel: resolved.resolvedModel ?? null, provider, quotaPools: this.quotaRegistry.poolsFor(candidate.family), effort, degraded: Boolean(candidate.degraded) };
-      this.onEvent?.({ type: 'ROLE_ROUTE_SELECTED', ...selected }); return selected;
+      this._decide({ type: 'ROLE_ROUTE_SELECTED', ...selected });
+      assertRoutePrimaryFirstInvariant(this.rolePolicy, role, selected.requestedFamily, skippedThisCall);
+      return selected;
     }
+    this.routeAudit.record({ type: 'ROLE_ROUTE_POOL_EXHAUSTED', role, loopId: this.context.loopId ?? null, round: this.context.round ?? null });
     return null;
   }
   recordFailure(selection, failure) {

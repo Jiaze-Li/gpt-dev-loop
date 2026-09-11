@@ -22,6 +22,7 @@ import {
   QuotaPoolRegistry,
   ProviderHealthRegistry,
   EffortPolicy,
+  RouteAuditLog,
 } from '../orchestrator/roleRouting.js';
 import { resolveModelFamily, MODEL_FAMILY_REGISTRY } from '../orchestrator/modelFamilyResolver.js';
 import { narrowReviewTransportCwd, narrowAgyGeminiDir } from './adapters/scratchCwd.js';
@@ -227,6 +228,20 @@ export function createReviewLoopProviderPool({
   //            verification skipped (deterministic tests / `doctor` inspection).
   //   { supported: false } -> AGY families fail closed, never wired.
   customAgentSupport = null,
+  // Durable routing-decision audit (see RouteAuditLog). In-memory-only by
+  // default, matching quotaRegistry above — deterministic tests must never
+  // touch disk just by calling pool.route(). The real MCP entrypoint injects
+  // a disk-backed instance.
+  routeAudit = new RouteAuditLog(),
+  // Zero-token, synchronous stale-health re-probe forwarded to RoleRouter.
+  // null (default) -> a stale provider_health skip is trusted as-is, the
+  // pre-existing behaviour. The real MCP entrypoint injects a probe that
+  // re-provisions the AGY isolated agent (still zero-token: local file I/O,
+  // no CLI spawn, no model call) so a transient startup-time failure does not
+  // permanently sideline agy:opus / agy:gemini-reviewer for the process's
+  // whole lifetime.
+  healthRevalidator = null,
+  staleHealthTtlMs = 10 * 60 * 1000,
 } = {}) {
   // Resolve every registered family to a concrete model (or null = provider
   // default) at construction. Stable family identity in, concrete version out —
@@ -389,6 +404,9 @@ export function createReviewLoopProviderPool({
     quotaRegistry,
     providerHealth,
     effortPolicy: new EffortPolicy(),
+    routeAudit,
+    healthRevalidator,
+    staleHealthTtlMs,
     resolveFamily: (family) => {
       const r = resolution[family] ?? resolveModelFamily(family, { env, agyCatalog });
       return {
@@ -496,9 +514,40 @@ function buildSupervisorInvoke() {
   };
 }
 
+// Zero-token stale-health revalidator for the AGY families: re-runs the
+// local, synchronous, no-CLI-spawn provisioning check that startup wiring
+// already performs once (see agyIsolationAvailable below). It re-verifies
+// only that half of the gate — "agy actually LOADS the isolated agent" needs
+// a real CLI probe and stays async, so it is NOT re-run here; the per-call
+// effective-loading verification already enforced elsewhere remains the
+// backstop for that half. Non-AGY families get no opinion (null) — the
+// stale-health TTL only ever matters for a family this returns non-null for.
+export function createAgyZeroTokenHealthRevalidator({
+  agyGeminiDir = narrowAgyGeminiDir(),
+  provisionMinimalAgent = provisionMinimalAgyAgent,
+} = {}) {
+  return (family) => {
+    if (!family.startsWith('agy:')) return null;
+    try {
+      provisionMinimalAgent({ geminiDir: agyGeminiDir });
+      return { available: true, reason: 'zero-token re-provisioning of the reviewloop-minimal agent succeeded' };
+    } catch (err) {
+      return { available: false, reason: `zero-token re-provisioning failed: ${err?.message ?? String(err)}` };
+    }
+  };
+}
+
 export function createProductionReviewLoopProviders({
   env = process.env, callAgy, github, agyCatalog = null, transportRuntime = null,
   customAgentSupport = null, agyGeminiDir = undefined,
+  // Left undefined by default so createReviewLoopProviderPool's own inert,
+  // in-memory-only defaults apply — this factory is exercised directly by
+  // several deterministic tests and must not touch disk on its own. The real
+  // MCP entrypoint (reviewloopMcpServer.js) is the one place that passes a
+  // disk-backed routeAudit and the AGY zero-token revalidator explicitly.
+  routeAudit = undefined,
+  healthRevalidator = undefined,
+  staleHealthTtlMs = undefined,
 } = {}) {
   // `agyCatalog` + `transportRuntime` + `customAgentSupport` are supplied by the
   // MCP entrypoint, which probes them once at startup; left null here so nothing
@@ -508,6 +557,9 @@ export function createProductionReviewLoopProviders({
   const pool = createReviewLoopProviderPool({
     callAgy, env, agyCatalog, transportRuntime, customAgentSupport,
     ...(agyGeminiDir ? { agyGeminiDir } : {}),
+    ...(routeAudit !== undefined ? { routeAudit } : {}),
+    ...(healthRevalidator !== undefined ? { healthRevalidator } : {}),
+    ...(staleHealthTtlMs !== undefined ? { staleHealthTtlMs } : {}),
   });
   const reviewerInvoke = buildReviewerInvoke();
   const supervisorInvoke = buildSupervisorInvoke();

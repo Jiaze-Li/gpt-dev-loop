@@ -6,6 +6,11 @@ import {
   QuotaPoolRegistry,
   RoleRouter,
   ProviderHealthRegistry,
+  RouteAuditLog,
+  RouteAuditError,
+  RoleRouterInvariantError,
+  ROUTE_SKIP_REASONS,
+  assertRoutePrimaryFirstInvariant,
   supportsProductionRole,
 } from '../src/orchestrator/roleRouting.js';
 
@@ -152,4 +157,207 @@ test('provider health failure removes a family without touching policy', () => {
 test('quota topology no longer references claude:sonnet', () => {
   const quota = new QuotaPoolRegistry({ filePath: null });
   assert.deepEqual(quota.poolsFor('claude:sonnet'), []);
+});
+
+// ---- durable routing-decision audit --------------------------------------
+
+test('a bare RoleRouter (no routeAudit configured) never touches disk but still records every decision in-memory', () => {
+  const router = new RoleRouter({ resolveFamily: resolver });
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:opus');
+  assert.equal(router.routeAudit.filePath, null);
+  assert.ok(router.routeAudit.entries.some((e) => e.type === 'ROLE_ROUTE_SELECTED' && e.requestedFamily === 'agy:opus'));
+});
+
+test('every pre-dispatch skip is durably persisted with an enumerated reason before the router moves to the next candidate', () => {
+  const audited = [];
+  const health = new ProviderHealthRegistry();
+  health.record('agy:opus', 'UNAVAILABLE', 'PROVIDER_UNAVAILABLE');
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    routeAudit: new RouteAuditLog({ sink: (e) => audited.push(e) }),
+  });
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:gemini-reviewer');
+  const skip = audited.find((e) => e.type === 'ROLE_ROUTE_SKIPPED' && e.candidate === 'agy:opus');
+  assert.ok(skip, 'the skip of the primary candidate must be in the durable audit');
+  assert.equal(skip.reason, ROUTE_SKIP_REASONS.PROVIDER_HEALTH);
+  assert.ok(Object.values(ROUTE_SKIP_REASONS).includes(skip.reason));
+  const select = audited.find((e) => e.type === 'ROLE_ROUTE_SELECTED');
+  assert.equal(select.requestedFamily, 'agy:gemini-reviewer');
+});
+
+test('a routing-decision audit that fails to persist makes the router fail closed instead of silently skipping', () => {
+  const health = new ProviderHealthRegistry();
+  health.record('agy:opus', 'UNAVAILABLE', 'PROVIDER_UNAVAILABLE');
+  let calls = 0;
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    routeAudit: new RouteAuditLog({
+      sink: () => { calls += 1; throw new Error('disk full'); },
+    }),
+  });
+  assert.throws(() => router.route('reviewer'), (err) => {
+    assert.ok(err instanceof RouteAuditError);
+    assert.equal(err.code, 'ROUTE_AUDIT_UNPERSISTED');
+    return true;
+  });
+  // It must fail closed on the FIRST unpersisted decision — never fall
+  // through to agy:gemini-reviewer on an unrecorded basis.
+  assert.equal(calls, 1);
+});
+
+test('an unenumerated skip reason is refused before any attempt to persist it', () => {
+  const audited = [];
+  const router = new RoleRouter({ resolveFamily: resolver, routeAudit: new RouteAuditLog({ sink: (e) => audited.push(e) }) });
+  assert.throws(() => router._decide({ type: 'ROLE_ROUTE_SKIPPED', role: 'reviewer', candidate: 'agy:opus', reason: 'made_up_reason' }), (err) => {
+    assert.ok(err instanceof RouteAuditError);
+    assert.equal(err.code, 'ROUTE_REASON_NOT_ENUMERATED');
+    return true;
+  });
+  assert.equal(audited.length, 0, 'a reason that is not in the enum must never reach the audit sink');
+});
+
+// ---- primary-first invariant ----------------------------------------------
+
+test('primary-first invariant: whenever agy:opus is READY, the Reviewer first real dispatch selects it', () => {
+  const router = new RoleRouter({ resolveFamily: resolver });
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:opus');
+});
+
+test('assertRoutePrimaryFirstInvariant is a no-op when the primary itself was selected', () => {
+  assert.doesNotThrow(() => assertRoutePrimaryFirstInvariant(DEFAULT_ROLE_POLICY, 'reviewer', 'agy:opus', []));
+});
+
+test('assertRoutePrimaryFirstInvariant throws when the primary was bypassed without ever being evaluated', () => {
+  assert.throws(
+    () => assertRoutePrimaryFirstInvariant(DEFAULT_ROLE_POLICY, 'reviewer', 'codex:default', []),
+    (err) => { assert.ok(err instanceof RoleRouterInvariantError); assert.equal(err.code, 'ROUTE_PRIMARY_NOT_EVALUATED'); return true; },
+  );
+});
+
+test('assertRoutePrimaryFirstInvariant throws when the primary was skipped for a non-enumerated reason', () => {
+  assert.throws(
+    () => assertRoutePrimaryFirstInvariant(DEFAULT_ROLE_POLICY, 'reviewer', 'codex:default', [
+      { candidate: 'agy:opus', reason: 'vibes', persisted: true },
+    ]),
+    (err) => { assert.ok(err instanceof RoleRouterInvariantError); assert.equal(err.code, 'ROUTE_PRIMARY_REASON_NOT_ENUMERATED'); return true; },
+  );
+});
+
+test('assertRoutePrimaryFirstInvariant passes when the primary was skipped for a persisted, enumerated reason', () => {
+  assert.doesNotThrow(() => assertRoutePrimaryFirstInvariant(DEFAULT_ROLE_POLICY, 'reviewer', 'codex:default', [
+    { candidate: 'agy:opus', reason: ROUTE_SKIP_REASONS.PROVIDER_HEALTH, persisted: true },
+    { candidate: 'agy:gemini-reviewer', reason: ROUTE_SKIP_REASONS.PROVIDER_HEALTH, persisted: true },
+  ]));
+});
+
+// ---- zero-token stale-health revalidation ---------------------------------
+
+test('a stale provider_health skip is revalidated with a zero-token probe and recovers the primary', () => {
+  let now = 0;
+  const health = new ProviderHealthRegistry({ now: () => now });
+  health.record('agy:opus', 'UNAVAILABLE', 'startup isolation probe failed');
+  let revalidatorCalls = 0;
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    now: () => now,
+    staleHealthTtlMs: 1000,
+    healthRevalidator: (family) => {
+      revalidatorCalls += 1;
+      return family === 'agy:opus' ? { available: true, reason: 'zero-token re-probe ok' } : null;
+    },
+  });
+  now = 2000; // past the TTL
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:opus');
+  assert.equal(revalidatorCalls, 1);
+  assert.equal(health.get('agy:opus').status, 'READY');
+});
+
+test('a stale provider_health skip that revalidation confirms is still down stays skipped, durably, and is not re-probed immediately again', () => {
+  let now = 0;
+  const health = new ProviderHealthRegistry({ now: () => now });
+  health.record('agy:opus', 'UNAVAILABLE', 'startup isolation probe failed');
+  const audited = [];
+  let revalidatorCalls = 0;
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    now: () => now,
+    staleHealthTtlMs: 1000,
+    routeAudit: new RouteAuditLog({ sink: (e) => audited.push(e) }),
+    healthRevalidator: () => { revalidatorCalls += 1; return { available: false, reason: 'still broken' }; },
+  });
+  now = 2000;
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:gemini-reviewer');
+  assert.equal(revalidatorCalls, 1);
+  const skip = audited.find((e) => e.type === 'ROLE_ROUTE_SKIPPED' && e.candidate === 'agy:opus');
+  assert.equal(skip.revalidated, true);
+  assert.equal(skip.healthReason, 'still broken');
+  // Immediately calling again must not re-probe: checkedAt was refreshed, so
+  // this call is no longer stale relative to `now`.
+  router.route('reviewer');
+  assert.equal(revalidatorCalls, 1);
+});
+
+test('a fresh (non-stale) provider_health skip is never revalidated even when a revalidator is configured', () => {
+  let now = 0;
+  const health = new ProviderHealthRegistry({ now: () => now });
+  health.record('agy:opus', 'UNAVAILABLE', 'just failed');
+  let revalidatorCalls = 0;
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    now: () => now,
+    staleHealthTtlMs: 1000,
+    healthRevalidator: () => { revalidatorCalls += 1; return { available: true }; },
+  });
+  now = 500; // well under the TTL
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:gemini-reviewer');
+  assert.equal(revalidatorCalls, 0);
+});
+
+test('AUTH_FAILED health entries are never auto-revalidated regardless of staleness', () => {
+  let now = 0;
+  const health = new ProviderHealthRegistry({ now: () => now });
+  health.record('agy:opus', 'AUTH_FAILED', 'PROVIDER_AUTH_FAILED');
+  let revalidatorCalls = 0;
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    now: () => now,
+    staleHealthTtlMs: 1000,
+    healthRevalidator: () => { revalidatorCalls += 1; return { available: true }; },
+  });
+  now = 999999;
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:gemini-reviewer');
+  assert.equal(revalidatorCalls, 0, 'an auth failure must never be auto-cleared by the stale-health path');
+});
+
+test('a revalidator that throws is treated as still unavailable — never silently trusted', () => {
+  let now = 0;
+  const health = new ProviderHealthRegistry({ now: () => now });
+  health.record('agy:opus', 'UNAVAILABLE', 'startup isolation probe failed');
+  const audited = [];
+  const router = new RoleRouter({
+    providerHealth: health,
+    resolveFamily: resolver,
+    now: () => now,
+    staleHealthTtlMs: 1000,
+    routeAudit: new RouteAuditLog({ sink: (e) => audited.push(e) }),
+    healthRevalidator: () => { throw new Error('probe process crashed'); },
+  });
+  now = 2000;
+  const sel = router.route('reviewer');
+  assert.equal(sel.requestedFamily, 'agy:gemini-reviewer');
+  const skip = audited.find((e) => e.type === 'ROLE_ROUTE_SKIPPED' && e.candidate === 'agy:opus');
+  assert.match(skip.healthReason, /revalidator_threw/);
 });
