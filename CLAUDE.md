@@ -4,9 +4,12 @@
 
 Label every review finding with a severity prefix and lead each inline comment with it.
 
-- **P1** - must fix before merge: wrong results, data loss or corruption, a fail-closed path failing silently, credential or security exposure, breaking an existing caller or a documented contract.
-- **P2** - should fix, does not block merge: unhandled edge cases with bounded blast radius, error paths that swallow context, real but unlikely races, missing test coverage for new branching logic.
-- **P3** - nit: naming, structure, duplication, stale comments.
+- **P1** - blocking: wrong results, data loss or corruption, a fail-closed path failing silently, credential or security exposure, breaking an existing caller or a documented contract.
+- **P2** - blocking: unhandled edge cases with bounded blast radius, error paths that swallow context, real but unlikely races, missing test coverage for new branching logic.
+- **P3** - non-blocking nit: naming, structure, duplication, stale comments.
+
+ReviewLoop completion policy: **no P1 and no P2 → eligible for PASS**. P3 is
+reported (capped) but never blocks completion by default.
 
 Review output rules:
 
@@ -18,4 +21,13 @@ Review output rules:
 
 ## Project context
 
-This repository orchestrates an automated development loop: a Task Card is executed by Claude, verified by deterministic gates, then reviewed by a GPT reviewer; REWORK loops back into a fresh execution session. Operating rules live in `.agents/rules/supergpt.md`.
+This repository is **ReviewLoop**: a post-execution review and repair
+controller for coding agents. The Worker (the coding agent the user is talking
+to) owns execution — it implements, tests, and pushes directly. ReviewLoop
+owns the deterministic Gate, an independent Reviewer, external PR-review
+waiting, non-convergence detection, and exception-only Supervisor guidance. It
+never writes application code, commits, pushes, merges, or force-pushes.
+
+`REWORK` loops back to the **same** Worker session, not a fresh one. The Worker
+contract lives in `agent-policy/COMMON.md`; the architecture in
+`docs/ARCHITECTURE.md`.

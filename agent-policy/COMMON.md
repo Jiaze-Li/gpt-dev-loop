@@ -1,49 +1,49 @@
-# SuperGPT Front-Agent Contract
+# ReviewLoop Worker Contract
 
-This is the single active SuperGPT policy for Claude, Codex, and AGY. Do not maintain client-specific routing or launch rules elsewhere.
+Contract version: 3
 
-## Front-agent role
+The one source of truth for how a coding agent uses ReviewLoop. The installer
+writes it byte-identically into each agent's auto-loaded rules inside one
+managed block; `npm run doctor` verifies the match with zero model calls.
 
-Claude, Codex, and AGY are human interfaces and launchers. They accept the user's request, decide whether it belongs in SuperGPT, launch the workflow, relay local progress, and return the terminal result. Once SuperGPT owns a task, the front agent must not duplicate planning, implementation, verification, review, or rework.
+## You are the Worker
 
-## V1 routing
+- You are the Worker: the coding agent the user is talking to right now.
+- Handle the user's coding task directly with your normal tools — inspect,
+  edit, test, lint, build, debug, `git`, whatever the task needs.
+- ReviewLoop does NOT implement the task, choose your model, spawn a session,
+  or restrict which files or commands you touch.
 
-For requests that modify code, default to SuperGPT unless the work is obviously a trivial, single-step, low-risk edit.
+## Using ReviewLoop
 
-Use the front agent directly only for explanation/research-only requests and obvious tiny edits such as a typo, one small documentation edit, or one explicit low-risk value change.
+- For non-trivial code work, call `reviewloop_begin({ goal, cwd })` BEFORE your
+  first edit to capture the pre-edit baseline. Pass `prNumber` to review an open
+  PR (PR base -> exact PR HEAD) with the same engine instead of the worktree.
+- Do the work.
+- When your implementation is ready, call `reviewloop_review({ loopId })`.
+  - `PASS` → report completion.
+  - `REWORK` → fix the returned findings yourself in THIS same session, then
+    call `reviewloop_review` again.
+  - `HUMAN_REQUIRED` → **STOP.** This ends the task: report the blocker and
+    findings to the user and wait. Do not `reviewloop_begin` again, switch
+    session, or push a new HEAD for a fresh counter — budget spent.
+  - `WAITING_FOR_REVIEW` → transient (a lease is held, or the PR HEAD kept
+    moving); call `reviewloop_review` again once state settles.
+  - `PUSH_REQUIRED` / `NO_PROGRESS` → change or push real state first.
 
-Use SuperGPT for features, bug fixes, refactors, migrations, debugging, tests, multi-file or multi-layer changes, repeated implement/verify cycles, or any request where planning and independent review are valuable. When uncertain, choose SuperGPT.
+## Execution budget
 
-V2 will replace this front-agent judgment with the deterministic zero-token `supergpt_route` operation. Until then, all three frontends apply this exact policy.
+- One user instruction buys ONE ReviewLoop budget: at most 3 automatic review
+  rounds. Three rounds without converging → `HUMAN_REQUIRED`, task over.
+- Only a NEW user message ("continue PR #4") starts a new task, which may open a
+  fresh `reviewloop_begin` with a fresh 3-round budget.
 
-## One launch path
+## Rules
 
-When SuperGPT is selected, use the SuperGPT MCP tools. Do not use the SuperGPT CLI as an agent fallback and do not create another execution path.
-
-Normal autonomous execution:
-
-1. Call `supergpt_start({ goal, cwd })` with the user's original goal and exact current workspace.
-2. Receive `{ status: "RUNNING", workflowId }`.
-3. Attach `supergpt_watch({ workflowId })` for local zero-model-token progress until terminal.
-4. Relay meaningful progress without redoing SuperGPT's reasoning or work.
-5. Return the terminal result. Ask the user only when the workflow reaches a genuine `HUMAN_REQUIRED` state or the user explicitly asks to intervene.
-
-Other MCP operations:
-
-- `supergpt_plan({ goal, cwd })` when the user explicitly asks to plan before execution.
-- `supergpt_status({ workflowId })` for an on-demand local status snapshot.
-- `supergpt_verify({ workflowId })` for trusted host verification when requested by the workflow.
-- `supergpt_resume({ workflowId, answer, cwd })` after a required human answer or accepted host verification.
-- `supergpt_stop({ workflowId })` when the user asks to stop.
-- `supergpt_run` only when a caller explicitly needs a blocking convenience operation.
-
-If the SuperGPT MCP is unavailable, report the installation/configuration problem instead of silently taking over a substantial task. The CLI remains a human-operated diagnostic/recovery interface, not an alternate agent workflow.
-
-## Invariants
-
-- Invocation workspace in -> the same workspace receives approved changes out.
-- Front agents do not invent Task Cards or internal workflow state.
-- Front agents do not independently inspect or re-review work that SuperGPT owns unless the user explicitly asks for a separate review.
-- Progress observation is local and must not spend model calls asking whether the workflow is still running.
-- Repository-local instructions may add project-specific build, test, style, and architecture rules, but must not redefine this global routing/launch contract.
-- A new policy or entrypoint replaces the old one; do not keep parallel fallback policies or duplicate launch paths.
+- In PR mode, push your fix when the user's task authorizes it; ReviewLoop
+  reviews the pushed PR HEAD and never pushes, merges, or force-pushes for you.
+- Do not call `reviewloop_review` repeatedly without changing state — identical
+  evidence returns a deterministic no-progress result, never a fresh review.
+- Do not self-repair ReviewLoop while using it on another repository; report an
+  install/config problem instead of working around it.
+- ReviewLoop never force-pushes, auto-merges, or weakens the objective.

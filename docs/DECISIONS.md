@@ -1,125 +1,37 @@
-# Architecture / Product Decisions
+# ReviewLoop decisions
 
-This file records decisions already agreed during initial design discussion so that later implementation does not accidentally reopen them without cause.
+Current architectural decisions. Historical SuperGPT V1/V2 decisions are under
+`docs/history/`.
 
-## D-001 — The product is a development loop, not a new coding agent
-
-**Decision:** `gpt-dev-loop` is deterministic orchestration and transport around existing models. It is not itself an AI agent.
-
-**Reason:** The value is removing manual prompt forwarding while preserving clear role separation.
-
-## D-002 — Human and GPT discuss the plan before autonomous execution
-
-**Decision:** The normal workflow begins with the human and ChatGPT agreeing on requirements / architecture / acceptance and writing that agreement into the target repo.
-
-**Reason:** Product and domain decisions should be made before the unattended implementation loop whenever possible.
-
-## D-003 — Claude does not need GPT to actively wake it
-
-**Decision:** The coding side runs the loop and synchronously calls GPT when review is required.
-
-**Reason:** This avoids building a complex bidirectional event-notification system. GPT only needs to answer review/planning calls.
-
-## D-004 — Reviewer path should use ChatGPT web session, not OpenAI API
-
-**Decision:** The intended GPT reviewer path uses the user's existing ChatGPT web session and must not silently switch to separately billed OpenAI API usage.
-
-**Reason:** Avoid incremental API billing and reuse the interactive ChatGPT environment the user already uses for planning/review.
-
-**Caveat:** ChatGPT plan usage limits still apply. Web automation is not treated as an official stable machine API and may require maintenance when the website changes.
-
-## D-005 — Handoff must be mechanical
-
-**Decision:** Agent-to-GPT transport is local deterministic code. Claude should not use vision/screenshots or visually operate the ChatGPT website.
-
-**Reason:** Browser reasoning wastes executor context/usage and is less reliable than a narrow machine interface.
-
-## D-006 — GitHub diff is primary implementation evidence
-
-**Decision:** Reviewer requests should identify the repository and exact base/head state. GPT should inspect the actual GitHub diff when possible.
-
-**Reason:** Executor summaries are lossy and can omit mistakes. Git evidence is reproducible and independently auditable.
-
-## D-007 — Claude Code is the first UI, but Claude is not the architecture
-
-**Decision:** V1 should feel native inside Claude Code, but Claude-specific integration remains an adapter.
-
-**Reason:** The user wants one familiar control surface today, while future Codex support should require only a new adapter rather than a rewrite.
-
-## D-008 — Local independent repository
-
-**Decision:** `gpt-dev-loop` lives in its own local/GitHub repository with its own development history.
-
-**Reason:** Clean versioning, portability, easy migration, and separation from target application repositories.
-
-## D-009 — Prefer invisible setup over remembered commands
-
-**Decision:** Normal operation should not require the user to remember `serve`, port, login, or daemon commands.
-
-**Reason:** Operational simplicity is a core product requirement, not cosmetic polish.
-
-**Implementation implication:** readiness/login should be detected automatically; human interaction should occur only when authentication truly needs intervention.
-
-## D-010 — V1 stays smaller than supergpt
-
-**Decision:** Do not port the entire `supergpt` state machine and protocol before proving the communication and review loop.
-
-**Reason:** The minimum valuable product is `ask_gpt` + Claude workflow + Git evidence + review/rework loop.
-
-## D-011 — Reuse supergpt lessons selectively
-
-**Decision:** Carry forward proven ideas such as deterministic gates, Git anchors, independent evidence, bounded retry, rework state, phase-aware resume, and Git-safety controls as reliability needs appear.
-
-**Reason:** These mechanisms solve real failure modes already encountered, but they should not obscure the initial PoC.
-
-## D-012 — Reviewer approval gates completion
-
-**Decision:** The executor cannot declare success solely on its own judgment. A normal autonomous run ends only after explicit reviewer `DONE` / equivalent approval.
-
-**Reason:** Otherwise the executor also becomes its own quality authority, defeating the purpose of the loop.
-
-## D-013 — Human intervention must be explicit
-
-**Decision:** Use a terminal `HUMAN_REQUIRED` outcome for decisions that are not safe to automate.
-
-Typical triggers:
-
-- ambiguity in product behavior;
-- architecture decision outside agreed constraints;
-- scope expansion;
-- contradictory requirements;
-- repeated failed rework;
-- unsafe or destructive action requiring approval.
-
-## D-014 — Task representation and size are policy, not architecture
-
-**Decision:** Natural-language task descriptions are acceptable initially. Task cards, task size, planning horizon, retry limits, and stop policy remain configurable.
-
-**Reason:** These questions require empirical tuning from real use rather than premature schema design.
-
-## D-015 — Long-term planning strategy should be hybrid
-
-**Decision:** Prefer global architectural/milestone planning with local incremental task materialization rather than either fully preplanning every coding card or replanning the entire project after every commit.
-
-**Reason:** This preserves architectural coherence while reducing stale detailed plans and unnecessary reviewer/planner context.
-
-## D-016 — Secrets never enter the repository
-
-**Decision:** ChatGPT login state, browser profile data, cookies, tokens, and credentials remain local and ignored by Git.
-
-**Reason:** The repository may be public and must remain safe to clone/share.
-
-## Open decisions
-
-These are intentionally not frozen yet:
-
-- exact runtime/language for the local core;
-- whether to embed/fork `gpt-web-bridge` code or depend on it as a module;
-- exact ChatGPT conversation/session strategy;
-- exact Claude Plugin packaging layout;
-- whether evidence commit/push is performed by the agent or a trusted core process in the earliest V1;
-- structured vs natural-language review response for the first prototype;
-- exact task sizing defaults;
-- public/private distribution strategy once implementation contains bridge details.
-
-These should be resolved through Phase 1–3 experiments rather than assumption.
+| # | decision |
+|---|---|
+| D1 | Worker-owned execution. The coding agent the user is talking to implements, tests, and pushes. |
+| D2 | ReviewLoop is not a coding agent. It never writes application code. |
+| D3 | Planner removed. The Worker receives the user's prompt directly; there is no task decomposition, no Fast/Full path, no task queue. |
+| D4 | Executor pool removed. No internal Executor role, no Sonnet-only chain, no fresh rework sessions. |
+| D5 | The Worker uses its host's normal permissions. ReviewLoop does not sandbox the Worker (allowed_files / exact verification commands / no-pipe restrictions are gone). |
+| D6 | Git evidence is authoritative. The baseline-to-current diff is the primary Reviewer input. |
+| D7 | The Gate is verification, not a command-permission system. 0 model tokens. |
+| D8 | P1/P2 block completion; P3 does not. Root `CLAUDE.md` review conventions are aligned to this. |
+| D9 | The first actionable REWORK goes directly to the same Worker — no Supervisor, no new session. |
+| D10 | Supervisor is exception-only: invoked at most once, only after a genuine changed implementation left the same blocking finding. |
+| D11 | Local waiting never wakes the Worker or a model. `WAITING_FOR_REVIEW` is a durable state. |
+| D12 | A PR review is bound to the exact PR HEAD. Each round re-reads the live PR HEAD (fail closed if unresolvable) and reviews `prBaseSha → that HEAD` inside an isolated exact-HEAD worktree; a pre-`PASS` recheck refuses to certify a stale review if the HEAD moved. An old-HEAD clean review never approves a new HEAD. See D29 for the full snapshot-correctness mechanism. |
+| D28 | ONE review engine. PR is a review TARGET (`prBaseSha → exact PR HEAD` diff), never a reviewer transport. The `@codex review` / `@claude review` external-review engine and its machinery (`prReviewController`, `ExternalModelTriggerAuthority`, `prTrust`, `threadResolution`, `trustedPrReview`, `prCloseoutPolicy`) are removed. Both LOCAL and PR targets run the same deterministic Gate → internal Reviewer routing (`agy:opus` first) → convergence → Supervisor → spend accounting. `githubBackend` is a slim target adapter (repo id, base SHA, HEAD SHA, PR diff, opt-in result publication) and never reviews. The objective fingerprint folds in `prBaseSha` + `reviewedHeadSha`, and every PR round writes a durable tamper-evident audit record to `loopState.audit[]`. |
+| D13 | Same evidence cannot spend twice. `NO NEW INFORMATION → NO NEW MODEL CALL`, enforced at the authority boundary. |
+| D14 | ReviewLoop never auto-merges and never force-pushes. |
+| D15 | The Worker-facing MCP surface is exactly two tools; COMMON ≤ 2.5 KB; result payloads are compact and never carry raw evidence blobs. |
+| D16 | `~/.reviewloop` is the runtime root. `~/.supergpt` is never read, written, or auto-resumed; a legacy V2 snapshot fails closed. |
+| D17 | Reviewer/Supervisor transports are narrow single-turn inference from one isolated empty scratch cwd — never a second coding Worker. One physical attempt per call; failover is the controller's, not the transport's. |
+| D18 | Stable model-family identity is preserved without concrete version pins: `agy:*` resolves from the runtime catalog, `codex:default` delegates to the Codex default, and `claude:opus` passes the stable provider alias `opus`; telemetry records the concrete model actually used. |
+| D19 | A pool family is either a wired, selectable transport or explicitly UNAVAILABLE with a reason. No phantom fallbacks. `codex`/`claude` wire only after zero-token `--version` plus local auth-status preflights succeed. |
+| D20 | Authentication has two boundaries: local `codex login status` / `claude auth status` failures are pre-dispatch and make that family unavailable; an auth-looking error after a prompt-bearing invocation starts is `PROVIDER_AUTH_REJECTED`, has unknown spend unless provider usage proves otherwise, and must not authorize failover. |
+| D21 | `benchmark:transports` is zero-provider and covers both transport narrowness and controller E2E-A (one-round PASS), E2E-B (REWORK→PASS), and E2E-C (persistent blocker→Supervisor once). |
+| D22 | Every AGY family runs through the `reviewloop-minimal` custom agent (`inheritCustomizations: false`), provisioned deterministically/idempotently at `<isolated gemini dir>/config/agents/reviewloop-minimal/agent.md` and reached with `--gemini_dir` — **not** a workspace `.agents/` path (agy does not reliably discover a workspace-local custom agent and silently falls back to the default agent when `--agent` is unresolvable). Never provisioned into the user's HOME or AGY global config. Effective loading is checked by a zero-model startup capability probe **and** per-call verification; any failure fails closed (AGY families UNAVAILABLE) — ReviewLoop never accepts an AGY default-agent reply. Definitive isolated-agent live result: `agy:gemini-supervisor` medium Supervisor `usageVolume 2933`, `effectiveLoadingVerified`. Earlier ~40k (isolation not in effect — default agent) and ~6.7k (pre-verification) figures are **not** a baseline. No production family is `highContext`; both Gemini role heads are in ordinary automatic routing. |
+| D24 | Gemini production routing uses two role-specific stable family identities, each with a FIXED reasoning effort: `agy:gemini-reviewer` (`defaultEffort: low`, reviewer role only) is the Reviewer head; `agy:gemini-supervisor` (`defaultEffort: medium`, supervisor role only) is the Supervisor head. Editing `DEFAULT_ROLE_POLICY`'s `effort` field alone is insufficient — the concrete `agy` model is resolved and bound at provider-pool construction from the family's own `defaultEffort`, so a single `agy:gemini` family can only ever carry one effort. Both new families resolve from `catalogPrefix: gemini-`, share the one `agy-gemini` quota pool (`DEFAULT_QUOTA_TOPOLOGY`) so a Gemini quota/rate cooldown on either takes both out of routing, and reuse the existing `reviewloop-minimal` isolation / AGY transport / token accounting / fail-closed behaviour. Reviewer routing: `agy:gemini-reviewer → codex:default → agy:sonnet → agy:gpt-oss → claude:opus`. Supervisor routing: `agy:gemini-supervisor → codex:default → agy:sonnet → claude:opus`. Telemetry stays honest: the concrete `-low` / `-medium` id resolved for the family is exactly what the transport passes as `--model` and what the durable spend record persists. |
+| D23 | `usageVolume` (the `MAX_USAGE_VOLUME` safety ceiling) is provider/family-aware (`usageAccountingOf`), keyed off the family/provider in the CallIntent, never a model name. Precedence: authoritative provider-reported total (trusted **only** from a token-total field confirmed for that class — `AUTHORITATIVE_TOTAL_ALIASES`; a bare `total` and any total on an unknown provider are ignored) → family fallback (`openai` = input+output, cache-read is a subset; `anthropic` = input+output+cache_creation+cache_read, separate categories) → conservative additive flagged `semanticsKnown:false` for AGY-without-total / unknown providers. A fallback reports known only when its mechanically-required fields are present; a partial post-dispatch usage object (`volumeResolved:false`) fails closed into the existing `MODEL_SPEND_USAGE_UNRESOLVED` / `ReservationLedger` UNRESOLVED path, never read as 0. Cached tokens are never double-counted; raw breakdown + `usageAccounting` provenance persisted per record. UNKNOWN != ZERO preserved. |
+| D25 | Brand-new Worker file attribution is structural, not content-based: any file untracked at baseline makes every brand-new Worker file (tracked add or untracked) fail the evidence closed — ReviewLoop keeps only a digest per baseline-untracked file and will not chase lossless transforms (base64/gzip/hex/NUL-stripping). A clean starting tree is unaffected. Independently: a git submodule (gitlink) in the Worker's tracked diff — new commits or a dirty submodule worktree — fails closed (ReviewLoop does not recurse into submodules); and a single untracked file is read into memory only up to an 8 MiB cap, larger files are digested with a bounded streaming read and, if brand-new Worker output, fail closed rather than OOMing the MCP process. |
+| D26 | Cross-host lease loss is fail-closed. `renew()` is a compare-and-swap on the inode (write only through the descriptor opened on the published lock file), so it can never overwrite a successor lease. A displaced owner that resumes mid-review must not start a new paid model dispatch or write ReviewLoop durable state: `assertLeaseHeld` (a fresh ownership probe that latches on any non-confirmation) gates both boundaries, and a lost lease aborts the call to a read-only `WAITING_FOR_REVIEW` — the new owner reconciles state. |
+| D27 | The Reviewer and Supervisor first-choice candidates are pinned to DIFFERENT quota pools so a cooldown on one role's primary never disables the other's. Reviewer first choice is `agy:opus` (AGY-hosted Claude Opus, `agy-claude-gpt` pool); Supervisor first choice stays `agy:gemini-supervisor` (`agy-gemini` pool, unchanged). `agy:opus` is `PRODUCTION_ROLE_CAPABILITIES: ['reviewer']` only — the Supervisor pool is untouched. It resolves its concrete Opus dynamically from the AGY runtime catalog (`catalogPrefix: 'claude-opus-'`, `defaultEffort: null`) at pool construction — never a long-term version pin — and shares the `agy-claude-gpt` quota pool with `agy:sonnet` + `agy:gpt-oss`, so one `PROVIDER_QUOTA_EXHAUSTED` / `PROVIDER_RATE_LIMITED` cooldown on that pool skips all three at route time with no wasted probe. `agy:opus` reuses the existing `reviewloop-minimal` isolation, AGY transport, token accounting (`accountingClassOf` → `agy`), ModelSpendAuthority, token sentinel and bounded failover unchanged. Reviewer routing: `agy:opus → agy:gemini-reviewer → codex:default → agy:sonnet → agy:gpt-oss → claude:opus`. Supervisor routing unchanged: `agy:gemini-supervisor → codex:default → agy:sonnet → claude:opus`. |
+| D30 | Final routing-hardening invariants (`a1cfe2c` → `928f79f`). `agy:opus` eligible → must be the Reviewer primary selection, enforced by `assertRoutePrimaryFirstInvariant` (throws `ROUTE_PRIMARY_NOT_EVALUATED` / `ROUTE_PRIMARY_REASON_NOT_ENUMERATED` / `ROUTE_PRIMARY_SKIP_UNPERSISTED` on violation). Any pre-dispatch skip must record a durable, enumerated `ROUTE_SKIP_REASONS` value before route advances; an unpersisted or unenumerated decision fails closed rather than passing through. A candidate with `transportAvailable === false` is skipped `NO_TRANSPORT` and can never be selected regardless of health/quota. Stale provider health is cleared only by a zero-token revalidation probe scoped to the exact failure class that can prove recovery — only `reasonCode: AGY_PROVISIONING_FAILED` is eligible for re-probe; every other reasonCode requires an MCP server restart, never a same-process re-probe. `RouteAuditLog` durably records `loopId` / `round` / `operationId` / `attempt` / `chunkIndex` / `chunkTotal` per routing decision — no failover or chunked round collapses into one abstract audit entry. |
+| D29 | PR-target snapshot correctness. (1) Evidence is bound to explicit, fetched commit SHAs: `prEvidence.js` computes `merge-base(prBaseSha, reviewedHeadSha) .. reviewedHeadSha` via LOCAL `git diff` — never a live `gh pr diff` call, which is not provably bound to one frozen SHA pair. (2) Gate and Reviewer evidence run against the SAME exact snapshot: `prWorktree.js` builds an isolated, disposable `git worktree --detach` at the round's live-observed PR HEAD (fetching missing commits by exact SHA, falling back to `refs/pull/<n>/head` for the HEAD SHA only), runs the Gate and the verification-manifest drift check inside it, and always tears it down (success or failure) — never touching the user's own worktree, index, HEAD, or branches, never committing/pushing/force-pushing. (3) Repository identity is proven, not assumed: `prIdentity.js` compares cwd's literal `git config remote.origin.url` (never `git remote get-url`, which can be locally rewritten by `insteadOf`) against `prBackend.resolveRepo({ cwd, prNumber })`; `reviewloop_begin` refuses to register a PR loop on any mismatch or unresolvable identity. (4) The durable audit records every PHYSICAL Reviewer/Supervisor call (role, family, provider, quota pool, resolved model, attempt, round, chunk index/total, outcome, usage) — a failover or chunked round keeps every attempt, never collapsing to one abstract "internal" entry. PASS requires ALL of: repository identity known, Reviewer evidence bound to the exact reviewed HEAD, Gate ran inside that exact HEAD's worktree, and the live PR HEAD re-read just before certifying still matches — any one UNKNOWN refuses PASS. |

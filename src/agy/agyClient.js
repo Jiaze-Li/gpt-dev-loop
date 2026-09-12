@@ -79,7 +79,7 @@ export class AgyOutputError extends AgyError {
 }
 
 // Raised when a conversation resume was requested (`conversationId`) but `agy`
-// could not resume it, or resumed a *different* conversation. SuperGPT needs
+// could not resume it, or resumed a *different* conversation. ReviewLoop needs
 // explicit turn-to-turn continuity, so any ambiguity here fails closed.
 export class AgyConversationResumeError extends AgyError {
   constructor(message) {
@@ -125,6 +125,18 @@ function extractText(json) {
   return null;
 }
 
+// Recover the concrete model id from the agy json envelope when the caller
+// omitted --model (dynamic provider-default resolution). Tolerant of field
+// naming; returns null when the envelope does not report one.
+function extractModel(json) {
+  if (!json || typeof json !== 'object') return null;
+  const candidates = [json.model, json.model_id, json.modelId, json.usage?.model, json.meta?.model];
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.trim() !== '') return c.trim();
+  }
+  return null;
+}
+
 /**
  * Run one non-interactive `agy` prompt and return a normalized result.
  *
@@ -137,6 +149,12 @@ function extractText(json) {
  * @param {string} [opts.conversationId]    resume this conversation (fail-closed)
  * @param {boolean} [opts.disableSlashCommands] disable agy slash/skill expansion
  * @param {string} [opts.agent]             optional dedicated agy agent name
+ * @param {string} [opts.geminiDir]         optional isolated gemini dir
+ *   (passed as `--gemini_dir=<path>`). Used by ReviewLoop to point agy at a
+ *   redirected config tree that holds ONLY the `reviewloop-minimal` agent and
+ *   never touches the user's real `~/.gemini`.
+ * @param {string} [opts.logFile]           optional agy `--log-file` path, so
+ *   the caller can verify which agent agy actually activated for the run.
  * @param {string} [opts.cwd]               working dir for the child
  * @param {Function} [opts.spawn]           injectable spawn (for tests)
  * @param {AbortSignal} [opts.signal]       stops the owned agy process group and waits for teardown
@@ -153,6 +171,8 @@ export async function callAgy({
   conversationId,
   disableSlashCommands = true,
   agent,
+  geminiDir,
+  logFile,
   cwd,
   spawn = nodeSpawn,
   signal,
@@ -179,13 +199,19 @@ export async function callAgy({
   // (e.g. `--output-format`) as the prompt and silently ignores the real one.
   // Attaching it also means every other flag is an ordinary flag that cannot
   // be consumed as the prompt, regardless of ordering.
+  // `model` null / '' -> omit --model entirely so `agy` picks its own current
+  // default (dynamic family resolution's provider-default path). A concrete id
+  // is passed through verbatim.
   const args = [
     `--print=${prompt}`,
     '--output-format', 'json',
-    '--model', model,
   ];
+  if (typeof model === 'string' && model.trim() !== '') args.push('--model', model.trim());
   if (disableSlashCommands) args.push('--disable-slash-commands');
   if (typeof agent === 'string' && agent.trim() !== '') args.push('--agent', agent.trim());
+  // Attached form so the path can never be misparsed as a following flag.
+  if (typeof geminiDir === 'string' && geminiDir.trim() !== '') args.push(`--gemini_dir=${geminiDir.trim()}`);
+  if (typeof logFile === 'string' && logFile.trim() !== '') args.push('--log-file', logFile.trim());
   if (typeof jsonSchema === 'string' && jsonSchema.length > 0) {
     args.push('--json-schema', jsonSchema);
   }
@@ -322,7 +348,10 @@ export async function callAgy({
   const usage = json && typeof json === 'object' && json.usage && typeof json.usage === 'object' ? json.usage : null;
 
   return {
-    model,
+    // The concrete model actually used: the explicit id when one was passed,
+    // otherwise whatever the provider envelope reports it resolved to.
+    model: (typeof model === 'string' && model.trim() !== '' ? model.trim() : null) ?? extractModel(json),
+    requestedModel: (typeof model === 'string' && model.trim() !== '' ? model.trim() : null),
     exitCode: code,
     text: extractText(json),
     json,

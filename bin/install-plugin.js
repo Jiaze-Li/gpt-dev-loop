@@ -1,10 +1,17 @@
 #!/usr/bin/env node
-// SuperGPT global frontend installer.
+// ReviewLoop global installer.
 //
-// Product contract: Claude, Codex, and AGY are identical front-agent launchers.
-// All three receive the same agent-policy/COMMON.md and the same `supergpt` MCP
-// server. Client-specific differences are limited to the mechanics required to
-// write each client's global configuration.
+// Installs the ReviewLoop Worker Contract (agent-policy/COMMON.md) and the
+// shared `reviewloop` MCP server into whichever supported coding agents are
+// present (Claude, Codex, Gemini/AGY). Missing agents are skipped, not fatal.
+//
+// It ALSO transactionally migrates an older SuperGPT install found on the
+// machine:
+//   - removes the `supergpt` MCP registration it owns (claude / codex / agy)
+//   - removes the `<!-- SUPERGPT-GLOBAL-POLICY -->` managed block
+//   - removes the old AGY `supergpt` skill
+// Unrelated user content outside the managed block is preserved byte-for-byte.
+// Every touched file is snapshotted first; any failure rolls all of them back.
 
 import path from 'node:path';
 import os from 'node:os';
@@ -16,12 +23,15 @@ import { existsSync } from 'node:fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
-const MCP_BIN = path.join(REPO_ROOT, 'bin', 'supergpt-mcp.js');
+const MCP_BIN = path.join(REPO_ROOT, 'bin', 'reviewloop-mcp.js');
 const POLICY_FILE = path.join(REPO_ROOT, 'agent-policy', 'COMMON.md');
 
-const MCP_NAME = 'supergpt';
-const MANAGED_BEGIN = '<!-- SUPERGPT-GLOBAL-POLICY:BEGIN -->';
-const MANAGED_END = '<!-- SUPERGPT-GLOBAL-POLICY:END -->';
+const MCP_NAME = 'reviewloop';
+const LEGACY_MCP_NAME = 'supergpt';
+const MANAGED_BEGIN = '<!-- REVIEWLOOP-GLOBAL-POLICY:BEGIN -->';
+const MANAGED_END = '<!-- REVIEWLOOP-GLOBAL-POLICY:END -->';
+const LEGACY_BEGIN = '<!-- SUPERGPT-GLOBAL-POLICY:BEGIN -->';
+const LEGACY_END = '<!-- SUPERGPT-GLOBAL-POLICY:END -->';
 
 export function resolveGlobalConfigDir(env = process.env, homeDir = os.homedir()) {
   if (env.ANTIGRAVITY_CONFIG_DIR) return env.ANTIGRAVITY_CONFIG_DIR;
@@ -33,21 +43,44 @@ function managedBlock(content) {
   return `${MANAGED_BEGIN}\n${String(content).trim()}\n${MANAGED_END}`;
 }
 
-export function stripManagedPolicy(text = '') {
+function locate(text, begin, end, label) {
   const raw = String(text);
-  const begin = raw.indexOf(MANAGED_BEGIN);
-  const end = raw.indexOf(MANAGED_END);
-  if (begin === -1 && end === -1) return raw;
-  if (begin === -1 || end === -1 || end < begin) {
-    throw new Error('Refusing to modify malformed SuperGPT managed policy block');
+  const b = raw.indexOf(begin);
+  const e = raw.indexOf(end);
+  if (b === -1 && e === -1) return null;
+  if (b === -1 || e === -1 || e < b) {
+    throw new Error(`Refusing to modify malformed ${label} managed policy block`);
   }
-  if (raw.indexOf(MANAGED_BEGIN, begin + MANAGED_BEGIN.length) !== -1) {
-    throw new Error('Refusing to modify duplicate SuperGPT managed policy blocks');
+  if (raw.indexOf(begin, b + begin.length) !== -1) {
+    throw new Error(`Refusing to modify duplicate ${label} managed policy blocks`);
   }
-  const before = raw.slice(0, begin).trimEnd();
-  const after = raw.slice(end + MANAGED_END.length).trimStart();
+  return { raw, begin: b, end: e + end.length };
+}
+
+function stripOne(text, begin, end, label) {
+  const located = locate(text, begin, end, label);
+  if (!located) return String(text);
+  const { raw, begin: b, end: e } = located;
+  const before = raw.slice(0, b).trimEnd();
+  const after = raw.slice(e).trimStart();
   if (before && after) return `${before}\n\n${after}`;
   return before || after;
+}
+
+// Removes BOTH the current ReviewLoop block and any legacy SuperGPT block.
+export function stripManagedPolicy(text = '') {
+  return stripOne(stripOne(text, LEGACY_BEGIN, LEGACY_END, 'SuperGPT'), MANAGED_BEGIN, MANAGED_END, 'ReviewLoop');
+}
+
+export function extractManagedPolicy(text = '') {
+  const located = locate(text, MANAGED_BEGIN, MANAGED_END, 'ReviewLoop');
+  if (!located) return null;
+  const { raw, begin, end } = located;
+  return raw.slice(begin + MANAGED_BEGIN.length, end - MANAGED_END.length).trim();
+}
+
+export function hasLegacyManagedPolicy(text = '') {
+  return String(text).includes(LEGACY_BEGIN);
 }
 
 async function upsertManagedPolicy(filePath, content) {
@@ -61,7 +94,7 @@ async function upsertManagedPolicy(filePath, content) {
 async function removeManagedPolicy(filePath) {
   if (!existsSync(filePath)) return false;
   const existing = await readFile(filePath, 'utf8');
-  if (!existing.includes(MANAGED_BEGIN) && !existing.includes(MANAGED_END)) return false;
+  if (!existing.includes(MANAGED_BEGIN) && !existing.includes(LEGACY_BEGIN)) return false;
   const unmanaged = stripManagedPolicy(existing);
   await writeFile(filePath, unmanaged ? `${unmanaged.trimEnd()}\n` : '', 'utf8');
   return true;
@@ -69,10 +102,7 @@ async function removeManagedPolicy(filePath) {
 
 function runCli(execFileSync, command, args, { allowFailure = false } = {}) {
   try {
-    return String(execFileSync(command, args, {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }) ?? '').trim();
+    return String(execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) ?? '').trim();
   } catch (err) {
     if (allowFailure) return null;
     const detail = err?.stderr ? String(err.stderr).trim() : err?.message;
@@ -80,27 +110,29 @@ function runCli(execFileSync, command, args, { allowFailure = false } = {}) {
   }
 }
 
-function assertFrontendCli(execFileSync, command) {
-  const version = runCli(execFileSync, command, ['--version']);
-  if (!version) throw new Error(`${command} --version returned no output`);
-  return version;
+function frontendAvailable(execFileSync, command) {
+  return runCli(execFileSync, command, ['--version'], { allowFailure: true }) !== null;
 }
 
 function registerClaudeMcp(execFileSync, nodeBin, mcpBin) {
+  runCli(execFileSync, 'claude', ['mcp', 'remove', LEGACY_MCP_NAME, '--scope', 'user'], { allowFailure: true });
   runCli(execFileSync, 'claude', ['mcp', 'remove', MCP_NAME, '--scope', 'user'], { allowFailure: true });
   runCli(execFileSync, 'claude', ['mcp', 'add', MCP_NAME, '--scope', 'user', '--', nodeBin, mcpBin]);
 }
 
 function registerCodexMcp(execFileSync, nodeBin, mcpBin) {
+  runCli(execFileSync, 'codex', ['mcp', 'remove', LEGACY_MCP_NAME], { allowFailure: true });
   runCli(execFileSync, 'codex', ['mcp', 'remove', MCP_NAME], { allowFailure: true });
   runCli(execFileSync, 'codex', ['mcp', 'add', MCP_NAME, '--', nodeBin, mcpBin]);
 }
 
 function removeClaudeMcp(execFileSync) {
+  runCli(execFileSync, 'claude', ['mcp', 'remove', LEGACY_MCP_NAME, '--scope', 'user'], { allowFailure: true });
   return runCli(execFileSync, 'claude', ['mcp', 'remove', MCP_NAME, '--scope', 'user'], { allowFailure: true }) !== null;
 }
 
 function removeCodexMcp(execFileSync) {
+  runCli(execFileSync, 'codex', ['mcp', 'remove', LEGACY_MCP_NAME], { allowFailure: true });
   return runCli(execFileSync, 'codex', ['mcp', 'remove', MCP_NAME], { allowFailure: true }) !== null;
 }
 
@@ -113,7 +145,7 @@ function hasCodexMcp(execFileSync) {
 }
 
 function renderAgySkill(commonPolicy) {
-  return `---\nname: supergpt\ndescription: Shared SuperGPT frontend launcher contract.\n---\n\n${String(commonPolicy).trim()}\n`;
+  return `---\nname: reviewloop\ndescription: Shared ReviewLoop Worker contract.\n---\n\n${String(commonPolicy).trim()}\n`;
 }
 
 async function snapshotFileState(filePath) {
@@ -126,8 +158,6 @@ async function snapshotFileState(filePath) {
 }
 
 async function restoreFileState(filePath, snapshot) {
-  // Remove any partial replacement first, including an unexpected directory
-  // or symlink at a path that used to be absent or a regular file.
   await rm(filePath, { recursive: true, force: true });
   if (!snapshot?.existed) return;
   await mkdir(path.dirname(filePath), { recursive: true });
@@ -138,6 +168,7 @@ async function restoreFileStates(snapshots) {
   const errors = [];
   for (const [filePath, snapshot] of snapshots) {
     try {
+      // eslint-disable-next-line no-await-in-loop
       await restoreFileState(filePath, snapshot);
     } catch (err) {
       errors.push(`${filePath}: ${err?.message || err}`);
@@ -150,11 +181,8 @@ async function readAgyConfig(mcpConfigFile) {
   let config = { mcpServers: {} };
   if (existsSync(mcpConfigFile)) {
     try {
-      const raw = await readFile(mcpConfigFile, 'utf8');
-      config = JSON.parse(raw);
-      if (!config || typeof config !== 'object' || Array.isArray(config)) {
-        throw new Error('config must be a JSON object');
-      }
+      config = JSON.parse(await readFile(mcpConfigFile, 'utf8'));
+      if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('config must be a JSON object');
     } catch (err) {
       throw new Error(`Refusing to overwrite existing invalid MCP config ${mcpConfigFile}: ${err.message}`);
     }
@@ -176,59 +204,71 @@ export async function installGlobal({
   const agyConfigDir = configDir ?? resolveGlobalConfigDir(process.env, homeDir);
   const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
   const agySkillTargetDir = path.join(agyConfigDir, 'skills', MCP_NAME);
+  const legacyAgySkillDir = path.join(agyConfigDir, 'skills', LEGACY_MCP_NAME);
   const agyPolicyFile = path.join(agySkillTargetDir, 'SKILL.md');
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
+  const geminiPolicyFile = path.join(homeDir, '.gemini', 'GEMINI.md');
 
-  // Preflight everything before changing any frontend configuration.
-  const [commonPolicy, agyConfig] = await Promise.all([
-    readFile(policyFile, 'utf8'),
-    readAgyConfig(mcpConfigFile),
-  ]);
-  const versions = {
-    agy: assertFrontendCli(execFileSync, 'agy'),
-    claude: assertFrontendCli(execFileSync, 'claude'),
-    codex: assertFrontendCli(execFileSync, 'codex'),
+  const commonPolicy = await readFile(policyFile, 'utf8');
+  const agyConfig = await readAgyConfig(mcpConfigFile);
+
+  const present = {
+    claude: frontendAvailable(execFileSync, 'claude'),
+    codex: frontendAvailable(execFileSync, 'codex'),
+    agy: frontendAvailable(execFileSync, 'agy'),
   };
+  if (!present.claude && !present.codex && !present.agy) {
+    throw new Error('No supported coding agent (claude / codex / agy) found on this machine');
+  }
 
-  const claudeMcpConfigFile = path.join(homeDir, '.claude.json');
-  const codexMcpConfigFile = path.join(homeDir, '.codex', 'config.toml');
   const transactionalPaths = [
-    mcpConfigFile,
-    agyPolicyFile,
-    claudePolicyFile,
-    codexPolicyFile,
-    claudeMcpConfigFile,
-    codexMcpConfigFile,
+    mcpConfigFile, agyPolicyFile,
+    claudePolicyFile, codexPolicyFile, geminiPolicyFile,
+    path.join(homeDir, '.claude.json'), path.join(homeDir, '.codex', 'config.toml'),
   ];
   const snapshots = new Map();
   for (const filePath of transactionalPaths) {
+    // eslint-disable-next-line no-await-in-loop
     snapshots.set(filePath, await snapshotFileState(filePath));
   }
 
-  // Validate existing managed policy blocks before the first MCP registration
-  // mutates frontend state.
-  for (const policyPath of [claudePolicyFile, codexPolicyFile]) {
-    const snapshot = snapshots.get(policyPath);
-    if (snapshot?.existed) stripManagedPolicy(snapshot.content.toString('utf8'));
+  for (const policyPath of [claudePolicyFile, codexPolicyFile, geminiPolicyFile]) {
+    const snap = snapshots.get(policyPath);
+    if (snap?.existed) stripManagedPolicy(snap.content.toString('utf8'));
   }
 
+  const migrated = { legacyBlocks: [], legacyMcp: [], legacySkill: false };
+
   try {
-    registerClaudeMcp(execFileSync, nodeBin, mcpBin);
-    registerCodexMcp(execFileSync, nodeBin, mcpBin);
+    if (present.claude) registerClaudeMcp(execFileSync, nodeBin, mcpBin);
+    if (present.codex) registerCodexMcp(execFileSync, nodeBin, mcpBin);
 
-    await mkdir(agyConfigDir, { recursive: true });
-    await mkdir(agySkillTargetDir, { recursive: true });
+    if (existsSync(mcpConfigFile) && agyConfig.mcpServers[LEGACY_MCP_NAME]) {
+      migrated.legacyMcp.push('agy');
+    }
+    delete agyConfig.mcpServers[LEGACY_MCP_NAME];
 
-    agyConfig.mcpServers[MCP_NAME] = { command: nodeBin, args: [mcpBin] };
-    await writeFile(mcpConfigFile, `${JSON.stringify(agyConfig, null, 2)}\n`, 'utf8');
-    await writeFile(agyPolicyFile, renderAgySkill(commonPolicy), 'utf8');
+    if (present.agy || existsSync(mcpConfigFile)) {
+      await mkdir(agyConfigDir, { recursive: true });
+      await mkdir(agySkillTargetDir, { recursive: true });
+      agyConfig.mcpServers[MCP_NAME] = { command: nodeBin, args: [mcpBin] };
+      await writeFile(mcpConfigFile, `${JSON.stringify(agyConfig, null, 2)}\n`, 'utf8');
+      await writeFile(agyPolicyFile, renderAgySkill(commonPolicy), 'utf8');
+    }
 
-    await upsertManagedPolicy(claudePolicyFile, commonPolicy);
-    await upsertManagedPolicy(codexPolicyFile, commonPolicy);
+    for (const [frontend, policyPath] of [
+      ['claude', claudePolicyFile], ['codex', codexPolicyFile], ['agy', geminiPolicyFile],
+    ]) {
+      const snap = snapshots.get(policyPath);
+      const legacy = snap?.existed && hasLegacyManagedPolicy(snap.content.toString('utf8'));
+      if (legacy) migrated.legacyBlocks.push(frontend);
+      if (present[frontend] || legacy) {
+        // eslint-disable-next-line no-await-in-loop
+        await upsertManagedPolicy(policyPath, commonPolicy);
+      }
+    }
   } catch (err) {
-    // Registration helpers remove/replace existing entries. Remove any partial
-    // new entry, then restore exact pre-install bytes for every frontend file.
     removeCodexMcp(execFileSync);
     removeClaudeMcp(execFileSync);
     const rollbackErrors = await restoreFileStates(snapshots);
@@ -239,14 +279,25 @@ export async function installGlobal({
     throw err;
   }
 
+  // Every fallible write above has now succeeded. ONLY now delete the legacy
+  // SuperGPT skill directory — it is not in `transactionalPaths` (a dir, not a
+  // file) and cannot be snapshot-restored, so deferring its removal to here is
+  // what guarantees a rolled-back install never loses the user's prior skill.
+  if ((present.agy || existsSync(mcpConfigFile)) && existsSync(legacyAgySkillDir)) {
+    await rm(legacyAgySkillDir, { recursive: true, force: true });
+    migrated.legacySkill = true;
+  }
+
   return {
     success: true,
-    versions,
+    present,
+    migrated,
     mcpBin,
     mcpConfigFile,
     agyPolicyFile,
     claudePolicyFile,
     codexPolicyFile,
+    geminiPolicyFile,
   };
 }
 
@@ -260,19 +311,21 @@ export async function uninstallGlobal({
   const agySkillTargetDir = path.join(agyConfigDir, 'skills', MCP_NAME);
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
+  const geminiPolicyFile = path.join(homeDir, '.gemini', 'GEMINI.md');
 
   let removedAgyMcp = false;
   if (existsSync(mcpConfigFile)) {
     try {
       const config = JSON.parse(await readFile(mcpConfigFile, 'utf8'));
-      if (config?.mcpServers?.[MCP_NAME]) {
-        delete config.mcpServers[MCP_NAME];
+      let changed = false;
+      for (const name of [MCP_NAME, LEGACY_MCP_NAME]) {
+        if (config?.mcpServers?.[name]) { delete config.mcpServers[name]; changed = true; }
+      }
+      if (changed) {
         await writeFile(mcpConfigFile, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
         removedAgyMcp = true;
       }
-    } catch {
-      // Do not rewrite unrelated malformed user configuration during uninstall.
-    }
+    } catch { /* never rewrite unrelated malformed user config */ }
   }
 
   const removedAgyPolicy = existsSync(agySkillTargetDir);
@@ -282,6 +335,7 @@ export async function uninstallGlobal({
   const removedCodexMcp = removeCodexMcp(execFileSync);
   const removedClaudePolicy = await removeManagedPolicy(claudePolicyFile);
   const removedCodexPolicy = await removeManagedPolicy(codexPolicyFile);
+  const removedGeminiPolicy = await removeManagedPolicy(geminiPolicyFile);
 
   return {
     success: true,
@@ -291,103 +345,127 @@ export async function uninstallGlobal({
     removedAgyPolicy,
     removedClaudePolicy,
     removedCodexPolicy,
+    removedGeminiPolicy,
   };
 }
 
 export async function checkGlobalStatus({
   configDir,
   homeDir = os.homedir(),
+  policyFile = POLICY_FILE,
   execFileSync = nodeExecFileSync,
 } = {}) {
   const agyConfigDir = configDir ?? resolveGlobalConfigDir(process.env, homeDir);
   const mcpConfigFile = path.join(agyConfigDir, 'mcp_config.json');
-  const agyPolicyFile = path.join(agyConfigDir, 'skills', MCP_NAME, 'SKILL.md');
+  const agySkillFile = path.join(agyConfigDir, 'skills', MCP_NAME, 'SKILL.md');
   const claudePolicyFile = path.join(homeDir, '.claude', 'CLAUDE.md');
   const codexPolicyFile = path.join(homeDir, '.codex', 'AGENTS.md');
+  const geminiPolicyFile = path.join(homeDir, '.gemini', 'GEMINI.md');
+
+  const expectedPolicy = (await readFile(policyFile, 'utf8')).trim();
 
   let agyMcpInstalled = false;
-  let configuredBin = null;
+  let legacyAgyMcp = false;
   if (existsSync(mcpConfigFile)) {
     try {
       const config = JSON.parse(await readFile(mcpConfigFile, 'utf8'));
-      const entry = config?.mcpServers?.[MCP_NAME];
-      if (entry) {
-        agyMcpInstalled = true;
-        configuredBin = entry.args?.[0] ?? null;
-      }
-    } catch {
-      // Status reports false instead of mutating invalid configuration.
-    }
+      agyMcpInstalled = Boolean(config?.mcpServers?.[MCP_NAME]);
+      legacyAgyMcp = Boolean(config?.mcpServers?.[LEGACY_MCP_NAME]);
+    } catch { /* report false */ }
   }
 
-  const hasManagedPolicy = async (filePath) => {
-    if (!existsSync(filePath)) return false;
-    try {
-      const text = await readFile(filePath, 'utf8');
-      return text.includes(MANAGED_BEGIN) && text.includes(MANAGED_END);
-    } catch {
-      return false;
-    }
+  const managedPolicyState = async (filePath) => {
+    if (!existsSync(filePath)) return { policyInstalled: false, reason: 'missing-file', legacy: false };
+    let text;
+    try { text = await readFile(filePath, 'utf8'); } catch { return { policyInstalled: false, reason: 'unreadable', legacy: false }; }
+    const legacy = hasLegacyManagedPolicy(text);
+    let content;
+    try { content = extractManagedPolicy(text); } catch (err) { return { policyInstalled: false, reason: 'corrupt-block', detail: err.message, legacy }; }
+    if (content === null) return { policyInstalled: false, reason: 'missing-block', legacy };
+    if (content !== expectedPolicy) return { policyInstalled: false, reason: 'stale-content', legacy };
+    return { policyInstalled: true, reason: 'ok', legacy };
   };
 
-  const frontendAvailable = (command) => runCli(execFileSync, command, ['--version'], { allowFailure: true }) !== null;
+  const avail = (command) => runCli(execFileSync, command, ['--version'], { allowFailure: true }) !== null;
+  const [claudePolicy, codexPolicy, geminiPolicy] = await Promise.all([
+    managedPolicyState(claudePolicyFile),
+    managedPolicyState(codexPolicyFile),
+    managedPolicyState(geminiPolicyFile),
+  ]);
 
   return {
     mcpConfigFile,
-    configuredBin,
+    legacyAgyMcp,
     agy: {
-      available: frontendAvailable('agy'),
+      available: avail('agy'),
       mcpInstalled: agyMcpInstalled,
-      policyInstalled: existsSync(agyPolicyFile),
-      policyFile: agyPolicyFile,
+      policyInstalled: geminiPolicy.policyInstalled,
+      policyReason: geminiPolicy.reason,
+      legacyPolicy: geminiPolicy.legacy,
+      policyFile: geminiPolicyFile,
+      skillInstalled: existsSync(agySkillFile),
+      skillFile: agySkillFile,
     },
     claude: {
-      available: frontendAvailable('claude'),
+      available: avail('claude'),
       mcpInstalled: hasClaudeMcp(execFileSync),
-      policyInstalled: await hasManagedPolicy(claudePolicyFile),
+      policyInstalled: claudePolicy.policyInstalled,
+      policyReason: claudePolicy.reason,
+      legacyPolicy: claudePolicy.legacy,
       policyFile: claudePolicyFile,
     },
     codex: {
-      available: frontendAvailable('codex'),
+      available: avail('codex'),
       mcpInstalled: hasCodexMcp(execFileSync),
-      policyInstalled: await hasManagedPolicy(codexPolicyFile),
+      policyInstalled: codexPolicy.policyInstalled,
+      policyReason: codexPolicy.reason,
+      legacyPolicy: codexPolicy.legacy,
       policyFile: codexPolicyFile,
     },
   };
 }
 
 function installedText(frontend) {
-  return frontend.available && frontend.mcpInstalled && frontend.policyInstalled ? 'Installed' : 'Incomplete';
+  if (!frontend.available) return 'Skipped (agent not installed)';
+  if (frontend.mcpInstalled && frontend.policyInstalled) return 'Installed';
+  const notes = [];
+  if (!frontend.mcpInstalled) notes.push('MCP not registered');
+  if (!frontend.policyInstalled) notes.push(`policy ${frontend.policyReason || 'not installed'}`);
+  return `Incomplete (${notes.join(', ')})`;
 }
 
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--status')) {
     const status = await checkGlobalStatus();
-    console.log('SuperGPT Global Frontend Status:');
+    console.log('ReviewLoop global status:');
     console.log(`  AGY:     ${installedText(status.agy)}`);
     console.log(`  Claude:  ${installedText(status.claude)}`);
     console.log(`  Codex:   ${installedText(status.codex)}`);
+    if (status.legacyAgyMcp) console.log('  note: legacy `supergpt` MCP registration still present — run install to migrate');
     return;
   }
-
   if (args.includes('--uninstall')) {
     await uninstallGlobal();
-    console.log('SuperGPT global frontend integration removed.');
+    console.log('ReviewLoop global integration removed.');
     return;
   }
-
   const result = await installGlobal();
-  console.log('SuperGPT installed globally for AGY, Claude, and Codex.');
+  const targets = Object.entries(result.present).filter(([, v]) => v).map(([k]) => k);
+  console.log(`ReviewLoop installed globally for: ${targets.join(', ') || '(none available)'}`);
   console.log(`  MCP server: ${result.mcpBin}`);
   console.log('  Policy:     agent-policy/COMMON.md (single source of truth)');
-  console.log('Restart/open a new frontend session so each client reloads its global MCP and policy.');
+  if (result.migrated.legacyBlocks.length || result.migrated.legacyMcp.length || result.migrated.legacySkill) {
+    console.log(`  Migrated legacy SuperGPT: blocks=[${result.migrated.legacyBlocks}] mcp=[${result.migrated.legacyMcp}] skill=${result.migrated.legacySkill}`);
+  }
+  console.log('Restart/open a new agent session so each client reloads its MCP and policy.');
 }
 
-const invokedDirectly = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+const invokedDirectly = process.argv[1]
+  && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if (invokedDirectly) {
   main().catch((err) => {
-    console.error('SuperGPT installation failed:', err.message);
+    console.error('ReviewLoop installation failed:', err.message);
     process.exitCode = 1;
   });
 }

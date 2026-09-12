@@ -1,100 +1,133 @@
-# SuperGPT (gpt-dev-loop)
+# ReviewLoop (gpt-dev-loop)
 
-SuperGPT is a local autonomous coding system. A front-facing agent launches one workflow; the deterministic Core owns planning, isolated execution, verification, independent review, rework, delivery, persistence, and recovery.
+ReviewLoop adds an autonomous review/fix loop around the coding agent you are
+already using. It does not replace or spawn that coding agent.
 
-## Product model
+> ReviewLoop is a post-execution review and repair controller for coding
+> agents. The user's current coding agent (the **Worker**) owns execution;
+> ReviewLoop owns independent verification, review, non-convergence detection,
+> and exception guidance. It has ONE review engine — the same deterministic
+> Gate, internal Reviewer routing, Supervisor and 3-round convergence policy
+> judge a LOCAL target (baseline → Worker delta) and a PR target (PR base →
+> exact PR HEAD).
 
-Claude, Codex, and AGY have the same role:
+## Model
 
-```text
-User
-  -> Claude / Codex / AGY
-  -> one shared frontend policy
-  -> one shared SuperGPT MCP
-  -> runSuperGPT()
-  -> Planner
-  -> Executor
-  -> deterministic Gate
-  -> independent Reviewer
-  -> next task / rework
-  -> Supervisor only for genuine exceptions
-  -> safe delivery
+```
+USER
+  ↓
+WORKER  (Claude Code / Codex / Gemini / any coding agent)
+  ↓  implements, tests, lints, builds directly in its current session
+ReviewLoop
+  ├─ deterministic Gate      (0 model tokens)
+  ├─ Reviewer                (independent; metered by Token Safety)
+  └─ Supervisor              (exception-only, on non-convergence)
 ```
 
-The front agent is a human interface and launcher, not a second implementation engine. Once SuperGPT owns a task, the front agent does not duplicate planning, coding, testing, review, or rework.
+ReviewLoop does **not**: write application code, commit, push, merge,
+force-push, choose the Worker's model, spawn or restart the Worker, or budget
+the Worker.
 
-## One frontend contract
+## Worker usage
 
-`agent-policy/COMMON.md` is the only active front-agent policy. There are no Claude-, Codex-, or AGY-specific routing/launch policies.
+The Worker calls two MCP tools:
 
-Normal SuperGPT execution is MCP-only for front agents:
+| tool | when | cost |
+|---|---|---|
+| `reviewloop_begin({ goal, cwd, prNumber?, reviewer? })` | before the first edit | 0 model calls |
+| `reviewloop_review({ loopId })` | when the implementation is ready | Gate (0) + Reviewer if justified |
 
-1. `supergpt_start({ goal, cwd })`
-2. `supergpt_watch({ workflowId })`
-3. return the terminal result or surface a real `HUMAN_REQUIRED` question
+`reviewloop_review` returns one of: `PASS`, `REWORK` (fix the findings in the
+same session, call again), `HUMAN_REQUIRED`, `WAITING_FOR_REVIEW` (transient —
+call again once state settles), `NO_PROGRESS`, `PUSH_REQUIRED`.
 
-The CLI remains available for humans and diagnostics, but it is not an alternate agent workflow.
+Full Worker contract: [`agent-policy/COMMON.md`](agent-policy/COMMON.md).
 
-## Global install
+## PR target
 
-Prerequisites: Node 20+, Git, AGY, Claude Code, and Codex available on `PATH`.
+Pass `prNumber` to review an open PR. `reviewloop_begin` freezes the exact PR
+snapshot — repository, `prNumber`, base SHA, HEAD SHA — and every review round
+runs the **same** engine as a LOCAL target over the PR's `base → HEAD` diff:
+deterministic Gate → internal Reviewer routing (`agy:opus` first) → convergence
+policy → Supervisor only on non-convergence. Before a PR `PASS`, ReviewLoop
+re-reads the live PR HEAD and refuses to certify a stale review if it moved.
+Each round writes a durable, tamper-evident audit record. ReviewLoop never
+pushes, merges, force-pushes, or posts a third-party review trigger.
 
-```bash
-npm run install-global
-node bin/install-plugin.js --status
+## CLI
+
+```
+reviewloop doctor        zero-token prerequisite + repo-invariant check
+reviewloop status        list local ReviewLoop sessions
+npm run install-global   install/refresh the global policy + MCP for present agents
+npm run doctor
 ```
 
-One installation gives all three frontends the same `supergpt` MCP server and the same `COMMON.md` behavior. Re-open/restart frontend sessions after installation so they reload global configuration.
+## Docs
 
-See `docs/GLOBAL_INSTALL.md` for details.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — current source of truth
+- [`docs/DECISIONS.md`](docs/DECISIONS.md) — architectural decisions
+- [`docs/ROADMAP.md`](docs/ROADMAP.md)
+- [`docs/GLOBAL_INSTALL.md`](docs/GLOBAL_INSTALL.md)
+- [`docs/history/SUPERGPT_V1_V2_LESSONS.md`](docs/history/SUPERGPT_V1_V2_LESSONS.md) — why ReviewLoop replaced SuperGPT V1/V2
 
-## V1 workflow
+## Certification status
 
-For a reliable Planner task queue, normal transitions are deterministic:
+Three distinct certification events on `v2-routing`. They are **not**
+interchangeable — each covers a different implementation snapshot and a
+different part of the engine; read them separately, not as one running total.
 
-```text
-Planner once
-  -> Executor
-  -> Gate
-  -> Reviewer
-     PASS -> next task / WORKFLOW_DONE
-     first ordinary REWORK -> Executor
-     Gate failure -> Executor
-     ambiguity / repeated non-convergence / plan mismatch / HUMAN_REQUIRED -> Supervisor
-```
+### 1. Historical LOCAL real-provider certification — `ce02f1e`
 
-Reviewer independence is preserved. Supervisor is not part of the normal happy path.
+Certified implementation snapshot: **`ce02f1e83276d7349ac6dfec332f75c7b972fd32`**
+— the frozen implementation head this certification was run against.
 
-## Public MCP operations
+- Deterministic bar at `ce02f1e`: **PASS** — `npm test` **573/573**,
+  `npm run doctor` PASS, `npm run benchmark:transports` PASS (0 real spawns),
+  `git diff --check` clean.
+- A full `reviewloop_begin` → Gate → Reviewer → verdict loop was carried to a
+  controller **PASS** over the `ce02f1e` snapshot against the byte-exact
+  frozen delta `bb0c36e → ce02f1e`: Reviewer **`agy:opus`** (first choice),
+  live-resolved model `claude-opus-4-6-thinking`, quota pool
+  `agy-claude-gpt`; Supervisor first choice `agy:gemini-supervisor` not
+  invoked (converged round 1); 1 physical Reviewer call, 0 Supervisor calls;
+  `usageVolume` **8960**; AGY isolation / effective-loading verification
+  **PASS**; no blocking P1/P2 findings.
+- Scope: **LOCAL mode only**, first-choice Reviewer only. Does not cover PR
+  mode or multi-provider failover.
 
-- `supergpt_prepare`
-- `supergpt_plan`
-- `supergpt_start`
-- `supergpt_run`
-- `supergpt_watch`
-- `supergpt_status`
-- `supergpt_wait`
-- `supergpt_verify`
-- `supergpt_resume`
-- `supergpt_stop`
+### 2. PR-target real-provider certification — PR #5
 
-Status/watch/wait and deterministic control-plane operations read local persisted state and do not need model calls.
+Implementation freeze: **`787a4070336d9839590d437ce95ec8a898519d11`**.
+Certification PR: **#5**, reviewed head
+**`755c1e53cdcf113e2c85aa901e4e43ed21836d1d`**.
 
-## Safety and reliability
+- Physical Reviewer: **`codex:default`**. 1 Reviewer call, 0 Supervisor calls.
+- Controller verdict: **PASS**, round 1, "no P1/P2 findings".
+- `usageVolume` **16759**, `contextOverheadTokens` **16460** — Token Sentinel
+  **not tripped** (threshold 40000 single-call / 30000 context-overhead).
+- Exercises the real PR-target production path end to end: repository
+  identity, exact base/head SHA binding, Gate on the exact reviewed HEAD, one
+  real Reviewer call.
 
-- exact invocation workspace snapshot and isolated worktree execution;
-- deterministic Gate before independent Reviewer acceptance;
-- conflict-checked delivery back to the invocation workspace;
-- durable terminal states and phase-aware resume;
-- provider failover, quota/health policy, bounded retries, and process cleanup;
-- no browser/ChatGPT-Web dependency in the V1 production path.
+### 3. Final routing-hardening implementation — `928f79f`
 
-## Roadmap
+Implementation head: **`928f79fdbc342ad1ca0f22f2357c4ed78dc88a6e`**.
 
-V1 is the current production baseline. `docs/V2_PLAN.md` is the sole active V2 plan. V2 adds centralized zero-token `supergpt_route`, Fast/Full paths, and the PR review/fix/re-review closeout loop without reintroducing parallel frontend policies.
+- Deterministic local suite / `npm run doctor` / `npm run benchmark:transports`:
+  **PASS**.
+- Independent manual GitHub code review: **PASS**.
+- **No extra real-provider certification was performed against this head.**
+  One real-provider certification attempt over the routing-hardening change
+  hit the post-settlement Token Sentinel (a `codex:default` Reviewer call,
+  `usageVolume` 79256 / `contextOverheadTokens` 69297, both over threshold) —
+  this is a **safety trip, not a code finding**: the anomalous call was fully
+  accounted, the loop latched to `HUMAN_REQUIRED`, and no further automatic
+  provider spend occurred. The Sentinel thresholds were **not** raised or
+  bypassed to get past it.
 
-Historical browser-bridge material is retained only under `docs/handoff/archive/` and Git history.
+`claude:opus` uses the stable provider alias `opus`; `codex:default` follows
+the provider default. No concrete release is pinned by default.
 
-## License
-
-MIT
+Historical SuperGPT V1/V2 measured numbers are labelled historical in
+`docs/history/` and are not ReviewLoop certification.
