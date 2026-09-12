@@ -229,6 +229,19 @@ export async function callAgy({
       child = spawn(executable, args, {
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // AGY_CLI_DISABLE_AUTO_UPDATE: agy ships a background self-updater
+        // (google3/third_party/jetski/cli/updater). Under ReviewLoop's
+        // concurrent/rapid invocation pattern (many short-lived agy calls in
+        // a pool), independent processes can each race to spawn their own
+        // updater child at ~the same time; a historical agy changelog entry
+        // ("Fixed a background auto-updater double-spawn race ...") shows
+        // this exact race existed for two concurrent processes and was only
+        // partially addressed. Under N-way concurrency it can still cascade
+        // into an unbounded fork storm (observed: CPU pegged, PID space
+        // wrapping within minutes, Mac overheating to 90+C). agy has no use
+        // for self-updating when invoked non-interactively by ReviewLoop, so
+        // disable it unconditionally for every spawn.
+        env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true' },
         ...PROCESS_GROUP_SPAWN_OPTS,
       });
     } catch (err) {
