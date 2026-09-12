@@ -156,20 +156,38 @@ export function createReviewLoopMcpServer({
   return server;
 }
 
-export async function startReviewLoopMcpServer(options = {}) {
+// Extracted as its own seam (injectable probes) so the isolation boundary —
+// both AGY probes MUST use the same isolated ReviewLoop gemini dir, never
+// ambient AGY config — can be asserted mechanically in tests without
+// spinning up a real MCP stdio transport. When the MCP host process is
+// itself AGY, an ambient `agy` invocation here would load the ambient AGY
+// MCP config (which includes this very ReviewLoop server), spawning a child
+// AGY/ReviewLoop process chain. Isolation, not Worker-identity detection, is
+// what closes that loop.
+export async function resolveMcpStartupRuntimeInputs({
+  probeAgyModelCatalog: probeCatalog = probeAgyModelCatalog,
+  detectAgyCustomAgentSupport: detectCustomAgentSupport = detectAgyCustomAgentSupport,
+  narrowAgyGeminiDir: resolveAgyGeminiDir = narrowAgyGeminiDir,
+} = {}) {
   // Probe runtime resolution inputs once at startup: the `agy models` catalog
   // (metadata listing, not a model call) and the CLI-transport availability
   // (`codex --version` / `claude --version`). Both degrade safely on failure.
+  const agyGeminiDir = resolveAgyGeminiDir();
   const [agyCatalog, transportRuntime, customAgentSupport] = await Promise.all([
-    Promise.resolve().then(() => probeAgyModelCatalog()),
+    Promise.resolve().then(() => probeCatalog({ geminiDir: agyGeminiDir })),
     probeReviewTransportRuntime(),
     // Zero-model-turn probe: does this agy build load the isolated
     // reviewloop-minimal agent from the redirected gemini dir? Unsupported ->
     // the AGY families fail closed instead of silently running the default agent.
-    detectAgyCustomAgentSupport({ geminiDir: narrowAgyGeminiDir() }).catch((err) => ({
+    detectCustomAgentSupport({ geminiDir: agyGeminiDir }).catch((err) => ({
       supported: false, reason: `capability probe threw: ${err?.message ?? err}`,
     })),
   ]);
+  return { agyCatalog, transportRuntime, customAgentSupport };
+}
+
+export async function startReviewLoopMcpServer(options = {}) {
+  const { agyCatalog, transportRuntime, customAgentSupport } = await resolveMcpStartupRuntimeInputs();
   const server = createReviewLoopMcpServer({
     agyCatalog, transportRuntime, customAgentSupport, ...options,
   });

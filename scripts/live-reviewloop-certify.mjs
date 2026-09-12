@@ -121,7 +121,7 @@ async function readSpendRecords(ctl, loopId) {
 
 const defaultDeps = Object.freeze({
   createProviders: (opts) => createProductionReviewLoopProviders(opts),
-  probeAgyModelCatalog: () => probeAgyModelCatalog(),
+  probeAgyModelCatalog: () => probeAgyModelCatalog({ geminiDir: narrowAgyGeminiDir() }),
   probeReviewTransportRuntime: (o) => probeReviewTransportRuntime(o),
   detectAgyCustomAgentSupport: () => detectAgyCustomAgentSupport({ geminiDir: narrowAgyGeminiDir() }),
 });
