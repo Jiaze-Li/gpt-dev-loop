@@ -691,3 +691,148 @@ test('fail closed: an intermediate directory swapped for a symlink is rejected, 
     fs.rmSync(secretDir, { recursive: true, force: true });
   }
 });
+
+// P1 follow-up (PR #4 review thread on 465b266/dfe5bdd): the previous
+// intermediate-directory fix compared `realpath(abs)` BEFORE the open against
+// `realpath(abs)` AFTER the read. That is two separate syscalls with a real
+// window in between — a concurrent process can swap the parent directory for
+// a symlink strictly AFTER the "before" check runs (so it still reports the
+// real, expected location) and strictly BEFORE the "after" check runs (having
+// already restored the original directory), leaking the swapped-in target's
+// bytes into evidence while both pathname checks report success. Two more
+// checks around the same open cannot close a check-then-use race — closing it
+// requires the check and the open to be one kernel call.
+//
+// This test reproduces exactly that window deterministically (via call-count
+// driven fakes, standing in for the real interleaving) against:
+//   (a) a faithful reconstruction of the OLD before/after-realpath algorithm,
+//       proving it reports the attacker's bytes as safe, and
+//   (b) the CURRENT fingerprintUntracked (via collectWorkerDelta), with the
+//       atomic whole-path guard forced unavailable, proving it refuses to
+//       open the path at all — there is no read for the race to land in.
+test('P1 regression: parent directory swapped strictly between the pre-open check and the open, restored strictly before any post-read check', async () => {
+  const dir = initRepo();
+  const abs = path.join(dir, 'sub', 'leak.txt');
+  const ATTACKER_BYTES = Buffer.from('TOP_SECRET_VIA_TRUE_RACE_WINDOW');
+  const LEGIT_BYTES = Buffer.from('legit-worker-output');
+
+  // Shared attack-simulation state: swapped=true models the window during
+  // which `sub` is a symlink to the attacker's directory.
+  function makeFakes() {
+    const state = { swapped: false, opens: 0, realpathAbsCalls: 0 };
+    const fakeLstat = async () => ({ isSymbolicLink: () => false, isFile: () => true });
+    const fakeRealpath = async (p) => {
+      if (p === dir) return dir; // repo root: fixed, never raced here
+      if (p === abs) {
+        state.realpathAbsCalls += 1;
+        if (state.realpathAbsCalls === 1) {
+          // "Before" check: sub is still the real directory at this instant.
+          state.swapped = true; // attacker swaps it the moment this check returns
+          return abs;
+        }
+        // Any later realpath(abs) call ("after" check): attacker has already
+        // restored the real directory before this check runs.
+        state.swapped = false;
+        return abs;
+      }
+      throw Object.assign(new Error(`unexpected realpath(${p})`), { code: 'ENOENT' });
+    };
+    const fakeOpen = async () => {
+      state.opens += 1;
+      // Models the real syscall outcome of an O_NOFOLLOW-only open through an
+      // intermediate symlink: it transparently follows the swapped parent.
+      const bytes = state.swapped ? ATTACKER_BYTES : LEGIT_BYTES;
+      const stat = { isSymbolicLink: () => false, isFile: () => true, ino: 1, size: bytes.length };
+      return {
+        stat: async () => stat,
+        readFile: async () => Buffer.from(bytes),
+        close: async () => {},
+      };
+    };
+    return { state, fakeLstat, fakeRealpath, fakeOpen };
+  }
+
+  // (a) Faithful reconstruction of the OLD algorithm (before this fix):
+  //     lstat -> realpath(cwd) + realpath(abs) BEFORE -> open(O_NOFOLLOW) ->
+  //     read -> realpath(abs) AFTER, trusted if it matches "before".
+  async function oldFingerprintUntracked({
+    cwdArg, filePath, lstat, open, realpath,
+  }) {
+    const p = path.join(cwdArg, filePath);
+    const info = await lstat(p);
+    if (info.isSymbolicLink() || !info.isFile()) return { safe: false, reason: 'not a regular file' };
+    const realCwd = await realpath(cwdArg);
+    const realBefore = await realpath(p);
+    const expected = path.join(realCwd, filePath);
+    if (realBefore !== expected) return { safe: false, reason: 'parent swap detected before open' };
+    const fh = await open(p, 0 /* O_RDONLY | O_NOFOLLOW, final component only */);
+    const st = await fh.stat();
+    const buf = await fh.readFile();
+    const st2 = await fh.stat();
+    if (st2.ino !== st.ino || st2.size !== buf.length) return { safe: false, reason: 'changed during read' };
+    const realAfter = await realpath(p);
+    if (realAfter !== realBefore) return { safe: false, reason: 'parent swap detected after read' };
+    return { safe: true, bytes: buf };
+  }
+
+  const oldRun = makeFakes();
+  const oldResult = await oldFingerprintUntracked({
+    cwdArg: dir, filePath: 'sub/leak.txt', lstat: oldRun.fakeLstat, open: oldRun.fakeOpen, realpath: oldRun.fakeRealpath,
+  });
+  assert.equal(oldResult.safe, true, 'the OLD before/after-realpath algorithm is fooled by this exact race');
+  assert.deepEqual(oldResult.bytes, ATTACKER_BYTES, 'the OLD algorithm hands back the attacker\'s bytes as "safe"');
+
+  // (b) The CURRENT implementation, exercised through the public API, with
+  // the atomic whole-path guard forced unavailable (the conservative,
+  // non-Darwin-shaped case) so the only defence in play is the fail-closed
+  // "refuse any parent component" policy this fix adds.
+  try {
+    const emptyLsFilesSpawn = (cmd, args) => {
+      if (args.join(' ').startsWith('ls-files')) {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => child.emit('close', 0));
+        return child;
+      }
+      return nodeSpawn(cmd, args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    };
+    const baseline = await captureBaseline({ cwd: dir, spawn: emptyLsFilesSpawn });
+
+    const scriptedSpawn = (cmd, args) => {
+      if (args.join(' ').startsWith('ls-files')) {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          child.stdout.emit('data', Buffer.from('sub/leak.txt\0'));
+          child.emit('close', 0);
+        });
+        return child;
+      }
+      return nodeSpawn(cmd, args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    };
+
+    const newRun = makeFakes();
+    const delta = await collectWorkerDelta({
+      cwd: dir,
+      baseline,
+      spawn: scriptedSpawn,
+      lstat: newRun.fakeLstat,
+      open: newRun.fakeOpen,
+      realpath: newRun.fakeRealpath,
+      atomicGuardFlag: null, // force "no atomic whole-path guard available"
+    });
+
+    assert.equal(delta.evidenceComplete, false, 'a parent-component path with no atomic guard fails the evidence closed');
+    assert.ok(
+      delta.incompleteReasons.some((r) => /parent director/i.test(r) && /atomic/i.test(r)),
+      JSON.stringify(delta.incompleteReasons),
+    );
+    assert.equal(newRun.state.opens, 0, 'the current implementation never opens the path at all — there is no window for the race to land in');
+    assert.doesNotMatch(delta.diff ?? '', /TOP_SECRET_VIA_TRUE_RACE_WINDOW/, 'the attacker bytes never entered evidence');
+    assert.equal(delta.changedFiles.includes('sub/leak.txt'), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
